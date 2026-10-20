@@ -43,7 +43,7 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn eval(columns: Vec<ArrayRef>) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -128,10 +128,14 @@ fn legacy_regexp_replace_baseline_invalid_pattern_full_error_above_512_bytes() {
         column(vec![Some("-")]),
     ])
     .unwrap_err();
-    assert_eq!(actual.as_bytes(), expected.as_bytes());
+    assert_eq!(
+        regex_source(&actual).to_string().as_bytes(),
+        expected.as_bytes()
+    );
+    assert!(actual.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
     println!(
         "regexp_replace legacy raw regex error bytes={}",
-        actual.len()
+        regex_source(&actual).to_string().len()
     );
 }
 #[test]
@@ -144,7 +148,10 @@ fn legacy_regexp_replace_baseline_first_needed_error_order() {
         column(vec![Some("-"), Some("-"), Some("-")]),
     ])
     .unwrap_err();
-    assert_eq!(actual, regex::Regex::new(first).unwrap_err().to_string());
+    assert_eq!(
+        regex_source(&actual).to_string(),
+        regex::Regex::new(first).unwrap_err().to_string()
+    );
 }
 #[test]
 fn legacy_regexp_replace_baseline_literal_and_column_patterns_same_semantics() {
@@ -174,7 +181,11 @@ fn legacy_regexp_replace_baseline_literal_and_column_patterns_same_semantics() {
         ]);
         match (actual, dynamic) {
             (Ok(a), Ok(b)) => assert_eq!(a.to_data(), b.to_data()),
-            (Err(a), Err(b)) => assert_eq!(a.as_bytes(), b.as_bytes()),
+            (Err(a), Err(b)) => {
+                use novarocks_failure_contract::FailureProjection;
+                assert_eq!(a.failure_fact(), b.failure_fact());
+                assert_eq!(regex_source(&a).to_string(), regex_source(&b).to_string());
+            }
             other => panic!("literal/column disagreement: {other:?}"),
         }
     }
@@ -237,7 +248,10 @@ fn legacy_regexp_replace_baseline_non_utf8_type_error_before_row_mask() {
     for argument in 0..3 {
         let mut columns = vec![column(vec![None]), column(vec![None]), column(vec![None])];
         columns[argument] = Arc::new(Int64Array::from(vec![None]));
-        assert_eq!(eval(columns).unwrap_err(), "regexp_replace expects string");
+        let failure = eval(columns).unwrap_err();
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.to_string(), "regexp_replace expects string");
     }
 }
 #[test]
@@ -251,15 +265,29 @@ fn legacy_regexp_replace_baseline_eager_arguments_even_when_source_is_null() {
     );
     let source = chunk(vec![column(vec![None])]);
     let expected = arena.eval(missing, &source).unwrap_err();
-    assert_eq!(
-        eval_string_function(
-            "regexp_replace",
-            &arena,
-            input,
-            &[input, missing, replacement],
-            &source
-        )
-        .unwrap_err(),
-        expected
+    let actual = eval_string_function(
+        "regexp_replace",
+        &arena,
+        input,
+        &[input, missing, replacement],
+        &source,
+    )
+    .unwrap_err();
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(actual.failure_fact(), expected.failure_fact());
+    assert_eq!(actual.to_string(), expected.to_string());
+    assert!(
+        !actual.same_occurrence(&expected),
+        "independent evaluations must not share origin identity merely because their facts match"
     );
+}
+
+fn regex_source(failure: &crate::runtime::fragment::ExecutionFailure) -> &regex::Error {
+    let mut source: &(dyn std::error::Error + 'static) = failure;
+    loop {
+        if let Some(source) = source.downcast_ref::<regex::Error>() {
+            return source;
+        }
+        source = source.source().expect("actual regex SDK cause");
+    }
 }

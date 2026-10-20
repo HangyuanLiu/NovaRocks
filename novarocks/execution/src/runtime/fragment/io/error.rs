@@ -51,6 +51,7 @@ pub struct FragmentIoError {
     operation: FragmentIoOperation,
     kind: FragmentIoErrorKind,
     message: String,
+    source: Option<crate::runtime::fragment::SharedDomainFailure>,
 }
 
 impl FragmentIoError {
@@ -63,6 +64,31 @@ impl FragmentIoError {
             operation,
             kind,
             message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Preserve a known producer's original source and neutral fact. The IO
+    /// operation/kind remain transport context and cannot reclassify it.
+    pub fn from_domain<E>(
+        operation: FragmentIoOperation,
+        kind: FragmentIoErrorKind,
+        cause: E,
+    ) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let source = crate::runtime::fragment::SharedDomainFailure::new(cause);
+        Self {
+            operation,
+            kind,
+            message: novarocks_failure_contract::BoundedDetail::truncating_display(&source)
+                .into_string(),
+            source: Some(source),
         }
     }
 
@@ -85,4 +111,57 @@ impl fmt::Display for FragmentIoError {
     }
 }
 
-impl std::error::Error for FragmentIoError {}
+impl std::error::Error for FragmentIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for FragmentIoError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        if let Some(source) = &self.source {
+            return source.failure_fact();
+        }
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let namespace = match self.operation {
+            FragmentIoOperation::ExchangeTransmit => domain::EXCHANGE,
+            FragmentIoOperation::ResultOpen
+            | FragmentIoOperation::ResultWrite
+            | FragmentIoOperation::ResultFinish => domain::RESULT,
+            FragmentIoOperation::Lookup => domain::EXECUTION,
+        };
+        let (class, code) = match self.kind {
+            FragmentIoErrorKind::Unavailable => (
+                FailureClass::Dependency,
+                ExecutionReason::FragmentIoUnavailable,
+            ),
+            FragmentIoErrorKind::Timeout => {
+                (FailureClass::Control, ExecutionReason::FragmentIoTimeout)
+            }
+            FragmentIoErrorKind::RemoteRejected => (
+                FailureClass::Dependency,
+                ExecutionReason::FragmentIoRemoteRejected,
+            ),
+            FragmentIoErrorKind::InvalidResponse => (
+                FailureClass::Invariant,
+                ExecutionReason::FragmentIoInvalidResponse,
+            ),
+            FragmentIoErrorKind::Cancelled => {
+                (FailureClass::Control, ExecutionReason::FragmentIoCancelled)
+            }
+            FragmentIoErrorKind::Internal => (
+                FailureClass::Unexpected,
+                ExecutionReason::FragmentIoInternal,
+            ),
+        };
+        FailureFact::new(class, FailureReason::new(namespace, code.code()))
+    }
+}
+impl From<FragmentIoError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(error: FragmentIoError) -> Self {
+        Self::from_domain(error)
+    }
+}

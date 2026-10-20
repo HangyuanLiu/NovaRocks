@@ -28,7 +28,9 @@
 //! A hash join's membership runtime-filter producers observe its build keys
 //! in the build sink. The one build driver is their one local partition.
 
+use super::super::program_failure;
 use super::*;
+use crate::exec::fragment::error::FragmentBindingErrorKind;
 use crate::exec::operators::compiled_expression::root_value_type;
 use crate::exec::operators::compiled_nljoin::{
     CompiledNlJoinPlan, CompiledNlJoinProbeProcessorFactory,
@@ -52,17 +54,25 @@ fn compiled_join_producers(
     id: ProgramNodeId,
     plan: &CompiledHashJoinPlan,
     ctx: &PipelineBuildContext,
-) -> Result<Option<Arc<NativeRuntimeFilterProducerFactory>>, String> {
+) -> ExecutionResult<Option<Arc<NativeRuntimeFilterProducerFactory>>> {
     let ProgramNodeKind::Join {
         runtime_filters, ..
     } = program
         .graph()
         .nodes()
         .get(id.index())
-        .ok_or_else(|| format!("compiled join node {} is absent", id.index()))?
+        .ok_or_else(|| {
+            program_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                format!("compiled join node {} is absent", id.index()),
+            )
+        })?
         .kind()
     else {
-        return Err(format!("compiled node {} is not a hash join", id.index()));
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!("compiled node {} is not a hash join", id.index()),
+        ));
     };
     let Some(first) = runtime_filters.first() else {
         return Ok(None);
@@ -73,11 +83,14 @@ fn compiled_join_producers(
     for filter in runtime_filters {
         let producer = &filter.producer;
         if producer.kind() != FilterProducerKind::Membership {
-            return Err(format!(
-                "compiled hash join at local node {} runtime-filter binding_id={} with a {:?} producer is not executable yet",
-                id.index(),
-                producer.binding_id(),
-                producer.kind()
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled hash join at local node {} runtime-filter binding_id={} with a {:?} producer is not executable yet",
+                    id.index(),
+                    producer.binding_id(),
+                    producer.kind()
+                ),
             ));
         }
         producers.push((filter.key_ordinal, runtime_filter_producer(producer)?));
@@ -87,9 +100,12 @@ fn compiled_join_producers(
         plan.eq_null_safe(),
         |ordinal| {
             let site = plan.build_site(ordinal).ok_or_else(|| {
-                format!(
-                    "compiled hash join at local node {} has no build key {ordinal}",
-                    id.index()
+                program_failure(
+                    FragmentBindingErrorKind::MissingAssignment,
+                    format!(
+                        "compiled hash join at local node {} has no build key {ordinal}",
+                        id.index()
+                    ),
                 )
             })?;
             Ok(root_value_type(program, site)?.data_type().clone())
@@ -134,11 +150,14 @@ pub(super) fn build_hash_join(
     let build_build = build_node(program, build, ctx, error, ordered)?;
     let mut build_build = gather_to_one(build_build, ctx, node_id);
     if producers.is_some() && build_build.pipeline.dop != COMPILED_JOIN_BUILD_PARTITIONS {
-        return Err(format!(
-            "compiled hash join at local node {} builds on {} drivers, not on the one partition its runtime-filter producers declare",
-            id.index(),
-            build_build.pipeline.dop
-        ).into());
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled hash join at local node {} builds on {} drivers, not on the one partition its runtime-filter producers declare",
+                id.index(),
+                build_build.pipeline.dop
+            ),
+        ));
     }
     let probe_dop = probe_build.pipeline.dop.max(1) as usize;
     let state = Arc::new(BroadcastJoinSharedState::new(

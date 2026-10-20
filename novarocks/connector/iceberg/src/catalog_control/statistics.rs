@@ -891,24 +891,14 @@ fn statistics_receipt(
 
 fn known_uncommitted(error: ConnectorError) -> ExternalMutationOutcome<StatisticsReceipt> {
     ExternalMutationOutcome::KnownUncommitted {
-        failure: ConnectorMutationFailure::new(failure_kind(error.kind()), error.to_string()),
+        failure: ConnectorMutationFailure::from_connector(error.clone()),
         cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
     }
 }
 
+#[cfg(test)]
 fn failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
-    match kind {
-        ConnectorErrorKind::InvalidRequest => ConnectorMutationFailureKind::InvalidRequest,
-        ConnectorErrorKind::NotFound => ConnectorMutationFailureKind::NotFound,
-        ConnectorErrorKind::PermissionDenied => ConnectorMutationFailureKind::PermissionDenied,
-        ConnectorErrorKind::Unsupported => ConnectorMutationFailureKind::Unsupported,
-        ConnectorErrorKind::Cancelled => ConnectorMutationFailureKind::Cancelled,
-        ConnectorErrorKind::DeadlineExceeded => ConnectorMutationFailureKind::DeadlineExceeded,
-        ConnectorErrorKind::ResourceExhausted => ConnectorMutationFailureKind::ResourceExhausted,
-        ConnectorErrorKind::Unavailable => ConnectorMutationFailureKind::Unavailable,
-        ConnectorErrorKind::CorruptData => ConnectorMutationFailureKind::CorruptData,
-        ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
-    }
+    kind.into()
 }
 
 fn validate_context(

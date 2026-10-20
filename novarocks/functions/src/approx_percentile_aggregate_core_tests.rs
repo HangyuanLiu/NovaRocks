@@ -112,7 +112,8 @@ fn approx_percentile_shared_original_weighted_demand_and_full_type_errors() {
     assert_eq!(
         input
             .update_row(&mut state, 0, ApproxPercentileDiagnostic::WeightedUpdate)
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
         "percentile_approx_weighted: percentile weight must be non-negative, got -8"
     );
     let input = WeightedInput::try_new(
@@ -127,7 +128,8 @@ fn approx_percentile_shared_original_weighted_demand_and_full_type_errors() {
     assert_eq!(
         input
             .update_row(&mut state, 0, ApproxPercentileDiagnostic::WeightedUpdate)
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
         "percentile_approx_weighted: percentile parameter must be between 0 and 1, got 1.25"
     );
     let input = WeightedInput::try_new(
@@ -142,7 +144,8 @@ fn approx_percentile_shared_original_weighted_demand_and_full_type_errors() {
     assert_eq!(
         input
             .update_row(&mut state, 0, ApproxPercentileDiagnostic::WeightedUpdate)
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
         "percentile_approx_weighted: unsupported numeric input type Boolean"
     );
 }
@@ -165,7 +168,7 @@ fn approx_percentile_shared_original_four_payload_readers_and_magic_bug() {
         )
         .unwrap();
         assert_eq!(
-            percentile::encode_state(&state),
+            percentile::encode_state(&state).unwrap(),
             vec![0xa2, 4, 0, 0x10, 0x27, 0, 0, 0, 0, 0, 0]
         );
     }
@@ -183,7 +186,8 @@ fn approx_percentile_shared_original_four_payload_readers_and_magic_bug() {
             0,
             ApproxPercentileDiagnostic::WeightedMerge
         )
-        .unwrap_err(),
+        .unwrap_err()
+        .to_string(),
         format!(
             "percentile_approx_weighted_merge: unsupported percentile payload type {:?}",
             dtype

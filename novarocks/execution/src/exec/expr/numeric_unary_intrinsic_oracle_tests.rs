@@ -74,7 +74,7 @@ fn compare(input: ArrayRef) {
                     .find(|error| error.selected_ordinal() == row)
                     .unwrap()
                     .message(),
-                message
+                (message).detail()
             ),
         }
     }
@@ -100,7 +100,7 @@ fn compare(input: ArrayRef) {
                     .find(|error| error.selected_ordinal() == ordinal)
                     .unwrap()
                     .message(),
-                message
+                (message).detail()
             ),
         }
     }

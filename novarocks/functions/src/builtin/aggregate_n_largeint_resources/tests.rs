@@ -192,12 +192,6 @@ pub(in crate::builtin) fn causes() -> [KernelFailure; 7] {
         KernelFailure::InstanceFailed,
     ]
 }
-fn kernel_cause(error: ScalarStateError) -> KernelFailure {
-    match error {
-        ScalarStateError::Kernel(cause) => cause,
-        other => panic!("expected typed cause, got {other:?}"),
-    }
-}
 pub(in crate::builtin) fn clean(host: &Host) {
     let ledger = host.ledger.lock().unwrap();
     assert!(ledger.blocks.is_empty());
@@ -225,11 +219,11 @@ struct Writer {
     protected: usize,
 }
 impl ByEncodeBuffer for Writer {
-    fn push(&mut self, byte: u8) -> Result<(), ScalarStateError> {
+    fn push(&mut self, byte: u8) -> Result<(), KernelFailure> {
         self.bytes.push(byte);
         Ok(())
     }
-    fn append(&mut self, bytes: &[u8], _: &mut ScalarWork<'_, '_>) -> Result<(), ScalarStateError> {
+    fn append(&mut self, bytes: &[u8], _: &mut ScalarWork<'_, '_>) -> Result<(), KernelFailure> {
         let at = self.appends;
         self.appends += 1;
         // Header writes precede the decimal call; both length and text appends
@@ -489,7 +483,7 @@ fn opaque_refusals_preserve_all_typed_causes_and_release_granted_prefixes() {
                         &mut ScalarWork::new(None),
                     )
                     .unwrap_err();
-                assert_eq!(kernel_cause(error), cause);
+                assert_eq!(error, cause);
                 assert_eq!(writer.bytes.len(), 9);
                 assert_eq!(resources.formats, 0);
                 assert_eq!(host.ledger.lock().unwrap().attempts, stop + 1);
@@ -512,7 +506,7 @@ fn opaque_refusals_preserve_all_typed_causes_and_release_granted_prefixes() {
                 &mut ScalarWork::new(None),
             )
             .unwrap_err();
-            assert_eq!(kernel_cause(error), cause);
+            assert_eq!(error, cause);
             assert_eq!(resources.parsed, 0);
             assert_eq!(host.ledger.lock().unwrap().attempts, 1);
         }
@@ -543,7 +537,7 @@ fn control_refusals_at_both_call_boundaries_keep_first_cause_without_footer() {
                         &mut ScalarWork::new(Some(&mut checkpoints)),
                     )
                     .unwrap_err();
-                assert_eq!(kernel_cause(error), cause);
+                assert_eq!(error, cause);
                 assert_eq!(writer.bytes.len(), 9);
                 assert_eq!(resources.formats, stop);
                 assert_eq!(control.checks.lock().unwrap().len(), stop + 1);
@@ -591,7 +585,7 @@ fn control_refusals_at_both_call_boundaries_keep_first_cause_without_footer() {
                     &mut ScalarWork::new(Some(&mut checkpoints)),
                 )
                 .unwrap_err();
-                assert_eq!(kernel_cause(error), cause);
+                assert_eq!(error, cause);
                 assert_eq!(resources.parsed, usize::from(stop == after));
                 assert_eq!(
                     control.checks.lock().unwrap().as_slice(),
@@ -630,7 +624,7 @@ fn append_failure_destroys_text_under_its_live_loans_and_preserves_cause() {
                         &mut ScalarWork::new(Some(&mut checkpoints)),
                     )
                     .unwrap_err();
-                assert_eq!(kernel_cause(error), cause);
+                assert_eq!(error, cause);
                 assert_eq!(resources.formats, 1);
                 assert_eq!(writer.appends, stop + 1);
                 assert_eq!(writer.protected, stop - 1);
@@ -673,12 +667,31 @@ fn malformed_payload_preserves_original_error_order_and_success_only_footer() {
                 &mut ScalarWork::new(None),
             )
             .unwrap_err();
-            match (original, result) {
-                (ScalarStateError::Legacy(old), ScalarStateError::Legacy(new)) => {
-                    assert_eq!(old, expected);
-                    assert_eq!(new, old);
+            assert_eq!(original.to_string(), expected);
+            assert_eq!(result.to_string(), expected);
+            {
+                use novarocks_failure_contract::FailureProjection;
+                use std::error::Error;
+                fn has_source<E: Error + 'static>(cause: &dyn Error, _: &E) -> bool {
+                    let mut source = cause.source();
+                    while let Some(actual) = source {
+                        if actual.is::<E>() {
+                            return true;
+                        }
+                        source = actual.source();
+                    }
+                    false
                 }
-                other => panic!("expected original Legacy text, got {other:?}"),
+                for cause in [&original, &result] {
+                    assert_eq!(
+                        cause.failure_fact(),
+                        crate::DataFailureReason::InvalidEncoding.failure_fact()
+                    );
+                    match std::str::from_utf8(text) {
+                        Err(source) => assert!(has_source(cause, &source)),
+                        Ok(text) => assert!(has_source(cause, &text.parse::<i256>().unwrap_err())),
+                    }
+                }
             }
             assert_eq!(resources.parsed, 0);
             assert_eq!(
@@ -707,7 +720,7 @@ fn codec_loans_reject_a_foreign_allocator_before_entering_the_formatter() {
             .serialize_with_codec_resources(&mut writer, &mut resources, &mut ScalarWork::new(None))
             .unwrap_err();
         assert_eq!(
-            kernel_cause(error),
+            error,
             invalid("min_n/max_n codec reservation uses another host authority")
         );
         assert_eq!(resources.formats, 0);
@@ -737,4 +750,50 @@ fn parse_policy_checks_extent_arithmetic_before_any_host_call() {
         assert_eq!(host.ledger.lock().unwrap().attempts, 0);
     }
     clean(&host);
+}
+
+#[test]
+fn production_n_sort_admits_library_work_without_grants_for_discarded_comparison_text() {
+    for include_nan in [false, true] {
+        let host = Arc::new(Host::default());
+        {
+            let allocator = allocator(&host);
+            let charge = charge(&host);
+            let values = (0..512)
+                .rev()
+                .map(|value| {
+                    TrackedAggScalarValue::Float64(if include_nan && value == 257 {
+                        f64::NAN
+                    } else {
+                        f64::from(value)
+                    })
+                })
+                .collect();
+            let mut state = state(&allocator, values);
+            let before = host.ledger.lock().unwrap().attempts;
+            state
+                .push_value_with_sort_resources(
+                    TrackedAggScalarValue::Float64(-1.0),
+                    true,
+                    &mut BoundNSortResources {
+                        charge: &charge,
+                        allocator: &allocator,
+                    },
+                    &mut ScalarWork::new(None),
+                )
+                .unwrap();
+            let ledger = host.ledger.lock().unwrap();
+            assert_eq!(
+                ledger.attempts - before,
+                2,
+                "one real scope per reached sort; comparisons create no discarded diagnostic allocation"
+            );
+            assert!(
+                ledger.loans.is_empty(),
+                "both library sort scopes actually ended"
+            );
+            assert_eq!(state.values.len(), 17);
+        }
+        clean(&host);
+    }
 }

@@ -197,9 +197,6 @@ fn observed<T>(
     let result = work.finish_result(result);
     observation.finish(result)
 }
-fn operational(message: impl Into<String>) -> KernelFailure {
-    KernelFailure::Operational(KernelDiagnostic::new(&message.into()))
-}
 fn integer(a: &dyn Array, row: usize) -> Result<i64, KernelFailure> {
     Ok(match a.data_type() {
         DataType::Int8 => down::<Int8Array>(a)?.value(row) as i64,
@@ -209,8 +206,25 @@ fn integer(a: &dyn Array, row: usize) -> Result<i64, KernelFailure> {
         _ => return Err(internal("basic aggregate integer state differs")),
     })
 }
-fn failure(message: &'static str) -> KernelFailure {
-    KernelFailure::Operational(KernelDiagnostic::new(message))
+/// A whole aggregate state/result overflows; this is not a promoted row error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BasicNumericOverflow;
+impl std::fmt::Display for BasicNumericOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("decimal overflow")
+    }
+}
+impl std::error::Error for BasicNumericOverflow {}
+impl novarocks_failure_contract::FailureProjection for BasicNumericOverflow {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &crate::DataFailureReason::NumericOutOfRange,
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for BasicNumericOverflow {}
+fn numeric_overflow() -> KernelFailure {
+    KernelFailure::from_domain(BasicNumericOverflow)
 }
 fn down<T: 'static>(a: &dyn Array) -> Result<&T, KernelFailure> {
     a.as_any()
@@ -440,34 +454,90 @@ pub enum BasicStateDomain {
     Decimal128,
     Decimal256,
 }
-/// State decode errors retain full legacy text until the caller's boundary.
+/// Frozen intermediate-state and Arrow construction failures retain their
+/// original primitive cause, without retaining input text or schema owners.
 #[derive(Debug)]
 pub enum BasicStateError {
     Kernel(KernelFailure),
-    Operational(String),
+    StateContract(novarocks_failure_contract::BoundedDetail),
+    StateDecode {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        detail: novarocks_failure_contract::BoundedDetail,
+    },
+    StateArrow(arrow_schema::ArrowError),
 }
 impl From<KernelFailure> for BasicStateError {
-    fn from(e: KernelFailure) -> Self {
-        Self::Kernel(e)
+    fn from(source: KernelFailure) -> Self {
+        Self::Kernel(source)
     }
 }
+impl std::fmt::Display for BasicStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kernel(source) => source.fmt(f),
+            Self::StateContract(detail) | Self::StateDecode { detail, .. } => detail.fmt(f),
+            Self::StateArrow(source) => source.fmt(f),
+        }
+    }
+}
+impl std::error::Error for BasicStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Kernel(source) => Some(source),
+            Self::StateDecode { source, .. } => Some(source.as_ref()),
+            Self::StateArrow(source) => Some(source),
+            Self::StateContract(_) => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for BasicStateError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let (class, code) = match self {
+            Self::Kernel(source) => return source.failure_fact(),
+            Self::StateContract(_) => (FailureClass::Invariant, 156),
+            Self::StateDecode { .. } => (FailureClass::Invariant, 157),
+            Self::StateArrow(arrow_schema::ArrowError::MemoryError(_)) => {
+                (FailureClass::Resource, 158)
+            }
+            // This boundary builds fixed primitive/struct state carriers from
+            // frozen metadata; it performs no I/O or variable-offset encoding.
+            Self::StateArrow(_) => (FailureClass::Invariant, 159),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for BasicStateError {}
 impl BasicStateError {
     pub fn into_kernel_failure(self) -> KernelFailure {
         match self {
-            Self::Kernel(e) => e,
-            Self::Operational(s) => operational(s),
+            Self::Kernel(source) => source,
+            source => KernelFailure::from_domain(source),
         }
     }
-    pub fn into_legacy_message(self) -> String {
-        match self {
-            Self::Operational(s) => s,
-            Self::Kernel(
-                KernelFailure::Internal(d)
-                | KernelFailure::Operational(d)
-                | KernelFailure::InvalidProgram(d),
-            ) => d.message().to_owned(),
-            Self::Kernel(e) => e.to_string(),
-        }
+}
+fn state_decode_source<E: std::error::Error + Send + Sync + 'static>(source: E) -> BasicStateError {
+    let detail = novarocks_failure_contract::BoundedDetail::truncating_display(&source);
+    BasicStateError::StateDecode {
+        source: Box::new(source),
+        detail,
+    }
+}
+fn contextual_state_decode<E: std::error::Error + Send + Sync + 'static>(
+    source: E,
+    label: &str,
+    component: &str,
+    value: &str,
+) -> BasicStateError {
+    let detail = novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+        "invalid {label} state {component} '{value}': {source}"
+    ));
+    BasicStateError::StateDecode {
+        source: Box::new(source),
+        detail,
     }
 }
 fn observed_core<T>(
@@ -478,15 +548,24 @@ fn observed_core<T>(
     observation.checkpoint(0)?;
     let mut w = EvaluationCheckpoints::new(&observation);
     let result = f(&mut w);
-    let completion = match &result {
-        Err(BasicStateError::Kernel(e)) => w.finish_result::<()>(Err(e.clone())),
-        _ => w.finish(),
-    };
-    observation.finish(completion)?;
-    result
+    match result {
+        Ok(value) => observation
+            .finish(w.finish_result(Ok(value)))
+            .map_err(Into::into),
+        // Every BasicStateError variant is an authored outer failure at all
+        // actual consumers. Do not start a new cooperative tail after it.
+        Err(original) => match observation.finish(Ok(())) {
+            // The original observer can already own an earlier refusal. This
+            // reads that latch only; it never calls the controller again.
+            Err(earlier) => Err(earlier.into()),
+            Ok(()) => Err(original),
+        },
+    }
 }
-fn state_error(message: impl Into<String>) -> BasicStateError {
-    BasicStateError::Operational(message.into())
+fn state_error(message: impl std::fmt::Display) -> BasicStateError {
+    BasicStateError::StateContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(message),
+    )
 }
 #[derive(Clone, Copy, Debug)]
 pub enum BasicValue {
@@ -555,11 +634,9 @@ impl BasicComputation<'_> {
                         let diff = i32::from(target) - i32::from(input_scale);
                         let factor = 10i128
                             .checked_pow(diff.unsigned_abs())
-                            .ok_or_else(|| failure("decimal overflow"))?;
+                            .ok_or_else(|| numeric_overflow())?;
                         if diff > 0 {
-                            v = v
-                                .checked_mul(factor)
-                                .ok_or_else(|| failure("decimal overflow"))?;
+                            v = v.checked_mul(factor).ok_or_else(|| numeric_overflow())?;
                         } else if diff < 0 {
                             v /= factor;
                         }
@@ -572,15 +649,13 @@ impl BasicComputation<'_> {
                         for _ in 0..diff.unsigned_abs() {
                             factor = factor
                                 .checked_mul(i256::from_i128(10))
-                                .ok_or_else(|| failure("decimal overflow"))?;
+                                .ok_or_else(|| numeric_overflow())?;
                             w.step()?;
                         }
                         if diff > 0 {
                             v = v.wrapping_mul(factor);
                         } else if diff < 0 {
-                            v = v
-                                .checked_div(factor)
-                                .ok_or_else(|| failure("decimal overflow"))?;
+                            v = v.checked_div(factor).ok_or_else(|| numeric_overflow())?;
                         }
                         next.wide = next.wide.wrapping_add(v);
                     }
@@ -690,45 +765,48 @@ impl BasicComputation<'_> {
                 _ => "avg",
             };
             let (sum, count) = text.split_once(',').ok_or_else(|| {
-                state_error(format!("invalid {label} state '{}': missing ','", text))
+                state_error(format_args!(
+                    "invalid {label} state '{}': missing ','",
+                    text
+                ))
             })?;
             match self.domain {
                 BasicStateDomain::Decimal128 => {
-                    s.decimal = sum.parse().map_err(|e| {
-                        state_error(format!("invalid {label} state sum '{}': {}", sum, e))
-                    })?
+                    s.decimal = sum
+                        .parse()
+                        .map_err(|e| contextual_state_decode(e, label, "sum", sum))?
                 }
                 BasicStateDomain::Decimal256 => {
-                    s.wide = sum.parse().map_err(|e| {
-                        state_error(format!("invalid {label} state sum '{}': {}", sum, e))
-                    })?
+                    s.wide = sum
+                        .parse()
+                        .map_err(|e| contextual_state_decode(e, label, "sum", sum))?
                 }
                 _ => {
-                    s.sum = sum.parse().map_err(|e| {
-                        state_error(format!("invalid {label} state sum '{}': {}", sum, e))
-                    })?
+                    s.sum = sum
+                        .parse()
+                        .map_err(|e| contextual_state_decode(e, label, "sum", sum))?
                 }
             }
-            s.count = count.parse().map_err(|e| {
-                state_error(format!("invalid {label} state count '{}': {}", count, e))
-            })?;
+            s.count = count
+                .parse()
+                .map_err(|e| contextual_state_decode(e, label, "count", count))?;
         } else if self.operation.variance() {
             let mut it = text.split(',');
             s.x = it
                 .next()
-                .ok_or_else(|| failure("variance/stddev intermediate utf8 missing mean"))?
+                .ok_or_else(|| state_error("variance/stddev intermediate utf8 missing mean"))?
                 .parse::<f64>()
-                .map_err(|e| state_error(e.to_string()))?;
+                .map_err(state_decode_source)?;
             s.m2 = it
                 .next()
-                .ok_or_else(|| failure("variance/stddev intermediate utf8 missing m2"))?
+                .ok_or_else(|| state_error("variance/stddev intermediate utf8 missing m2"))?
                 .parse::<f64>()
-                .map_err(|e| state_error(e.to_string()))?;
+                .map_err(state_decode_source)?;
             s.count = it
                 .next()
-                .ok_or_else(|| failure("variance/stddev intermediate utf8 missing count"))?
+                .ok_or_else(|| state_error("variance/stddev intermediate utf8 missing count"))?
                 .parse::<i64>()
-                .map_err(|e| state_error(e.to_string()))?;
+                .map_err(state_decode_source)?;
         } else {
             let mut parts = text.split(',');
             let expected = if self.operation == BasicOperation::Corr {
@@ -747,33 +825,33 @@ impl BasicComputation<'_> {
                 .next()
                 .unwrap()
                 .parse::<f64>()
-                .map_err(|e| state_error(e.to_string()))?;
+                .map_err(state_decode_source)?;
             s.y = parts
                 .next()
                 .unwrap()
                 .parse::<f64>()
-                .map_err(|e| state_error(e.to_string()))?;
+                .map_err(state_decode_source)?;
             s.m2 = parts
                 .next()
                 .unwrap()
                 .parse::<f64>()
-                .map_err(|e| state_error(e.to_string()))?;
+                .map_err(state_decode_source)?;
             s.count = parts
                 .next()
                 .unwrap()
                 .parse::<i64>()
-                .map_err(|e| state_error(e.to_string()))?;
+                .map_err(state_decode_source)?;
             if expected == 6 {
                 s.m2x = parts
                     .next()
                     .unwrap()
                     .parse::<f64>()
-                    .map_err(|e| state_error(e.to_string()))?;
+                    .map_err(state_decode_source)?;
                 s.m2y = parts
                     .next()
                     .unwrap()
                     .parse::<f64>()
-                    .map_err(|e| state_error(e.to_string()))?;
+                    .map_err(state_decode_source)?;
             }
         }
         w.step()?;
@@ -793,7 +871,7 @@ impl BasicComputation<'_> {
                 _ => (16, "avg"),
             };
             if bytes.len() != width {
-                return Err(state_error(format!(
+                return Err(state_error(format_args!(
                     "invalid {label} binary state length: {}",
                     bytes.len()
                 )));
@@ -813,7 +891,7 @@ impl BasicComputation<'_> {
                 (32, "covar")
             };
             if bytes.len() != width {
-                return Err(state_error(format!(
+                return Err(state_error(format_args!(
                     "{label} intermediate binary size mismatch: expected {width}, got {}",
                     bytes.len()
                 )));
@@ -837,7 +915,7 @@ impl BasicComputation<'_> {
     }
     fn decimal_sum_info(&self) -> Result<(u8, i8), BasicStateError> {
         let DataType::Struct(fields) = self.intermediate_type else {
-            return Err(state_error(format!(
+            return Err(state_error(format_args!(
                 "avg decimal intermediate type mismatch: {:?}",
                 self.intermediate_type
             )));
@@ -849,14 +927,14 @@ impl BasicComputation<'_> {
             fields[1].data_type(),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         ) {
-            return Err(state_error(format!(
+            return Err(state_error(format_args!(
                 "avg decimal intermediate count type mismatch: {:?}",
                 fields[1].data_type()
             )));
         }
         match fields[0].data_type() {
             DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Ok((*p, *s)),
-            other => Err(state_error(format!(
+            other => Err(state_error(format_args!(
                 "avg decimal intermediate sum type mismatch: {:?}",
                 other
             ))),
@@ -1105,7 +1183,7 @@ impl BasicComputation<'_> {
                                 Ok((s.count != 0).then_some(s.decimal))
                             })?)
                             .with_precision_and_scale(p, s)
-                            .map_err(|e| state_error(e.to_string()))?,
+                            .map_err(BasicStateError::StateArrow)?,
                         )
                     }
                     BasicStateDomain::Decimal256 => {
@@ -1115,7 +1193,7 @@ impl BasicComputation<'_> {
                                 Ok((s.count != 0).then_some(s.wide))
                             })?)
                             .with_precision_and_scale(p, s)
-                            .map_err(|e| state_error(e.to_string()))?,
+                            .map_err(BasicStateError::StateArrow)?,
                         )
                     }
                     _ => Arc::new(Float64Array::from(collect(&snapshot, w, |s| {
@@ -1132,7 +1210,7 @@ impl BasicComputation<'_> {
                 .into();
                 output = Arc::new(
                     StructArray::try_new(fields, vec![sum, count], None)
-                        .map_err(|e| state_error(e.to_string()))?,
+                        .map_err(BasicStateError::StateArrow)?,
                 );
             } else if intermediate {
                 return Err(state_error(if self.operation.variance() {
@@ -1150,7 +1228,7 @@ impl BasicComputation<'_> {
                     i32::from(scale) - i32::from(self.state_scale()?.expect("decimal state scale"));
                 let factor = 10i128
                     .checked_pow(diff.unsigned_abs())
-                    .ok_or_else(|| failure("decimal overflow"))?;
+                    .ok_or_else(|| numeric_overflow())?;
                 let values = collect(&snapshot, w, |s| {
                     if s.count == 0 {
                         return Ok(None);
@@ -1158,7 +1236,7 @@ impl BasicComputation<'_> {
                     let sum = if diff > 0 {
                         s.decimal
                             .checked_mul(factor)
-                            .ok_or_else(|| failure("decimal overflow"))?
+                            .ok_or_else(|| numeric_overflow())?
                     } else if diff < 0 {
                         s.decimal / factor
                     } else {
@@ -1169,7 +1247,7 @@ impl BasicComputation<'_> {
                 output = Arc::new(
                     Decimal128Array::from(values)
                         .with_precision_and_scale(precision, scale)
-                        .map_err(|e| state_error(e.to_string()))?,
+                        .map_err(BasicStateError::StateArrow)?,
                 );
             } else if self.operation == BasicOperation::Avg
                 && self.domain == BasicStateDomain::Decimal256
@@ -1183,7 +1261,7 @@ impl BasicComputation<'_> {
                 for _ in 0..diff.unsigned_abs() {
                     factor = factor
                         .checked_mul(i256::from_i128(10))
-                        .ok_or_else(|| failure("decimal overflow"))?;
+                        .ok_or_else(|| numeric_overflow())?;
                     w.step()?;
                 }
                 let values = collect(&snapshot, w, |s| {
@@ -1195,7 +1273,7 @@ impl BasicComputation<'_> {
                         } else if diff < 0 {
                             s.wide
                                 .checked_div(factor)
-                                .ok_or_else(|| failure("decimal overflow"))?
+                                .ok_or_else(|| numeric_overflow())?
                         } else {
                             s.wide
                         };
@@ -1205,7 +1283,7 @@ impl BasicComputation<'_> {
                 output = Arc::new(
                     Decimal256Array::from(values)
                         .with_precision_and_scale(*precision, *scale)
-                        .map_err(|e| state_error(e.to_string()))?,
+                        .map_err(BasicStateError::StateArrow)?,
                 );
             } else {
                 let values = collect(&snapshot, w, |s| Ok(self.float_result(s)))?;
@@ -1247,7 +1325,7 @@ fn round_i128(sum: i128, count: i64) -> i128 {
 }
 fn round_i256(sum: i256, count: i64) -> Result<i256, KernelFailure> {
     let divisor = i256::from_i128(count as i128);
-    let overflow = || failure("decimal overflow");
+    let overflow = || numeric_overflow();
     let mut q = sum.checked_div(divisor).ok_or_else(overflow)?;
     let r = sum.checked_rem(divisor).ok_or_else(overflow)?;
     if r == i256::ZERO {

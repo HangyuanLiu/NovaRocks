@@ -22,6 +22,50 @@
 //! and submit is counted, which is what lets a rollback be asserted as a
 //! balance rather than as an absence of a symptom.
 
+// Each fake action authors its own refusal; no text-to-cause constructor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureRefusal {
+    Materialize,
+    Receiver,
+    Capability,
+    Submit,
+    TaskDomain,
+    Operator,
+    ArrayLengths,
+}
+impl std::fmt::Display for FixtureRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Materialize => "catalog binding could not be materialized",
+            Self::Receiver => "receiver could not be installed",
+            Self::Capability => "inbound capability could not be installed",
+            Self::Submit => "no driver capacity for this task",
+            Self::TaskDomain => "split queue is full",
+            Self::Operator => "operator error",
+            Self::ArrayLengths => "upstream array lengths differ",
+        })
+    }
+}
+impl std::error::Error for FixtureRefusal {}
+impl novarocks_execution_contract::failure::FailureProjection for FixtureRefusal {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (code, class) = match self {
+            Self::Materialize => (60010, FailureClass::Dependency),
+            Self::Receiver => (60011, FailureClass::Dependency),
+            Self::Capability => (60012, FailureClass::Invariant),
+            Self::Submit => (60013, FailureClass::Resource),
+            Self::TaskDomain => (60014, FailureClass::Resource),
+            Self::Operator => (60015, FailureClass::Data),
+            Self::ArrayLengths => (60016, FailureClass::Data),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -53,8 +97,8 @@ use novarocks_execution_contract::task_execution::operation::{
     UpdateQueryContext, UpdateTask,
 };
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
-    TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion,
+    AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskResourceFacts, TaskState,
+    TaskStatus, TaskStatusCursor, TaskStatusVersion,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
@@ -225,6 +269,77 @@ impl HostGate {
     }
 }
 
+struct OpenHostGateOnDrop(Arc<HostGate>);
+impl Drop for OpenHostGateOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+fn assert_failure_projection(
+    status: &TaskStatus,
+    identity: TaskIdentity,
+    category: TaskFailureCategory,
+    phase: novarocks_execution_contract::TaskFailurePhase,
+    safe_detail: &str,
+    installed: bool,
+) {
+    assert_eq!(status.identity(), identity);
+    assert_eq!(status.state(), TaskState::Failed);
+    assert_eq!(status.installed(), installed);
+    let Some(novarocks_execution_contract::TerminationDetail::Failed(failure)) =
+        status.termination()
+    else {
+        panic!("expected the Task's own failure: {status:?}");
+    };
+    assert_eq!(failure.category(), category);
+    assert_eq!(failure.phase(), phase);
+    assert_eq!(failure.detail().as_str(), safe_detail);
+}
+
+fn assert_fixture_source(
+    control: &novarocks_execution::runtime::task_control::TaskExecutionControl,
+    author: FixtureRefusal,
+    class: novarocks_execution_contract::failure::FailureClass,
+    code: u16,
+    private_detail: &str,
+) -> Arc<
+    novarocks_execution_contract::AcceptedTaskConclusion<
+        novarocks_execution::runtime::fragment::ExecutionFailure,
+    >,
+> {
+    use novarocks_execution_contract::failure::{
+        FailureFact, FailureProjection, FailureReason, domain,
+    };
+    let accepted = control
+        .accepted()
+        .expect("the actual Task accepted the source");
+    let original = accepted
+        .originating_failure()
+        .expect("actual rich originating cause");
+    assert_eq!(
+        original.failure_fact(),
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap())
+        )
+    );
+    assert_eq!(original.context(), None);
+    let novarocks_execution::runtime::fragment::ExecutionFailureCause::Domain(source) =
+        original.cause()
+    else {
+        panic!("preserve the domain's typed source: {original:?}");
+    };
+    assert_eq!(source.downcast_ref::<FixtureRefusal>(), Some(&author));
+    assert_eq!(source.detail(), private_detail);
+    assert_eq!(original.detail(), private_detail);
+    let observed = control
+        .error()
+        .expect("execution observes the accepted source");
+    assert!(std::ptr::eq(observed.cause(), original.cause()));
+    accepted
+}
+
 struct FakeContextHost {
     ledger: Arc<HostLedger>,
     clock: Arc<ManualClock>,
@@ -294,9 +409,9 @@ impl QueryContextHost for FakeContextHost {
             self.clock.advance(advance);
         }
         if self.fail_materialize.load(Ordering::SeqCst) {
-            return Err(HostRejection::new(
+            return Err(HostRejection::from_domain(
                 TaskFailureCategory::Execution,
-                "catalog binding could not be materialized",
+                FixtureRefusal::Materialize,
             ));
         }
         self.ledger
@@ -381,6 +496,9 @@ struct FakeTaskHost {
     /// how a concurrency test forces a real overlap.
     require_arrivals: AtomicUsize,
     reporters: Mutex<Vec<TaskStatusReporter>>,
+    /// Actual work capabilities from the real accepted Task, for cause identity
+    /// assertions after synchronous preparation has exited. No fixture owner is minted.
+    controls: Mutex<Vec<Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>>>,
     /// The descriptor and static bytes of every creation the owner handed
     /// this host, in call order, so a case can prove which body won.
     prepared: Mutex<Vec<(TaskDescriptor, bytes::Bytes)>>,
@@ -401,8 +519,22 @@ impl FakeTaskHost {
             arrivals: AtomicUsize::new(0),
             require_arrivals: AtomicUsize::new(0),
             reporters: Mutex::new(Vec::new()),
+            controls: Mutex::new(Vec::new()),
             prepared: Mutex::new(Vec::new()),
         }
+    }
+
+    fn control(
+        &self,
+        identity: TaskIdentity,
+    ) -> Arc<novarocks_execution::runtime::task_control::TaskExecutionControl> {
+        self.controls
+            .lock()
+            .expect("actual preparation controls")
+            .iter()
+            .find(|control| control.identity() == identity)
+            .expect("the host borrowed this accepted Task's actual capability")
+            .clone()
     }
 
     fn prepared(&self) -> Vec<(TaskDescriptor, bytes::Bytes)> {
@@ -433,8 +565,12 @@ impl TaskExecutionHost for FakeTaskHost {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
-        _preparation_stop: novarocks_worker::TaskPreparationStopView,
+        preparation: novarocks_worker::TaskPreparationContext<'_>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
+        self.controls
+            .lock()
+            .expect("actual preparation controls")
+            .push(preparation.runtime_control());
         self.ledger
             .installs_attempted
             .fetch_add(1, Ordering::SeqCst);
@@ -451,9 +587,9 @@ impl TaskExecutionHost for FakeTaskHost {
             .expect("prepared")
             .push((descriptor.clone(), plan.to_bytes()));
         if self.fail_receiver.load(Ordering::SeqCst) {
-            return Err(HostRejection::new(
+            return Err(HostRejection::from_domain(
                 TaskFailureCategory::Exchange,
-                "receiver could not be installed",
+                FixtureRefusal::Receiver,
             ));
         }
         self.ledger
@@ -478,9 +614,9 @@ impl TaskExecutionHost for FakeTaskHost {
         _descriptor: &TaskDescriptor,
     ) -> Result<(), HostRejection> {
         if self.fail_capability.load(Ordering::SeqCst) {
-            return Err(HostRejection::new(
+            return Err(HostRejection::from_domain(
                 TaskFailureCategory::Protocol,
-                "inbound capability could not be installed",
+                FixtureRefusal::Capability,
             ));
         }
         self.ledger
@@ -505,9 +641,9 @@ impl TaskExecutionHost for FakeTaskHost {
         if self.fail_submit.load(Ordering::SeqCst) {
             // Nothing is allocated and no worker exists: this is the only
             // step that could have started one.
-            return Err(HostRejection::new(
+            return Err(HostRejection::from_domain(
                 TaskFailureCategory::ResourceExhausted,
-                "no driver capacity for this task",
+                FixtureRefusal::Submit,
             ));
         }
         self.reporters
@@ -531,9 +667,9 @@ impl TaskExecutionHost for FakeTaskHost {
         _operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
         if self.fail_task_domain.load(Ordering::SeqCst) {
-            return Err(HostRejection::new(
+            return Err(HostRejection::from_domain(
                 TaskFailureCategory::ResourceExhausted,
-                "split queue is full",
+                FixtureRefusal::TaskDomain,
             ));
         }
         self.ledger
@@ -587,6 +723,9 @@ impl Fixture {
             Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
             Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
             novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
+                Arc::new(
+                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+                ),
                 #[cfg(novarocks_dev_controls)]
                 None,
             ),
@@ -918,18 +1057,18 @@ fn a_create_for_a_terminal_or_reaped_identity_fails_closed() {
     assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
 }
 
-/// A first creation whose body the host refuses leaves nothing behind, and a
-/// later legal create of the same identity wins a new round.
+/// A host refusal leaves an accepted failed identity. Its replay never
+/// interprets a new body; only another identity may install a legal task.
 #[test]
-fn a_refused_first_creation_rolls_back_so_a_later_legal_create_wins() {
+fn a_refused_accepted_creation_preserves_its_source_and_spends_the_identity() {
+    use novarocks_execution_contract::{TaskFailurePhase, failure::FailureClass};
     let fixture = Fixture::new();
-    fixture.establish(1);
+    let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
     fixture
         .task_host
         .fail_receiver
         .store(true, Ordering::SeqCst);
-
     let refused = fixture
         .registry
         .create_task(&fixture.create_request(identity), body(5));
@@ -939,35 +1078,94 @@ fn a_refused_first_creation_rolls_back_so_a_later_legal_create_wins() {
         "{refused:?}"
     );
     assert!(refused.acknowledgement().is_none());
-    // The refusal happened inside the host's own install, before the owner
-    // recorded a receiver, so the owner had nothing to remove.
+    assert_eq!(
+        refused.detail().unwrap().as_str(),
+        "Dependency failure (reason 13:60011)"
+    );
+    let control = fixture.task_host.control(identity);
+    let accepted_source = assert_fixture_source(
+        &control,
+        FixtureRefusal::Receiver,
+        FailureClass::Dependency,
+        60011,
+        "receiver could not be installed",
+    );
+    let source = fixture.registry.status_source(context).unwrap();
+    let terminal = source
+        .latest(identity)
+        .expect("the accepted failure remains observable");
+    assert_failure_projection(
+        &terminal,
+        identity,
+        TaskFailureCategory::Execution,
+        TaskFailurePhase::Preparation,
+        "Dependency failure (reason 13:60011)",
+        false,
+    );
+    assert_eq!(
+        source.observe(TaskStatusCursor::unobserved(identity)),
+        CursorObservation::Current(Box::new(terminal.clone()))
+    );
     assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 0);
     assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 0);
     assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 0);
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.capabilities_removed),
+        1,
+        "Accepted owns a late-frame reservation even without installed ingress"
+    );
     assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 0);
+    assert_eq!(fixture.registry.counters().creations_rolled_back, 0);
     assert!(!fixture.registry.has_live_task(identity));
 
     fixture
         .task_host
         .fail_receiver
         .store(false, Ordering::SeqCst);
-    let accepted = fixture
+    let replay = fixture
         .registry
         .create_task(&fixture.create_request(identity), body(6));
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
     assert_eq!(
-        accepted.outcome(),
+        replay.acknowledgement().unwrap().current_status(),
+        &terminal
+    );
+    assert_eq!(fixture.task_host.prepared().len(), 1);
+    assert!(Arc::ptr_eq(&accepted_source, &control.accepted().unwrap()));
+    let legal = fixture.identity(1, 1, 2);
+    let installed = fixture
+        .registry
+        .create_task(&fixture.create_request(legal), body(6));
+    assert_eq!(
+        installed.outcome(),
         OperationOutcome::Accepted,
-        "{accepted:?}"
+        "{installed:?}"
     );
     assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 2);
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(
-        fixture.task_host.prepared()[1].1,
-        bytes::Bytes::from(vec![6; 8]),
-        "the new round prepared its own body"
-    );
-    assert!(fixture.registry.has_live_task(identity));
+    let prepared = fixture.task_host.prepared();
+    assert_eq!(prepared[0].0.identity(), identity);
+    assert_eq!(prepared[0].1, bytes::Bytes::from(vec![5; 8]));
+    assert_eq!(prepared[1].0.identity(), legal);
+    assert_eq!(prepared[1].1, bytes::Bytes::from(vec![6; 8]));
+    assert!(fixture.registry.has_live_task(legal));
+    let replay_after = fixture
+        .registry
+        .create_task(&fixture.create_request(identity), stream_body());
+    assert_eq!(replay_after.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(replay_after.acknowledgement(), replay.acknowledgement());
+    assert_eq!(fixture.task_host.prepared().len(), 2);
+    assert!(Arc::ptr_eq(
+        &accepted_source,
+        &assert_fixture_source(
+            &control,
+            FixtureRefusal::Receiver,
+            FailureClass::Dependency,
+            60011,
+            "receiver could not be installed"
+        )
+    ));
 }
 
 #[test]
@@ -992,115 +1190,208 @@ fn a_create_waiting_on_the_gate_is_bounded_by_its_own_deadline() {
 }
 
 #[test]
-fn a_failed_creation_leaves_nothing_findable() {
+fn a_failed_accepted_creation_retains_typed_terminal_after_real_preparation_exit() {
+    use novarocks_execution_contract::{TaskFailurePhase, failure::FailureClass};
     let fixture = Fixture::new();
-    fixture.establish(1);
+    let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
     fixture.task_host.fail_submit.store(true, Ordering::SeqCst);
-
     let receipt = fixture
         .registry
         .create_task(&fixture.create_request(identity), body(5));
     assert_eq!(receipt.outcome(), OperationOutcome::ResourceExhausted);
     assert!(receipt.acknowledgement().is_none());
-
-    // Both installs were undone, and the only step that could have started a
-    // worker never did.
+    assert_eq!(
+        receipt.detail().unwrap().as_str(),
+        "Resource failure (reason 13:60013)"
+    );
+    let control = fixture.task_host.control(identity);
+    let accepted = assert_fixture_source(
+        &control,
+        FixtureRefusal::Submit,
+        FailureClass::Resource,
+        60013,
+        "no driver capacity for this task",
+    );
+    // Submission really returned an error: there is no Runnable or reporter
+    // whose fake completion could stand in for preparation exiting.
+    assert!(fixture.task_host.reporters.lock().unwrap().is_empty());
     assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.capabilities_removed), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 0);
-    assert_eq!(fixture.registry.counters().creations_rolled_back, 1);
+    assert_eq!(fixture.registry.counters().creations_rolled_back, 0);
     assert_eq!(fixture.registry.counters().tasks_created, 0);
-
-    // Nothing is findable by a later status or update.
     assert!(!fixture.registry.has_live_task(identity));
+    let source = fixture
+        .registry
+        .status_source(context)
+        .expect("accepted Task source");
+    let terminal = source
+        .latest(identity)
+        .expect("preparation failure retained");
+    assert_failure_projection(
+        &terminal,
+        identity,
+        TaskFailureCategory::ResourceExhausted,
+        TaskFailurePhase::Preparation,
+        "Resource failure (reason 13:60013)",
+        false,
+    );
+    assert_eq!(
+        source.observe(TaskStatusCursor::unobserved(identity)),
+        CursorObservation::Current(Box::new(terminal.clone()))
+    );
     let update = fixture.registry.update_task(
         &UpdateTask::try_new(
             TaskOperationId::new_v7(),
             identity,
             vec![filter_update(1, 3)],
         )
-        .expect("a legal update"),
+        .unwrap(),
     );
-    assert_eq!(update.outcome(), OperationOutcome::InvalidStateOrRequest);
+    assert_eq!(update.outcome(), OperationOutcome::TerminalRejected);
+    assert_eq!(
+        update.detail().unwrap().as_str(),
+        "update reached a terminal task and was never applied"
+    );
+    assert_eq!(HostLedger::get(&fixture.ledger.task_domains_applied), 0);
     let final_info = fixture
         .registry
         .get_final_task_info(&GetFinalTaskInfo::new(TaskOperationId::new_v7(), identity));
     assert_eq!(
         final_info.outcome(),
-        OperationOutcome::InvalidStateOrRequest
+        OperationOutcome::Accepted,
+        "{final_info:?}"
     );
-    let source = fixture
-        .registry
-        .status_source(fixture.context(1))
-        .expect("an active context has a source");
-    assert!(source.latest(identity).is_none());
     assert_eq!(
-        source.observe(TaskStatusCursor::unobserved(identity)),
-        CursorObservation::Unknown
+        final_info.acknowledgement().unwrap().final_status(),
+        &terminal
     );
+    fixture.task_host.fail_submit.store(false, Ordering::SeqCst);
+    let replay = fixture
+        .registry
+        .create_task(&fixture.create_request(identity), body(6));
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(
+        replay.acknowledgement().unwrap().current_status(),
+        &terminal
+    );
+    assert_eq!(fixture.task_host.prepared().len(), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 1);
+    assert!(Arc::ptr_eq(&accepted, &control.accepted().unwrap()));
 }
 
 #[test]
-fn concurrent_creates_observe_one_shared_failure() {
+fn concurrent_creates_observe_one_accepted_failure_without_another_preparation() {
+    use novarocks_execution_contract::{TaskFailurePhase, failure::FailureClass};
     let fixture = Fixture::new();
     let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
     let descriptor = fixture.descriptor(identity);
     fixture.task_host.fail_submit.store(true, Ordering::SeqCst);
-
+    fixture.task_host.submit_gate.close();
+    let _release = OpenHostGateOnDrop(Arc::clone(&fixture.task_host.submit_gate));
     const CREATES: usize = 3;
     fixture
         .task_host
         .require_arrivals
         .store(CREATES, Ordering::SeqCst);
     let mut handles = Vec::new();
-    for _ in 0..CREATES {
+    for plan in 5..5 + CREATES as u8 {
         let registry = Arc::clone(&fixture.registry);
-        let task_host = Arc::clone(&fixture.task_host);
+        let host = Arc::clone(&fixture.task_host);
         let descriptor = descriptor.clone();
         handles.push(std::thread::spawn(move || {
             let request =
                 CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
-                    .expect("a legal create");
-            task_host.arrivals.fetch_add(1, Ordering::SeqCst);
-            registry.create_task(&request, body(5))
+                    .unwrap();
+            host.arrivals.fetch_add(1, Ordering::SeqCst);
+            registry.create_task(&request, body(plan))
         }));
     }
+    while HostLedger::get(&fixture.ledger.submit_attempts) == 0
+        || fixture.registry.in_flight_operations(context) < CREATES
+    {
+        std::thread::yield_now();
+    }
+    let source = fixture.registry.status_source(context).unwrap();
+    let preparing = source
+        .latest(identity)
+        .expect("one real accepted preparation");
+    assert_eq!(preparing.state(), TaskState::Planned);
+    assert!(!preparing.installed());
+    let control = fixture.task_host.control(identity);
+    assert!(control.accepted().is_none());
+    fixture.task_host.submit_gate.open();
     let receipts: Vec<_> = handles
         .into_iter()
         .map(|handle| handle.join().expect("create thread"))
         .collect();
-    // Every create either converged on the owner's failure or, arriving after
-    // the reservation was already gone, ran and failed the same way. Either
-    // path is the same category and never a partial success.
+    let accepted = assert_fixture_source(
+        &control,
+        FixtureRefusal::Submit,
+        FailureClass::Resource,
+        60013,
+        "no driver capacity for this task",
+    );
+    let terminal = source.latest(identity).expect("the one accepted failure");
+    assert_failure_projection(
+        &terminal,
+        identity,
+        TaskFailureCategory::ResourceExhausted,
+        TaskFailurePhase::Preparation,
+        "Resource failure (reason 13:60013)",
+        false,
+    );
+    let mut operation_refusals = 0;
     for receipt in &receipts {
-        assert_eq!(
-            receipt.outcome(),
-            OperationOutcome::ResourceExhausted,
-            "{receipt:?}"
-        );
+        match receipt.outcome() {
+            OperationOutcome::ResourceExhausted => {
+                operation_refusals += 1;
+                assert!(receipt.acknowledgement().is_none());
+                assert_eq!(
+                    receipt.detail().unwrap().as_str(),
+                    "Resource failure (reason 13:60013)"
+                );
+            }
+            OperationOutcome::Idempotent => {
+                assert!(receipt.detail().is_none());
+                let acknowledgement = receipt.acknowledgement().unwrap();
+                assert_eq!(acknowledgement.identity(), identity);
+                assert_eq!(acknowledgement.current_status(), &terminal);
+                assert!(acknowledgement.domains().is_empty());
+            }
+            other => panic!(
+                "a spent accepted identity cannot create a new round: {other:?}: {receipt:?}"
+            ),
+        }
     }
-    assert!(!fixture.registry.has_live_task(identity));
+    assert!(
+        operation_refusals >= 1,
+        "the winning synchronous operation reports its own refusal"
+    );
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
+    assert_eq!(fixture.task_host.prepared().len(), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 0);
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_removed), 1);
+    assert!(!fixture.registry.has_live_task(identity));
+    let replay = fixture
+        .registry
+        .create_task(&fixture.create_request(identity), stream_body());
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
     assert_eq!(
-        HostLedger::get(&fixture.ledger.receivers_installed),
-        HostLedger::get(&fixture.ledger.receivers_removed)
+        replay.acknowledgement().unwrap().current_status(),
+        &terminal
     );
-    assert_eq!(
-        HostLedger::get(&fixture.ledger.capabilities_installed),
-        HostLedger::get(&fixture.ledger.capabilities_removed)
-    );
-    // Each round that won the identity prepared exactly once; a create that
-    // converged on a round never reached the host at all.
-    assert_eq!(
-        HostLedger::get(&fixture.ledger.installs_attempted),
-        HostLedger::get(&fixture.ledger.submit_attempts)
-    );
-    assert!(HostLedger::get(&fixture.ledger.installs_attempted) <= CREATES);
+    assert_eq!(fixture.task_host.prepared().len(), 1);
+    assert!(Arc::ptr_eq(&accepted, &control.accepted().unwrap()));
 }
 
 // --------------------------------------------------------- context lifecycle
@@ -1278,18 +1569,43 @@ fn a_task_failure_can_win_the_context_latch() {
     let context = fixture.establish(1);
     let reporter = fixture.create(fixture.identity(1, 1, 1), 5);
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
-    let failure = TaskFailure::new(
-        TaskFailureCategory::Execution,
-        SafeDetail::new("operator error").expect("fits"),
+    let original = novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+        FixtureRefusal::Operator,
     );
+    let accepted = reporter.report_failure(
+        original.clone(),
+        novarocks_execution_contract::TaskFailurePhase::Execution,
+    );
+    assert_eq!(
+        accepted.decision,
+        novarocks_execution_contract::ConclusionDecision::Accept
+    );
+    assert!(std::ptr::eq(
+        accepted.accepted.originating_failure().unwrap().cause(),
+        original.cause()
+    ));
+    assert_eq!(reporter.current().state(), TaskState::Failing);
+    let primary = reporter.current().termination().unwrap().clone();
     assert!(matches!(
-        reporter.failing(failure.clone()),
+        reporter.conclude_termination(primary.clone(), TaskOutputFacts::default()),
         StatusAdvance::Published(_)
     ));
-    assert!(matches!(
-        reporter.failed(failure),
-        StatusAdvance::Published(_)
-    ));
+    assert_failure_projection(
+        &reporter.current(),
+        reporter.identity(),
+        TaskFailureCategory::Execution,
+        novarocks_execution_contract::TaskFailurePhase::Execution,
+        "Data failure (reason 13:60015)",
+        true,
+    );
+    let source = assert_fixture_source(
+        &fixture.task_host.control(reporter.identity()),
+        FixtureRefusal::Operator,
+        novarocks_execution_contract::failure::FailureClass::Data,
+        60015,
+        "operator error",
+    );
+    assert!(Arc::ptr_eq(&source, &accepted.accepted));
     reporter.release_output();
     reporter.note_actual_stopped();
     reporter.note_resources_converged();
@@ -1572,6 +1888,12 @@ fn a_terminal_status_and_output_release_do_not_prove_actual_stop() {
         StatusAdvance::Published(_)
     ));
     reporter.release_output();
+    fixture
+        .task_host
+        .ignore_stand_down
+        .store(true, Ordering::SeqCst);
+    assert!(!reporter.convergence().actual_stopped());
+    assert!(!reporter.convergence().resources_converged());
 
     fixture.quiesce(context, &[reporter.identity()]);
     let release = fixture
@@ -1638,6 +1960,13 @@ fn release_reports_not_ready_before_it_succeeds() {
 
     // Terminal but its output has not drained: still not ready.
     fixture.finish(&reporter);
+    fixture
+        .task_host
+        .ignore_stand_down
+        .store(true, Ordering::SeqCst);
+    assert!(reporter.convergence().actual_stopped());
+    assert!(reporter.convergence().resources_converged());
+    assert!(!reporter.convergence().output_released());
     fixture.quiesce(context, &[identity]);
     fixture.registry.advance_deadlines();
     let second = fixture.registry.release_query_context(&request);
@@ -2032,24 +2361,30 @@ fn retention_is_swept_by_capacity_as_well_as_by_horizon() {
 }
 
 #[test]
-fn a_create_that_loses_to_a_closing_context_is_reclaimed_without_ever_being_observed() {
-    // Capacity 1: the second context's retired task reclaims the first one.
+fn an_accepted_creation_closed_during_submission_retains_terminal_before_gone() {
+    use novarocks_execution_contract::{TaskConclusion, TerminationDetail};
     let fixture = Fixture::with_config(|config| {
         config.retained_task_capacity = 1;
         config.gone_fence_capacity = 1;
     });
     let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
+    let source = fixture.registry.status_source(context).unwrap();
     fixture.task_host.submit_gate.close();
+    let _release = OpenHostGateOnDrop(Arc::clone(&fixture.task_host.submit_gate));
     let registry = Arc::clone(&fixture.registry);
     let request = fixture.create_request(identity);
     let create = std::thread::spawn(move || registry.create_task(&request, body(5)));
     while HostLedger::get(&fixture.ledger.submit_attempts) == 0 {
         std::thread::yield_now();
     }
-    // The abort linearizes while the create is submitting its runnable, so
-    // the create loses: its task exists only to converge, and no observer is
-    // ever told it was created.
+    let preparing = source
+        .latest(identity)
+        .expect("Accepted precedes submission");
+    assert_eq!(preparing.state(), TaskState::Planned);
+    assert!(!preparing.installed());
+    let control = fixture.task_host.control(identity);
+    assert!(control.accepted().is_none());
     let abort = fixture
         .registry
         .abort_query_context(&AbortQueryContext::new(
@@ -2058,31 +2393,87 @@ fn a_create_that_loses_to_a_closing_context_is_reclaimed_without_ever_being_obse
             AbortCause::QueryFailed,
         ));
     assert_eq!(abort.outcome(), OperationOutcome::Accepted);
+    let conclusion = control
+        .accepted()
+        .expect("abort belongs to the already accepted Task");
+    assert_eq!(
+        conclusion.neutral().conclusion(),
+        &TaskConclusion::Terminated(TerminationDetail::Aborted(AbortCause::QueryFailed))
+    );
+    assert!(conclusion.originating_failure().is_none());
+    assert_eq!(
+        source.latest(identity).unwrap().state(),
+        TaskState::Aborting
+    );
+    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 0);
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 0);
+    assert_eq!(
+        fixture.registry.admission_reservation_count(),
+        1,
+        "a control receipt cannot free the preparation owner"
+    );
     fixture.task_host.submit_gate.open();
     let receipt = create.join().expect("create thread");
+    assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
+    let acknowledged = receipt
+        .acknowledgement()
+        .expect("accepted identity remains acknowledged");
+    assert_eq!(acknowledged.identity(), identity);
+    assert_eq!(acknowledged.current_status().state(), TaskState::Aborting);
+    assert!(!acknowledged.current_status().installed());
     assert_eq!(
-        receipt.outcome(),
-        OperationOutcome::ContextTerminalReceipt,
-        "{receipt:?}"
+        acknowledged.current_status().termination(),
+        Some(&TerminationDetail::Aborted(AbortCause::QueryFailed))
     );
-    let source = fixture
-        .registry
-        .status_source(context)
-        .expect("a retained context has an observation source");
     fixture.registry.advance_deadlines();
+    let reporter = fixture.task_host.reporter(identity);
+    assert!(reporter.convergence().actual_stopped());
+    assert!(reporter.convergence().output_released());
+    assert!(reporter.convergence().resources_converged());
+    assert!(reporter.convergence().retired());
+    let terminal = source
+        .latest(identity)
+        .expect("the terminal of an accepted Task is observable");
+    assert_eq!(terminal.state(), TaskState::Aborted);
+    assert!(!terminal.installed());
     assert_eq!(
-        source.observe(TaskStatusCursor::unobserved(identity)),
-        CursorObservation::Unknown
+        terminal.termination(),
+        Some(&TerminationDetail::Aborted(AbortCause::QueryFailed))
     );
+    assert!(Arc::ptr_eq(&conclusion, &control.accepted().unwrap()));
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_removed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
+    assert_eq!(
+        source.next_task_event(),
+        Some(TaskStatusEvent::Status(terminal.clone()))
+    );
+    assert!(source.next_task_event().is_none());
 
-    // Reclaiming the retired record by capacity, then expiring its gone
-    // fence, must neither fence nor forget an observation nobody saw.
+    // Capacity reclaims an observable accepted terminal, then its detailed
+    // fence. Every behind observer must see terminal-before-Gone while retained.
     let second = fixture.establish(2);
     for task in 1..=2u32 {
         let reporter = fixture.create(fixture.identity(2, 1, task), 5);
         fixture.finish(&reporter);
         reporter.release_output();
         fixture.registry.advance_deadlines();
+        if task == 1 {
+            assert_eq!(
+                source.observe(TaskStatusCursor::unobserved(identity)),
+                CursorObservation::Current(Box::new(terminal.clone()))
+            );
+            assert_eq!(
+                source.observe(TaskStatusCursor::at(identity, terminal.version())),
+                CursorObservation::Gone
+            );
+            assert_eq!(
+                source.next_task_event(),
+                Some(TaskStatusEvent::Gone(identity))
+            );
+        }
     }
     assert_eq!(
         fixture
@@ -2093,15 +2484,14 @@ fn a_create_that_loses_to_a_closing_context_is_reclaimed_without_ever_being_obse
     );
     assert_eq!(
         source.observe(TaskStatusCursor::unobserved(identity)),
-        CursorObservation::Unknown
+        CursorObservation::Gone,
+        "expired detailed observation is an explicit gap, never Unknown"
     );
-    while let Some(event) = source.next_event() {
-        assert_ne!(event, TaskStatusEvent::Gone(identity));
-        assert!(
-            !matches!(&event, TaskStatusEvent::Status(status) if status.identity() == identity),
-            "a task that lost its creation is never observable: {event:?}"
-        );
-    }
+    assert_eq!(
+        source.next_task_event(),
+        Some(TaskStatusEvent::Gone(identity))
+    );
+    assert!(source.next_task_event().is_none());
     assert_eq!(
         fixture.registry.context_state(second),
         QueryContextState::Active
@@ -2567,7 +2957,40 @@ fn an_opted_in_replay_gate_fails_explicitly_on_a_host_without_that_capability() 
         .reserve_test_update_consumption(&request, grant.cancellation())
         .err()
         .expect("an unsupported host cannot silently omit the declared gate");
-    assert!(error.detail().as_str().contains("does not support"));
+    use novarocks_execution_contract::failure::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(error.category(), TaskFailureCategory::Internal);
+    assert_eq!(error.detail().as_str(), "Invariant failure (reason 10:149)");
+    assert_eq!(
+        error.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(149).unwrap())
+        )
+    );
+    let original = error.into_failure();
+    let novarocks_execution::runtime::fragment::ExecutionFailureCause::Domain(source) =
+        original.cause()
+    else {
+        panic!("retain the Worker's actual unsupported-host source");
+    };
+    let private_detail = "this execution host does not support a controlled split-consumption gate";
+    assert_eq!(original.detail(), private_detail);
+    assert_eq!(
+        std::error::Error::source(source).unwrap().to_string(),
+        private_detail
+    );
+    let control = fixture.task_host.control(identity);
+    assert!(
+        control.accepted().is_none(),
+        "an operation refusal is not a Task failure"
+    );
+    assert!(!control.is_stopped());
+    assert_eq!(
+        fixture.task_host.reporter(identity).current().state(),
+        TaskState::Planned
+    );
 }
 
 #[test]
@@ -3580,7 +4003,7 @@ fn termination_grace_fixes_the_conclusion_without_forging_convergence() {
 }
 
 #[test]
-fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
+fn an_accepted_creation_aborted_during_submission_retains_its_worker_until_convergence() {
     let fixture = Fixture::new();
     let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
@@ -3592,6 +4015,7 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
     // Hold the creation owner inside `submit_runnable`, after both installs
     // have already succeeded.
     fixture.task_host.submit_gate.close();
+    let _release = OpenHostGateOnDrop(Arc::clone(&fixture.task_host.submit_gate));
     let request = fixture.create_request(identity);
     let registry = Arc::clone(&fixture.registry);
     let owner_request = request.clone();
@@ -3600,6 +4024,11 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
         std::thread::yield_now();
     }
 
+    let control = fixture.task_host.control(identity);
+    assert!(control.accepted().is_none());
+    let source = fixture.registry.status_source(context).unwrap();
+    assert_eq!(source.latest(identity).unwrap().state(), TaskState::Planned);
+    assert!(!source.latest(identity).unwrap().installed());
     let registry = Arc::clone(&fixture.registry);
     let converging = std::thread::spawn(move || registry.create_task(&request, body(6)));
     while fixture.registry.in_flight_operations(context) < 2 {
@@ -3618,23 +4047,44 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
     fixture.task_host.submit_gate.open();
     let created = creating.join().expect("creating thread");
     let replay = converging.join().expect("converging create thread");
+    use novarocks_execution_contract::{TaskConclusion, TerminationDetail};
     assert_eq!(
         created.outcome(),
-        OperationOutcome::ContextTerminalReceipt,
-        "the abort linearized first, so the create must not install a task"
+        OperationOutcome::Accepted,
+        "Accepted identity preceded expensive submission"
     );
-    assert!(created.acknowledgement().is_none());
-    assert_eq!(replay.outcome(), created.outcome());
-    assert_eq!(replay.detail(), created.detail());
-    assert!(replay.acknowledgement().is_none());
+    let created_receipt = created.acknowledgement().unwrap();
+    assert_eq!(created_receipt.identity(), identity);
+    assert_eq!(
+        created_receipt.current_status().state(),
+        TaskState::Aborting
+    );
+    assert!(!created_receipt.current_status().installed());
+    assert_eq!(
+        created_receipt.current_status().termination(),
+        Some(&TerminationDetail::Aborted(AbortCause::QueryFailed))
+    );
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(
+        replay.acknowledgement(),
+        created.acknowledgement(),
+        "Live replay preserves the immutable create receipt"
+    );
+    let conclusion = control.accepted().unwrap();
+    assert_eq!(
+        conclusion.neutral().conclusion(),
+        &TaskConclusion::Terminated(TerminationDetail::Aborted(AbortCause::QueryFailed))
+    );
+    assert!(conclusion.originating_failure().is_none());
     assert_eq!(
         HostLedger::get(&fixture.ledger.contexts_closed),
         1,
         "the abort winner closes the context-wide admission fence once"
     );
 
-    // The submitted worker lost creation eligibility, but it stays owned and
-    // charged because the fake ignored stand-down. The data-plane capability
+    // Accepted remains owned and charged while its submitted worker ignores
+    // stand-down; Installed is never published after the accepted abort.
+    // The data-plane capability
     // is already closed while its receiver remains until actual convergence.
     assert!(fixture.registry.has_live_task(identity));
     assert_eq!(fixture.registry.admission_reservation_count(), 1);
@@ -3677,14 +4127,30 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
         QueryContextState::TerminalRetained
     );
 
-    // The fixed creation failure is the entity's answer, whatever body a
-    // replay carries: it is never rebuilt and never turned into a success.
+    // The terminal of the same accepted identity answers later replay; no
+    // body is reinterpreted and no new worker is created.
     let terminal_replay = fixture
         .registry
         .create_task(&fixture.create_request(identity), stream_body());
-    assert_eq!(terminal_replay.outcome(), created.outcome());
-    assert_eq!(terminal_replay.detail(), created.detail());
-    assert!(terminal_replay.acknowledgement().is_none());
+    assert_eq!(terminal_replay.outcome(), OperationOutcome::Idempotent);
+    assert!(terminal_replay.detail().is_none());
+    let terminal = source.latest(identity).unwrap();
+    assert_eq!(terminal.state(), TaskState::Aborted);
+    assert!(!terminal.installed());
+    assert_eq!(
+        terminal.termination(),
+        Some(&TerminationDetail::Aborted(AbortCause::QueryFailed))
+    );
+    assert_eq!(
+        terminal_replay.acknowledgement(),
+        created.acknowledgement(),
+        "creation replay retains the original receipt after later terminal status"
+    );
+    assert!(Arc::ptr_eq(&conclusion, &control.accepted().unwrap()));
+    assert_eq!(
+        fixture.task_host.prepared(),
+        vec![(fixture.descriptor(identity), bytes::Bytes::from(vec![5; 8]))]
+    );
     assert_eq!(
         HostLedger::get(&fixture.ledger.aborts),
         abort_signals,
@@ -3811,12 +4277,45 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
         .task_host
         .ignore_stand_down
         .store(true, Ordering::SeqCst);
-    let failure = TaskFailure::new(
-        TaskFailureCategory::Execution,
-        SafeDetail::new("upstream array lengths differ").unwrap(),
+    let original = novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+        FixtureRefusal::ArrayLengths,
     );
-    child_reporter.failing(failure.clone());
-    child_reporter.failed(failure.clone());
+    let accepted = child_reporter.report_failure(
+        original.clone(),
+        novarocks_execution_contract::TaskFailurePhase::Execution,
+    );
+    assert_eq!(
+        accepted.decision,
+        novarocks_execution_contract::ConclusionDecision::Accept
+    );
+    assert!(std::ptr::eq(
+        accepted.accepted.originating_failure().unwrap().cause(),
+        original.cause()
+    ));
+    let failure = match child_reporter.current().termination().cloned().unwrap() {
+        novarocks_execution_contract::TerminationDetail::Failed(failure) => failure,
+        other => panic!("the child owns the originating failure: {other:?}"),
+    };
+    assert!(matches!(
+        child_reporter.failed(failure.clone()),
+        StatusAdvance::Published(_)
+    ));
+    assert_failure_projection(
+        &child_reporter.current(),
+        child,
+        TaskFailureCategory::Execution,
+        novarocks_execution_contract::TaskFailurePhase::Execution,
+        "Data failure (reason 13:60016)",
+        true,
+    );
+    let original_accepted = assert_fixture_source(
+        &fixture.task_host.control(child),
+        FixtureRefusal::ArrayLengths,
+        novarocks_execution_contract::failure::FailureClass::Data,
+        60016,
+        "upstream array lengths differ",
+    );
+    assert!(Arc::ptr_eq(&original_accepted, &accepted.accepted));
     fixture.registry.advance_deadlines();
     assert_eq!(
         fixture.registry.context_state(context),
@@ -3895,6 +4394,33 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
         FetchStatus::AwaitTerminalControl,
         "an unproven ACK must never be manufactured into EOF"
     );
+    // These are the original submitted workers, not synthetic cleanup reporters.
+    assert!(!child_reporter.convergence().actual_stopped());
+    child_reporter.release_output();
+    child_reporter.note_actual_stopped();
+    child_reporter.note_resources_converged();
+    assert!(matches!(
+        root_reporter.conclude_termination(
+            novarocks_execution_contract::TerminationDetail::Aborted(AbortCause::PeerTaskFailed),
+            TaskOutputFacts::default()
+        ),
+        StatusAdvance::Published(_)
+    ));
+    root_reporter.release_output();
+    root_reporter.note_actual_stopped();
+    root_reporter.note_resources_converged();
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::TerminalRetained
+    );
+    assert!(!fixture.registry.has_live_task(child));
+    assert!(!fixture.registry.has_live_task(root));
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 2);
+    assert!(Arc::ptr_eq(
+        &original_accepted,
+        &fixture.task_host.control(child).accepted().unwrap()
+    ));
 }
 
 #[test]

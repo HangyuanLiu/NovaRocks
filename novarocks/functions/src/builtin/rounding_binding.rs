@@ -337,7 +337,7 @@ mod tests {
             let mut calls = self.calls.lock().unwrap();
             let index = calls.len();
             calls.push(units);
-            if let Some((at, error)) = self.refusal
+            if let Some((at, error)) = self.refusal.clone()
                 && at == index
             {
                 return Err(error);
@@ -785,13 +785,13 @@ mod tests {
             for at in 0..calls.len() {
                 let control = Control {
                     calls: Mutex::new(Vec::new()),
-                    refusal: Some((at, error)),
+                    refusal: Some((at, error.clone())),
                 };
                 let actual = binding_control::scope(&control, |work| {
                     bind_result("round", request(&args), work)
                 })
                 .unwrap_err();
-                assert_eq!(actual.control_error(), Some(error));
+                assert_eq!(actual.control_error(), Some(error.clone()));
                 assert_eq!(control.calls.lock().unwrap().len(), at + 1);
             }
         }

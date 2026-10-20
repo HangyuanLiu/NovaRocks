@@ -52,8 +52,7 @@ fn checked_view<'a>(
             "binary numeric input is not an installed numeric profile",
         ));
     }
-    NumericArrayView::new(array)
-        .map_err(|_| internal("binary numeric selected carrier cannot be downcast"))
+    NumericArrayView::new(array).map_err(KernelFailure::from_domain)
 }
 pub(super) fn evaluate_numeric_binary<'a>(
     op: NumericBinaryOp,
@@ -541,7 +540,7 @@ mod tests {
         );
         assert!(matches!(
             wrong_shape.evaluate(selection, &wrong, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
 

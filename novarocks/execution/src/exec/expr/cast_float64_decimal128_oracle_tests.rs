@@ -91,7 +91,7 @@ fn compare(
                 let CastRowResult::RowError(err) = pure else {
                     panic!("original batch error must retain exact selected row recipe")
                 };
-                assert_eq!(err.message(), message);
+                assert_eq!(err.message(), (message).detail());
                 assert_eq!(err.selected_ordinal(), ordinal);
             }
         }

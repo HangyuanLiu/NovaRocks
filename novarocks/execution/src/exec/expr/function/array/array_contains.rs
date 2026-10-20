@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
 };
@@ -82,9 +84,16 @@ pub fn eval_array_contains<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_contains requires exactly 2 prepared argument(s)",
+        ));
+    }
     let _ = expr;
     if chunk.is_empty() {
+        arena.eval(args[0], chunk)?;
+        arena.eval(args[1], chunk)?;
         return Ok(Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())) as ArrayRef);
     }
     let arr_is_const = is_row_constant_expr(arena, args[0]);
@@ -101,10 +110,10 @@ pub fn eval_array_contains<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_contains expects ListArray, got {:?}",
                 arr.data_type()
-            )
+            ))
         })?;
     let values = list.values();
     if target_arr.data_type() != values.data_type() {

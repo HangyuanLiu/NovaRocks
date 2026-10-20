@@ -4025,7 +4025,7 @@ mod tests {
             fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
                 if (self.at_entry && units == 0) || (!self.at_entry && units == 256) {
                     self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return Err(self.cause);
+                    return Err(self.cause.clone());
                 }
                 Ok(())
             }
@@ -4037,7 +4037,7 @@ mod tests {
         ] {
             for at_entry in [true, false] {
                 let control = Refuse {
-                    cause,
+                    cause: cause.clone(),
                     at_entry,
                     seen: std::sync::atomic::AtomicBool::new(false),
                 };
@@ -4081,7 +4081,7 @@ mod tests {
                     "the original control must observe the refused work"
                 );
                 assert!(matches!(
-                    (cause, result),
+                    (cause.clone(), result),
                     (
                         CompileControlError::Cancelled,
                         Err(crate::compiler::SqlCompileError::Cancelled)

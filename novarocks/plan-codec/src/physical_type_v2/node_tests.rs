@@ -41,7 +41,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         events.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -89,7 +89,7 @@ fn prefixes(source: &[DataType], ordinary: bool) -> Vec<u32> {
     for at in 0..expected.len() {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(

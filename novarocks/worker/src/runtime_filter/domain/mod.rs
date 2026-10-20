@@ -73,7 +73,7 @@ pub use snapshot::{BackendReducedLogicalDomain, BackendReducedLogicalSnapshot};
 pub use subscription::{BackendSubscriptionError, BackendSubscriptionGroup};
 pub use transport::{
     BackendAcceptStatus, BackendContributionRouteIdentity, BackendDeliveryRouteIdentity,
-    BackendEnvelopeKind, BackendIngressResult, BackendProducerOpenMetadata,
+    BackendEnvelopeKind, BackendIngressResult, BackendProducerOpenMetadata, BackendTransportError,
     BackendTransportFailOpenReason,
 };
 

@@ -17,6 +17,7 @@
 
 //! Real process-boundary compatibility-island admission scenarios.
 
+use super::native_creation::receipt_verdict;
 use crate::actors::mysql as mysql_actor;
 #[path = "compatibility_sql_intent.rs"]
 mod compatibility_sql_intent;
@@ -288,12 +289,12 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let acquisition_receipt =
             only_successful_receipt(acquisition, "admission ticket acquisition")?;
         ensure!(
-            proto::TaskOperationOutcome::try_from(acquisition_receipt.outcome)
+            proto::TaskOperationOutcome::try_from(receipt_verdict(&acquisition_receipt)?.outcome)
                 == Ok(proto::TaskOperationOutcome::Accepted),
             "admission ticket acquisition must be accepted, got {acquisition_receipt:?}"
         );
-        let Some(proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ticket)) =
-            acquisition_receipt.ack
+        let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(ticket)) =
+            receipt_verdict(&acquisition_receipt)?.ack.clone()
         else {
             anyhow::bail!("accepted admission acquisition omitted its ticket acknowledgement");
         };
@@ -361,12 +362,12 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         )?;
         let foreign_receipt = only_successful_receipt(foreign_response, "foreign Establish")?;
         ensure!(
-            proto::TaskOperationOutcome::try_from(foreign_receipt.outcome)
+            proto::TaskOperationOutcome::try_from(receipt_verdict(&foreign_receipt)?.outcome)
                 == Ok(proto::TaskOperationOutcome::CompatibilityMismatch),
             "foreign Establish must return CompatibilityMismatch, got {foreign_receipt:?}"
         );
         ensure!(
-            foreign_receipt.ack.is_none(),
+            receipt_verdict(&foreign_receipt)?.ack.is_none(),
             "compatibility mismatch must not carry an acknowledgement"
         );
         ensure!(
@@ -386,12 +387,12 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let create_receipt =
             only_successful_receipt(create_response, "CreateTask after foreign Establish")?;
         ensure!(
-            proto::TaskOperationOutcome::try_from(create_receipt.outcome)
+            proto::TaskOperationOutcome::try_from(receipt_verdict(&create_receipt)?.outcome)
                 == Ok(proto::TaskOperationOutcome::NotReady),
             "CreateTask after foreign Establish must immediately require an active context, got {create_receipt:?}"
         );
         ensure!(
-            create_receipt.ack.is_none(),
+            receipt_verdict(&create_receipt)?.ack.is_none(),
             "CreateTask against an absent context must not carry an acknowledgement"
         );
         ensure!(
@@ -425,12 +426,12 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let renewed_receipt =
             only_successful_receipt(renewed_acquisition, "renewed admission ticket acquisition")?;
         ensure!(
-            proto::TaskOperationOutcome::try_from(renewed_receipt.outcome)
+            proto::TaskOperationOutcome::try_from(receipt_verdict(&renewed_receipt)?.outcome)
                 == Ok(proto::TaskOperationOutcome::Accepted),
             "renewed admission ticket acquisition must be accepted, got {renewed_receipt:?}"
         );
-        let Some(proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(renewed_ticket)) =
-            renewed_receipt.ack
+        let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(renewed_ticket)) =
+            receipt_verdict(&renewed_receipt)?.ack.clone()
         else {
             anyhow::bail!("renewed admission acquisition omitted its ticket acknowledgement");
         };
@@ -450,14 +451,14 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         )?;
         let matching_receipt = only_successful_receipt(matching_response, "matching Establish")?;
         ensure!(
-            proto::TaskOperationOutcome::try_from(matching_receipt.outcome)
+            proto::TaskOperationOutcome::try_from(receipt_verdict(&matching_receipt)?.outcome)
                 == Ok(proto::TaskOperationOutcome::Accepted),
             "matching Establish must be accepted, got {matching_receipt:?}"
         );
         ensure!(
             matches!(
-                matching_receipt.ack,
-                Some(proto::task_operation_receipt::Ack::QueryContext(_))
+                receipt_verdict(&matching_receipt)?.ack.clone(),
+                Some(proto::task_operation_verdict::Ack::QueryContext(_))
             ),
             "accepted matching Establish must carry a query-context acknowledgement"
         );
@@ -964,12 +965,12 @@ fn assert_other_island_admission_cut(
     )?;
     let receipt = only_successful_receipt(response, "OtherIsland admission acquisition")?;
     ensure!(
-        proto::TaskOperationOutcome::try_from(receipt.outcome)
+        proto::TaskOperationOutcome::try_from(receipt_verdict(&receipt)?.outcome)
             == Ok(proto::TaskOperationOutcome::CompatibilityMismatch),
         "OtherIsland admission must reject the primary island identity, got {receipt:?}"
     );
     ensure!(
-        receipt.ack.is_none(),
+        receipt_verdict(&receipt)?.ack.is_none(),
         "rejected admission must not issue a ticket"
     );
     ensure!(
@@ -1196,7 +1197,12 @@ pub(super) fn only_successful_receipt(
         "{subject} must return exactly one receipt, got {}",
         receipts.len()
     );
-    Ok(receipts.remove(0))
+    let receipt = receipts.remove(0);
+    novarocks_task_codec::operation::decode_receipt_header(
+        &receipt,
+        novarocks_proto_codec::FieldPath::root("scenario_receipt"),
+    )?;
+    Ok(receipt)
 }
 
 pub(super) fn raw_apply_task_operations(

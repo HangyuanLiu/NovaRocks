@@ -93,10 +93,14 @@ fn largeint_text_original_v1_all_policy_nullability_min_max_slice_and_empty() {
 #[test]
 fn largeint_text_shared_raw_adapter_retains_original_full_errors() {
     let wrong: ArrayRef = std::sync::Arc::new(arrow::array::Int64Array::from(vec![1]));
-    assert_eq!(
-        novarocks_functions::largeint_text::cast_array(&wrong).unwrap_err(),
-        "cast LARGEINT to VARCHAR: expected FixedSizeBinaryArray"
-    );
+    let refusal = novarocks_functions::largeint_text::cast_array(&wrong).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert!(matches!(
+        refusal,
+        novarocks_functions::largeint::LargeIntCarrierFailure::ExpectedArray(_)
+    ));
+    assert_eq!(refusal.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(refusal.failure_fact().reason().code(), 292);
     let arr = novarocks_types::largeint::array_from_i128(&[Some(-1)]).unwrap();
     assert_eq!(
         novarocks_functions::largeint_text::cast_array(&arr)

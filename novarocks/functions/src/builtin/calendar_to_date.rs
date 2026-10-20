@@ -46,8 +46,8 @@ pub(super) fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
 }
-pub(super) fn evaluate_to_date<'a>(
-    input: CalendarInput<'_, 'a>,
+pub(super) fn evaluate_to_date<'a, E>(
+    input: CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
@@ -122,12 +122,7 @@ pub(super) fn evaluate_to_date<'a>(
             || work.step(),
         )
     })();
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
+    if result.as_ref().is_err_and(KernelFailure::is_interruption) {
         return result;
     }
     work.finish()?;
@@ -145,8 +140,7 @@ impl KernelEvaluationControl for LegacyControl {
 }
 /// The arena caller supplies one evaluated child and all original child rows.
 /// This adapter has no live date, timezone, name lookup or alternate parser.
-pub fn evaluate_legacy_to_date(array: &ArrayRef) -> Result<ArrayRef, String> {
-    use super::calendar_extended::CalendarCarrierError;
+pub fn evaluate_legacy_to_date(array: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
     use crate::{EvaluatedArgument, FunctionValueType, Selection};
     let types = [FunctionArgumentType::Value(
         FunctionValueType::try_with_logical_type(
@@ -154,35 +148,21 @@ pub fn evaluate_legacy_to_date(array: &ArrayRef) -> Result<ArrayRef, String> {
             true,
             novarocks_type_contract::ValueLogicalType::Physical,
         )
-        .map_err(|error| error.to_string())?,
+        .map_err(KernelFailure::from)?,
     )];
     let arguments = [EvaluatedArgument::Column(array)];
     let target = FunctionValueType::new(DataType::Date32, true);
-    let failure = std::cell::RefCell::new(None);
-    let carrier_error_boundary = |error: CalendarCarrierError<'_>| {
-        *failure.borrow_mut() = Some(error.legacy_message());
-        internal("legacy date carrier failure")
-    };
     let output = evaluate_to_date(
-        CalendarInput {
+        CalendarInput::<std::convert::Infallible> {
             types: &types,
             target: &target,
             carrier: &DataType::Date32,
             arguments: &arguments,
             selected: Selection::all(array.len()),
-            row_error_boundary: None,
-            carrier_error_boundary: Some(&carrier_error_boundary),
+            row_error_port: None,
             legacy: true,
         },
         &LegacyControl,
-    )
-    .map_err(|error| {
-        failure.take().unwrap_or_else(|| match error {
-            KernelFailure::InvalidProgram(message)
-            | KernelFailure::Internal(message)
-            | KernelFailure::Operational(message) => message.message().to_string(),
-            other => other.to_string(),
-        })
-    })?;
+    )?;
     Ok(output.values().clone())
 }

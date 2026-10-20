@@ -16,7 +16,29 @@
 // under the License.
 //! Selection-vector and probe-mask primitives for hash join search.
 
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{Array, BooleanArray};
+#[derive(Debug)]
+struct JoinSelectionContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinSelectionContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinSelectionContract {}
+impl novarocks_failure_contract::FailureProjection for JoinSelectionContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinSelectionContract.reason(),
+        )
+    }
+}
+fn selection_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinSelectionContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct JoinSelection {
@@ -46,20 +68,20 @@ impl JoinSelection {
         self.probe.is_empty()
     }
 
-    pub(crate) fn compact_by_mask(&mut self, mask: &BooleanArray) -> Result<(), String> {
+    pub(crate) fn compact_by_mask(&mut self, mask: &BooleanArray) -> Result<(), ExecutionFailure> {
         if self.probe.len() != self.build.len() {
-            return Err(format!(
+            return Err(selection_contract(format_args!(
                 "join selection length mismatch: probe={} build={}",
                 self.probe.len(),
                 self.build.len()
-            ));
+            )));
         }
         if mask.len() != self.len() {
-            return Err(format!(
+            return Err(selection_contract(format_args!(
                 "join residual mask length mismatch: mask={} selection={}",
                 mask.len(),
                 self.len()
-            ));
+            )));
         }
         let mut write = 0usize;
         for read in 0..mask.len() {
@@ -135,12 +157,12 @@ impl ProbeMask {
         }
     }
 
-    pub(crate) fn set(&mut self, row: usize, value: bool) -> Result<(), String> {
+    pub(crate) fn set(&mut self, row: usize, value: bool) -> Result<(), ExecutionFailure> {
         let len = self.keep.len();
         let Some(slot) = self.keep.get_mut(row) else {
-            return Err(format!(
+            return Err(selection_contract(format_args!(
                 "join probe mask row out of bounds: row={row} len={len}"
-            ));
+            )));
         };
         *slot = value;
         Ok(())
@@ -200,7 +222,17 @@ mod tests {
 
         let err = selection.compact_by_mask(&mask).expect_err("mismatch");
 
-        assert_eq!(err, "join selection length mismatch: probe=2 build=1");
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
+        assert_eq!(
+            err.detail(),
+            "join selection length mismatch: probe=2 build=1"
+        );
+        assert_eq!(selection.probe, vec![0, 1]);
+        assert_eq!(selection.build, vec![0]);
     }
 
     #[test]
@@ -230,7 +262,16 @@ mod tests {
 
         let err = mask.set(2, true).expect_err("out of bounds");
 
-        assert_eq!(err, "join probe mask row out of bounds: row=2 len=2");
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
+        assert_eq!(
+            err.detail(),
+            "join probe mask row out of bounds: row=2 len=2"
+        );
+        assert_eq!(mask.as_slice(), &[false, false]);
     }
 
     #[test]

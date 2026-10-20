@@ -40,6 +40,7 @@ novarocks-result-contract.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-local-program.workspace = true
 novarocks-functions.workspace = true
+novarocks-failure-contract.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true

@@ -62,7 +62,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
         self.work.lock().unwrap().push((phase, units));
-        if let Some((at, failure)) = self.failure
+        if let Some((at, failure)) = self.failure.clone()
             && at == units
         {
             Err(failure)
@@ -1460,13 +1460,13 @@ fn entry_and_midwork_failures_are_typed_and_declaration_count_is_bounded() {
     ] {
         for at in [0, 256] {
             let control = Control {
-                failure: Some((at, failure)),
+                failure: Some((at, failure.clone())),
                 ..Default::default()
             };
             assert_eq!(
                 ProgramResolvedCalls::try_new(snapshot.clone(), calls.clone(), &control)
                     .unwrap_err(),
-                ProgramResolvedCallsError::Control(failure)
+                ProgramResolvedCallsError::Control(failure.clone())
             );
             assert_eq!(
                 control.work.lock().unwrap().last(),
@@ -1808,7 +1808,7 @@ fn created_call_table_every_control_boundary_keeps_first_cause_and_no_tail() {
     impl PureCompileControl for Compile<'_> {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
             let at = self.next.fetch_add(1, Ordering::Relaxed);
-            if let Some((boundary, error)) = self.fail
+            if let Some((boundary, error)) = self.fail.clone()
                 && at == boundary
             {
                 self.refused_requests
@@ -1822,11 +1822,11 @@ fn created_call_table_every_control_boundary_keeps_first_cause_and_no_tail() {
     let (catalog, owner, _) = catalogue();
     let source = scalar_snapshot();
     let token = scalar_token(&catalog, &owner, 0);
-    let run = |fail| {
+    let run = |fail: Option<(usize, CompileControlError)>| {
         let requests = AtomicUsize::new(0);
         let control = Compile {
             next: AtomicUsize::new(0),
-            fail,
+            fail: fail.clone(),
             requests: &requests,
             refused_requests: AtomicUsize::new(usize::MAX),
         };
@@ -1873,7 +1873,7 @@ fn created_call_table_every_control_boundary_keeps_first_cause_and_no_tail() {
         CompileControlError::ResourceExhausted,
     ] {
         for at in 0..total {
-            run(Some((at, cause)));
+            run(Some((at, cause.clone())));
         }
     }
 }

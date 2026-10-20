@@ -292,7 +292,7 @@ fn original_negate_after_match_error() -> String {
         },
         DataType::Boolean,
     );
-    arena.eval(root, &chunk).unwrap_err()
+    arena.eval(root, &chunk).unwrap_err().detail().to_owned()
 }
 #[test]
 fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_it() {

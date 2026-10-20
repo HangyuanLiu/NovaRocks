@@ -37,14 +37,16 @@ pub enum RuntimeFilterContractErrorCode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterContractError {
     code: RuntimeFilterContractErrorCode,
-    detail: String,
+    detail: novarocks_execution_contract::failure::BoundedDetail,
 }
 
 impl RuntimeFilterContractError {
     pub fn new(code: RuntimeFilterContractErrorCode, detail: impl Into<String>) -> Self {
         Self {
             code,
-            detail: detail.into(),
+            detail: novarocks_execution_contract::failure::BoundedDetail::truncating(
+                &detail.into(),
+            ),
         }
     }
 
@@ -57,7 +59,7 @@ impl RuntimeFilterContractError {
     }
 
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.detail.as_str()
     }
 }
 
@@ -89,5 +91,69 @@ mod tests {
             error.to_string(),
             "ParticipantClosed: participant already released"
         );
+    }
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for RuntimeFilterContractError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        let reason = match self.code {
+            RuntimeFilterContractErrorCode::InvalidContract => R::RuntimeFilterInvalidContract,
+            // This code identifies an attempt/participant binding mismatch,
+            // not accepted client cancellation or dependency unavailability.
+            RuntimeFilterContractErrorCode::ParticipantClosed => {
+                R::RuntimeFilterParticipantMismatch
+            }
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
+    #[test]
+    fn real_rf_codes_survive_scan_resolution_and_host_rejection_without_text_classification() {
+        use std::error::Error;
+        for (code, reason) in [
+            (RuntimeFilterContractErrorCode::InvalidContract, 12),
+            (RuntimeFilterContractErrorCode::ParticipantClosed, 13),
+        ] {
+            let original = RuntimeFilterContractError::new(
+                code,
+                "cancelled resource exhausted numeric overflow 雪".repeat(100),
+            );
+            let expected = original.failure_fact();
+            assert_eq!(expected.class(), FailureClass::Invariant);
+            assert_eq!(expected.reason().domain(), domain::WORKER.get());
+            assert_eq!(expected.reason().code(), reason);
+            assert!(original.detail().len() <= 512);
+            let resolver: crate::RuntimeFilterSessionResolver =
+                std::sync::Arc::new(move || Err(original.clone()));
+            let original = resolver().err().unwrap();
+            let rejection = crate::HostRejection::from_domain(
+                novarocks_execution_contract::TaskFailureCategory::Protocol,
+                original,
+            );
+            let execution = rejection
+                .source()
+                .unwrap()
+                .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
+                .unwrap();
+            assert_eq!(execution.failure_fact(), expected);
+            let mut source = execution.source();
+            let mut retained = false;
+            while let Some(error) = source {
+                if let Some(actual) = error.downcast_ref::<RuntimeFilterContractError>() {
+                    assert_eq!(actual.code(), code);
+                    assert_eq!(actual.failure_fact(), expected);
+                    retained = true;
+                }
+                source = error.source();
+            }
+            assert!(retained);
+        }
     }
 }

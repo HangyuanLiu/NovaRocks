@@ -78,7 +78,7 @@ impl<'a> NumericValue<'a> {
                 ));
             }
         }
-        let view = NumericArrayView::new(argument.array()).map_err(|message| internal(&message))?;
+        let view = NumericArrayView::new(argument.array()).map_err(KernelFailure::from_domain)?;
         Ok(Self {
             argument,
             view,
@@ -194,12 +194,7 @@ pub(super) fn evaluate_truncate<'a>(
             Ok((x, digits))
         },
     )
-    .map_err(|error| match error {
-        MathNumericError::Kernel(error) => error,
-        // Exact supported inputs and safe output casts have no lawful whole
-        // data-error route. Preserve an unexpected core diagnostic as Internal.
-        MathNumericError::Legacy(message) => internal(&message),
-    })?;
+    .map_err(MathNumericError::into_kernel)?;
     SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("truncate compact output violates its selected contract"))
 }

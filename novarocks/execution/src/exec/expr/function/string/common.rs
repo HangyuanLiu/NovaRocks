@@ -16,6 +16,9 @@
 // under the License.
 use arrow::array::{Array, ArrayRef, Int32Array, Int64Array};
 
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::ExecutionResult;
+
 pub(super) const OLAP_STRING_MAX_LENGTH: usize = 1_048_576;
 
 pub(super) enum IntArgArray<'a> {
@@ -49,12 +52,12 @@ impl IntArgArray<'_> {
 pub(super) fn downcast_int_arg_array<'a>(
     arr: &'a ArrayRef,
     func_name: &str,
-) -> Result<IntArgArray<'a>, String> {
+) -> ExecutionResult<IntArgArray<'a>> {
     if let Some(v) = arr.as_any().downcast_ref::<Int32Array>() {
         return Ok(IntArgArray::Int32(v));
     }
     if let Some(v) = arr.as_any().downcast_ref::<Int64Array>() {
         return Ok(IntArgArray::Int64(v));
     }
-    Err(format!("{func_name} expects int"))
+    Err(expression_contract(format_args!("{func_name} expects int")))
 }

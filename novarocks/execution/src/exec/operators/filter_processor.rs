@@ -27,6 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::collections::HashSet;
@@ -39,8 +40,15 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_types::SlotId;
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
+#[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for predicate processors that apply row-level filter masks to input chunks.
@@ -77,16 +85,13 @@ impl OperatorFactory for FilterFixtureFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(FilterFixtureOperator {
+        Box::new(Transform::hydrating(FilterFixtureKernel {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             predicate: self.predicate,
             encoding_policy: self.encoding_policy.clone(),
             construction: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
-        })
+        }))
     }
 }
 
@@ -307,110 +312,99 @@ fn collect_slot_ids(arena: &ExprArena, expr: ExprId, out: &mut HashSet<SlotId>) 
 }
 
 #[cfg(test)]
-struct FilterFixtureOperator {
+struct FilterFixtureKernel {
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     name: String,
     arena: Arc<ExprArena>,
     predicate: ExprId,
     encoding_policy: FilterEncodingPolicy,
-    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
-    pending_output: Option<Chunk>,
-    finishing: bool,
-    finished: bool,
 }
 
 #[cfg(test)]
-impl Operator for FilterFixtureOperator {
-    fn creates_typed_storage(&self) -> bool {
-        true
-    }
+impl OperatorLifecycle for FilterFixtureKernel {
     fn set_construction_factory(
         &mut self,
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) {
         self.construction = Some(factory);
     }
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+}
+#[cfg(test)]
+impl InputEncodingPolicy for FilterFixtureKernel {
+    fn retains_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+        self.encoding_policy
+            .accepts_encoded_column(slot_id, data_type)
     }
 }
 
+#[derive(Debug)]
+pub(super) enum FilterFailure {
+    PredicateType,
+    Arrow(arrow::error::ArrowError),
+}
+impl std::fmt::Display for FilterFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PredicateType => f.write_str("filter predicate is not a Boolean array"),
+            Self::Arrow(error) => write!(f, "filter kernel: {error}"),
+        }
+    }
+}
+impl std::error::Error for FilterFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Arrow(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for FilterFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::PredicateType => ExecutionReason::FilterPredicateType,
+            Self::Arrow(_) => ExecutionReason::FilterArrow,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
 #[cfg(test)]
-impl ProcessorOperator for FilterFixtureOperator {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending_output.is_none()
-    }
-
-    fn has_output(&self) -> bool {
-        self.pending_output.is_some()
-    }
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        if self.pending_output.is_some() {
-            return Err("filter received input while output buffer is full"
-                .to_string()
-                .into());
-        }
+impl TransformKernel for FilterFixtureKernel {
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         if chunk.is_empty() {
-            self.pending_output = Some(chunk);
-            return Ok(());
+            return Ok(StepResult::new(Some(chunk), NextStep::NeedInput, rows));
         }
-
-        // Vectorized implementation: use eval to compute predicate on entire chunk
         let factory = self
             .construction
             .as_ref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
         let owner = factory.begin_input_construction(&chunk)?;
-        let control = super::compiled_expression::RuntimeKernelControl::new(state.error_state());
-        let predicate_array =
-            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), &control)
-                .eval(self.predicate, &chunk)?;
-
-        // Downcast to BooleanArray
+        let evaluation =
+            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), ctx);
+        let predicate_array = evaluation.eval(self.predicate, &chunk)?;
         let filter_mask = predicate_array
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "Filter predicate must return boolean array".to_string())?;
-
-        // The same actual caller owns construction of the filtered output.
-        self.pending_output = Some(chunk.filter_for_evaluation(filter_mask, owner.as_ref())?);
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let out = self.pending_output.take();
-        if out.is_some() && self.finishing && self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(out)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        if self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(())
-    }
-
-    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
-        self.encoding_policy
-            .accepts_encoded_column(slot_id, data_type)
+            .ok_or_else(|| {
+                crate::runtime::fragment::ExecutionFailure::from_domain(
+                    FilterFailure::PredicateType,
+                )
+            })?;
+        let filtered = chunk.filter_for_evaluation(filter_mask, owner.as_ref())?;
+        Ok(StepResult::new(Some(filtered), NextStep::NeedInput, rows))
     }
 }
 
@@ -419,6 +413,7 @@ mod tests {
     use super::*;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use crate::exec::pipeline::test_driver::TestDriver;
     use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
@@ -537,22 +532,19 @@ mod tests {
         for input in [empty, original] {
             let mut first = factory.create(1, 0);
             install_fixture_creator(first.as_mut());
-            let processor = first.as_processor_mut().expect("filter processor");
-            processor.push_chunk(&state, input).expect("filter");
-            let filtered = processor
-                .pull_chunk(&state)
-                .unwrap()
-                .expect("filtered batch");
+            let mut calls = TestDriver::new(first.as_mut(), &state);
+            let mut output = calls.input_and_collect(input).expect("filter");
+            assert_eq!(output.len(), 1);
+            let filtered = output.pop().unwrap();
             assert!(filtered.is_empty());
             let expected_schema = filtered.schema();
             let expected_slots = filtered.chunk_schema_ref();
             let mut second = factory.create(1, 0);
             install_fixture_creator(second.as_mut());
-            let processor = second.as_processor_mut().expect("second filter processor");
-            processor
-                .push_chunk(&state, filtered)
-                .expect("typed empty filter");
-            let output = processor.pull_chunk(&state).unwrap().expect("empty output");
+            let mut calls = TestDriver::new(second.as_mut(), &state);
+            let mut batches = calls.input_and_collect(filtered).expect("second filter");
+            assert_eq!(batches.len(), 1);
+            let output = batches.pop().unwrap();
             assert!(output.is_empty());
             assert_eq!(output.schema(), expected_schema);
             assert!(Arc::ptr_eq(&output.chunk_schema_ref(), &expected_slots));
@@ -564,8 +556,8 @@ mod tests {
                     .len(),
                 0
             );
-            processor.set_finishing(&state).expect("normal finish");
-            assert!(second.is_finished());
+            calls.signal_eos().expect("normal finish");
+            assert!(calls.collect_until_finished().unwrap().is_empty());
         }
     }
 
@@ -674,18 +666,20 @@ mod tests {
         let factory = FilterFixtureFactory::new(7, Arc::clone(&arena), predicate);
         let mut op = factory.create(1, 0);
         install_fixture_creator(op.as_mut());
-        let processor = op.as_processor_mut().expect("processor");
+        let policy = FilterEncodingPolicy::from_predicate(&arena, predicate);
         let dict_type = dict_utf8_type();
 
-        assert!(processor.accepts_encoded_column(SlotId::new(1), &dict_type));
-        assert!(processor.accepts_encoded_column(SlotId::new(2), &dict_type));
-        assert!(!processor.accepts_encoded_column(SlotId::new(3), &DataType::Int32));
+        assert!(policy.accepts_encoded_column(SlotId::new(1), &dict_type));
+        assert!(policy.accepts_encoded_column(SlotId::new(2), &dict_type));
+        assert!(!policy.accepts_encoded_column(SlotId::new(3), &DataType::Int32));
 
         let state = RuntimeState::default();
-        processor
-            .push_chunk(&state, filter_test_chunk())
-            .expect("push");
-        let output = processor.pull_chunk(&state).expect("pull").expect("output");
+        let mut calls = TestDriver::new(op.as_mut(), &state);
+        let mut output = calls
+            .input_and_collect(filter_test_chunk())
+            .expect("filter");
+        assert_eq!(output.len(), 1);
+        let output = output.pop().unwrap();
 
         assert_eq!(output.len(), 2);
         assert_int32_utf8_dictionary(&output.columns()[0]);
@@ -751,12 +745,13 @@ mod tests {
         let factory = FilterFixtureFactory::new(8, Arc::new(arena), predicate);
         let mut op = factory.create(1, 0);
         install_fixture_creator(op.as_mut());
-        let processor = op.as_processor_mut().expect("processor");
         let state = RuntimeState::default();
-        processor
-            .push_chunk(&state, filter_test_chunk())
-            .expect("evaluate constant against dictionary column");
-        let output = processor.pull_chunk(&state).expect("pull").expect("output");
+        let mut calls = TestDriver::new(op.as_mut(), &state);
+        let mut output = calls
+            .input_and_collect(filter_test_chunk())
+            .expect("evaluate selected constant");
+        assert_eq!(output.len(), 1);
+        let output = output.pop().unwrap();
 
         assert_eq!(output.len(), 2);
         assert_int32_utf8_dictionary(&output.columns()[0]);

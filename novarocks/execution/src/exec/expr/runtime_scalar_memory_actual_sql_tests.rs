@@ -115,6 +115,9 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
                 execution_runtime: Some(runtime),
                 query_memory: funded.then_some(binding),
                 task_identity: Some(task),
+                task_control: Some(crate::runtime::task_control::test_support::control_for(
+                    task,
+                )),
                 #[cfg(novarocks_dev_controls)]
                 exchange_test_observer: None,
             },
@@ -136,17 +139,21 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
         operator.set_construction_factory(construction);
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
-        let processor = operator.as_processor_mut().unwrap();
+        let mut processor =
+            crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
         let result = processor
-            .push_chunk(
-                &state,
+            .input_without_output(
                 Chunk::try_new_with_chunk_schema(batch.clone(), schema.clone()).unwrap(),
             )
-            .and_then(|()| processor.set_finishing(&state));
+            .and_then(|()| processor.signal_eos());
         if funded {
             result.unwrap();
             let mut values = Vec::new();
-            while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+            while let Some(chunk) = processor
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .unwrap()
+            {
                 values.extend(
                     chunk
                         .columns()
@@ -168,7 +175,11 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
                 )
             );
             assert_eq!(
-                processor.pull_chunk(&state).unwrap_err().cause(),
+                processor
+                    .advance_to_boundary()
+                    .map(|step| step.output)
+                    .unwrap_err()
+                    .cause(),
                 error.cause()
             );
         }

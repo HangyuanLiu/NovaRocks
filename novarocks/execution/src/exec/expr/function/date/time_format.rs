@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::expr::{ExprId, ExprNode};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
@@ -24,10 +24,11 @@ use novarocks_functions::{
 };
 pub fn eval_time_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Utf8)?;
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
     let override_values = if let Some(ExprNode::Cast(child, _)) = arena.node(args[0]) {
         if matches!(arena.data_type(*child), Some(DataType::Utf8)) {
@@ -35,8 +36,11 @@ pub fn eval_time_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let raw = raw
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "time_format expects string".to_string())?;
-            Some(shared::clock_strings(raw, &mut work).map_err(TimeTextError::into_legacy)?)
+                .ok_or_else(|| TimeTextError::contract("time_format expects string"))?;
+            Some(
+                shared::clock_strings(raw, &mut work)
+                    .map_err(crate::runtime::fragment::ExecutionFailure::from)?,
+            )
         } else {
             None
         }
@@ -48,14 +52,13 @@ pub fn eval_time_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let format = format
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "time_format expects string format".to_string())?;
+        .ok_or_else(|| TimeTextError::contract("time_format expects string format"))?;
     let seconds = if let Some(v) = override_values {
         v
     } else {
-        shared::format_argument(&time, &mut work).map_err(TimeTextError::into_legacy)?
+        shared::format_argument(&time, &mut work)
+            .map_err(crate::runtime::fragment::ExecutionFailure::from)?
     };
-    Ok(
-        (shared::format_output(&seconds, format, chunk.len(), &mut work)
-            .map_err(TimeTextError::into_legacy))?,
-    )
+    shared::format_output(&seconds, format, chunk.len(), &mut work)
+        .map_err(crate::runtime::fragment::ExecutionFailure::from)
 }

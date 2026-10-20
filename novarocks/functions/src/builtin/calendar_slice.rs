@@ -17,7 +17,10 @@
 
 //! One original slice computation, selected row protocol and temporal output projection.
 use super::calendar_extended::DateInput;
-use super::calendar_extended_shared::legacy_to_timestamp_value;
+use super::calendar_extended_shared::{
+    CalendarFailure, RawCalendarFailure, finish_calendar_result,
+};
+use super::calendar_timestamp::{TimestampValueError, timestamp_value};
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelEvaluationControl,
     KernelFailure, RowDataError, ScalarCallInput, SelectedValues, Selection, ValueLogicalType,
@@ -29,6 +32,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
+use novarocks_failure_contract::BoundedDetail;
 use std::{alloc::Layout, sync::Arc, time::Duration as WaitDuration};
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CalendarSliceDomain {
@@ -54,39 +58,66 @@ enum SliceRowError {
     NullInterval,
     NullUnit,
     PositiveInterval,
-    UnsupportedUnit(String),
+    UnsupportedUnit(BoundedDetail),
     DateTimeUnit,
     NullBoundary,
-    UnsupportedBoundary(String),
+    UnsupportedBoundary(BoundedDetail),
     BeforeOrigin,
     Arithmetic,
     IndexOverflow,
-    Timestamp(String),
+    Timestamp(TimestampValueError),
+}
+struct SliceDiagnostic<'a> {
+    error: &'a SliceRowError,
+    domain: CalendarSliceDomain,
+}
+impl std::fmt::Display for SliceDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self.domain.name();
+        match self.error {
+            SliceRowError::NullInterval => write!(f, "{name} requires non-null interval"),
+            SliceRowError::NullUnit => write!(f, "{name} requires non-null unit"),
+            SliceRowError::PositiveInterval => {
+                write!(f, "{name} requires second parameter must be greater than 0")
+            }
+            SliceRowError::UnsupportedUnit(unit) => {
+                write!(f, "time_slice unsupported unit: {}", unit.as_str())
+            }
+            SliceRowError::DateTimeUnit => {
+                f.write_str("can't use time_slice for date with time(hour/minute/second)")
+            }
+            SliceRowError::NullBoundary => write!(f, "{name} requires non-null boundary"),
+            SliceRowError::UnsupportedBoundary(boundary) => write!(
+                f,
+                "time_slice expects boundary floor/ceil, got {}",
+                boundary.as_str()
+            ),
+            SliceRowError::BeforeOrigin => {
+                f.write_str("time used with time_slice can't before 0001-01-01 00:00:00")
+            }
+            SliceRowError::Arithmetic => {
+                write!(f, "{name} input exceeds supported slice arithmetic")
+            }
+            SliceRowError::IndexOverflow => write!(f, "{name} bucket index overflow"),
+            SliceRowError::Timestamp(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
 }
 impl SliceRowError {
-    fn legacy_message(&self, domain: CalendarSliceDomain) -> String {
-        let name = domain.name();
+    fn reason(&self) -> crate::DataFailureReason {
         match self {
-            Self::NullInterval => format!("{name} requires non-null interval"),
-            Self::NullUnit => format!("{name} requires non-null unit"),
-            Self::PositiveInterval => {
-                format!("{name} requires second parameter must be greater than 0")
+            Self::Arithmetic | Self::IndexOverflow | Self::Timestamp(_) => {
+                crate::DataFailureReason::NumericOutOfRange
             }
-            Self::UnsupportedUnit(unit) => format!("time_slice unsupported unit: {unit}"),
-            Self::DateTimeUnit => {
-                "can't use time_slice for date with time(hour/minute/second)".into()
-            }
-            Self::NullBoundary => format!("{name} requires non-null boundary"),
-            Self::UnsupportedBoundary(boundary) => {
-                format!("time_slice expects boundary floor/ceil, got {boundary}")
-            }
-            Self::BeforeOrigin => {
-                "time used with time_slice can't before 0001-01-01 00:00:00".into()
-            }
-            Self::Arithmetic => format!("{name} input exceeds supported slice arithmetic"),
-            Self::IndexOverflow => format!("{name} bucket index overflow"),
-            Self::Timestamp(error) => error.clone(),
+            _ => crate::DataFailureReason::InvalidValue,
         }
+    }
+    fn raw_row_error(&self, domain: CalendarSliceDomain, ordinal: usize) -> RowDataError {
+        let detail = BoundedDetail::truncating_display(SliceDiagnostic {
+            error: self,
+            domain,
+        });
+        RowDataError::with_reason(ordinal, self.reason(), detail.as_str())
     }
     fn row_error(&self, domain: CalendarSliceDomain, ordinal: usize) -> RowDataError {
         match self {
@@ -94,9 +125,15 @@ impl SliceRowError {
             Self::UnsupportedBoundary(_) => {
                 RowDataError::new(ordinal, "time_slice expects boundary floor/ceil")
             }
-            _ => RowDataError::new(ordinal, &self.legacy_message(domain)),
+            _ => self.raw_row_error(domain, ordinal),
         }
     }
+}
+fn bounded_lowercase(raw: &str) -> BoundedDetail {
+    let bounded = BoundedDetail::truncating(raw);
+    let mut text = bounded.as_str().to_owned();
+    text.make_ascii_lowercase();
+    BoundedDetail::truncating(&text)
 }
 enum SliceCalculationError {
     Row(SliceRowError),
@@ -128,19 +165,25 @@ enum TimeSliceUnit {
 
 impl TimeSliceUnit {
     fn parse(raw: &str) -> Result<Self, SliceRowError> {
-        match raw.to_ascii_lowercase().as_str() {
-            "year" | "years" => Ok(Self::Year),
-            "quarter" | "quarters" => Ok(Self::Quarter),
-            "month" | "months" => Ok(Self::Month),
-            "week" | "weeks" => Ok(Self::Week),
-            "day" | "days" => Ok(Self::Day),
-            "hour" | "hours" => Ok(Self::Hour),
-            "minute" | "minutes" => Ok(Self::Minute),
-            "second" | "seconds" => Ok(Self::Second),
-            "millisecond" | "milliseconds" => Ok(Self::Millisecond),
-            "microsecond" | "microseconds" => Ok(Self::Microsecond),
-            other => Err(SliceRowError::UnsupportedUnit(other.to_owned())),
+        // Length checks in eq_ignore_ascii_case reject oversized invalid tokens
+        // without copying or scanning their complete source text.
+        for (singular, plural, unit) in [
+            ("year", "years", Self::Year),
+            ("quarter", "quarters", Self::Quarter),
+            ("month", "months", Self::Month),
+            ("week", "weeks", Self::Week),
+            ("day", "days", Self::Day),
+            ("hour", "hours", Self::Hour),
+            ("minute", "minutes", Self::Minute),
+            ("second", "seconds", Self::Second),
+            ("millisecond", "milliseconds", Self::Millisecond),
+            ("microsecond", "microseconds", Self::Microsecond),
+        ] {
+            if raw.eq_ignore_ascii_case(singular) || raw.eq_ignore_ascii_case(plural) {
+                return Ok(unit);
+            }
         }
+        Err(SliceRowError::UnsupportedUnit(bounded_lowercase(raw)))
     }
 
     fn index(self, dt: NaiveDateTime, start: NaiveDateTime) -> Option<i64> {
@@ -234,13 +277,14 @@ fn calculate_row_lazy<'text>(
         None => "floor",
     };
     work.flush()?;
-    let boundary = boundary.to_ascii_lowercase();
-    work.flush()?;
-    let use_ceil = match boundary.as_str() {
-        "floor" => false,
-        "ceil" => true,
-        other => return Err(SliceRowError::UnsupportedBoundary(other.to_owned()).into()),
+    let use_ceil = if boundary.eq_ignore_ascii_case("floor") {
+        false
+    } else if boundary.eq_ignore_ascii_case("ceil") {
+        true
+    } else {
+        return Err(SliceRowError::UnsupportedBoundary(bounded_lowercase(boundary)).into());
     };
+    work.flush()?;
     let dt = match datetime(work)? {
         Some(value) => value,
         None => return Ok(None),
@@ -405,12 +449,7 @@ impl SliceValues {
             }
             Self::Datetime(values) => values.push(
                 value
-                    .map(|dt| {
-                        legacy_to_timestamp_value(
-                            dt,
-                            &DataType::Timestamp(TimeUnit::Microsecond, None),
-                        )
-                    })
+                    .map(|dt| timestamp_value(dt, TimeUnit::Microsecond))
                     .transpose()
                     .map_err(SliceRowError::Timestamp)?,
             ),
@@ -424,7 +463,7 @@ impl SliceValues {
         }
     }
 }
-struct SliceInput<'a> {
+struct SliceInput<'a, E = std::convert::Infallible> {
     domain: CalendarSliceDomain,
     selection: Selection<'a>,
     batch_rows: usize,
@@ -432,12 +471,12 @@ struct SliceInput<'a> {
     count: SliceCount<'a>,
     unit: SliceText<'a>,
     boundary: Option<SliceText<'a>>,
-    row_error: Option<&'a dyn Fn(&SliceRowError) -> Result<(), KernelFailure>>,
+    row_error: Option<&'a dyn Fn(&SliceRowError, usize) -> Result<RowDataError, E>>,
 }
-fn evaluate_input<'a>(
-    input: SliceInput<'a>,
+fn evaluate_input<'a, E>(
+    input: SliceInput<'a, E>,
     control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
+) -> Result<SelectedValues<'a>, CalendarFailure<E>> {
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
     let result = (|| {
@@ -476,13 +515,14 @@ fn evaluate_input<'a>(
             let failure = match value {
                 Ok(value) => output.push(value).err(),
                 Err(SliceCalculationError::Row(error)) => Some(error),
-                Err(SliceCalculationError::Kernel(error)) => return Err(error),
+                Err(SliceCalculationError::Kernel(error)) => return Err(error.into()),
             };
             if let Some(error) = failure {
-                if let Some(boundary) = input.row_error {
-                    boundary(&error)?;
-                }
-                errors.push(error.row_error(input.domain, ordinal));
+                let row = match input.row_error {
+                    Some(port) => port(&error, ordinal).map_err(CalendarFailure::Row)?,
+                    None => error.row_error(input.domain, ordinal),
+                };
+                errors.push(row);
                 output
                     .push(None)
                     .map_err(|_| internal("slice NULL projection failed"))?;
@@ -499,8 +539,9 @@ fn evaluate_input<'a>(
             errors.into_boxed_slice(),
             || work.step(),
         )
+        .map_err(CalendarFailure::Outer)
     })();
-    work.finish_result(result)
+    finish_calendar_result(work, result)
 }
 struct LegacyControl;
 impl KernelEvaluationControl for LegacyControl {
@@ -518,11 +559,9 @@ pub fn evaluate_legacy_slice(
     count: &[Option<i64>],
     unit: &StringArray,
     boundary: Option<&StringArray>,
-) -> Result<ArrayRef, String> {
-    let failure = std::cell::RefCell::new(None);
-    let row_error = |error: &SliceRowError| {
-        *failure.borrow_mut() = Some(error.legacy_message(domain));
-        Err(internal("legacy slice row failure"))
+) -> Result<ArrayRef, RawCalendarFailure> {
+    let row_error = |error: &SliceRowError, ordinal: usize| -> Result<RowDataError, RowDataError> {
+        Err(error.raw_row_error(domain, ordinal))
     };
     let output = evaluate_input(
         SliceInput {
@@ -542,12 +581,7 @@ pub fn evaluate_legacy_slice(
             row_error: Some(&row_error),
         },
         &LegacyControl,
-    )
-    .map_err(|error| {
-        failure
-            .take()
-            .unwrap_or_else(|| format!("legacy slice kernel failure: {error:?}"))
-    })?;
+    )?;
     Ok(Arc::clone(output.values()))
 }
 pub(super) fn exact_profile(
@@ -614,7 +648,7 @@ pub(super) fn evaluate_selected<'a>(
         })
     };
     evaluate_input(
-        SliceInput {
+        SliceInput::<std::convert::Infallible> {
             domain,
             selection: input.selection(),
             batch_rows: input.selection().batch_rows(),
@@ -636,6 +670,7 @@ pub(super) fn evaluate_selected<'a>(
         },
         control,
     )
+    .map_err(CalendarFailure::into_kernel)
 }
 #[cfg(test)]
 #[path = "calendar_slice_tests.rs"]

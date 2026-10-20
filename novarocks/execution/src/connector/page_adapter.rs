@@ -63,7 +63,7 @@ impl From<ConstructionFailure> for PageConversionFailure {
 impl PageConversionFailure {
     fn into_execution(self) -> ExecutionFailure {
         match self {
-            Self::Page(error) => error.to_string().into(),
+            Self::Page(error) => ExecutionFailure::from_domain(error),
             Self::Construction(error) => error.into(),
         }
     }
@@ -74,7 +74,7 @@ impl PageConversionFailure {
             // Only the explicit pure adapter uses this conversion. Its body
             // has no construction owner and cannot originate this variant.
             Self::Construction(error) => {
-                PageAdapterError::new(PageAdapterErrorKind::Chunk, error.to_string())
+                PageAdapterError::new(PageAdapterCause::Chunk, error.to_string())
             }
         }
     }
@@ -104,56 +104,78 @@ impl std::fmt::Display for PageAdapterErrorKind {
     }
 }
 
-/// A typed page-conversion failure.
-///
-/// A connector failure keeps its original [`ConnectorError`], because the
-/// caller's fail-fast policy depends on its kind: a cancellation and corrupt
-/// data are not the same event.
+/// A page-conversion cause. Connector failures always retain their original
+/// typed payload; local contract failures cannot impersonate a Connector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PageAdapterCause {
+    ChannelMismatch,
+    PositionMismatch,
+    Chunk,
+    Connector(ConnectorError),
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageAdapterError {
-    kind: PageAdapterErrorKind,
-    detail: String,
-    connector_error: Option<ConnectorError>,
+    cause: PageAdapterCause,
+    detail: novarocks_failure_contract::BoundedDetail,
 }
-
 impl PageAdapterError {
-    pub fn new(kind: PageAdapterErrorKind, detail: impl Into<String>) -> Self {
+    fn new(cause: PageAdapterCause, detail: impl std::fmt::Display) -> Self {
         Self {
-            kind,
-            detail: detail.into(),
-            connector_error: None,
+            cause,
+            detail: novarocks_failure_contract::BoundedDetail::truncating_display(detail),
         }
     }
-
     pub fn from_connector(error: ConnectorError, context: &str) -> Self {
+        let detail = novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "{context}: {error}"
+        ));
         Self {
-            kind: PageAdapterErrorKind::Connector,
-            detail: format!("{context}: {error}"),
-            connector_error: Some(error),
+            cause: PageAdapterCause::Connector(error),
+            detail,
         }
     }
-
     pub const fn kind(&self) -> PageAdapterErrorKind {
-        self.kind
+        match &self.cause {
+            PageAdapterCause::ChannelMismatch => PageAdapterErrorKind::ChannelMismatch,
+            PageAdapterCause::PositionMismatch => PageAdapterErrorKind::PositionMismatch,
+            PageAdapterCause::Chunk => PageAdapterErrorKind::Chunk,
+            PageAdapterCause::Connector(_) => PageAdapterErrorKind::Connector,
+        }
     }
-
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.detail.as_str()
     }
-
-    /// The underlying connector failure, when the adapter did not originate it.
     pub const fn connector_error(&self) -> Option<&ConnectorError> {
-        self.connector_error.as_ref()
+        match &self.cause {
+            PageAdapterCause::Connector(error) => Some(error),
+            _ => None,
+        }
     }
 }
-
 impl std::fmt::Display for PageAdapterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.kind, self.detail)
+        write!(formatter, "{}: {}", self.kind(), self.detail)
     }
 }
-
-impl std::error::Error for PageAdapterError {}
+impl std::error::Error for PageAdapterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.connector_error()
+            .map(|error| error as &dyn std::error::Error)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for PageAdapterError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match &self.cause {
+            PageAdapterCause::Connector(error) => return error.failure_fact(),
+            PageAdapterCause::ChannelMismatch => ExecutionReason::SourcePageChannels,
+            PageAdapterCause::PositionMismatch => ExecutionReason::SourcePagePositions,
+            PageAdapterCause::Chunk => ExecutionReason::SourcePageBinding,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
 
 /// Converts pages against the scan's frozen complete typed declaration.
 /// Channels beyond its bound prefix remain provider working columns and are
@@ -201,7 +223,7 @@ fn convert_page(
     }
     if !output_schema.is_typed() {
         return Err(PageAdapterError::new(
-            PageAdapterErrorKind::Chunk,
+            PageAdapterCause::Chunk,
             "connector page output schema lacks complete typed bindings",
         )
         .into());
@@ -211,7 +233,7 @@ fn convert_page(
     let channel_count = page.channel_count();
     if slot_ids.len() > channel_count {
         return Err(PageAdapterError::new(
-            PageAdapterErrorKind::ChannelMismatch,
+            PageAdapterCause::ChannelMismatch,
             format!(
                 "scan output binds {} channels but the page carries {channel_count}",
                 slot_ids.len()
@@ -241,7 +263,7 @@ fn convert_page(
         }
         if column.len() != positions {
             return Err(PageAdapterError::new(
-                PageAdapterErrorKind::PositionMismatch,
+                PageAdapterCause::PositionMismatch,
                 format!(
                     "channel {index} produced {} values for a page of {positions} positions",
                     column.len()
@@ -278,13 +300,11 @@ fn convert_page(
         {
             // The explicit pure fixture path uses the same complete declaration,
             // including row count for a zero-channel page; it never derives types.
-            Chunk::try_new_typed_with_columns_observed::<String, _>(
-                Arc::clone(output_schema),
-                columns,
-                positions,
-                |_| Ok(()),
-            )
-            .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?
+            Chunk::try_new_typed_with_columns_observed::<
+                crate::runtime::fragment::ExecutionFailure,
+                _,
+            >(Arc::clone(output_schema), columns, positions, |_| Ok(()))
+            .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?
         }
     };
 
@@ -303,7 +323,7 @@ fn convert_page(
     if let Some(output_memory) = output_memory {
         chunk
             .attach_connector_output_memory(output_memory)
-            .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
+            .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?;
     }
     Ok(chunk)
 }
@@ -438,7 +458,9 @@ mod tests {
         let error = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
         let factory = actual_factory(&tracker, error.clone());
         let initial = tracker.current();
-        let original = ExecutionFailure::from("original scan stop".to_owned());
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(&("original scan stop".to_owned())),
+        ));
         error.set_error(original.clone());
         let mut converter = SourcePageConverter::with_output_schema(declared_schema(true));
         let refused = converter
@@ -774,5 +796,43 @@ mod tests {
         assert_eq!(chunk.len(), 19);
         assert!(chunk.columns().is_empty());
         assert_eq!(chunk.chunk_schema().slot_ids(), schema.slot_ids());
+    }
+}
+
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn page_conversion_preserves_connector_cause_and_does_not_classify_diagnostics() {
+        use novarocks_spi::connector::ConnectorErrorKind;
+        for kind in [
+            ConnectorErrorKind::Unavailable,
+            ConnectorErrorKind::Cancelled,
+        ] {
+            let original = ConnectorError::new(kind, "ResourceExhausted: secret".repeat(200));
+            let expected = original.failure_fact();
+            let failure = PageConversionFailure::Page(PageAdapterError::from_connector(
+                original.clone(),
+                "page input",
+            ))
+            .into_execution();
+            assert_eq!(failure.failure_fact(), expected);
+            let crate::runtime::fragment::ExecutionFailureCause::Domain(domain) = failure.cause()
+            else {
+                panic!("page cause")
+            };
+            let actual = domain.downcast_ref::<PageAdapterError>().unwrap();
+            assert_eq!(actual.connector_error(), Some(&original));
+            assert!(actual.detail().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+            assert_eq!(
+                std::error::Error::source(actual)
+                    .unwrap()
+                    .downcast_ref::<ConnectorError>(),
+                Some(&original)
+            );
+        }
+        let local = PageAdapterError::new(PageAdapterCause::ChannelMismatch, "resource exhausted");
+        assert_eq!(local.failure_fact().class(), FailureClass::Invariant);
     }
 }

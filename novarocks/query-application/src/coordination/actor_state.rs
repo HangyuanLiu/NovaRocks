@@ -1916,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_failure_is_a_stable_statement_failure() {
+    fn construction_failure_is_a_stable_statement_failure() {
         let mut state = LogicalExecutionState::new(
             execution(1),
             RecoveryMode::RestartAttemptBeforeVisibility,

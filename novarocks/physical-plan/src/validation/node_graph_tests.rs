@@ -52,7 +52,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after the original graph refusal");
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -160,7 +160,7 @@ fn prefixes<T>(call: impl Fn(&Control) -> Result<T, CompileControlError>, all: b
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(matches!(call(&control), Err(actual) if actual == cause));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);

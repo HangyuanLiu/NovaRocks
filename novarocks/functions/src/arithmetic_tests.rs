@@ -35,7 +35,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at + 1
         {
             Err(cause)
@@ -623,7 +623,7 @@ fn prepare_original_control_refusal_keeps_every_exact_prefix_on_success_and_ordi
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = CompileControl {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 let error = PreparedArithmeticRecipe::try_new(

@@ -56,7 +56,7 @@ impl PureCompileControl for CallbackControl {
             assert!(at <= refusal, "the rejected owner was called again");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((refusal, cause)) if refusal == at => Err(cause),
             _ => Ok(()),
         }
@@ -145,7 +145,7 @@ fn assert_every_refusal(input: &Input, baseline: &[(CompilePhase, u32)]) {
     assert!(baseline.iter().all(|(phase, _)| *phase == PHASE));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            let control = CallbackControl::refusing(at, cause);
+            let control = CallbackControl::refusing(at, cause.clone());
             assert_eq!(
                 input.construct(&control).unwrap_err(),
                 ConstantError::Control(cause)

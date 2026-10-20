@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
             assert!(index <= stop, "callback after originating control refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == index => Err(cause),
             _ => Ok(()),
         }
@@ -86,7 +86,7 @@ fn prefixes(
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(PhysicalTableRequestError::Control(actual)) if actual == cause)

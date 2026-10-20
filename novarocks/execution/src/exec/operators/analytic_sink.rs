@@ -27,15 +27,20 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::operators::analytic_shared::AnalyticSharedState;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
-use std::sync::Arc;
-
+use crate::exec::operators::analytic_shared::{AnalyticInputMemory, AnalyticSharedState};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{SinkKernel, SinkStep, Transform},
+    step::NextStep,
+    step_context::StepContext,
+};
 use crate::runtime::runtime_state::RuntimeState;
+use std::sync::Arc;
 
 /// Factory that builds analytic sink operators which materialize partition/order inputs into shared analytic state.
 pub struct AnalyticSinkFactory {
@@ -58,12 +63,12 @@ impl OperatorFactory for AnalyticSinkFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(AnalyticSinkOperator {
+        Box::new(Transform::hydrating(AnalyticSinkOperator {
             name: self.name.clone(),
             state: self.state.clone(),
-            finished: false,
+            memory: None,
             construction: None,
-        })
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -74,69 +79,58 @@ impl OperatorFactory for AnalyticSinkFactory {
 struct AnalyticSinkOperator {
     name: String,
     state: AnalyticSharedState,
-    finished: bool,
+    memory: Option<AnalyticInputMemory>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
-impl Operator for AnalyticSinkOperator {
+impl OperatorLifecycle for AnalyticSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
     fn creates_typed_storage(&self) -> bool {
         true
     }
-
     fn set_construction_factory(
         &mut self,
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) {
         self.construction = Some(factory);
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.memory = Some(self.state.input_memory(state));
+        Ok(())
     }
 }
-
-impl ProcessorOperator for AnalyticSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.is_finished()
+impl AnalyticSinkOperator {
+    fn memory(&self) -> ExecutionResult<&AnalyticInputMemory> {
+        self.memory.as_ref().ok_or_else(|| {
+            novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "analytic input runtime binding is missing",
+                ),
+            )
+            .into()
+        })
     }
-
-    fn has_output(&self) -> bool {
-        false
+}
+impl InputEncodingPolicy for AnalyticSinkOperator {}
+impl SinkKernel for AnalyticSinkOperator {
+    fn consume(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        self.state.push_input(self.memory()?, chunk)?;
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        Ok(self.state.push_input(state, chunk)?)
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
         let factory = self
             .construction
             .as_deref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-        self.state.finish_created(state, factory)?;
-        self.finished = true;
-        Ok(())
+        self.state.finish_created(self.memory()?, factory, ctx)?;
+        Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }

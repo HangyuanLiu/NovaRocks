@@ -398,7 +398,7 @@ fn map_owner_sparse_constant_keys_have_distinct_actual_addresses() {
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
 #[test]
-fn map_owner_null_key_skips_value_but_duplicate_key_keeps_original_data_frontier() {
+fn map_owner_null_key_skips_value_but_duplicate_key_keeps_contract_frontier() {
     let keys = Arc::new(StringArray::from(vec![None, Some("a"), Some("a")])) as ArrayRef;
     let values = Arc::new(arrow_array::UInt32Array::from(vec![Some(8), None, Some(3)])) as ArrayRef;
     let kernel = make_kernel(&keys, &values, AggregateKernelPhase::Single);
@@ -430,19 +430,8 @@ fn map_owner_null_key_skips_value_but_duplicate_key_keeps_original_data_frontier
         &Control::default(),
     )
     .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("whole original Data")
-    };
-    assert_eq!(
-        data.message(),
-        "update aggregate state: unsupported tracked scalar type: UInt32"
-    );
-    assert_eq!(data.input_rows(), &[2]);
-    assert_eq!(data.state_indices(), &[9]);
-    assert!(std::ptr::eq(
-        data.aggregate_contract(),
-        kernel.contract.as_ref()
-    ));
+    let cause = expect_scalar_contract(failure, 313);
+    assert_eq!(cause.to_string(), "unsupported tracked scalar type: UInt32");
     assert!(state.failed && state.core.entries.is_empty());
     assert!(matches!(
         update_selected(
@@ -457,12 +446,12 @@ fn map_owner_null_key_skips_value_but_duplicate_key_keeps_original_data_frontier
         ),
         Err(EvaluationFailure::Kernel(KernelFailure::InstanceFailed))
     ));
-    drop(data);
+    drop(cause);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
 #[test]
-fn map_owner_final_lazy_unsupported_output_has_actual_emission_domain() {
+fn map_owner_final_lazy_unsupported_output_is_outer_at_actual_emission() {
     let keys = arrow_array::new_null_array(&DataType::UInt32, 1);
     let values = Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef;
     let kernel = make_kernel(&keys, &values, AggregateKernelPhase::Single);
@@ -482,18 +471,9 @@ fn map_owner_final_lazy_unsupported_output_has_actual_emission_domain() {
     )
     .unwrap();
     let failure = emit(&kernel, &state, host.clone(), &Control::default()).unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("whole original output Data")
-    };
-    assert_eq!(
-        data.message(),
-        "build aggregate final output: unsupported scalar output type: UInt32"
-    );
-    assert_eq!(data.state_indices(), &[9]);
-    assert_eq!(data.input_rows(), &[0]);
-    assert_eq!(data.emission_row_capacity(), Some(32));
-    assert_eq!(data.aggregate_phase(), AggregateInvocationPhase::Final);
-    drop(data);
+    let cause = expect_scalar_contract(failure, 314);
+    assert_eq!(cause.to_string(), "unsupported scalar output type: UInt32");
+    drop(cause);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
@@ -512,8 +492,12 @@ fn long_bad() -> (ArrayRef, ArrayRef) {
     (Arc::new(StringArray::from(vec!["a"])) as ArrayRef, values)
 }
 #[test]
-fn map_owner_long_original_actual_carrier_debug_is_not_clipped() {
+fn map_owner_rejected_carrier_is_bounded_and_drops_actual_field_owner() {
     let (keys, values) = long_bad();
+    let DataType::FixedSizeList(field, _) = values.data_type() else {
+        panic!("actual complex carrier")
+    };
+    let weak = Arc::downgrade(field);
     let kernel = make_kernel(&keys, &values, AggregateKernelPhase::Single);
     let host = Arc::new(Host::default());
     let mut state = kernel
@@ -530,22 +514,25 @@ fn map_owner_long_original_actual_carrier_debug_is_not_clipped() {
         &Control::default(),
     )
     .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("whole full original diagnostic")
-    };
-    let expected = format!(
-        "update aggregate state: unsupported tracked scalar type: {:?}",
-        values.data_type()
-    );
-    assert!(expected.len() > 512);
-    assert_eq!(data.message(), expected);
-    let clone = data.clone();
-    drop(data);
+    let cause = expect_scalar_contract(failure, 313);
+    assert!(cause.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+    let clone = cause.clone();
+    drop(cause);
     drop(state);
-    assert!(host.ledger.lock().unwrap().bytes > 0);
+    drop(kernel);
+    drop(values);
+    drop(keys);
+    assert!(
+        weak.upgrade().is_none(),
+        "failure must not retain the rejected type graph"
+    );
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(clone.failure_fact().reason().code(), 313);
     drop(clone);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
+
 #[test]
 fn map_owner_each_update_callback_and_real_allocation_keeps_all_seven_causes() {
     let text = "é中🙂".repeat(100);
@@ -625,7 +612,7 @@ fn map_owner_each_update_callback_and_real_allocation_keeps_all_seven_causes() {
     }
 }
 #[test]
-fn map_owner_real_diagnostic_allocation_causes_and_missing_host_are_not_data() {
+fn map_owner_contract_frontier_allocation_causes_and_missing_host_are_not_data() {
     let (keys, values) = long_bad();
     let kernel = make_kernel(&keys, &values, AggregateKernelPhase::Single);
     assert!(matches!(
@@ -649,7 +636,7 @@ fn map_owner_real_diagnostic_allocation_causes_and_missing_host_are_not_data() {
     )
     .unwrap_err();
     let attempts = host.ledger.lock().unwrap().attempts - start;
-    assert!(matches!(failure, EvaluationFailure::InvocationData(_)));
+    expect_scalar_contract(failure.clone(), 313);
     drop(failure);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
@@ -768,7 +755,7 @@ fn map_owner_each_merge_and_emit_callback_has_no_tail_and_drop() {
     }
 }
 #[test]
-fn map_owner_data_construction_checkpoints_do_not_add_optional_footer() {
+fn map_owner_contract_checkpoints_do_not_add_optional_footer() {
     let (keys, values) = long_bad();
     let kernel = make_kernel(&keys, &values, AggregateKernelPhase::Single);
     let reference = Arc::new(Host::default());
@@ -788,7 +775,7 @@ fn map_owner_data_construction_checkpoints_do_not_add_optional_footer() {
     )
     .unwrap_err();
     let checkpoints = trace.trace.lock().unwrap().len();
-    assert!(matches!(failure, EvaluationFailure::InvocationData(_)));
+    expect_scalar_contract(failure.clone(), 313);
     drop(failure);
     drop(state);
     assert_eq!(reference.ledger.lock().unwrap().bytes, 0);
@@ -839,7 +826,7 @@ fn map_owner_data_construction_checkpoints_do_not_add_optional_footer() {
             &[9],
             &control
         ),
-        Err(EvaluationFailure::InvocationData(_))
+        Err(EvaluationFailure::Kernel(ref cause)) if { use novarocks_failure_contract::FailureProjection; cause.failure_fact().reason().code() == 313 }
     ));
     assert_eq!(control.trace.lock().unwrap().len(), checkpoints);
     drop(state);
@@ -939,7 +926,7 @@ impl PureCompileControl for CompilationTrace {
             assert!(at <= stop, "no compile tail after first cause");
         }
         checks.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -970,19 +957,19 @@ fn map_owner_actual_local_phase_clone_has_original_identity_and_compile_causes()
             for callback in 0..checkpoints {
                 let control = CompilationTrace {
                     checks: Mutex::new(vec![]),
-                    refusal: Some((callback, cause)),
+                    refusal: Some((callback, cause.clone())),
                 };
                 let failure = single
                     .clone_for_local_phase(contract.clone(), &control)
                     .unwrap_err();
-                assert_eq!(failure, compile_failure(cause));
+                assert_eq!(failure, compile_failure(cause.clone()));
                 assert_eq!(control.checks.lock().unwrap().len(), callback + 1);
             }
         }
     }
 }
 #[test]
-fn map_owner_merge_null_root_skips_bad_value_and_nonnull_row_reports_full_data() {
+fn map_owner_merge_null_root_skips_bad_value_and_nonnull_row_reports_contract() {
     let keys = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
     let values = Arc::new(arrow_array::UInt32Array::from(vec![1, 2])) as ArrayRef;
     let kernel = make_kernel(&keys, &values, AggregateKernelPhase::Final);
@@ -1015,18 +1002,10 @@ fn map_owner_merge_null_root_skips_bad_value_and_nonnull_row_reports_full_data()
         &Control::default(),
     )
     .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("whole merge Data")
-    };
-    assert_eq!(
-        data.message(),
-        "merge aggregate state: unsupported tracked scalar type: UInt32"
-    );
-    assert_eq!(data.aggregate_phase(), AggregateInvocationPhase::Merge);
-    assert_eq!(data.input_rows(), &[0, 1]);
-    assert_eq!(data.state_indices(), &[9, 9]);
+    let cause = expect_scalar_contract(failure, 313);
+    assert_eq!(cause.to_string(), "unsupported tracked scalar type: UInt32");
     assert!(state.failed && state.core.entries.is_empty());
-    drop(data);
+    drop(cause);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
@@ -1218,4 +1197,68 @@ fn map_owner_nominal_largeint_four_phases_keep_exact_child_metadata() {
         drop(direct);
         assert_eq!(host.ledger.lock().unwrap().bytes, 0);
     }
+}
+
+fn expect_scalar_contract(failure: EvaluationFailure, code: u16) -> KernelFailure {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let EvaluationFailure::Kernel(cause) = failure else {
+        panic!("frozen scalar contract failure must remain outer")
+    };
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(cause.failure_fact().reason().code(), code);
+    cause
+}
+
+#[test]
+fn map_whole_numeric_origin_survives_real_diagnostic_deadline_and_host_exit() {
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    let input: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![128]));
+    let kernel = make_kernel(&input, &input, AggregateKernelPhase::Single);
+    let host = Arc::new(Host::default());
+    let weak = Arc::downgrade(&host);
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let origin = scalar::build_scalar_array(
+        &DataType::Int8,
+        vec![Some(V::Int64(128))],
+        &mut ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let expected = origin.clone();
+    let control = Control {
+        refusal: Some((0, KernelFailure::DeadlineExceeded)),
+        ..Default::default()
+    };
+    let mut sink = FailureSink {
+        allocator: &allocator,
+        domain: FailureDomain::Mutation {
+            contract: &kernel.contract,
+            phase: AggregateInvocationPhase::Update,
+            selection: Selection::all(1),
+            mapping: &[0],
+        },
+        control: &control,
+    };
+    let EvaluationFailure::Kernel(error) = sink.scalar(origin) else {
+        panic!("diagnostic cannot complete")
+    };
+    assert_eq!(error.failure_fact(), expected.failure_fact());
+    let KernelFailure::Source(source) = &error else {
+        panic!("both actual sources required")
+    };
+    let source = source
+        .source()
+        .unwrap()
+        .downcast_ref::<super::super::aggregate_map_source_failure::MapDiagnosticFailure>()
+        .unwrap();
+    assert_eq!(source.origin, expected);
+    assert_eq!(source.diagnostic, KernelFailure::DeadlineExceeded);
+    assert_eq!(source.phase, AggregateInvocationPhase::Update);
+    assert_eq!(control.trace.lock().unwrap().len(), 1);
+    drop(sink);
+    drop(allocator);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+    drop(host);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(error.failure_fact(), expected.failure_fact());
 }

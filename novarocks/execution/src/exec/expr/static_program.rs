@@ -28,6 +28,13 @@ use super::function::FunctionKind;
 use super::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::exec::chunk::ChunkFieldSchema;
 
+fn legacy_expression_refusal(detail: &'static str) -> crate::runtime::fragment::ExecutionFailure {
+    crate::exec::fragment::error::program_binding_failure(
+        crate::exec::fragment::error::FragmentBindingErrorKind::WrongAssignmentKind,
+        detail,
+    )
+}
+
 impl ExprArena {
     /// Consume the decoder-owned arena once. Static nodes and dictionaries are
     /// frozen before any Task or driver state is created.
@@ -93,7 +100,9 @@ impl ExprArena {
     /// Build the existing expression kernel ABI for one LocalProgramGraph instance.
     /// The source remains the only retained static expression graph; dictionary
     /// bytes stay behind shared Arcs.
-    pub(crate) fn from_immutable(expressions: &ImmutableExpressions) -> Result<Self, String> {
+    pub(crate) fn from_immutable(
+        expressions: &ImmutableExpressions,
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
         if expressions.nodes().iter().any(|node| {
             matches!(
                 node.kind(),
@@ -102,7 +111,9 @@ impl ExprArena {
                     | StaticExprKind::NaryOr { .. }
             )
         }) {
-            return Err("compiled calls cannot enter the legacy expression bridge".to_string());
+            return Err(legacy_expression_refusal(
+                "compiled calls cannot enter the legacy expression bridge",
+            ));
         }
         let mut arena = Self::default();
         arena.set_allow_throw_exception(expressions.allow_throw_exception());
@@ -138,44 +149,53 @@ fn old_id(id: ProgramExprId) -> ExprId {
     ExprId(id.index())
 }
 
-fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
+fn thaw_kind(kind: &StaticExprKind) -> crate::runtime::fragment::ExecutionResult<ExprNode> {
     use StaticExprKind as Static;
     Ok(match kind {
         Static::PreparedNullSafeComparison { .. } => {
-            return Err(
-                "compiled null-safe comparison cannot enter the legacy expression bridge"
-                    .to_string(),
-            );
+            return Err(legacy_expression_refusal(
+                "compiled null-safe comparison cannot enter the legacy expression bridge",
+            ));
         }
         Static::PreparedCast { .. } => {
-            return Err("compiled cast cannot enter the legacy expression bridge".to_string());
+            return Err(legacy_expression_refusal(
+                "compiled cast cannot enter the legacy expression bridge",
+            ));
         }
         Static::PreparedNativeNegate(..) => {
-            return Err(
-                "compiled native negate cannot enter the legacy expression bridge".to_string(),
-            );
+            return Err(legacy_expression_refusal(
+                "compiled native negate cannot enter the legacy expression bridge",
+            ));
         }
         Static::PreparedNativeBitNot(..) => {
-            return Err(
-                "compiled native BitwiseNot cannot enter the legacy expression bridge".to_string(),
-            );
+            return Err(legacy_expression_refusal(
+                "compiled native BitwiseNot cannot enter the legacy expression bridge",
+            ));
         }
         Static::PreparedLike { .. } => {
-            return Err("compiled LIKE cannot enter the legacy expression bridge".to_string());
+            return Err(legacy_expression_refusal(
+                "compiled LIKE cannot enter the legacy expression bridge",
+            ));
         }
         Static::PreparedInList { .. } => {
-            return Err("compiled IN cannot enter the legacy expression bridge".to_string());
+            return Err(legacy_expression_refusal(
+                "compiled IN cannot enter the legacy expression bridge",
+            ));
         }
         Static::PreparedBetween { .. } => {
-            return Err("compiled BETWEEN cannot enter the legacy expression bridge".to_string());
+            return Err(legacy_expression_refusal(
+                "compiled BETWEEN cannot enter the legacy expression bridge",
+            ));
         }
         Static::PreparedArithmetic { .. } => {
-            return Err(
-                "compiled arithmetic cannot enter the legacy expression bridge".to_string(),
-            );
+            return Err(legacy_expression_refusal(
+                "compiled arithmetic cannot enter the legacy expression bridge",
+            ));
         }
         Static::BoundCall { .. } | Static::NaryAnd { .. } | Static::NaryOr { .. } => {
-            return Err("compiled calls cannot enter the legacy expression bridge".to_string());
+            return Err(legacy_expression_refusal(
+                "compiled calls cannot enter the legacy expression bridge",
+            ));
         }
         Static::Literal(value) => ExprNode::Literal(thaw_literal(value)),
         Static::Constant(value) => ExprNode::Constant(value.clone()),
@@ -498,12 +518,33 @@ mod tests {
 
     use super::*;
 
+    fn binding_detail(error: crate::runtime::fragment::ExecutionFailure) -> String {
+        use crate::exec::fragment::error::{
+            FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+        };
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let crate::runtime::fragment::ExecutionFailureCause::Domain(domain) = error.cause() else {
+            panic!("the bridge's binding author");
+        };
+        let original = domain.downcast_ref::<FragmentBindingError>().unwrap();
+        assert_eq!(
+            original.kind(),
+            FragmentBindingErrorKind::WrongAssignmentKind
+        );
+        assert_eq!(original.target(), FragmentBindingTarget::Program);
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(error.failure_fact(), original.failure_fact());
+        original.detail().to_owned()
+    }
+
     #[test]
     fn compiled_nullsafe_cannot_lose_intrinsic_null_semantics_in_legacy_bridge() {
         let left = ProgramExprId::new(0);
         let right = ProgramExprId::new(1);
         assert_eq!(
-            thaw_kind(&StaticExprKind::PreparedNullSafeComparison { left, right }).unwrap_err(),
+            binding_detail(
+                thaw_kind(&StaticExprKind::PreparedNullSafeComparison { left, right }).unwrap_err()
+            ),
             "compiled null-safe comparison cannot enter the legacy expression bridge"
         );
         assert!(matches!(
@@ -521,7 +562,7 @@ mod tests {
             allow_throw_exception: true,
         };
         assert_eq!(
-            thaw_kind(&kind).unwrap_err(),
+            binding_detail(thaw_kind(&kind).unwrap_err()),
             "compiled cast cannot enter the legacy expression bridge"
         );
     }
@@ -536,7 +577,7 @@ mod tests {
             allow_throw_exception: true,
         };
         assert_eq!(
-            thaw_kind(&kind).unwrap_err(),
+            binding_detail(thaw_kind(&kind).unwrap_err()),
             "compiled arithmetic cannot enter the legacy expression bridge"
         );
     }
@@ -559,7 +600,7 @@ mod tests {
             Ok(_) => panic!("compiled call entered legacy dispatch"),
         };
         assert_eq!(
-            error,
+            binding_detail(error),
             "compiled calls cannot enter the legacy expression bridge"
         );
     }

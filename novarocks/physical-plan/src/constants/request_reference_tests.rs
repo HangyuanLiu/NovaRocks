@@ -47,7 +47,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() < at, "callback after originating refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -254,11 +254,11 @@ fn every_prefix(
         for at in 1..=trace.len() {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert_eq!(
                 operation(&control),
-                Err(ConstantReferenceError::Control(cause))
+                Err(ConstantReferenceError::Control(cause.clone()))
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
         }
@@ -471,7 +471,7 @@ fn wide_real_request_channels_observe_quantum_before_selecting_the_last_original
     for cause in CAUSES {
         let refused = Control {
             trace: Mutex::default(),
-            refusal: Some((at, cause)),
+            refusal: Some((at, cause.clone())),
         };
         assert_eq!(
             project(&fragment, &pools, &refused).unwrap_err(),

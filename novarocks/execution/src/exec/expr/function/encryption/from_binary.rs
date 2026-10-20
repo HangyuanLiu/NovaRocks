@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -25,9 +26,9 @@ pub fn eval_from_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() != 1 && args.len() != 2 {
-        return Err(("from_binary expects 1 or 2 arguments".to_string()).into());
+        return Err(expression_contract("from_binary expects 1 or 2 arguments"));
     }
 
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "from_binary", 0)?;
@@ -91,7 +92,8 @@ pub fn eval_from_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             return Ok(Arc::new(StringArray::from(out)) as ArrayRef);
         }
 
-        return Ok((super::common::build_bytes_output_latin1(bytes_out, Some(&DataType::Binary)))?);
+        return super::common::build_bytes_output_latin1(bytes_out, Some(&DataType::Binary))
+            .map_err(ExecutionFailure::from);
     }
 
     let mut out = Vec::with_capacity(chunk.len());

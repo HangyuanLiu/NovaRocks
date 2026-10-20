@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Exact HLL payload lifecycle over the original shared HLL register/state author.
-use super::aggregate_hll_core::{
-    self as core, HLL_REGISTERS_COUNT, HllError, HllRawState, HllWork,
-};
+use super::aggregate_hll_core::{self as core, HLL_REGISTERS_COUNT, HllRawState, HllWork};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
@@ -73,14 +71,6 @@ pub(super) struct PayloadMerge<'a> {
     input: SelectedAggregateMergeInput<'a, 'a>,
     diagnostic: Option<(core::HllMergeFailure, InvocationData)>,
 }
-fn kernel_hash_failure(cause: HllError) -> KernelFailure {
-    match cause {
-        HllError::Kernel(cause) => cause,
-        HllError::Legacy(_) => {
-            internal("HLL no-data operation produced an undeclared input failure")
-        }
-    }
-}
 fn observed_evaluation<T>(
     control: &dyn KernelEvaluationControl,
     f: impl FnOnce(&mut EvaluationCheckpoints<'_>) -> Result<T, EvaluationFailure>,
@@ -117,29 +107,9 @@ fn prepare_payload_diagnostic(
     } else {
         crate::aggregate_format::AggregateFailureStage::Merge
     };
-    let reader = match core::HllPayloadInput::try_new(argument.array()) {
-        Ok(reader) => reader,
-        Err(recipe) => {
-            // Unlike NDV, the original carrier match rejects NULL/empty unsupported input too.
-            let host = HostAggregateAllocator::try_new(
-                allocator
-                    .ok_or_else(|| invalid("HLL payload Data requires actual aggregate host"))?,
-            )?;
-            let message = HostDiagnostic::prepare(&host, &mut work, |writer| {
-                write!(writer, "{}", stage.message(&recipe))
-            })?;
-            let data = InvocationData::prepare_aggregate(
-                &host,
-                contract.clone(),
-                phase,
-                selection,
-                mapping,
-                message,
-                &mut work,
-            )?;
-            return Err(data.into());
-        }
-    };
+    // The original payload reader checks the carrier before NULL/empty rows.
+    let reader =
+        core::HllPayloadInput::try_new(argument.array()).map_err(|cause| cause.into_kernel())?;
     let mut failure = None;
     for ordinal in 0..selection.len() {
         let row = selection
@@ -167,13 +137,14 @@ fn prepare_payload_diagnostic(
     let message = HostDiagnostic::prepare(&host, &mut work, |writer| {
         write!(writer, "{}", stage.message(failure.message()))
     })?;
-    let data = InvocationData::prepare_aggregate(
+    let data = InvocationData::prepare_aggregate_with_reason(
         &host,
         contract.clone(),
         phase,
         selection,
         mapping,
         message,
+        crate::DataFailureReason::InvalidEncoding,
         &mut work,
     )?;
     work.finish()?;
@@ -352,7 +323,7 @@ impl PreparedAggregateKernel for PayloadKernel {
                         _ => internal("HLL payload violated its exact prepared failure recipe")
                             .into(),
                     },
-                    |cause| EvaluationFailure::Kernel(kernel_hash_failure(cause)),
+                    |cause| EvaluationFailure::Kernel(cause),
                 )
             })
         });
@@ -454,7 +425,7 @@ impl PreparedAggregateKernel for PayloadKernel {
                         )
                         .into(),
                     },
-                    |cause| EvaluationFailure::Kernel(kernel_hash_failure(cause)),
+                    |cause| EvaluationFailure::Kernel(cause),
                 )?;
             }
             Ok(())
@@ -506,8 +477,8 @@ impl PreparedAggregateKernel for PayloadKernel {
                 };
                 work.flush()?;
                 let reservation = charge.reserve_operation(bound)?;
-                let payload = core::serialize_hll_state(&state.core, &mut HllWork::new(Some(work)))
-                    .map_err(kernel_hash_failure)?;
+                let payload =
+                    core::serialize_hll_state(&state.core, &mut HllWork::new(Some(work)))?;
                 match payload {
                     Some(payload) => {
                         work.flush()?;
@@ -564,9 +535,7 @@ impl PreparedAggregateKernel for PayloadKernel {
                         match core::nullable_payload_cardinality(
                             Some(&state.core),
                             &mut HllWork::new(Some(work)),
-                        )
-                        .map_err(kernel_hash_failure)?
-                        {
+                        )? {
                             Some(value) => builder.append_value(value),
                             None => builder.append_null(),
                         }

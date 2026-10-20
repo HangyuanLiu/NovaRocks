@@ -188,7 +188,7 @@ impl PureCompileControl for Trace {
             assert!(index <= stop, "callback after first cause")
         }
         events.push((phase, units));
-        if let Some((stop, cause)) = self.refuse {
+        if let Some((stop, cause)) = self.refuse.clone() {
             if index == stop {
                 return Err(cause);
             }
@@ -219,7 +219,7 @@ fn e08s1_string_batch_static_all_three_compile_causes_keep_actual_prefix_and_ori
             ] {
                 let c = Trace {
                     events: Mutex::new(Vec::new()),
-                    refuse: Some((stop, cause)),
+                    refuse: Some((stop, cause.clone())),
                 };
                 original
                     .admit_bound_lifecycle_observed(&binding, PureCallLifecycle::Scalar, &c)

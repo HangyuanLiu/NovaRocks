@@ -36,8 +36,7 @@ use arrow::datatypes::{DataType, Field, FieldRef};
 use novarocks_connector_contract::{ConnectorReadPublicFacts, PureProviderCompileError};
 use novarocks_spi::connector::read_stack::ConnectorReadPublicSchema;
 use novarocks_spi::connector::{
-    ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorErrorKind,
-    ConnectorFieldPath,
+    ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorFieldPath,
 };
 #[cfg(test)]
 use novarocks_type_contract::PureCompileControl;
@@ -154,11 +153,11 @@ pub(super) fn validate_program_columns(
             ),
         }
     })();
-    if matches!(&result, Err(Failure::Control(_))) {
-        return result;
-    }
+    // Every nested checkpoint refusal propagates through `?`. An authored
+    // error therefore returns before another cooperative observation starts.
+    result?;
     work.flush()?;
-    result
+    Ok(())
 }
 
 /// The public schema of a frozen read of `columns` from an ordinary relation.
@@ -659,19 +658,14 @@ fn opaque_source<T>(
     operation: impl FnOnce() -> Result<T, ConnectorError>,
 ) -> Result<T, Failure> {
     work.flush()?;
-    let result = operation().map_err(source_error);
+    let value = operation().map_err(source_error)?;
     work.flush()?;
-    result
+    Ok(value)
 }
 fn source_error(error: ConnectorError) -> Failure {
-    Failure::Provider(ConnectorCodecError::new(
+    Failure::Provider(ConnectorCodecError::from_domain(
         ConnectorFieldPath::root("read_columns"),
-        match error.kind() {
-            ConnectorErrorKind::Unsupported => ConnectorCodecErrorKind::Unsupported,
-            ConnectorErrorKind::ResourceExhausted => ConnectorCodecErrorKind::Capacity,
-            _ => ConnectorCodecErrorKind::InconsistentFields,
-        },
-        error.to_string(),
+        error,
     ))
 }
 fn invalid(message: impl AsRef<str>) -> Failure {
@@ -722,7 +716,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let index = trace.len();
             trace.push(units);
-            if let Some((stop, cause)) = self.stop
+            if let Some((stop, cause)) = self.stop.clone()
                 && stop == index
             {
                 return Err(cause);
@@ -1290,9 +1284,31 @@ mod tests {
             &Control::default(),
         )
         .unwrap_err();
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
+        };
+        let Failure::Provider(error) = error else {
+            panic!("expected the original provider Unsupported refusal");
+        };
+        assert_eq!(error.path(), &ConnectorFieldPath::root("read_columns"));
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
         assert!(
-            matches!(error, Failure::Provider(error) if error.kind() == ConnectorCodecErrorKind::Unsupported)
+            matches!(error.kind(), ConnectorCodecErrorKind::Domain(actual) if actual == source)
         );
+        let original = source.downcast_ref::<ConnectorError>().unwrap();
+        assert_eq!(
+            original.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        );
+        let expected = FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(4).unwrap()),
+        );
+        assert_eq!(original.failure_fact(), expected);
+        assert_eq!(error.failure_fact(), original.failure_fact());
     }
 
     #[test]
@@ -1453,7 +1469,7 @@ mod tests {
             for at in [0, quantum, tail] {
                 let control = Control {
                     trace: Mutex::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(run(&relation, columns, &public, &control), Err(Failure::Control(actual)) if actual == cause)
@@ -1479,10 +1495,32 @@ mod tests {
             .dereference(&[2])
             .unwrap();
         let public = physical_public(vec![Arc::new(Field::new("bucket", DataType::Int32, true))]);
+        let error = run(&system(), &[column], &public, &Control::default()).unwrap_err();
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
+        };
+        let Failure::Provider(error) = error else {
+            panic!("expected the original provider Unsupported refusal");
+        };
+        assert_eq!(error.path(), &ConnectorFieldPath::root("read_columns"));
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
         assert!(
-            matches!(run(&system(), &[column], &public, &Control::default()),
-            Err(Failure::Provider(error)) if error.kind() == ConnectorCodecErrorKind::Unsupported)
+            matches!(error.kind(), ConnectorCodecErrorKind::Domain(actual) if actual == source)
         );
+        let original = source.downcast_ref::<ConnectorError>().unwrap();
+        assert_eq!(
+            original.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        );
+        let expected = FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(4).unwrap()),
+        );
+        assert_eq!(original.failure_fact(), expected);
+        assert_eq!(error.failure_fact(), original.failure_fact());
     }
 
     #[test]
@@ -1614,7 +1652,7 @@ mod tests {
             for at in [0, quantum, tail] {
                 let control = Control {
                     trace: Mutex::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(run(&relation,&columns,&public,&control),Err(Failure::Control(actual)) if actual==cause)
@@ -1625,7 +1663,8 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_shape_refusal_observes_tail_without_replacing_a_primary_control() {
+    fn ordinary_shape_refusal_keeps_original_codec_fact_without_starting_a_late_callback() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
         let schema = schema(vec![NestedField::required(
             1,
             "id",
@@ -1641,23 +1680,107 @@ mod tests {
                 .collect(),
         );
         let baseline = Control::default();
-        rejected(&relation, &[], &public);
-        assert!(matches!(
-            run(&relation, &[], &public, &baseline),
-            Err(Failure::Provider(_))
-        ));
+        let Err(Failure::Provider(original)) = run(&relation, &[], &public, &baseline) else {
+            panic!("ordinary field correspondence must reject");
+        };
+        assert_eq!(original.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(original.failure_fact().reason().code(), 165);
+        assert_eq!(
+            original.kind(),
+            &ConnectorCodecErrorKind::InconsistentFields
+        );
         let trace = baseline.trace.lock().unwrap().clone();
-        assert_eq!(trace.last(), Some(&1));
+        assert_eq!(trace, [0, 0]);
         for cause in causes() {
-            let at = trace.len() - 1;
+            for at in 0..trace.len() {
+                let control = Control {
+                    trace: Mutex::default(),
+                    stop: Some((at, cause.clone())),
+                };
+                assert!(
+                    matches!(run(&relation, &[], &public, &control), Err(Failure::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
             let control = Control {
                 trace: Mutex::default(),
-                stop: Some((at, cause)),
+                stop: Some((trace.len(), cause)),
             };
-            assert!(
-                matches!(run(&relation,&[],&public,&control),Err(Failure::Control(actual)) if actual==cause)
-            );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            let Err(Failure::Provider(actual)) = run(&relation, &[], &public, &control) else {
+                panic!("late callback must not replace the original field error");
+            };
+            assert_eq!(actual, original);
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
+    }
+
+    #[test]
+    fn opaque_source_keeps_exact_resource_fact_and_original_source_before_late_control() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{
+            ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorErrorKind,
+        };
+        use std::error::Error;
+        let mut ledger =
+            ConnectorDecodeLedger::new(ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap());
+        ledger.charge_raw(7).unwrap();
+        let raw = ledger.charge_raw(2).unwrap_err();
+        let fact = raw.failure_fact();
+        let original = ConnectorError::from_domain(ConnectorErrorKind::Internal, raw.clone())
+            .with_cleanup_context("original provider cleanup context");
+        for cause in causes() {
+            let control = Control {
+                trace: Mutex::default(),
+                stop: Some((2, cause)),
+            };
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation).unwrap();
+            let result = opaque_source(&mut work, || Err::<(), _>(original.clone()));
+            let Err(Failure::Provider(codec)) = work.finish_result(result, Failure::Control) else {
+                panic!("original source error must remain first");
+            };
+            assert!(matches!(codec.kind(), ConnectorCodecErrorKind::Domain(_)));
+            assert!(codec.compile_control_error().is_none());
+            assert_eq!(codec.path().to_string(), "read_columns");
+            assert_eq!(codec.failure_fact(), fact);
+            let source = codec
+                .source()
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            let returned = source.downcast_ref::<ConnectorError>().unwrap();
+            assert_eq!(returned, &original);
+            let nested = returned
+                .source()
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            assert_eq!(nested.downcast_ref::<ConnectorCodecError>(), Some(&raw));
+            assert_eq!(*control.trace.lock().unwrap(), [0, 0]);
+        }
+    }
+
+    #[test]
+    fn opaque_source_keeps_earlier_control_and_observes_a_successful_operation_tail() {
+        use std::cell::Cell;
+        for cause in causes() {
+            for at in [1, 2] {
+                let control = Control {
+                    trace: Mutex::default(),
+                    stop: Some((at, cause.clone())),
+                };
+                let mut work =
+                    CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation)
+                        .unwrap();
+                let called = Cell::new(false);
+                let result = opaque_source(&mut work, || {
+                    called.set(true);
+                    Ok(7)
+                });
+                assert!(matches!(result, Err(Failure::Control(actual)) if actual == cause));
+                assert_eq!(called.get(), at == 2);
+                assert_eq!(*control.trace.lock().unwrap(), vec![0; at + 1]);
+            }
         }
     }
 }

@@ -33,7 +33,7 @@ impl PureCompileControl for PrefixControl {
         let mut trace = self.observations.lock().unwrap();
         let index = trace.len();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.fail_at
+        if let Some((at, cause)) = self.fail_at.clone()
             && index == at
         {
             *self.refused.lock().unwrap() = true;
@@ -66,7 +66,7 @@ fn assert_prefixes(
     for at in 0..trace.len() {
         for cause in causes() {
             let owner = PrefixControl {
-                fail_at: Some((at, cause)),
+                fail_at: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
@@ -237,7 +237,7 @@ fn zero_work_owner_error_and_empty_success_both_observe_the_original_tail() {
         for at in 0..trace.len() {
             for cause in causes() {
                 let owner = PrefixControl {
-                    fail_at: Some((at, cause)),
+                    fail_at: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 assert_eq!(

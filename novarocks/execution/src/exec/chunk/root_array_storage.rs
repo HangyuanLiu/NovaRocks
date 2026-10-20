@@ -39,6 +39,60 @@ pub enum RootArrayStorageError {
     WorkExceeded,
 }
 
+impl std::fmt::Display for RootArrayStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnsupportedCarrier => "root storage inspection has an unsupported carrier",
+            Self::UnsupportedSchemaType => "root storage schema type is unsupported",
+            Self::CarrierDowncastMismatch => {
+                "root storage carrier downcast does not match its declared type"
+            }
+            Self::CarrierOuterOwnerMismatch => "root storage carrier has a different outer owner",
+            Self::UnknownMetadataOwner => "root storage metadata has no exact owner proof",
+            Self::CapacityExceeded => "root storage inspection exceeds its byte bound",
+            Self::WorkExceeded => "root storage inspection exceeds its structural work bound",
+        })
+    }
+}
+impl std::error::Error for RootArrayStorageError {}
+impl novarocks_failure_contract::FailureProjection for RootArrayStorageError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match self {
+            Self::UnsupportedCarrier => {
+                (FailureClass::Invariant, ExecutionReason::RootStorageCarrier)
+            }
+            Self::UnknownMetadataOwner => {
+                (FailureClass::Invariant, ExecutionReason::RootStorageOwner)
+            }
+            Self::UnsupportedSchemaType => (
+                FailureClass::Invariant,
+                ExecutionReason::RootStorageSchemaType,
+            ),
+            Self::CarrierDowncastMismatch => (
+                FailureClass::Invariant,
+                ExecutionReason::RootStorageDowncast,
+            ),
+            Self::CarrierOuterOwnerMismatch => (
+                FailureClass::Invariant,
+                ExecutionReason::RootStorageOuterOwner,
+            ),
+            Self::CapacityExceeded => (
+                FailureClass::Resource,
+                ExecutionReason::RootStorageByteBound,
+            ),
+            Self::WorkExceeded => (
+                FailureClass::Resource,
+                ExecutionReason::RootStorageWorkBound,
+            ),
+        };
+        // The borrowed inspector does not retain the caller's limit or the
+        // first rejected request, so their exact quantities remain unknown.
+        FailureFact::new(class, reason.reason())
+    }
+}
+
 /// Finite structural work. This never scans rows, offsets, dictionary keys,
 /// values, or computes logical nulls, even for CountOnly.
 #[derive(Clone, Copy, Debug)]

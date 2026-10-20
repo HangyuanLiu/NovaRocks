@@ -292,7 +292,7 @@ fn check_array_source(
         let all: Vec<_> = (0..expected_values.len()).collect();
         let sparse: Vec<_> = (0..expected_values.len()).step_by(2).collect();
         for rows in [&all[..], &sparse[..], &[1][..], &[][..]] {
-            let host = crate::exec::operators::compiled_aggregate::expression_allocation_host(
+            let host = crate::runtime::tracked_state_allocator::expression_allocation_host(
                 tracker.clone(),
             );
             let mut frame = CompiledExpressionInstance::try_new_with_allocator(

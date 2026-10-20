@@ -58,7 +58,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -639,7 +639,7 @@ fn writer_state_actual_visitor_callbacks_and_ordinary_refusals_preserve_every_co
             for cause in causes() {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 assert!(
                     matches!(walk(&owner, 1, &control, refuse), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
@@ -675,7 +675,7 @@ fn writer_state_foreign_equal_owner_cannot_supply_the_final_loan() {
         for cause in causes() {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(run(&control), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
@@ -737,7 +737,7 @@ fn writer_state_wide_actual_channels_keep_all_routes_and_sample_real_port_scan_q
         for cause in causes() {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(matches!(walk(&owner, 319, &control, None),
                 Err(SqlSourceJournalError::Control(actual)) if actual == cause));
@@ -799,7 +799,7 @@ fn writer_state_partial_cannot_borrow_merge_input_and_preserves_ordinary_tail_pr
         for cause in causes() {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(run(&control), Err(SqlSourceJournalError::Control(actual)) if actual == cause)

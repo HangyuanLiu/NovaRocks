@@ -1804,3 +1804,29 @@ mod retention_tests {
         assert!(weak.upgrade().is_none());
     }
 }
+
+impl novarocks_execution_contract::failure::FailureProjection for CowSelectionCodecError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self {
+            Self::UnsupportedType => (FailureClass::Invariant, 300),
+            Self::SchemaLimit => (FailureClass::Resource, 301),
+            Self::SchemaChanged => (FailureClass::Invariant, 302),
+            Self::BatchLimit => (FailureClass::Resource, 303),
+            Self::RecordLimit => (FailureClass::Resource, 304),
+            Self::ScratchLimit => (FailureClass::Resource, 305),
+            Self::TruncatedHeader => (FailureClass::Data, 306),
+            Self::HeaderVersion => (FailureClass::Data, 307),
+            Self::RecordLength => (FailureClass::Data, 308),
+            Self::TruncatedRecord => (FailureClass::Data, 309),
+            Self::TrailingRecordBytes => (FailureClass::Data, 310),
+            Self::MalformedSchema => (FailureClass::Data, 311),
+            Self::MalformedBatch => (FailureClass::Data, 312),
+            Self::SourceLimit => (FailureClass::Resource, 313),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}

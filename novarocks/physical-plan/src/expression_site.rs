@@ -134,7 +134,7 @@ pub struct PhysicalExpressionRoots {
     fragment: FragmentId,
     sites: Arc<BTreeMap<ExpressionRootSite, ExprUse>>,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExpressionRootError {
     Control(CompileControlError),
     TooManyRoots,
@@ -149,7 +149,14 @@ impl fmt::Display for ExpressionRootError {
         write!(f, "invalid physical expression root: {self:?}")
     }
 }
-impl std::error::Error for ExpressionRootError {}
+impl std::error::Error for ExpressionRootError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for ExpressionRootError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
@@ -319,7 +326,7 @@ impl PhysicalExpressionRoots {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let sites = Self::parts_in(fragment, &mut |_| Ok(()), false, &mut work);
         if let Err(ExpressionRootError::Control(c)) = &sites {
-            return Err((*c).into());
+            return Err(c.clone().into());
         }
         work.finish()?;
         Ok(Self {
@@ -716,7 +723,7 @@ pub struct PhysicalRootUses {
     flow: novarocks_type_contract::ExpressionControlFlow<crate::ExprId>,
     bindings: Arc<BTreeMap<ExpressionRootSite, novarocks_type_contract::ExpressionUseId>>,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RootUseBindingError {
     Control(CompileControlError),
     IncompleteCoverage,
@@ -739,7 +746,15 @@ impl fmt::Display for RootUseBindingError {
         write!(f, "invalid physical root-use binding: {self:?}")
     }
 }
-impl std::error::Error for RootUseBindingError {}
+impl std::error::Error for RootUseBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Roots(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for RootUseBindingError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
@@ -761,7 +776,7 @@ impl PhysicalRootUses {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let checked = self.validate_fragment_parts(fragment, &mut |_| Ok(()), false, &mut work);
         if let Err(RootUseBindingError::Control(c)) = &checked {
-            return Err((*c).into());
+            return Err(c.clone().into());
         }
         work.finish()?;
         checked
@@ -844,7 +859,7 @@ impl PhysicalRootUses {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let parts = Self::parts_in(fragment, flow, bindings, &mut |_| Ok(()), false, &mut work);
         if let Err(RootUseBindingError::Control(c)) = &parts {
-            return Err((*c).into());
+            return Err(c.clone().into());
         }
         work.finish()?;
         let (roots, flow, sites) = parts?;

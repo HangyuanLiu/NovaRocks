@@ -27,15 +27,14 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use crate::exec::chunk::Chunk;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::runtime_state::RuntimeState;
-use std::sync::Arc;
+use crate::exec::pipeline::shape::{Source, SourceKernel, SourceRead};
+use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 
 /// Factory that builds analytic source operators which emit finalized window results from shared analytic state.
 pub struct AnalyticSourceFactory {
@@ -58,10 +57,10 @@ impl OperatorFactory for AnalyticSourceFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(AnalyticSourceOperator {
+        Box::new(Source::new(AnalyticSourceOperator {
             name: self.name.clone(),
             state: self.state.clone(),
-        })
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -74,54 +73,32 @@ struct AnalyticSourceOperator {
     state: AnalyticSharedState,
 }
 
-impl Operator for AnalyticSourceOperator {
+impl OperatorLifecycle for AnalyticSourceOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.state.is_done()
-    }
 }
 
-impl ProcessorOperator for AnalyticSourceOperator {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
-        self.state.has_output()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("analytic source operator does not accept input"
-            .to_string()
-            .into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if let Some(chunk) = self.state.pop_output() {
-            return Ok(Some(chunk));
-        }
-        if self.state.is_done() {
-            return Ok(None);
-        }
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        Some(self.state.observable())
+impl SourceKernel for AnalyticSourceOperator {
+    fn poll_output(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
+        let observable = self.state.observable();
+        let observed_generation = observable.generation();
+        let (output, next) = match self.state.next_output() {
+            SourceRead::Chunk(chunk) => (Some(chunk), NextStep::Runnable),
+            SourceRead::Finished => (None, NextStep::Finished),
+            SourceRead::Pending => (
+                None,
+                NextStep::Wait(WaitFact {
+                    reason: WaitReason::Input,
+                    observable,
+                    observed_generation,
+                    deadline: None,
+                }),
+            ),
+        };
+        Ok(StepResult::new(output, next, 0))
     }
 }

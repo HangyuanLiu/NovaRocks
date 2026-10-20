@@ -1409,7 +1409,7 @@ mod tests {
             _: u32,
         ) -> Result<(), novarocks_type_contract::CompileControlError> {
             if phase == novarocks_type_contract::CompilePhase::FunctionSpecialization {
-                Err(self.0)
+                Err(self.0.clone())
             } else {
                 Ok(())
             }
@@ -1448,9 +1448,13 @@ mod tests {
             advance_factory(&mut memo, 200);
             let root_expr = memo.groups[root].logical_exprs[0].clone();
             let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
-            let result = rule.apply(&root_expr, &mut memo, &RefusingMvBindingControl(error));
+            let result = rule.apply(
+                &root_expr,
+                &mut memo,
+                &RefusingMvBindingControl(error.clone()),
+            );
             assert!(
-                matches!(result, Err(ref actual) if actual == &crate::compiler::SqlCompileError::from(error)),
+                matches!(result, Err(ref actual) if actual == &crate::compiler::SqlCompileError::from(error.clone())),
                 "the actual selected rollup owner must preserve {error}"
             );
         }
@@ -1469,9 +1473,9 @@ mod tests {
         impl PureCompileControl for AfterMissingOwnerControl {
             fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
                 if phase == CompilePhase::FunctionSpecialization
-                    && self.checkpoints.fetch_add(1, Ordering::SeqCst) >= 2
+                    && self.checkpoints.fetch_add(1, Ordering::SeqCst) >= 1
                 {
-                    return Err(self.error);
+                    return Err(self.error.clone());
                 }
                 Ok(())
             }
@@ -1545,10 +1549,10 @@ mod tests {
                     "the first ordinary owner miss ends this candidate before the next binding",
                 );
             assert!(alternatives.is_empty());
-            // Missing-owner lookup observes its entry and completed one-unit
-            // exit. A third specialization checkpoint would reject the next
-            // channel; it must never run after this candidate has missed.
-            assert_eq!(control.checkpoints.load(Ordering::SeqCst), 2);
+            // Only the entry callback precedes the original missing-owner
+            // result. An armed second callback must never replace that miss
+            // or start the next query channel.
+            assert_eq!(control.checkpoints.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -2495,7 +2499,7 @@ mod tests {
                     0,
                     "callback after first cause"
                 );
-                Err(self.cause)
+                Err(self.cause.clone())
             }
         }
         let control = crate::optimizer::test_optimizer_control();
@@ -2537,7 +2541,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let refusal = Refuse {
-                cause,
+                cause: cause.clone(),
                 calls: AtomicUsize::new(0),
             };
             assert_eq!(

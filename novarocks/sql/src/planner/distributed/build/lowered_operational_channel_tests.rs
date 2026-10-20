@@ -308,7 +308,7 @@ fn operational_channels_success_and_ordinary_refusal_stop_at_every_original_cont
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(matches!(project_with_pools(&receipt, pools, &control),

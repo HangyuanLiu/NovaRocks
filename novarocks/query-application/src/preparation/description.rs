@@ -807,7 +807,7 @@ mod tests {
         ) -> Result<(), novarocks_type_contract::CompileControlError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push((phase, units));
-            match self.refuse {
+            match self.refuse.clone() {
                 Some((ordinal, cause)) if calls.len() == ordinal + 1 => Err(cause),
                 _ => Ok(()),
             }
@@ -873,11 +873,14 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             for ordinal in 0..success.len() {
-                let trace = intrinsic_trace(Some((ordinal, cause)));
+                let trace = intrinsic_trace(Some((ordinal, cause.clone())));
                 let error = description
                     .validate_legacy_intrinsic_allow_throw_exception(true, &trace)
                     .unwrap_err();
-                assert_eq!(error, novarocks_sql::compiler::SqlCompileError::from(cause));
+                assert_eq!(
+                    error,
+                    novarocks_sql::compiler::SqlCompileError::from(cause.clone())
+                );
                 assert_eq!(*trace.calls.lock().unwrap(), success[..=ordinal]);
             }
         }
@@ -901,12 +904,12 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             for ordinal in 0..refused.len() {
-                let trace = intrinsic_trace(Some((ordinal, cause)));
+                let trace = intrinsic_trace(Some((ordinal, cause.clone())));
                 assert_eq!(
                     description
                         .validate_legacy_intrinsic_allow_throw_exception(false, &trace)
                         .unwrap_err(),
-                    novarocks_sql::compiler::SqlCompileError::from(cause)
+                    novarocks_sql::compiler::SqlCompileError::from(cause.clone())
                 );
                 assert_eq!(*trace.calls.lock().unwrap(), refused[..=ordinal]);
             }

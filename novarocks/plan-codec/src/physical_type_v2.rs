@@ -77,7 +77,19 @@ impl fmt::Display for TypeCodecError {
         }
     }
 }
-impl std::error::Error for TypeCodecError {}
+impl std::error::Error for TypeCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::ValueType(source) => Some(source),
+            Self::Carrier(source) => Some(source),
+            Self::Writer(source) => Some(source),
+            Self::Logical(source) => Some(source),
+            Self::ExecutionValue(source) => Some(source),
+            Self::InvalidShape(_) | Self::ResourceSource(_) => None,
+        }
+    }
+}
 impl From<crate::value_type_table::LogicalTypeCodecError> for TypeCodecError {
     fn from(error: crate::value_type_table::LogicalTypeCodecError) -> Self {
         match error {

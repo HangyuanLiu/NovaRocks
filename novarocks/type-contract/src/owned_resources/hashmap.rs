@@ -26,6 +26,14 @@ pub enum HashMapResourceError {
     SourceModel(&'static str),
     Arithmetic(&'static str),
 }
+impl std::fmt::Display for HashMapResourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceModel(detail) | Self::Arithmetic(detail) => f.write_str(detail),
+        }
+    }
+}
+impl std::error::Error for HashMapResourceError {}
 use HashMapResourceError::{Arithmetic, SourceModel};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -59,7 +59,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "a refused source was observed again");
         }
         trace.push((phase, units));
-        match self.fail {
+        match self.fail.clone() {
             Some((refusal, cause)) if at == refusal => Err(cause),
             _ => Ok(()),
         }
@@ -329,7 +329,7 @@ fn assert_refusals(
     );
     for at in positions {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(encode_single_field_schema(field, envelope, &control), Err(TypeCodecError::Control(actual)) if actual == cause)
             );

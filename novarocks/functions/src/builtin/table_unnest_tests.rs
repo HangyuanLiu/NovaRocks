@@ -47,7 +47,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -869,12 +869,7 @@ fn compile_refusal(
             actual == cause
         }
         Err(FunctionSpecializationFailure::Kernel(actual)) => {
-            actual
-                == match cause {
-                    CompileControlError::Cancelled => KernelFailure::Cancelled,
-                    CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
-                    CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
-                }
+            actual == KernelFailure::CompileControl(cause.clone())
         }
         _ => false,
     };
@@ -904,7 +899,7 @@ fn actual_installed_compile_callbacks_preserve_three_causes_success_and_ordinary
         for at in 0..trace.len() {
             for cause in compile_causes() {
                 let control = CompileControl {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 compile_refusal(run(&control), cause);
@@ -923,7 +918,7 @@ fn actual_installed_compile_callbacks_preserve_three_causes_success_and_ordinary
     for at in [0, quantum, trace.len() - 1] {
         for cause in compile_causes() {
             let control = CompileControl {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Default::default()
             };
             compile_refusal(fixture.prepare(&control), cause);

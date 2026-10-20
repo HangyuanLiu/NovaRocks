@@ -27,7 +27,9 @@ use arrow::datatypes::DataType;
 use base64::Engine;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use novarocks_types::largeint;
 use novarocks_types::value::bitmap as bitmap_common;
 
@@ -37,17 +39,17 @@ fn row_index(
     fn_name: &str,
     arg_idx: usize,
     chunk_len: usize,
-) -> Result<usize, String> {
+) -> Result<usize, ExecutionFailure> {
     if len == 1 {
         return Ok(0);
     }
     if len == chunk_len {
         return Ok(row);
     }
-    Err(format!(
+    Err(expression_contract(format_args!(
         "{} arg {} row count mismatch: arg_len={} chunk_len={}",
         fn_name, arg_idx, len, chunk_len
-    ))
+    )))
 }
 
 fn i64_arg_at(
@@ -55,11 +57,14 @@ fn i64_arg_at(
     row: usize,
     fn_name: &str,
     arg_idx: usize,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<i64>, ExecutionFailure> {
     match array.data_type() {
         DataType::Int8 => {
             let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
-                format!("{} downcast Int8Array failed for arg {}", fn_name, arg_idx)
+                expression_contract(format_args!(
+                    "{} downcast Int8Array failed for arg {}",
+                    fn_name, arg_idx
+                ))
             })?;
             if arr.is_null(row) {
                 Ok(None)
@@ -69,7 +74,10 @@ fn i64_arg_at(
         }
         DataType::Int16 => {
             let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
-                format!("{} downcast Int16Array failed for arg {}", fn_name, arg_idx)
+                expression_contract(format_args!(
+                    "{} downcast Int16Array failed for arg {}",
+                    fn_name, arg_idx
+                ))
             })?;
             if arr.is_null(row) {
                 Ok(None)
@@ -79,7 +87,10 @@ fn i64_arg_at(
         }
         DataType::Int32 => {
             let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                format!("{} downcast Int32Array failed for arg {}", fn_name, arg_idx)
+                expression_contract(format_args!(
+                    "{} downcast Int32Array failed for arg {}",
+                    fn_name, arg_idx
+                ))
             })?;
             if arr.is_null(row) {
                 Ok(None)
@@ -89,7 +100,10 @@ fn i64_arg_at(
         }
         DataType::Int64 => {
             let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                format!("{} downcast Int64Array failed for arg {}", fn_name, arg_idx)
+                expression_contract(format_args!(
+                    "{} downcast Int64Array failed for arg {}",
+                    fn_name, arg_idx
+                ))
             })?;
             if arr.is_null(row) {
                 Ok(None)
@@ -99,7 +113,10 @@ fn i64_arg_at(
         }
         DataType::UInt8 => {
             let arr = array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
-                format!("{} downcast UInt8Array failed for arg {}", fn_name, arg_idx)
+                expression_contract(format_args!(
+                    "{} downcast UInt8Array failed for arg {}",
+                    fn_name, arg_idx
+                ))
             })?;
             if arr.is_null(row) {
                 Ok(None)
@@ -112,10 +129,10 @@ fn i64_arg_at(
                 .as_any()
                 .downcast_ref::<UInt16Array>()
                 .ok_or_else(|| {
-                    format!(
+                    expression_contract(format_args!(
                         "{} downcast UInt16Array failed for arg {}",
                         fn_name, arg_idx
-                    )
+                    ))
                 })?;
             if arr.is_null(row) {
                 Ok(None)
@@ -128,10 +145,10 @@ fn i64_arg_at(
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .ok_or_else(|| {
-                    format!(
+                    expression_contract(format_args!(
                         "{} downcast UInt32Array failed for arg {}",
                         fn_name, arg_idx
-                    )
+                    ))
                 })?;
             if arr.is_null(row) {
                 Ok(None)
@@ -144,20 +161,23 @@ fn i64_arg_at(
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| {
-                    format!(
+                    expression_contract(format_args!(
                         "{} downcast UInt64Array failed for arg {}",
                         fn_name, arg_idx
-                    )
+                    ))
                 })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
-                let value = i64::try_from(arr.value(row)).map_err(|_| {
-                    format!(
-                        "{} arg {} value out of BIGINT range: {}",
-                        fn_name,
-                        arg_idx,
-                        arr.value(row)
+                let value = i64::try_from(arr.value(row)).map_err(|source| {
+                    bitmap_numeric_range(
+                        format_args!(
+                            "{} arg {} value out of BIGINT range: {}",
+                            fn_name,
+                            arg_idx,
+                            arr.value(row)
+                        ),
+                        source,
                     )
                 })?;
                 Ok(Some(value))
@@ -168,36 +188,39 @@ fn i64_arg_at(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| {
-                    format!(
+                    expression_contract(format_args!(
                         "{} downcast FixedSizeBinaryArray failed for arg {}",
                         fn_name, arg_idx
-                    )
+                    ))
                 })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
-                let value = largeint::i128_from_be_bytes(arr.value(row)).map_err(|e| {
-                    format!("{} arg {} decode LARGEINT failed: {}", fn_name, arg_idx, e)
-                })?;
-                let value = i64::try_from(value).map_err(|_| {
-                    format!(
-                        "{} arg {} value out of BIGINT range: {}",
-                        fn_name, arg_idx, value
+                let value = i128::from_be_bytes(arr.value(row).try_into().map_err(|source| {
+                    ExecutionFailure::from_domain(bitmap_common::BitmapValueFailure::Width(source))
+                })?);
+                let value = i64::try_from(value).map_err(|source| {
+                    bitmap_numeric_range(
+                        format_args!(
+                            "{} arg {} value out of BIGINT range: {}",
+                            fn_name, arg_idx, value
+                        ),
+                        source,
                     )
                 })?;
                 Ok(Some(value))
             }
         }
-        other => Err(format!(
+        other => Err(expression_contract(format_args!(
             "{} expects BIGINT-compatible input for arg {}, got {:?}",
             fn_name, arg_idx, other
-        )),
+        ))),
     }
 }
 
-fn encode_bitmap_values(values: &[u64]) -> Result<Vec<u8>, String> {
+fn encode_bitmap_values(values: &[u64]) -> Result<Vec<u8>, ExecutionFailure> {
     let set: BTreeSet<u64> = values.iter().copied().collect();
-    bitmap_common::encode_internal_bitmap(&set)
+    bitmap_common::encode_internal_bitmap(&set).map_err(ExecutionFailure::from_domain)
 }
 
 fn bitmap_minmax_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -207,7 +230,7 @@ fn bitmap_minmax_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     chunk: &Chunk,
     fn_name: &str,
     pick_max: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let input = arena.eval(args[0], chunk)?;
     let arr_opt = as_binary_or_null_array(&input, fn_name)?;
 
@@ -222,10 +245,11 @@ fn bitmap_minmax_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let arr = arr_opt.unwrap();
         let values = match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 values_i128.push(None);
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         let value = if pick_max {
             values.last().copied()
@@ -237,15 +261,24 @@ fn bitmap_minmax_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     match arena.data_type(expr) {
         Some(DataType::FixedSizeBinary(width)) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            Ok((largeint::array_from_i128(&values_i128))?)
+            let values = largeint::array_from_i128_observed(&values_i128, &mut |_| {
+                Ok::<(), std::convert::Infallible>(())
+            });
+            Ok(match values {
+                Ok(values) => values,
+                Err(never) => match never {},
+            })
         }
         _ => {
             let mut out = Int64Builder::new();
             for value in values_i128 {
                 match value {
                     Some(value) => {
-                        let value = i64::try_from(value).map_err(|_| {
-                            format!("{} value out of BIGINT range: {}", fn_name, value)
+                        let value = i64::try_from(value).map_err(|source| {
+                            bitmap_numeric_range(
+                                format_args!("{} value out of BIGINT range: {}", fn_name, value),
+                                source,
+                            )
                         })?;
                         out.append_value(value);
                     }
@@ -262,10 +295,10 @@ pub fn eval_bitmap_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let mut builder = BinaryBuilder::new();
+) -> Result<ArrayRef, ExecutionFailure> {
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
     for _ in 0..chunk.len() {
-        builder.append_value([bitmap_common::BITMAP_TYPE_EMPTY]);
+        builder.append_value([bitmap_common::BITMAP_TYPE_EMPTY])?;
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -275,9 +308,9 @@ pub fn eval_bitmap_from_string<__Eval: crate::exec::expr::ExprEvaluation + ?Size
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let input = arena.eval(args[0], chunk)?;
-    let mut builder = BinaryBuilder::new();
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
 
     macro_rules! parse_utf8_array {
         ($arr:expr) => {{
@@ -289,9 +322,10 @@ pub fn eval_bitmap_from_string<__Eval: crate::exec::expr::ExprEvaluation + ?Size
                 }
                 match bitmap_common::parse_bitmap_string($arr.value(idx)) {
                     Ok(values) => {
-                        builder.append_value(bitmap_common::encode_internal_bitmap(&values)?)
+                        builder.append_value(bitmap_common::encode_internal_bitmap(&values)?)?
                     }
-                    Err(_) => builder.append_null(),
+                    Err(source) if source.is_data() => builder.append_null(),
+                    Err(source) => return Err(ExecutionFailure::from_domain(source)),
                 }
             }
             return Ok(Arc::new(builder.finish()) as ArrayRef);
@@ -312,9 +346,10 @@ pub fn eval_bitmap_from_string<__Eval: crate::exec::expr::ExprEvaluation + ?Size
                 };
                 match bitmap_common::parse_bitmap_string(text) {
                     Ok(values) => {
-                        builder.append_value(bitmap_common::encode_internal_bitmap(&values)?)
+                        builder.append_value(bitmap_common::encode_internal_bitmap(&values)?)?
                     }
-                    Err(_) => builder.append_null(),
+                    Err(source) if source.is_data() => builder.append_null(),
+                    Err(source) => return Err(ExecutionFailure::from_domain(source)),
                 }
             }
             return Ok(Arc::new(builder.finish()) as ArrayRef);
@@ -341,11 +376,10 @@ pub fn eval_bitmap_from_string<__Eval: crate::exec::expr::ExprEvaluation + ?Size
         return Ok(Arc::new(builder.finish()) as ArrayRef);
     }
 
-    Err((format!(
+    Err(expression_contract(format_args!(
         "bitmap_from_string expects VARCHAR/BINARY input, got {:?}",
         input.data_type()
-    ))
-    .into())
+    )))
 }
 
 pub fn eval_bitmap_count<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -353,7 +387,7 @@ pub fn eval_bitmap_count<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let input = arena.eval(args[0], chunk)?;
     let arr_opt = as_binary_or_null_array(&input, "bitmap_count")?;
     let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
@@ -368,11 +402,16 @@ pub fn eval_bitmap_count<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let arr = arr_opt.unwrap();
         match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => {
-                let count = i64::try_from(values.len())
-                    .map_err(|_| format!("bitmap_count cardinality overflow: {}", values.len()))?;
+                let count = i64::try_from(values.len()).map_err(|source| {
+                    bitmap_numeric_range(
+                        format_args!("bitmap_count cardinality overflow: {}", values.len()),
+                        source,
+                    )
+                })?;
                 builder.append_value(count);
             }
-            Err(_) => builder.append_null(),
+            Err(source) if source.is_data() => builder.append_null(),
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -383,8 +422,8 @@ pub fn eval_bitmap_min<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((bitmap_minmax_impl(arena, expr, args, chunk, "bitmap_min", false))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    bitmap_minmax_impl(arena, expr, args, chunk, "bitmap_min", false)
 }
 
 pub fn eval_bitmap_max<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -392,8 +431,8 @@ pub fn eval_bitmap_max<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((bitmap_minmax_impl(arena, expr, args, chunk, "bitmap_max", true))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    bitmap_minmax_impl(arena, expr, args, chunk, "bitmap_max", true)
 }
 
 pub fn eval_bitmap_and<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -401,7 +440,7 @@ pub fn eval_bitmap_and<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
     let lhs_opt = as_binary_or_null_array(&lhs, "bitmap_and")?;
@@ -409,7 +448,7 @@ pub fn eval_bitmap_and<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let lhs_len = lhs_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let rhs_len = rhs_opt.map(|a| a.len()).unwrap_or(chunk.len());
-    let mut builder = BinaryBuilder::new();
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
     for row in 0..chunk.len() {
         let lhs_idx = row_index(row, lhs_len, "bitmap_and", 0, chunk.len())?;
         let rhs_idx = row_index(row, rhs_len, "bitmap_and", 1, chunk.len())?;
@@ -420,24 +459,26 @@ pub fn eval_bitmap_and<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         }
         let left = match bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
             Ok(values) => values,
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         let right = match bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
             Ok(values) => values,
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         let values: Vec<u64> = left
             .iter()
             .filter(|value| right.contains(value))
             .copied()
             .collect();
-        builder.append_value(encode_bitmap_values(&values)?);
+        builder.append_value(encode_bitmap_values(&values)?)?;
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -447,7 +488,7 @@ pub fn eval_bitmap_has_any<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
     let lhs_opt = as_binary_or_null_array(&lhs, "bitmap_has_any")?;
@@ -466,17 +507,19 @@ pub fn eval_bitmap_has_any<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         }
         let left = match bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
             Ok(values) => values,
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         let right = match bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
             Ok(values) => values,
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         let has_any = if left.len() <= right.len() {
             left.iter().any(|value| right.contains(value))
@@ -493,14 +536,14 @@ pub fn eval_sub_bitmap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let bitmap = arena.eval(args[0], chunk)?;
     let offset = arena.eval(args[1], chunk)?;
     let len = arena.eval(args[2], chunk)?;
 
     let bitmap_opt = as_binary_or_null_array(&bitmap, "sub_bitmap")?;
     let bitmap_len = bitmap_opt.map(|a| a.len()).unwrap_or(chunk.len());
-    let mut builder = BinaryBuilder::new();
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
 
     for row in 0..chunk.len() {
         let bitmap_idx = row_index(row, bitmap_len, "sub_bitmap", 0, chunk.len())?;
@@ -519,13 +562,18 @@ pub fn eval_sub_bitmap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         }
         let values = match bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
             Ok(values) => values.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
-        let cardinality = i64::try_from(values.len())
-            .map_err(|_| format!("sub_bitmap cardinality overflow: len={}", values.len()))?;
+        let cardinality = i64::try_from(values.len()).map_err(|source| {
+            bitmap_numeric_range(
+                format_args!("sub_bitmap cardinality overflow: len={}", values.len()),
+                source,
+            )
+        })?;
         let offset = offset.expect("checked");
         let offset_abs = offset.checked_abs().unwrap_or(i64::MAX);
         let out_of_range =
@@ -544,15 +592,16 @@ pub fn eval_sub_bitmap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             builder.append_null();
             continue;
         }
-        let start = usize::try_from(start)
-            .map_err(|_| format!("sub_bitmap start index overflow: {}", start))?;
+        let start = usize::try_from(start).map_err(|source| {
+            ExecutionFailure::from_domain(bitmap_common::BitmapValueFailure::Position(source))
+        })?;
         let take = usize::try_from(len).unwrap_or(usize::MAX);
         let selected: Vec<u64> = values.into_iter().skip(start).take(take).collect();
         if selected.is_empty() {
             builder.append_null();
             continue;
         }
-        builder.append_value(encode_bitmap_values(&selected)?);
+        builder.append_value(encode_bitmap_values(&selected)?)?;
     }
 
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -563,14 +612,14 @@ pub fn eval_bitmap_subset_limit<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let bitmap = arena.eval(args[0], chunk)?;
     let range_start = arena.eval(args[1], chunk)?;
     let limit = arena.eval(args[2], chunk)?;
 
     let bitmap_opt = as_binary_or_null_array(&bitmap, "bitmap_subset_limit")?;
     let bitmap_len = bitmap_opt.map(|a| a.len()).unwrap_or(chunk.len());
-    let mut builder = BinaryBuilder::new();
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
     for row in 0..chunk.len() {
         let bitmap_idx = row_index(row, bitmap_len, "bitmap_subset_limit", 0, chunk.len())?;
         let start_idx = row_index(
@@ -592,10 +641,11 @@ pub fn eval_bitmap_subset_limit<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
         }
         let values = match bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
             Ok(values) => values.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         if values.is_empty() {
             builder.append_null();
@@ -635,7 +685,7 @@ pub fn eval_bitmap_subset_limit<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
             builder.append_null();
             continue;
         }
-        builder.append_value(encode_bitmap_values(&selected)?);
+        builder.append_value(encode_bitmap_values(&selected)?)?;
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -645,14 +695,14 @@ pub fn eval_bitmap_subset_in_range<__Eval: crate::exec::expr::ExprEvaluation + ?
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let bitmap = arena.eval(args[0], chunk)?;
     let range_start = arena.eval(args[1], chunk)?;
     let range_end = arena.eval(args[2], chunk)?;
 
     let bitmap_opt = as_binary_or_null_array(&bitmap, "bitmap_subset_in_range")?;
     let bitmap_len = bitmap_opt.map(|a| a.len()).unwrap_or(chunk.len());
-    let mut builder = BinaryBuilder::new();
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
     for row in 0..chunk.len() {
         let bitmap_idx = row_index(row, bitmap_len, "bitmap_subset_in_range", 0, chunk.len())?;
         let start_idx = row_index(
@@ -680,10 +730,11 @@ pub fn eval_bitmap_subset_in_range<__Eval: crate::exec::expr::ExprEvaluation + ?
         }
         let values = match bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
             Ok(values) => values.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         if values.is_empty() {
             builder.append_null();
@@ -712,7 +763,7 @@ pub fn eval_bitmap_subset_in_range<__Eval: crate::exec::expr::ExprEvaluation + ?
             builder.append_null();
             continue;
         }
-        builder.append_value(encode_bitmap_values(&selected)?);
+        builder.append_value(encode_bitmap_values(&selected)?)?;
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -722,11 +773,11 @@ pub fn eval_bitmap_to_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let input = arena.eval(args[0], chunk)?;
     let arr_opt = as_binary_or_null_array(&input, "bitmap_to_binary")?;
     let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
-    let mut builder = BinaryBuilder::new();
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
     for row in 0..chunk.len() {
         let idx = row_index(row, len, "bitmap_to_binary", 0, chunk.len())?;
         if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
@@ -736,12 +787,13 @@ pub fn eval_bitmap_to_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
         let arr = arr_opt.unwrap();
         let values = match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
-        builder.append_value(bitmap_common::encode_external_bitmap(&values)?);
+        builder.append_value(bitmap_common::encode_external_bitmap(&values)?)?;
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -751,78 +803,16 @@ pub fn eval_bitmap_from_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Size
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    use arrow::datatypes::DataType as DT;
+) -> Result<ArrayRef, ExecutionFailure> {
     let input = arena.eval(args[0], chunk)?;
-    let input_len = input.len();
-    let mut builder = BinaryBuilder::new();
-    // Match StarRocks: `bitmap_from_binary` accepts both VARBINARY and
-    // VARCHAR — the latter is treated as raw bytes (StarRocks VARCHAR is
-    // 8-bit-clean), which is how the user may have stored bitmap binary
-    // in a STRING column. Returns NULL on malformed input.
-    let bytes_per_row: Result<Vec<Option<Vec<u8>>>, String> = match input.data_type() {
-        DT::Null => Ok(vec![None; chunk.len()]),
-        DT::Binary => {
-            let arr = input.as_any().downcast_ref::<BinaryArray>().unwrap();
-            (0..chunk.len())
-                .map(|row| {
-                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
-                    Ok(if arr.is_null(idx) {
-                        None
-                    } else {
-                        Some(arr.value(idx).to_vec())
-                    })
-                })
-                .collect()
-        }
-        DT::LargeBinary => {
-            let arr = input.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            (0..chunk.len())
-                .map(|row| {
-                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
-                    Ok(if arr.is_null(idx) {
-                        None
-                    } else {
-                        Some(arr.value(idx).to_vec())
-                    })
-                })
-                .collect()
-        }
-        DT::Utf8 => {
-            let arr = input.as_any().downcast_ref::<StringArray>().unwrap();
-            (0..chunk.len())
-                .map(|row| {
-                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
-                    Ok(if arr.is_null(idx) {
-                        None
-                    } else {
-                        Some(arr.value(idx).as_bytes().to_vec())
-                    })
-                })
-                .collect()
-        }
-        DT::LargeUtf8 => {
-            let arr = input.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            (0..chunk.len())
-                .map(|row| {
-                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
-                    Ok(if arr.is_null(idx) {
-                        None
-                    } else {
-                        Some(arr.value(idx).as_bytes().to_vec())
-                    })
-                })
-                .collect()
-        }
-        other => {
-            return Err((format!(
-                "bitmap_from_binary expects BITMAP/BINARY/VARCHAR input, got {other:?}"
-            ))
-            .into());
-        }
-    };
-    for opt_payload in bytes_per_row? {
-        let Some(payload) = opt_payload else {
+    let mut builder = BitmapBinaryOutput::new(chunk.len())?;
+    for row in 0..chunk.len() {
+        let idx = if input.data_type() == &DataType::Null {
+            0
+        } else {
+            row_index(row, input.len(), "bitmap_from_binary", 0, chunk.len())?
+        };
+        let Some(payload) = bitmap_bytes_at(&input, idx)? else {
             builder.append_null();
             continue;
         };
@@ -830,11 +820,10 @@ pub fn eval_bitmap_from_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Size
             builder.append_null();
             continue;
         }
-        match bitmap_common::decode_external_bitmap(&payload) {
-            Ok(values) => {
-                builder.append_value(bitmap_common::encode_internal_bitmap(&values)?);
-            }
-            Err(_) => builder.append_null(),
+        match bitmap_common::decode_external_bitmap(payload) {
+            Ok(values) => builder.append_value(bitmap_common::encode_internal_bitmap(&values)?)?,
+            Err(source) if source.is_data() => builder.append_null(),
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -845,11 +834,12 @@ pub fn eval_bitmap_to_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let input = arena.eval(args[0], chunk)?;
     let arr_opt = as_binary_or_null_array(&input, "bitmap_to_base64")?;
     let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = StringBuilder::new();
+    let mut output_extent = bitmap_common::BitmapOutputTally::for_text();
     for row in 0..chunk.len() {
         let idx = row_index(row, len, "bitmap_to_base64", 0, chunk.len())?;
         if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
@@ -859,12 +849,19 @@ pub fn eval_bitmap_to_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
         let arr = arr_opt.unwrap();
         let values = match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
-            Err(_) => {
+            Err(source) if source.is_data() => {
                 builder.append_null();
                 continue;
             }
+            Err(source) => return Err(ExecutionFailure::from_domain(source)),
         };
         let binary = bitmap_common::encode_external_bitmap(&values)?;
+        let encoded_len = base64::encoded_len(binary.len(), true).ok_or_else(|| {
+            ExecutionFailure::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?;
+        output_extent.append(encoded_len)?;
         builder.append_value(base64::engine::general_purpose::STANDARD.encode(binary));
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -879,14 +876,22 @@ pub fn eval_bitmap_to_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
 fn as_binary_or_null_array<'a>(
     arr: &'a ArrayRef,
     fn_name: &str,
-) -> Result<Option<&'a BinaryArray>, String> {
+) -> Result<Option<&'a BinaryArray>, ExecutionFailure> {
     use arrow::datatypes::DataType as DT;
     match arr.data_type() {
         DT::Null => Ok(None),
-        DT::Binary => Ok(Some(arr.as_any().downcast_ref::<BinaryArray>().unwrap())),
-        other => Err(format!(
+        DT::Binary => arr
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .map(Some)
+            .ok_or_else(|| {
+                expression_contract(format_args!(
+                    "{fn_name} frozen Binary carrier cannot be downcast"
+                ))
+            }),
+        other => Err(expression_contract(format_args!(
             "{fn_name} expects BITMAP/BINARY input, got {other:?}"
-        )),
+        ))),
     }
 }
 
@@ -894,7 +899,7 @@ fn bitmap_binary_op(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
     op: impl Fn(&BTreeSet<u64>, &BTreeSet<u64>) -> BTreeSet<u64>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let lhs_bin = as_binary_or_null_array(lhs, "bitmap op")?;
     let rhs_bin = as_binary_or_null_array(rhs, "bitmap op")?;
 
@@ -902,11 +907,11 @@ fn bitmap_binary_op(
     let len = match (lhs_bin, rhs_bin) {
         (Some(l), Some(r)) => {
             if l.len() != r.len() {
-                return Err(format!(
+                return Err(expression_contract(format_args!(
                     "bitmap op length mismatch: lhs={} rhs={}",
                     l.len(),
                     r.len()
-                ));
+                )));
             }
             l.len()
         }
@@ -915,7 +920,7 @@ fn bitmap_binary_op(
         (None, None) => lhs.len(),
     };
 
-    let mut out = BinaryBuilder::new();
+    let mut out = BitmapBinaryOutput::new(len)?;
     for i in 0..len {
         let lhs_null = lhs_bin.is_none_or(|a| a.is_null(i));
         let rhs_null = rhs_bin.is_none_or(|a| a.is_null(i));
@@ -926,30 +931,42 @@ fn bitmap_binary_op(
         let a = bitmap_common::decode_bitmap(lhs_bin.unwrap().value(i))?;
         let b = bitmap_common::decode_bitmap(rhs_bin.unwrap().value(i))?;
         let merged = op(&a, &b);
-        out.append_value(bitmap_common::encode_internal_bitmap(&merged)?);
+        out.append_value(bitmap_common::encode_internal_bitmap(&merged)?)?;
     }
     Ok(Arc::new(out.finish()) as ArrayRef)
 }
 
-pub fn eval_bitmap_or_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_bitmap_or_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     bitmap_binary_op(lhs, rhs, |a, b| a.union(b).copied().collect())
 }
 
-pub fn eval_bitmap_xor_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_bitmap_xor_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, ExecutionFailure> {
     bitmap_binary_op(lhs, rhs, |a, b| {
         a.symmetric_difference(b).copied().collect()
     })
 }
 
-pub fn eval_bitmap_andnot_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_bitmap_andnot_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, ExecutionFailure> {
     bitmap_binary_op(lhs, rhs, |a, b| a.difference(b).copied().collect())
 }
 
-pub fn eval_bitmap_intersect_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_bitmap_intersect_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, ExecutionFailure> {
     bitmap_binary_op(lhs, rhs, |a, b| a.intersection(b).copied().collect())
 }
 
-pub fn eval_bitmap_contains_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_bitmap_contains_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, ExecutionFailure> {
     use arrow::datatypes::DataType as DT;
     // Handle all-null literal for the bitmap argument.
     if lhs.data_type() == &DT::Null || rhs.data_type() == &DT::Null {
@@ -966,20 +983,19 @@ pub fn eval_bitmap_contains_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<Arr
         }
         return Ok(Arc::new(out.finish()) as ArrayRef);
     }
-    let lhs = lhs
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| "bitmap_contains expects BITMAP/BINARY input for arg 1".to_string())?;
+    let lhs = lhs.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+        expression_contract("bitmap_contains expects BITMAP/BINARY input for arg 1")
+    })?;
     let rhs = rhs
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "bitmap_contains expects BIGINT input for arg 2".to_string())?;
+        .ok_or_else(|| expression_contract("bitmap_contains expects BIGINT input for arg 2"))?;
     if lhs.len() != rhs.len() {
-        return Err(format!(
+        return Err(expression_contract(format_args!(
             "bitmap_contains length mismatch: lhs={} rhs={}",
             lhs.len(),
             rhs.len()
-        ));
+        )));
     }
     let mut out = BooleanBuilder::new();
     for i in 0..lhs.len() {
@@ -999,13 +1015,16 @@ pub fn eval_bitmap_or<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("bitmap_or expects 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "bitmap_or expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_bitmap_or_arrays(&lhs, &rhs))?)
+    eval_bitmap_or_arrays(&lhs, &rhs)
 }
 
 pub fn eval_bitmap_xor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -1013,13 +1032,16 @@ pub fn eval_bitmap_xor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("bitmap_xor expects 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "bitmap_xor expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_bitmap_xor_arrays(&lhs, &rhs))?)
+    eval_bitmap_xor_arrays(&lhs, &rhs)
 }
 
 pub fn eval_bitmap_andnot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -1027,13 +1049,16 @@ pub fn eval_bitmap_andnot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("bitmap_andnot expects 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "bitmap_andnot expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_bitmap_andnot_arrays(&lhs, &rhs))?)
+    eval_bitmap_andnot_arrays(&lhs, &rhs)
 }
 
 pub fn eval_bitmap_intersect<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -1041,13 +1066,16 @@ pub fn eval_bitmap_intersect<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("bitmap_intersect expects 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "bitmap_intersect expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_bitmap_intersect_arrays(&lhs, &rhs))?)
+    eval_bitmap_intersect_arrays(&lhs, &rhs)
 }
 
 pub fn eval_bitmap_contains<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -1055,13 +1083,109 @@ pub fn eval_bitmap_contains<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("bitmap_contains expects 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "bitmap_contains expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_bitmap_contains_arrays(&lhs, &rhs))?)
+    eval_bitmap_contains_arrays(&lhs, &rhs)
+}
+
+impl From<bitmap_common::BitmapValueFailure> for ExecutionFailure {
+    fn from(source: bitmap_common::BitmapValueFailure) -> Self {
+        Self::from_domain(source)
+    }
+}
+#[derive(Debug)]
+struct BitmapNumericRange {
+    detail: novarocks_failure_contract::BoundedDetail,
+    source: std::num::TryFromIntError,
+}
+impl std::fmt::Display for BitmapNumericRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail.as_str())
+    }
+}
+impl std::error::Error for BitmapNumericRange {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for BitmapNumericRange {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+    }
+}
+pub(super) fn bitmap_numeric_range(
+    detail: impl std::fmt::Display,
+    source: std::num::TryFromIntError,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(BitmapNumericRange {
+        detail: novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+        source,
+    })
+}
+struct BitmapBinaryOutput {
+    builder: BinaryBuilder,
+    extent: bitmap_common::BitmapOutputTally,
+}
+impl BitmapBinaryOutput {
+    fn new(rows: usize) -> ExecutionResult<Self> {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let offsets = rows
+            .checked_add(1)
+            .ok_or_else(|| ExecutionFailure::from_domain(LayoutResourceError::Arithmetic))?;
+        std::alloc::Layout::array::<i32>(offsets).map_err(|_| {
+            ExecutionFailure::from_domain(bitmap_common::BitmapValueFailure::StorageExtent {
+                required: offsets as u128 * std::mem::size_of::<i32>() as u128,
+            })
+        })?;
+        Ok(Self {
+            builder: BinaryBuilder::new(),
+            extent: bitmap_common::BitmapOutputTally::default(),
+        })
+    }
+    fn append_value(&mut self, bytes: impl AsRef<[u8]>) -> ExecutionResult<()> {
+        let bytes = bytes.as_ref();
+        self.extent.append(bytes.len())?;
+        self.builder.append_value(bytes);
+        Ok(())
+    }
+    fn append_null(&mut self) {
+        self.builder.append_null();
+    }
+    fn finish(&mut self) -> BinaryArray {
+        self.builder.finish()
+    }
+}
+fn bitmap_bytes_at(array: &ArrayRef, row: usize) -> ExecutionResult<Option<&[u8]>> {
+    if array.data_type() == &DataType::Null {
+        return Ok(None);
+    }
+    macro_rules! read {
+        ($ty:ty, $method:ident) => {{
+            let value = array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                expression_contract("bitmap_from_binary frozen byte carrier cannot be downcast")
+            })?;
+            if value.is_null(row) {
+                return Ok(None);
+            }
+            return Ok(Some(value.value(row).$method()));
+        }};
+    }
+    match array.data_type() {
+        DataType::Binary => read!(BinaryArray, as_ref),
+        DataType::LargeBinary => read!(LargeBinaryArray, as_ref),
+        DataType::Utf8 => read!(StringArray, as_bytes),
+        DataType::LargeUtf8 => read!(LargeStringArray, as_bytes),
+        other => Err(expression_contract(format_args!(
+            "bitmap_from_binary expects BITMAP/BINARY/VARCHAR input, got {other:?}"
+        ))),
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1161,7 +1285,10 @@ mod bitmap_binary_op_tests {
         Arc::new(arrow::array::NullArray::new(len)) as ArrayRef
     }
 
-    fn eval_bitmap_and_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+    fn eval_bitmap_and_arrays(
+        lhs: &ArrayRef,
+        rhs: &ArrayRef,
+    ) -> Result<ArrayRef, ExecutionFailure> {
         let lhs_opt = as_binary_or_null_array(lhs, "bitmap_and")?;
         let rhs_opt = as_binary_or_null_array(rhs, "bitmap_and")?;
         let lhs_len = lhs_opt.map(|a| a.len()).unwrap_or(lhs.len());
@@ -1187,7 +1314,10 @@ mod bitmap_binary_op_tests {
         Ok(Arc::new(builder.finish()) as ArrayRef)
     }
 
-    fn eval_bitmap_has_any_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+    fn eval_bitmap_has_any_arrays(
+        lhs: &ArrayRef,
+        rhs: &ArrayRef,
+    ) -> Result<ArrayRef, ExecutionFailure> {
         use arrow::array::BooleanBuilder;
         let lhs_opt = as_binary_or_null_array(lhs, "bitmap_has_any")?;
         let rhs_opt = as_binary_or_null_array(rhs, "bitmap_has_any")?;
@@ -1212,7 +1342,7 @@ mod bitmap_binary_op_tests {
         Ok(Arc::new(builder.finish()) as ArrayRef)
     }
 
-    fn eval_bitmap_count_arrays(input: &ArrayRef) -> Result<ArrayRef, String> {
+    fn eval_bitmap_count_arrays(input: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
         use arrow::array::Int64Builder;
         let arr_opt = as_binary_or_null_array(input, "bitmap_count")?;
         let len = arr_opt.map(|a| a.len()).unwrap_or(input.len());
@@ -1224,7 +1354,8 @@ mod bitmap_binary_op_tests {
             }
             match decode_bitmap(arr_opt.unwrap().value(i)) {
                 Ok(values) => builder.append_value(values.len() as i64),
-                Err(_) => builder.append_null(),
+                Err(source) if source.is_data() => builder.append_null(),
+                Err(source) => return Err(source.into()),
             }
         }
         Ok(Arc::new(builder.finish()) as ArrayRef)

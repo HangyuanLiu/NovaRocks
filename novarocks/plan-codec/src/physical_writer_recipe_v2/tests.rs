@@ -53,7 +53,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
         let mut events = self.events.lock().unwrap();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         let at = events.len();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after refusal");
@@ -810,7 +810,7 @@ fn independent_sender_layout_and_all_seven_exact_under_axes_preserve_resource() 
     for cause in CAUSES {
         let mut l = limits();
         l.max_allocation_requests = 1;
-        let (result, trace) = encode_run(&recipes, &ids, Some((1, cause)), l);
+        let (result, trace) = encode_run(&recipes, &ids, Some((1, cause.clone())), l);
         assert!(matches!(
             result,
             Err(E::Control(CompileControlError::ResourceExhausted))
@@ -835,7 +835,7 @@ fn every_prefix(
     assert!(!trace.is_empty());
     for stop in 0..trace.len() {
         for cause in CAUSES {
-            let (result, actual) = run(Some((stop, cause)));
+            let (result, actual) = run(Some((stop, cause.clone())));
             assert!(matches!(result,Err(E::Control(c)) if c==cause));
             assert_eq!(actual, trace[..=stop]);
         }
@@ -971,7 +971,7 @@ fn standalone_writer_source_law_preserves_wide_carrier_but_does_not_author_execu
     let baseline = control.trace();
     for stop in [0, baseline.len() / 2, baseline.len() - 1] {
         for cause in CAUSES {
-            control.reset(Some((stop, cause)));
+            control.reset(Some((stop, cause.clone())));
             let mut work = match CompileCheckpoints::try_new(&control, CompilePhase::Encode) {
                 Ok(work) => work,
                 Err(actual) => {

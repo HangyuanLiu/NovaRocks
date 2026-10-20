@@ -16,7 +16,7 @@
 // under the License.
 use super::common::extract_i64_array;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -30,23 +30,22 @@ fn eval_with_factor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     factor: i64,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let output_type = super::common::frozen_type(arena.arena(), expr)?.clone();
     let date = arena.eval(args[0], chunk)?;
     let interval = arena.eval(args[1], chunk)?;
     legacy_validate_datetime_source(&date)?;
     let intervals = extract_i64_array(&interval, "date_add")?;
     let rows = date.len().max(intervals.len());
     let interval: ArrayRef = Arc::new(Int64Array::from(intervals));
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    Ok((evaluate_legacy_calendar(
+
+    evaluate_legacy_calendar(
         CalendarOperation::DaysShift(factor),
         &[date, interval],
         &output_type,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }
 
 pub fn eval_date_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -54,8 +53,8 @@ pub fn eval_date_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, 1)
 }
 
 pub fn eval_adddate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -63,8 +62,8 @@ pub fn eval_adddate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, 1)
 }
 
 pub fn eval_days_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -72,8 +71,8 @@ pub fn eval_days_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, 1)
 }
 
 pub fn eval_weeks_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -81,8 +80,8 @@ pub fn eval_weeks_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, 7))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, 7)
 }
 
 pub fn eval_date_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -90,8 +89,8 @@ pub fn eval_date_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, -1))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, -1)
 }
 
 pub fn eval_subdate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -99,8 +98,8 @@ pub fn eval_subdate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, -1))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, -1)
 }
 
 pub fn eval_days_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -108,8 +107,8 @@ pub fn eval_days_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, -1))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, -1)
 }
 
 pub fn eval_weeks_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -117,6 +116,6 @@ pub fn eval_weeks_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_with_factor(arena, expr, args, chunk, -7))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_with_factor(arena, expr, args, chunk, -7)
 }

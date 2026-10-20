@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() < at, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -206,7 +206,7 @@ fn prefixes(
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert_eq!(operation(&control), Err(CallRequestError::Control(cause)));
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
@@ -341,7 +341,7 @@ fn request_table_and_source_wide_owned_loops_have_real_quantum_without_a_type_in
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((2, cause)),
+                refusal: Some((2, cause.clone())),
             };
             assert_eq!(operation(&control), Err(CallRequestError::Control(cause)));
             assert_eq!(*control.trace.lock().unwrap(), trace[..2]);

@@ -18,14 +18,17 @@
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallContract,
     ScalarCallInput, SelectedValues, Selection,
-    kernel_control::{internal, invalid},
+    kernel_control::invalid,
     kernel_input::EvaluationCheckpoints,
     largeint::{self, LargeIntObservation},
 };
 use arrow_array::{Array, ArrayRef, BinaryArray, StringArray, UInt64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-use std::{alloc::Layout, cell::RefCell};
+use std::alloc::Layout;
+#[path = "xx_hash3_128_failure.rs"]
+mod failure;
+use failure::HashArrayFailure;
 use twox_hash::xxhash3_128::Hasher;
 pub enum BytesArray {
     Utf8(StringArray),
@@ -45,22 +48,11 @@ impl BytesArray {
         }
     }
 }
-type ErrorBoundary<'a> = Option<&'a dyn Fn(&str) -> Result<(), KernelFailure>>;
-fn raw_error(message: String, boundary: ErrorBoundary<'_>) -> KernelFailure {
-    if let Some(boundary) = boundary {
-        if let Err(failure) = boundary(&message) {
-            return failure;
-        }
-    }
-    internal(&message)
-}
-/// The original normalization: Large offsets are converted by Arrow, and a
-/// failed cast retains the original generic admission error rather than its cause.
+/// The original Large-to-small byte cast keeps its actual format refusal.
 fn normalize_bytes(
     array: ArrayRef,
     arg_idx: usize,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<BytesArray, KernelFailure> {
     work.step()?;
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
@@ -79,42 +71,33 @@ fn normalize_bytes(
             DataType::Binary
         };
         work.flush()?;
-        let casted = arrow_cast::cast(&array, &target);
+        let casted = arrow_cast::cast(&array, &target)
+            .map_err(|source| HashArrayFailure::normalize(source).into_kernel())?;
         work.flush()?;
-        if let Ok(casted) = casted {
-            return normalize_bytes(casted, arg_idx, work, boundary);
-        }
+        return normalize_bytes(casted, arg_idx, work);
     }
-    Err(raw_error(
-        format!("xx_hash3_128: arg{} must be VARCHAR or VARBINARY", arg_idx),
-        boundary,
+    Err(HashArrayFailure::contract(format_args!(
+        "xx_hash3_128: arg{arg_idx} must be VARCHAR or VARBINARY"
     ))
+    .into_kernel())
 }
 /// V1 must call this immediately after each child evaluation, preserving the
 /// first unsupported argument before attempting to evaluate a later child.
-pub fn prepare_legacy_input(array: ArrayRef, arg_idx: usize) -> Result<BytesArray, String> {
-    let raw = RefCell::new(None);
-    let boundary = |message: &str| {
-        *raw.borrow_mut() = Some(message.to_string());
-        Err(KernelFailure::InstanceFailed)
-    };
+pub fn prepare_legacy_input(array: ArrayRef, arg_idx: usize) -> Result<BytesArray, KernelFailure> {
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
-    normalize_bytes(array, arg_idx, &mut work, Some(&boundary))
-        .map_err(|failure| raw.into_inner().unwrap_or_else(|| legacy_failure(failure)))
+    normalize_bytes(array, arg_idx, &mut work)
 }
-fn reserve<T>(
-    len: usize,
-    legacy: bool,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Vec<T>, KernelFailure> {
-    if legacy {
-        return Ok(Vec::with_capacity(len));
-    }
-    Layout::array::<T>(len).map_err(|_| KernelFailure::ResourceExhausted)?;
+fn reserve<T>(len: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, KernelFailure> {
+    Layout::array::<T>(len)
+        .map_err(|source| HashArrayFailure::layout::<T>(len, source).into_kernel())?;
     work.flush()?;
     let mut out = Vec::new();
-    out.try_reserve_exact(len)
-        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    out.try_reserve_exact(len).map_err(|source| {
+        KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+            "reserve XXH3 work vector",
+            source,
+        ))
+    })?;
     work.flush()?;
     Ok(out)
 }
@@ -160,8 +143,8 @@ pub(super) fn evaluate<'a>(
     let result = (|| {
         validate_profile(input.contract(), || work.step())?;
         let selection = input.selection();
-        let mut arrays = reserve(input.arguments().len(), false, &mut work)?;
-        let mut compact = reserve(input.arguments().len(), false, &mut work)?;
+        let mut arrays = reserve(input.arguments().len(), &mut work)?;
+        let mut compact = reserve(input.arguments().len(), &mut work)?;
         for (idx, arg) in input.arguments().iter().enumerate() {
             work.step()?;
             let mut array = arg.array().clone();
@@ -172,7 +155,7 @@ pub(super) fn evaluate<'a>(
             if large {
                 // Only demanded addresses enter the original Large->small normalizer.
                 // Arrow take preserves the Large source domain; it does no text decoding.
-                let mut indices = reserve(selection.len(), false, &mut work)?;
+                let mut indices = reserve(selection.len(), &mut work)?;
                 for (ordinal, row) in selection.iter().enumerate() {
                     work.step()?;
                     indices.push(arg.value_row(ordinal, row) as u64);
@@ -180,15 +163,11 @@ pub(super) fn evaluate<'a>(
                 work.flush()?;
                 let indices = UInt64Array::from(indices);
                 work.flush()?;
-                array =
-                    arrow_select::take::take(array.as_ref(), &indices, None).map_err(|error| {
-                        internal(&format!(
-                            "xx_hash3_128 selected byte projection failed: {error}"
-                        ))
-                    })?;
+                array = arrow_select::take::take(array.as_ref(), &indices, None)
+                    .map_err(|source| HashArrayFailure::gather(source).into_kernel())?;
                 work.flush()?;
             }
-            arrays.push(normalize_bytes(array, idx, &mut work, None)?);
+            arrays.push(normalize_bytes(array, idx, &mut work)?);
             compact.push(large);
         }
         let out = hash_values(
@@ -201,9 +180,7 @@ pub(super) fn evaluate<'a>(
                     input.arguments()[arg].value_row(ordinal, row)
                 }
             },
-            false,
             &mut work,
-            None,
         )?;
         SelectedValues::try_new_observed(
             selection,
@@ -220,49 +197,26 @@ pub fn evaluate_legacy(
     inputs: &[BytesArray],
     rows: usize,
     target: Option<&DataType>,
-) -> Result<ArrayRef, String> {
-    let raw = RefCell::new(None);
-    let boundary = |message: &str| {
-        *raw.borrow_mut() = Some(message.to_string());
-        Err(KernelFailure::InstanceFailed)
-    };
+) -> Result<ArrayRef, KernelFailure> {
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
-    let result = (|| {
-        let out = hash_values(
-            inputs,
-            Selection::all(rows),
-            |_, _, row| row,
-            true,
-            &mut work,
-            Some(&boundary),
-        )?;
-        let Some(target) = target else {
-            return Ok(out);
-        };
-        if out.data_type() == target || largeint::is_largeint_data_type(target) {
-            return Ok(out);
-        }
-        work.flush()?;
-        let out = arrow_cast::cast(&out, target).map_err(|error| {
-            raw_error(
-                format!("xx_hash3_128: failed to cast output: {}", error),
-                Some(&boundary),
-            )
-        })?;
-        work.flush()?;
-        Ok(out)
-    })();
-    result.map_err(|failure| raw.into_inner().unwrap_or_else(|| legacy_failure(failure)))
+    let out = hash_values(inputs, Selection::all(rows), |_, _, row| row, &mut work)?;
+    let Some(target) = target else { return Ok(out) };
+    if out.data_type() == target || largeint::is_largeint_data_type(target) {
+        return Ok(out);
+    }
+    work.flush()?;
+    let out = arrow_cast::cast(&out, target)
+        .map_err(|source| HashArrayFailure::output(source).into_kernel())?;
+    work.flush()?;
+    Ok(out)
 }
 fn hash_values(
     inputs: &[BytesArray],
     selection: Selection<'_>,
     mut row_for: impl FnMut(usize, usize, usize) -> usize,
-    legacy: bool,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
-    let mut out = reserve(selection.len(), legacy, work)?;
+    let mut out = reserve(selection.len(), work)?;
     for (ordinal, row) in selection.iter().enumerate() {
         work.step()?;
         let mut is_null = false;
@@ -297,20 +251,13 @@ fn hash_values(
         out.push(Some(hasher.finish_128() as i128));
         work.flush()?;
     }
-    if !legacy {
-        Layout::array::<u8>(
-            selection
-                .len()
-                .checked_mul(16)
-                .ok_or(KernelFailure::ResourceExhausted)?,
-        )
-        .map_err(|_| KernelFailure::ResourceExhausted)?;
-    }
+    Layout::array::<[u8; 16]>(selection.len()).map_err(|source| {
+        HashArrayFailure::layout::<[u8; 16]>(selection.len(), source).into_kernel()
+    })?;
     largeint::array_from_i128_observed(&out, &mut |event| match event {
         LargeIntObservation::Step => work.step(),
         LargeIntObservation::OpaqueBoundary => work.flush(),
-    })?
-    .map_err(|message| raw_error(message, boundary))
+    })
 }
 struct LegacyControl;
 impl KernelEvaluationControl for LegacyControl {
@@ -320,14 +267,6 @@ impl KernelEvaluationControl for LegacyControl {
 
     fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
         Ok(())
-    }
-}
-fn legacy_failure(failure: KernelFailure) -> String {
-    match failure {
-        KernelFailure::InvalidProgram(message)
-        | KernelFailure::Internal(message)
-        | KernelFailure::Operational(message) => message.message().to_string(),
-        other => other.to_string(),
     }
 }
 #[cfg(test)]

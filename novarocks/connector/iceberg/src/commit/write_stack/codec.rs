@@ -1688,13 +1688,110 @@ pub(crate) fn spi_codec_error(error: ConnectorWriteCodecError) -> ConnectorCodec
         }
         ProtocolErrorKind::VersionMismatch => ConnectorCodecErrorKind::VersionMismatch,
         ProtocolErrorKind::InvalidValue => ConnectorCodecErrorKind::InvalidValue,
-        ProtocolErrorKind::CompileControl(cause) => ConnectorCodecErrorKind::CompileControl(cause),
+        ProtocolErrorKind::CompileControl(cause) => {
+            ConnectorCodecErrorKind::CompileControl(cause.clone())
+        }
+        ProtocolErrorKind::Domain(source) => ConnectorCodecErrorKind::Domain(source.clone()),
     };
     ConnectorCodecError::new(path, kind, protocol.detail())
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn write_codec_bridge_keeps_real_decode_capacity_quantities_and_unsupported_reason() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{
+            ConnectorCodecError, ConnectorCodecErrorKind, ConnectorDecodeLedger,
+            ConnectorDecodeLimits, ConnectorFieldPath,
+        };
+        let mut ledger =
+            ConnectorDecodeLedger::new(ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap());
+        ledger.charge_raw(7).unwrap();
+        let known = ledger.charge_raw(2).unwrap_err();
+        let unknown = ConnectorCodecError::new(
+            ConnectorFieldPath::root("original"),
+            ConnectorCodecErrorKind::Capacity,
+            "unknown quantities",
+        );
+        let unsupported = ConnectorCodecError::new(
+            ConnectorFieldPath::root("original"),
+            ConnectorCodecErrorKind::Unsupported,
+            "actual capability refusal",
+        );
+        for original in [known, unknown, unsupported] {
+            let fact = original.failure_fact();
+            let protocol = novarocks_proto_codec::ProtocolError::from_domain(
+                novarocks_proto_codec::FieldPath::root("provider_payload").index(7),
+                original.clone(),
+            );
+            let returned = super::spi_codec_error(
+                novarocks_proto_codec::connector_write::ConnectorWriteCodecError::new(
+                    "iceberg", protocol,
+                ),
+            );
+            assert_eq!(returned.failure_fact(), fact);
+            assert_eq!(returned.path().to_string(), "provider_payload[7]");
+            assert!(returned.compile_control_error().is_none());
+            let shared = std::error::Error::source(&returned)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            assert_eq!(
+                shared.downcast_ref::<ConnectorCodecError>(),
+                Some(&original)
+            );
+            if let Some(resource) = fact.resource() {
+                assert_eq!(
+                    (
+                        resource.requested,
+                        resource.required_growth,
+                        resource.committed,
+                        resource.limit,
+                        resource.live
+                    ),
+                    (Some(2), Some(2), Some(7), Some(8), None)
+                );
+            } else {
+                assert!(returned.failure_fact().resource().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn write_codec_bridge_keeps_domain_fact_and_original_source() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let original = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+            "provider data refused",
+        );
+        let fact = original.failure_fact();
+        let protocol = novarocks_proto_codec::ProtocolError::from_domain(
+            novarocks_proto_codec::FieldPath::root("provider_payload").index(7),
+            original.clone(),
+        );
+        let error = super::spi_codec_error(
+            novarocks_proto_codec::connector_write::ConnectorWriteCodecError::new(
+                "iceberg", protocol,
+            ),
+        );
+        assert!(matches!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorCodecErrorKind::Domain(_)
+        ));
+        assert!(error.compile_control_error().is_none());
+        assert_eq!(error.path().to_string(), "provider_payload[7]");
+        assert_eq!(error.failure_fact(), fact);
+        let shared = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            shared.downcast_ref::<novarocks_spi::connector::ConnectorError>(),
+            Some(&original)
+        );
+    }
 
     #[test]
     fn write_codec_bridge_keeps_pure_compile_control_cause() {
@@ -1706,7 +1803,7 @@ mod tests {
         ] {
             let protocol = novarocks_proto_codec::ProtocolError::new(
                 novarocks_proto_codec::FieldPath::root("provider_payload").index(7),
-                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause),
+                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause.clone()),
                 cause.to_string(),
             );
             let error = super::spi_codec_error(
@@ -1714,7 +1811,7 @@ mod tests {
                     "iceberg", protocol,
                 ),
             );
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.compile_control_error(), Some(&cause));
             assert_eq!(error.path().to_string(), "provider_payload[7]");
             assert_eq!(
                 std::error::Error::source(&error)
@@ -2222,7 +2319,7 @@ mod tests {
         let error = codec
             .decode_writer_handle_value(&private, &mut context)
             .expect_err("Puffin cannot carry a Parquet row group size");
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert_eq!(error.path().to_string(), "writer_handle.iceberg.output");
         assert!(error.detail().contains("Iceberg Parquet row group size"));
 
@@ -2238,7 +2335,7 @@ mod tests {
         let error = codec
             .decode_writer_handle_value(&private, &mut context)
             .expect_err("merge target must retain the session's base snapshot");
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert_eq!(error.path().to_string(), "writer_handle.iceberg");
         assert!(error.detail().contains("frozen base snapshot"));
     }
@@ -2277,7 +2374,7 @@ mod tests {
             if units == self.at_units {
                 self.refused
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                return Err(self.failure);
+                return Err(self.failure.clone());
             }
             Ok(())
         }
@@ -2295,14 +2392,14 @@ mod tests {
     fn value_projection_control_entry_keeps_all_three_typed_causes() {
         let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::WriteHandle);
         for cause in projection_control_causes() {
-            let control = ProjectionControl::new(cause, 0);
+            let control = ProjectionControl::new(cause.clone(), 0);
             let mut ledger = ConnectorDecodeLedger::new(private_limits());
             let error =
                 match ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control) {
                     Ok(_) => panic!("entry refusal must not establish a decode scope"),
                     Err(error) => error,
                 };
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.compile_control_error(), Some(&cause));
             assert_eq!(*control.calls.lock().unwrap(), [0]);
         }
     }
@@ -2327,7 +2424,7 @@ mod tests {
                     dto::iceberg_merged_delete_reference::Entry::DeleteFilePath(path)
                 };
                 let references = [dto::IcebergMergedDeleteReference { entry: Some(entry) }];
-                let control = ProjectionControl::new(cause, 256);
+                let control = ProjectionControl::new(cause.clone(), 256);
                 let mut ledger = ConnectorDecodeLedger::new(private_limits());
                 let mut context =
                     ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control)
@@ -2339,7 +2436,7 @@ mod tests {
                         &mut context,
                     )
                     .unwrap_err();
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 assert_eq!(control.calls.lock().unwrap().last(), Some(&256));
                 let count = control.calls.lock().unwrap().len();
                 assert_eq!(
@@ -2347,7 +2444,7 @@ mod tests {
                         .flush_compile_control()
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(control.calls.lock().unwrap().len(), count);
             }
@@ -2371,7 +2468,7 @@ mod tests {
         }
         for cause in projection_control_causes() {
             for writer_side in [true, false] {
-                let control = ProjectionControl::new(cause, 256);
+                let control = ProjectionControl::new(cause.clone(), 256);
                 let mut ledger = ConnectorDecodeLedger::new(private_limits());
                 let mut context =
                     ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control)
@@ -2385,7 +2482,7 @@ mod tests {
                         .decode_commit_fragment_value(&fragment, &mut context)
                         .expect_err("fragment copy refusal")
                 };
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 let calls = control.calls.lock().unwrap();
                 assert_eq!(calls.last(), Some(&256));
                 assert!(calls.iter().all(|units| *units <= 256));
@@ -2408,7 +2505,7 @@ mod tests {
                     compression: dto::IcebergCompression::Snappy as i32,
                     parquet_row_group_size_bytes: Some(4096),
                 };
-                let control = ProjectionControl::new(cause, 1);
+                let control = ProjectionControl::new(cause.clone(), 1);
                 let mut ledger = ConnectorDecodeLedger::new(private_limits());
                 let mut context =
                     ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control)
@@ -2424,7 +2521,7 @@ mod tests {
                     .expect_err(
                         "the completed constructor tail must refuse publication or ordinary error",
                     );
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 assert_eq!(control.calls.lock().unwrap().last(), Some(&1));
             }
         }
@@ -2560,7 +2657,7 @@ mod tests {
                         .unwrap_err(),
                     _ => unreachable!(),
                 };
-                assert_eq!(error.kind(), ConnectorCodecErrorKind::VersionMismatch);
+                assert_eq!(error.kind(), &ConnectorCodecErrorKind::VersionMismatch);
                 assert_eq!(error.path().to_string(), "header.codec_revision");
                 assert_eq!(ledger.raw_bytes(), 0);
             }
@@ -2582,7 +2679,7 @@ mod tests {
             decode_private_handle(&facets, &unknown_root, private_limits())
                 .expect_err("unknown root field")
                 .kind(),
-            ConnectorCodecErrorKind::UnknownField
+            &ConnectorCodecErrorKind::UnknownField
         );
 
         let codec = IcebergWriteValueCodec::new("catalog.iceberg");
@@ -2598,7 +2695,7 @@ mod tests {
             )
             .expect_err("duplicate nested singular")
             .kind(),
-            ConnectorCodecErrorKind::DuplicateField
+            &ConnectorCodecErrorKind::DuplicateField
         );
 
         let mut unknown_nested = table.encode_to_vec();
@@ -2612,7 +2709,7 @@ mod tests {
             )
             .expect_err("unknown nested field")
             .kind(),
-            ConnectorCodecErrorKind::UnknownField
+            &ConnectorCodecErrorKind::UnknownField
         );
 
         let mut wrong_wire = table.encode_to_vec();
@@ -2626,7 +2723,7 @@ mod tests {
             )
             .expect_err("wrong nested wire type")
             .kind(),
-            ConnectorCodecErrorKind::InvalidValue
+            &ConnectorCodecErrorKind::InvalidValue
         );
     }
 
@@ -2654,7 +2751,7 @@ mod tests {
                 decode_private_handle(&facets, &bytes, limits)
                     .expect_err("one independent budget must reject")
                     .kind(),
-                ConnectorCodecErrorKind::Capacity
+                &ConnectorCodecErrorKind::Capacity
             );
         }
     }
@@ -2706,7 +2803,7 @@ mod tests {
         );
         let error = decode_private_handle(&facets, &zero_bytes, private_limits())
             .expect_err("the existing domain invariant rejects a claimed zero");
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert!(error.detail().contains("must be positive"));
     }
 
@@ -2818,7 +2915,7 @@ mod tests {
             decode_private_handle(&facets, &private.encode_to_vec(), private_limits())
                 .unwrap_err()
                 .kind(),
-            ConnectorCodecErrorKind::InconsistentFields
+            &ConnectorCodecErrorKind::InconsistentFields
         );
     }
 
@@ -2869,7 +2966,7 @@ mod tests {
                 decode_private_fragment(&facets, &private.encode_to_vec())
                     .unwrap_err()
                     .kind(),
-                ConnectorCodecErrorKind::InconsistentFields
+                &ConnectorCodecErrorKind::InconsistentFields
             );
         }
     }
@@ -2927,7 +3024,7 @@ mod tests {
             .expect_err("another generation must reject the envelope");
         assert_eq!(
             error.protocol().kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
         assert_public_provider_error_path(&error, "header.catalog");
         assert!(error.protocol().detail().contains("catalog"));
@@ -2959,7 +3056,7 @@ mod tests {
             .handle_decoder
             .decode_writer_handle(&parse_handle(raw))
             .expect_err("a Puffin writer with a Parquet row group size");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.protocol().kind(), &ProtocolErrorKind::InvalidValue);
         assert_public_provider_error_path(&error, "writer_handle.iceberg.output");
         assert!(
             error
@@ -3019,7 +3116,7 @@ mod tests {
             .expect_err("a deletion vector that disagrees with itself");
         assert_eq!(
             error.protocol().kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
         assert_public_provider_error_path(&error, "commit_fragment.iceberg.deletion_vector");
         assert!(
@@ -3055,6 +3152,44 @@ mod tests {
 
     #[test]
     fn an_oversized_handle_or_fragment_is_refused_by_the_codec_layer() {
+        fn assert_original_capacity(
+            error: &ConnectorWriteCodecError,
+            path: ConnectorFieldPath,
+            detail: &'static str,
+        ) {
+            use novarocks_failure_contract::{
+                FailureClass, FailureEvidence, FailureProjection, SharedFailureCause, domain,
+            };
+            let protocol = error.protocol();
+            assert!(matches!(protocol.kind(), ProtocolErrorKind::Domain(_)));
+            assert_eq!(
+                std::error::Error::source(error)
+                    .unwrap()
+                    .downcast_ref::<ProtocolError>(),
+                Some(protocol)
+            );
+            let shared = std::error::Error::source(protocol)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .expect("the protocol keeps the original codec error");
+            let original = shared
+                .downcast_ref::<ConnectorCodecError>()
+                .expect("the hard byte limit is authored by the codec");
+            let expected =
+                ConnectorCodecError::new(path, ConnectorCodecErrorKind::Capacity, detail);
+            assert_eq!(original, &expected);
+            assert!(std::error::Error::source(original).is_none());
+            let fact = protocol.failure_fact();
+            assert_eq!(fact, expected.failure_fact());
+            assert_eq!(fact.class(), FailureClass::Resource);
+            assert_eq!(fact.evidence(), FailureEvidence::Originating);
+            assert_eq!(fact.reason().domain(), domain::CONNECTOR.get());
+            assert_eq!(fact.reason().code(), 167);
+            // This hard-limit author supplies no measured quantities. The
+            // adapter preserves that absence instead of deriving or inventing them.
+            assert_eq!(fact.resource(), None);
+        }
+
         let facets = generation();
 
         // One path past the 16 MiB writer-handle bound. A bare path keeps the
@@ -3072,7 +3207,11 @@ mod tests {
             .handle_encoder
             .encode_writer_handle(&neutral)
             .expect_err("an oversized writer handle");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert_original_capacity(
+            &error,
+            ConnectorFieldPath::root("writer_handle").field("iceberg"),
+            "Iceberg writer handle exceeds its hard byte limit",
+        );
         assert_public_provider_error_path(&error, "writer_handle.iceberg");
 
         // One path past the 1 MiB commit-fragment bound.
@@ -3092,7 +3231,11 @@ mod tests {
             .fragment_encoder
             .encode_commit_fragment(&neutral)
             .expect_err("an oversized commit fragment");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert_original_capacity(
+            &error,
+            ConnectorFieldPath::root("commit_fragment").field("iceberg"),
+            "Iceberg commit fragment exceeds its hard byte limit",
+        );
         assert_public_provider_error_path(&error, "commit_fragment.iceberg");
     }
     fn unpartitioned() -> IcebergArtifactPartition {

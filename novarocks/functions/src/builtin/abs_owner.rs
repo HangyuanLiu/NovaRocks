@@ -609,7 +609,7 @@ mod tests {
     struct FailCompile(CompileControlError);
     impl PureCompileControl for FailCompile {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
 
@@ -629,11 +629,11 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             assert!(
-                matches!(owner.validate_and_refine(input, &FailCompile(error)),
+                matches!(owner.validate_and_refine(input, &FailCompile(error.clone())),
                 Err(FunctionEffectOwnerError::Control(actual)) if actual == error)
             );
             assert!(
-                matches!(owner.resolve(request(&arguments), &FailCompile(error)),
+                matches!(owner.resolve(request(&arguments), &FailCompile(error.clone())),
                 Err(FunctionBindingError::Control(actual)) if actual == error)
             );
         }

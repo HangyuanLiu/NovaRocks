@@ -30,6 +30,145 @@ use crate::{HostRejection, IngressRejection, authorize_inbound_frame};
 
 const CAPABILITY_LOCK: &str = "task inbound capability lock";
 
+/// These bounds charge reserved metadata records, not measured physical heap.
+#[derive(Debug)]
+enum InboundCapabilityFailure {
+    RecordSize,
+    ReservationConflict {
+        task: TaskIdentity,
+    },
+    CountLimit {
+        committed: usize,
+        limit: usize,
+    },
+    ByteLimit {
+        requested: usize,
+        committed: usize,
+        limit: usize,
+    },
+    ContextClosed {
+        task: TaskIdentity,
+    },
+    KeyClosed {
+        task: TaskIdentity,
+        key: UniqueId,
+        holder: TaskIdentity,
+    },
+    KeyClaimed {
+        task: TaskIdentity,
+        key: UniqueId,
+        holder: TaskIdentity,
+    },
+}
+impl std::fmt::Display for InboundCapabilityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordSize => f.write_str("normal-close record size overflow"),
+            Self::ReservationConflict { task } => write!(
+                f,
+                "normal-close reservation conflicts with accepted task {task}"
+            ),
+            Self::CountLimit { committed, limit } => write!(
+                f,
+                "backend normal-close record capacity exhausted: {committed} reserved records, limit {limit}"
+            ),
+            Self::ByteLimit {
+                requested,
+                committed,
+                limit,
+            } => write!(
+                f,
+                "backend normal-close record capacity exhausted: {requested} requested charge bytes, {committed} reserved, limit {limit}"
+            ),
+            Self::ContextClosed { task } => write!(
+                f,
+                "task {task} cannot install inbound capability after its query context closed"
+            ),
+            Self::KeyClosed { task, key, .. } => write!(
+                f,
+                "task {task} cannot reuse a normally closed kernel key {key}"
+            ),
+            Self::KeyClaimed { task, key, holder } => write!(
+                f,
+                "task {task} cannot claim kernel key {key}, which task {holder} already holds"
+            ),
+        }
+    }
+}
+impl std::error::Error for InboundCapabilityFailure {}
+impl novarocks_execution_contract::failure::FailureProjection for InboundCapabilityFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        let (reason, dimension, requested, committed, limit) = match self {
+            Self::RecordSize => {
+                return FailureFact::new(FailureClass::Resource, R::InboundRecordSize.reason());
+            }
+            Self::ReservationConflict { .. } => {
+                return FailureFact::new(
+                    FailureClass::Invariant,
+                    R::InboundReservationConflict.reason(),
+                );
+            }
+            Self::CountLimit { committed, limit } => (
+                R::InboundRecordCount,
+                ResourceDimension::Items,
+                1,
+                *committed,
+                *limit,
+            ),
+            Self::ByteLimit {
+                requested,
+                committed,
+                limit,
+            } => (
+                R::InboundRecordBytes,
+                ResourceDimension::Bytes,
+                *requested,
+                *committed,
+                *limit,
+            ),
+            Self::ContextClosed { .. } => {
+                return FailureFact::stop_observation(R::InboundContextClosed.reason());
+            }
+            Self::KeyClosed { task, holder, .. } => {
+                return if task == holder {
+                    FailureFact::stop_observation(R::InboundKeyClosed.reason())
+                } else {
+                    FailureFact::new(FailureClass::Invariant, R::InboundForeignClosedKey.reason())
+                };
+            }
+            Self::KeyClaimed { .. } => {
+                return FailureFact::new(FailureClass::Invariant, R::InboundKeyClaimed.reason());
+            }
+        };
+        let fact = FailureFact::new(FailureClass::Resource, reason.reason());
+        fact.with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Task),
+            constraint_scope: Some(ResourceScope::Process),
+            dimension,
+            requested: u64::try_from(requested).ok(),
+            required_growth: u64::try_from(requested).ok(),
+            limit: u64::try_from(limit).ok(),
+            live: None,
+            committed: u64::try_from(committed).ok(),
+        })
+    }
+}
+fn capability_rejection(source: InboundCapabilityFailure) -> HostRejection {
+    let category = match &source {
+        InboundCapabilityFailure::RecordSize
+        | InboundCapabilityFailure::CountLimit { .. }
+        | InboundCapabilityFailure::ByteLimit { .. } => {
+            novarocks_execution_contract::TaskFailureCategory::ResourceExhausted
+        }
+        _ => novarocks_execution_contract::TaskFailureCategory::Protocol,
+    };
+    // Static policy wording, identities and numeric charges are safe context.
+    let detail = novarocks_execution_contract::SafeDetail::truncating_display(&source);
+    HostRejection::from_domain_with_detail(category, source, detail)
+}
+
 /// Validated process-local bounds shared by active and retained close records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskInboundCapabilityLimits {
@@ -210,12 +349,8 @@ impl TaskInboundCapabilities {
     }
 
     pub fn reserve_normal_close(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
-        let bytes = Self::record_bytes(descriptor).ok_or_else(|| {
-            HostRejection::new(
-                novarocks_execution_contract::TaskFailureCategory::ResourceExhausted,
-                "normal-close record size overflow",
-            )
-        })?;
+        let bytes = Self::record_bytes(descriptor)
+            .ok_or_else(|| capability_rejection(InboundCapabilityFailure::RecordSize))?;
         if bytes == 0 {
             return Ok(());
         }
@@ -224,19 +359,25 @@ impl TaskInboundCapabilities {
             return if *existing == bytes {
                 Ok(())
             } else {
-                Err(HostRejection::new(
-                    novarocks_execution_contract::TaskFailureCategory::Protocol,
-                    "normal-close reservation conflicts with the accepted task",
+                Err(capability_rejection(
+                    InboundCapabilityFailure::ReservationConflict {
+                        task: descriptor.identity(),
+                    },
                 ))
             };
         }
-        if state.reserved.len() >= self.max_records
-            || bytes > self.max_bytes.saturating_sub(state.reserved_bytes)
-        {
-            return Err(HostRejection::new(
-                novarocks_execution_contract::TaskFailureCategory::ResourceExhausted,
-                "backend normal-close record capacity exhausted",
-            ));
+        if state.reserved.len() >= self.max_records {
+            return Err(capability_rejection(InboundCapabilityFailure::CountLimit {
+                committed: state.reserved.len(),
+                limit: self.max_records,
+            }));
+        }
+        if bytes > self.max_bytes.saturating_sub(state.reserved_bytes) {
+            return Err(capability_rejection(InboundCapabilityFailure::ByteLimit {
+                requested: bytes,
+                committed: state.reserved_bytes,
+                limit: self.max_bytes,
+            }));
         }
         state.reserved.insert(descriptor.identity(), bytes);
         state.reserved_bytes += bytes;
@@ -462,32 +603,25 @@ impl TaskInboundCapabilities {
             .closed_executions
             .contains(&descriptor.identity().query_execution_id())
         {
-            return Err(HostRejection::new(
-                novarocks_execution_contract::TaskFailureCategory::Protocol,
-                format!(
-                    "task {} cannot install inbound capability after its query context closed",
-                    descriptor.identity()
-                ),
+            return Err(capability_rejection(
+                InboundCapabilityFailure::ContextClosed {
+                    task: descriptor.identity(),
+                },
             ));
         }
-        if state.normally_closed.contains_key(&key) {
-            return Err(HostRejection::new(
-                novarocks_execution_contract::TaskFailureCategory::Protocol,
-                format!(
-                    "task {} cannot reuse a normally closed kernel key {key}",
-                    descriptor.identity()
-                ),
-            ));
+        if let Some(closed) = state.normally_closed.get(&key) {
+            return Err(capability_rejection(InboundCapabilityFailure::KeyClosed {
+                task: descriptor.identity(),
+                key,
+                holder: closed.destination,
+            }));
         }
         if let Some(existing) = state.installed.get(&key) {
-            return Err(HostRejection::new(
-                novarocks_execution_contract::TaskFailureCategory::Protocol,
-                format!(
-                    "task {} cannot claim kernel key {key}, which task {} already holds",
-                    descriptor.identity(),
-                    existing.identity()
-                ),
-            ));
+            return Err(capability_rejection(InboundCapabilityFailure::KeyClaimed {
+                task: descriptor.identity(),
+                key,
+                holder: existing.identity(),
+            }));
         }
         state.installed.insert(key, descriptor);
         if !state.installed[&key].topology().inbound().is_empty() {
@@ -738,9 +872,30 @@ mod tests {
         let (first, source) = descriptor(101, UniqueId::new(1, 2));
         let (second, _) = descriptor(201, UniqueId::new(3, 4));
         capabilities.reserve_normal_close(&first).unwrap();
-        assert!(capabilities.reserve_normal_close(&second).is_err());
+        let refused = capabilities.reserve_normal_close(&second).unwrap_err();
+        use novarocks_execution_contract::failure::{
+            FailureProjection, ResourceDimension, ResourceScope,
+        };
+        let fact = refused.failure_fact();
+        let resource = fact.resource().unwrap();
+        assert_eq!(resource.dimension, ResourceDimension::Items);
+        assert_eq!(resource.constraint_scope, Some(ResourceScope::Process));
+        assert_eq!(
+            (
+                resource.requested,
+                resource.limit,
+                resource.committed,
+                resource.live
+            ),
+            (Some(1), Some(1), Some(1), None)
+        );
         capabilities.install(Arc::new(first.clone())).unwrap();
         capabilities.close_normally(&first, || {});
+        let closed = capabilities.install(Arc::new(first.clone())).unwrap_err();
+        assert_eq!(
+            closed.failure_fact().evidence(),
+            novarocks_execution_contract::failure::FailureEvidence::StopObservation
+        );
         assert!(matches!(
             claim(&capabilities, first.fragment_instance_id(), source, 0, 1),
             InboundFrameClaim::NormallyClosed(_)

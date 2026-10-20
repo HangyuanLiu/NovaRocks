@@ -16,17 +16,19 @@
 // under the License.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
+use novarocks_functions::KernelFailure;
 use novarocks_functions::builtin::array_append_core::{
     AppendFailure, AppendOutputFacts, ArrayAppendInputs, append_observed,
 };
-use std::convert::Infallible;
-fn legacy_error(error: AppendFailure<Infallible>) -> String {
+fn append_error(error: AppendFailure<KernelFailure>) -> ExecutionFailure {
     match error {
-        AppendFailure::Data(message) => message,
-        AppendFailure::Control(never) => match never {},
+        AppendFailure::Operation(cause) | AppendFailure::Control(cause) => {
+            ExecutionFailure::from(cause)
+        }
     }
 }
 pub fn eval_array_append<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -34,22 +36,32 @@ pub fn eval_array_append<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_append requires two prepared arguments",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
     let target = arena.eval(args[1], chunk)?;
     let output = match arena.data_type(expr) {
         Some(DataType::List(field)) => AppendOutputFacts::FrozenList(field),
-        _ => AppendOutputFacts::OriginalInputList,
+        None => AppendOutputFacts::OriginalInputList,
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_append output type must be List, got {other:?}"
+            )));
+        }
     };
-    let mut observer = |_| Ok::<(), Infallible>(());
+    let mut observer = |_| Ok::<(), KernelFailure>(());
     let inputs =
-        ArrayAppendInputs::new(arr, target, output, &mut observer).map_err(legacy_error)?;
-    Ok((append_observed(
+        ArrayAppendInputs::new(arr, target, output, &mut observer).map_err(append_error)?;
+    append_observed(
         &inputs,
         novarocks_functions::Selection::all(chunk.len()),
-        |_, row| Ok::<_, Infallible>(inputs.legacy_rows(row)),
-        |_, _, _, _| Ok::<(), Infallible>(()),
+        |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
+        |_, _, _, _| Ok::<(), KernelFailure>(()),
         &mut observer,
     )
-    .map_err(legacy_error))?)
+    .map_err(append_error)
 }

@@ -168,13 +168,24 @@ fn run(
     ));
     operator.set_mem_tracker(tracker);
     operator.prepare().expect("prepare actual aggregate schema");
-    let processor = operator.as_processor_mut().unwrap();
+    let mut processor =
+        crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
     for chunk in input {
-        processor.push_chunk(&state, chunk.clone()).unwrap();
+        processor.input_without_output(chunk.clone()).unwrap();
     }
-    processor.set_finishing(&state).unwrap();
-    let result = processor.pull_chunk(&state).unwrap().unwrap();
-    assert!(processor.pull_chunk(&state).unwrap().is_none());
+    processor.signal_eos().unwrap();
+    let result = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
+    assert!(
+        processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap()
+            .is_none()
+    );
     result
 }
 fn input(program: &LocalProgram) -> Chunk {

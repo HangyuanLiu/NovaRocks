@@ -27,6 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::sync::Arc;
@@ -40,9 +41,15 @@ use crate::exec::operators::sort::{
 
 use super::creation::{CreatedSortArray, CreatedSortColumns, SortCreation};
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::runtime_state::RuntimeState;
 
 use arrow::array::ArrayRef;
@@ -199,7 +206,7 @@ impl OperatorFactory for SortProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(SortProcessorOperator {
+        Box::new(Transform::hydrating(SortProcessorKernel {
             input_layout: self.input_layout.clone(),
             #[cfg(test)]
             fixture_input_schema: self.fixture_input_schema.clone(),
@@ -218,19 +225,16 @@ impl OperatorFactory for SortProcessorFactory {
             buffered: Vec::new(),
             buffered_bytes: 0,
             buffered_rows: 0,
-            pending_output: None,
-            finishing: false,
-            finished: false,
             profile_initialized: false,
             profiles: None,
             construction: None,
             evaluation_control: None,
             prepared: false,
-        })
+        }))
     }
 }
 
-struct SortProcessorOperator {
+struct SortProcessorKernel {
     input_layout: Option<novarocks_local_program::StaticLayout>,
     #[cfg(test)]
     fixture_input_schema: Option<crate::exec::chunk::ChunkSchemaRef>,
@@ -252,14 +256,11 @@ struct SortProcessorOperator {
     buffered: Vec<Chunk>,
     buffered_bytes: i64,
     buffered_rows: i64,
-    pending_output: Option<Chunk>,
-    finishing: bool,
-    finished: bool,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
 }
 
-impl Operator for SortProcessorOperator {
+impl OperatorLifecycle for SortProcessorKernel {
     fn name(&self) -> &str {
         &self.name
     }
@@ -315,42 +316,31 @@ impl Operator for SortProcessorOperator {
         self.profiles = Some(profiles);
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.clear_buffered();
+        Ok(())
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.clear_buffered();
     }
 }
 
-impl ProcessorOperator for SortProcessorOperator {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending_output.is_none()
-    }
-
-    fn has_output(&self) -> bool {
-        self.pending_output.is_some()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for SortProcessorKernel {}
+impl TransformKernel for SortProcessorKernel {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
         if !self.prepared {
             return Err(ConstructionFailure::MissingOwner.into());
         }
-        if self.finished {
-            return Ok(());
-        }
-        self.bind_runtime_state(_state)?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         self.init_profile_if_needed();
-        if self.pending_output.is_some() {
-            return Err("sort received input while output buffer is full"
-                .to_string()
-                .into());
-        }
         self.creation()?
             .verify_chunks(std::slice::from_ref(&chunk))?;
         if !chunk.is_empty() {
@@ -361,36 +351,17 @@ impl ProcessorOperator for SortProcessorOperator {
             self.buffered.push(chunk);
         }
         self.maybe_prune_topn_buffered()?;
-        Ok(())
+        Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let out = self.pending_output.take();
-        if self.finishing && self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(out)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Ok(());
-        }
-        self.bind_runtime_state(_state)?;
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         self.init_profile_if_needed();
-        self.finishing = true;
-
-        let out = self.build_final_output_from_chunks(&self.buffered)?;
+        let output = self.build_final_output_from_chunks(&self.buffered)?;
         self.clear_buffered();
-        self.pending_output = out;
-        if self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+        Ok(StepResult::new(output, NextStep::Finished, 0))
     }
 }
 
-impl SortProcessorOperator {
+impl SortProcessorKernel {
     fn creation(&self) -> ExecutionResult<SortCreation<'_>> {
         if !self.prepared {
             return Err(ConstructionFailure::MissingOwner.into());
@@ -737,11 +708,10 @@ impl SortProcessorOperator {
         chunks: &[Chunk],
     ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         if self.offset != 0 {
-            return Err(format!(
+            return Err(super::operation_failure::contract(format_args!(
                 "topn_type {:?} requires offset=0, got {}",
                 self.topn_type, self.offset
-            )
-            .into());
+            )));
         }
         let rank_limit = self.limit.unwrap_or(0);
         if rank_limit == 0 {
@@ -775,7 +745,12 @@ impl SortProcessorOperator {
         let key_rows = converter
             .converter()
             .convert_columns(&key_columns)
-            .map_err(|cause| cause.to_string())?;
+            .map_err(|source| {
+                super::operation_failure::arrow(
+                    super::operation_failure::Operation::EncodeRows,
+                    source,
+                )
+            })?;
         let cutoff = rank_like_cutoff(
             self.topn_type,
             rank_limit,
@@ -904,6 +879,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::pipeline::step::NextStep;
+    use crate::exec::pipeline::test_driver::TestDriver;
 
     use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
     use arrow::array::{Array, Decimal128Array, Int32Array, make_array};
@@ -922,11 +899,15 @@ mod tests {
             Ok(())
         }
     }
-    struct TestSource {
+    struct TestSource<'state> {
+        state: &'state RuntimeState,
         layout: StaticLayout,
         creator: Arc<dyn InputConstructionFactory>,
     }
-    fn source_for(state: &RuntimeState, fields: &[(&str, DataType, bool)]) -> TestSource {
+    fn source_for<'state>(
+        state: &'state RuntimeState,
+        fields: &[(&str, DataType, bool)],
+    ) -> TestSource<'state> {
         let bindings = fields
             .iter()
             .map(|(_, ty, nullable)| {
@@ -971,7 +952,11 @@ mod tests {
             state.error_state(),
         )
         .unwrap();
-        TestSource { layout, creator }
+        TestSource {
+            state,
+            layout,
+            creator,
+        }
     }
     fn source_chunk<const N: usize>(
         source: &TestSource,
@@ -1037,14 +1022,16 @@ mod tests {
             make_chunk(&source, vec![None, Some(3)]),
         ];
         let mut processor = processor_for(&source, false, None, 0, SortTopNType::RowNumber, None);
+        let mut processor = TestDriver::new(&mut processor, &state);
         for chunk in chunks {
             processor
-                .push_chunk(&state, chunk)
+                .input_without_output(chunk)
                 .expect("push full-sort input");
         }
-        processor.set_finishing(&state).expect("finish full sort");
+        processor.signal_eos().expect("finish full sort");
         let out = processor
-            .pull_chunk(&state)
+            .advance_to_boundary()
+            .map(|step| step.output)
             .expect("pull sorted output")
             .expect("chunk");
         assert!(out.record_batch().schema().field(0).is_nullable());
@@ -1078,14 +1065,16 @@ mod tests {
             vec![overflow, 12_345_i128],
         )];
         let mut processor = processor_for(&source, false, None, 0, SortTopNType::RowNumber, None);
+        let mut processor = TestDriver::new(&mut processor, &state);
         for chunk in chunks {
             processor
-                .push_chunk(&state, chunk)
+                .input_without_output(chunk)
                 .expect("push full-sort input");
         }
-        processor.set_finishing(&state).expect("finish full sort");
+        processor.signal_eos().expect("finish full sort");
         let out = processor
-            .pull_chunk(&state)
+            .advance_to_boundary()
+            .map(|step| step.output)
             .expect("pull sorted output")
             .expect("chunk");
         let ids = out
@@ -1119,7 +1108,7 @@ mod tests {
         offset: usize,
         topn_type: SortTopNType,
         max_buffered_rows: Option<usize>,
-    ) -> SortProcessorOperator {
+    ) -> Transform<SortProcessorKernel, crate::exec::pipeline::shape::HydrateInput> {
         let mut arena = ExprArena::default();
         let key = arena.push_value_typed(
             crate::exec::expr::ExprNode::SlotId(SlotId::new(1)),
@@ -1128,7 +1117,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut processor = SortProcessorOperator {
+        let mut processor = SortProcessorKernel {
             input_layout: Some(source.layout.clone()),
             fixture_input_schema: None,
             output_schema: None,
@@ -1153,14 +1142,16 @@ mod tests {
             buffered: Vec::new(),
             buffered_bytes: 0,
             buffered_rows: 0,
-            pending_output: None,
-            finishing: false,
-            finished: false,
             profile_initialized: false,
             profiles: None,
         };
         processor.prepare().expect("actual installed sort prepare");
         processor
+            .bind_runtime_state(source.state)
+            .expect("actual sort fixture control binding");
+        let mut operator = Transform::hydrating(processor);
+        operator.set_construction_factory(source.creator.clone());
+        operator
     }
     fn chunk_from_array(source: &TestSource, array: ArrayRef) -> Chunk {
         let rows = array.len();
@@ -1193,6 +1184,7 @@ mod tests {
                 SortTopNType::RowNumber,
                 Some(rows_to_keep + 1),
             );
+            let mut processor = TestDriver::new(&mut processor, &state);
             let tracker = crate::runtime::mem_tracker::MemTracker::new_root("sort input");
             let original = (0..(rows_to_keep * 2) as i32).rev().collect::<Vec<_>>();
             let mut chunk = int_chunk(&source, original.clone());
@@ -1201,9 +1193,12 @@ mod tests {
             chunk.transfer_to(&tracker);
             assert!(tracker.current() > 0);
             processor
-                .push_chunk(&state, chunk)
+                .input_without_output(chunk)
                 .expect("push first batch");
-            assert_eq!(processor.buffered_rows, rows_to_keep as i64);
+            assert_eq!(
+                processor.operator().kernel_for_test().buffered_rows,
+                rows_to_keep as i64
+            );
             assert!(
                 input_array.upgrade().is_none(),
                 "pruning releases the input Arrow owner"
@@ -1214,18 +1209,31 @@ mod tests {
                 "pruning releases the original input charge"
             );
             processor
-                .push_chunk(&state, int_chunk(&source, (-6..0).collect()))
+                .input_without_output(int_chunk(&source, (-6..0).collect()))
                 .expect("push late best rows");
-            assert_eq!(processor.buffered_rows, rows_to_keep as i64);
-            let candidate_array = Arc::downgrade(&processor.buffered[0].columns()[0]);
-            processor.set_finishing(&state).expect("finish");
-            assert!(processor.buffered.is_empty());
-            assert_eq!((processor.buffered_rows, processor.buffered_bytes), (0, 0));
+            assert_eq!(
+                processor.operator().kernel_for_test().buffered_rows,
+                rows_to_keep as i64
+            );
+            let candidate_array =
+                Arc::downgrade(&processor.operator().kernel_for_test().buffered[0].columns()[0]);
+            processor.signal_eos().expect("finish");
+            let completed = processor
+                .advance_to_boundary()
+                .expect("materialize final topn");
+            assert!(processor.operator().kernel_for_test().buffered.is_empty());
+            assert_eq!(
+                (
+                    processor.operator().kernel_for_test().buffered_rows,
+                    processor.operator().kernel_for_test().buffered_bytes
+                ),
+                (0, 0)
+            );
             assert!(
                 candidate_array.upgrade().is_none(),
                 "finish releases the retained candidate"
             );
-            let output = processor.pull_chunk(&state).expect("pull").expect("output");
+            let output = completed.output.expect("output");
             let mut expected = original;
             expected.extend(-6..0);
             expected.sort_unstable();
@@ -1238,10 +1246,11 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             assert_eq!(output.chunk_schema(), schema.as_ref());
-            assert!(processor.is_finished());
+            assert!(matches!(processor.next(), NextStep::Finished));
             assert!(
                 processor
-                    .pull_chunk(&state)
+                    .advance_to_boundary()
+                    .map(|step| step.output)
                     .expect("pull after finish")
                     .is_none()
             );
@@ -1257,16 +1266,21 @@ mod tests {
             let state = RuntimeState::default();
             let source = source_for(&state, &[("v", DataType::Int32, true)]);
             let mut processor = processor_for(&source, true, Some(2), 0, kind, Some(3));
+            let mut processor = TestDriver::new(&mut processor, &state);
             processor
-                .push_chunk(&state, int_chunk(&source, vec![4, 2, 2, 1]))
+                .input_without_output(int_chunk(&source, vec![4, 2, 2, 1]))
                 .expect("first peer groups");
             processor
-                .push_chunk(&state, int_chunk(&source, vec![2, 1, 3]))
+                .input_without_output(int_chunk(&source, vec![2, 1, 3]))
                 .expect("late boundary peers");
-            processor.set_finishing(&state).expect("finish");
-            let output = processor.pull_chunk(&state).expect("pull").expect("output");
+            processor.signal_eos().expect("finish");
+            let output = processor
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .expect("pull")
+                .expect("output");
             assert_eq!(int_values(&output), expected);
-            assert!(processor.buffered.is_empty());
+            assert!(processor.operator().kernel_for_test().buffered.is_empty());
         }
     }
 
@@ -1276,6 +1290,7 @@ mod tests {
         let state = RuntimeState::default();
         let source = source_for(&state, &[("v", DataType::Float64, true)]);
         let mut processor = processor_for(&source, false, None, 0, SortTopNType::RowNumber, None);
+        let mut processor = TestDriver::new(&mut processor, &state);
         let mut chunk = chunk_from_array(
             &source,
             Arc::new(Float64Array::from(vec![
@@ -1288,14 +1303,23 @@ mod tests {
         let input_array = Arc::downgrade(&chunk.columns()[0]);
         let tracker = crate::runtime::mem_tracker::MemTracker::new_root("full sort input");
         chunk.transfer_to(&tracker);
-        processor.push_chunk(&state, chunk).expect("push");
+        processor.input_without_output(chunk).expect("push");
         assert!(input_array.upgrade().is_some());
         assert!(tracker.current() > 0);
-        processor.set_finishing(&state).expect("finish");
+        processor.signal_eos().expect("finish");
+        let completed = processor
+            .advance_to_boundary()
+            .expect("materialize full sort");
         assert!(input_array.upgrade().is_none());
         assert_eq!(tracker.current(), 0);
-        assert_eq!((processor.buffered_rows, processor.buffered_bytes), (0, 0));
-        let output = processor.pull_chunk(&state).expect("pull").expect("output");
+        assert_eq!(
+            (
+                processor.operator().kernel_for_test().buffered_rows,
+                processor.operator().kernel_for_test().buffered_bytes
+            ),
+            (0, 0)
+        );
+        let output = completed.output.expect("output");
         let values = output.columns()[0]
             .as_any()
             .downcast_ref::<Float64Array>()
@@ -1320,11 +1344,20 @@ mod tests {
                 SortTopNType::RowNumber,
                 None,
             );
-            processor.set_finishing(&state).expect("finish empty input");
-            assert!(processor.is_finished());
-            assert!(!processor.has_output());
-            assert!(!processor.need_input());
-            assert!(processor.pull_chunk(&state).expect("pull empty").is_none());
+            let mut processor = TestDriver::new(&mut processor, &state);
+            processor.signal_eos().expect("finish empty input");
+            let completed = processor
+                .advance_to_boundary()
+                .expect("complete empty sort");
+            assert!(completed.output.is_none());
+            assert!(matches!(completed.next, NextStep::Finished));
+            assert!(
+                processor
+                    .advance_to_boundary()
+                    .map(|step| step.output)
+                    .expect("pull empty")
+                    .is_none()
+            );
         }
     }
 
@@ -1454,13 +1487,16 @@ mod tests {
         op.set_construction_factory(source.creator.clone());
         op.prepare()
             .expect("actual installed partition-sort prepare");
-        let proc = op.as_processor_mut().expect("processor");
+        op.bind_runtime_state(&state)
+            .expect("actual partition-sort control");
+        let mut proc = TestDriver::new(op.as_mut(), &state);
 
-        proc.push_chunk(&state, chunk).expect("push chunk");
-        proc.set_finishing(&state).expect("set finishing");
+        proc.input_without_output(chunk).expect("push chunk");
+        proc.signal_eos().expect("set finishing");
 
         let result = proc
-            .pull_chunk(&state)
+            .advance_to_boundary()
+            .map(|step| step.output)
             .expect("pull chunk")
             .expect("non-empty output");
 
@@ -1592,15 +1628,18 @@ mod tests {
         op.set_construction_factory(source.creator.clone());
         op.prepare()
             .expect("actual installed partition-sort prepare");
-        let proc = op.as_processor_mut().expect("processor");
+        op.bind_runtime_state(&state)
+            .expect("actual partition-sort control");
+        let mut proc = TestDriver::new(op.as_mut(), &state);
 
         // Drive the ordinary runtime state through the processor lifecycle.
 
-        proc.push_chunk(&state, chunk).expect("push chunk");
-        proc.set_finishing(&state).expect("set finishing");
+        proc.input_without_output(chunk).expect("push chunk");
+        proc.signal_eos().expect("set finishing");
 
         let result = proc
-            .pull_chunk(&state)
+            .advance_to_boundary()
+            .map(|step| step.output)
             .expect("pull chunk")
             .expect("non-empty output");
 

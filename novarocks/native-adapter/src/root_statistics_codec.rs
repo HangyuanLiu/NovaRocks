@@ -619,3 +619,30 @@ fn advance(
     }
     Ok(turn)
 }
+
+impl novarocks_execution_contract::failure::FailureProjection for StatisticsCodecError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self {
+            Self::Schema => (FailureClass::Invariant, 100),
+            Self::NullValue => (FailureClass::Data, 101),
+            Self::FieldIds => (FailureClass::Data, 102),
+            Self::BlobType => (FailureClass::Data, 103),
+            Self::BodyLimit => (FailureClass::Resource, 104),
+            Self::RowLimit => (FailureClass::Resource, 105),
+            Self::MetadataLimit => (FailureClass::Resource, 106),
+            Self::Properties => (FailureClass::Data, 107),
+            Self::TruncatedHeader => (FailureClass::Data, 108),
+            Self::HeaderVersion => (FailureClass::Data, 109),
+            Self::RecordLength => (FailureClass::Data, 110),
+            Self::TruncatedRecord => (FailureClass::Data, 111),
+            Self::TrailingRecordBytes => (FailureClass::Data, 112),
+            Self::Failed => (FailureClass::Invariant, 113),
+            Self::Cancelled => (FailureClass::Control, 114),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}

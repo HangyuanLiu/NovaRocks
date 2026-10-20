@@ -110,9 +110,8 @@ pub(super) fn evaluate<'a>(
                 "hll_hash demanded carrier differs from its original full source type",
             ));
         }
-        let reader = crate::hll_hash_core::Input::try_new(array).map_err(|_| {
-            internal("hll_hash checked carrier violated its original reader contract")
-        })?;
+        let reader = crate::hll_hash_core::Input::try_new(array)
+            .map_err(crate::hll_hash_core::UnsupportedCarrier::into_failure)?;
         let selection = input.selection();
         let count = selection
             .len()

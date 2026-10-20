@@ -50,7 +50,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after original refusal");
         }
@@ -216,7 +216,7 @@ fn assert_prefix<T>(
     assert!(baseline.iter().all(|(p, _)| *p == phase));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(matches!(operation(), Err(Error::Control(actual)) if actual == cause));
             assert_eq!(control.trace(), baseline[..=at]);
         }
@@ -237,7 +237,7 @@ fn assert_ordinary_prefix<T>(
     // A zero-unit tail is legal after delegates flush completed work.
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(matches!(operation(), Err(Error::Control(actual)) if actual == cause));
             assert_eq!(control.trace(), baseline[..=at]);
         }
@@ -751,7 +751,7 @@ fn every_small_success_and_ordinary_tail_callback_keeps_three_primary_causes() {
         assert_eq!(resource_prefix.first(), Some(&(CompilePhase::Encode, 0)));
         for cause in CAUSES {
             for at in 0..resource_prefix.len() {
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 assert!(matches!(
                     encode_assert_rows_node(&original, encoded, SOURCE, l),
                     Err(Error::Control(actual)) if actual == cause
@@ -819,7 +819,7 @@ fn wide_ordered_keys_and_utf8_copy_reach_actual_quantum_without_after_refusal() 
                 .filter(|at| *at == 0 || *at + 1 == baseline.len() || baseline[*at].1 == 256)
             {
                 for cause in CAUSES {
-                    control.arm(Some((at, cause)));
+                    control.arm(Some((at, cause.clone())));
                     assert!(matches!(run(), Err(Error::Control(actual)) if actual == cause));
                     assert_eq!(control.trace(), baseline[..=at]);
                 }

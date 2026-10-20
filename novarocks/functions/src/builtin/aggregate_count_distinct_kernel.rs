@@ -20,7 +20,7 @@ use super::aggregate_count_distinct_core::{
     self as core, CountBuffer, CountDistinctState, SelectedCountKey, TrackedCountReader,
 };
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
@@ -159,8 +159,7 @@ impl PreparedAggregateKernel for CountDistinctKernel {
                     &TrackedCountReader(&allocator),
                     buffer,
                     &mut ScalarWork::new(Some(work)),
-                )
-                .map_err(ScalarStateError::into_kernel_failure)?
+                )?
             } else {
                 let mut arguments = HostVec::new_in(allocator.clone());
                 arguments
@@ -179,14 +178,12 @@ impl PreparedAggregateKernel for CountDistinctKernel {
                     &allocator,
                     buffer,
                     &mut ScalarWork::new(Some(work)),
-                )
-                .map_err(ScalarStateError::into_kernel_failure)?
+                )?
             };
             if let Some(key) = key {
                 state
                     .values
-                    .insert_with_work(key.bytes(), &mut ScalarWork::new(Some(work)))
-                    .map_err(ScalarStateError::into_kernel_failure)?;
+                    .insert_with_work(key.bytes(), &mut ScalarWork::new(Some(work)))?;
             }
             Ok(())
         });
@@ -247,10 +244,8 @@ impl PreparedAggregateKernel for CountDistinctKernel {
                 array.value(address),
                 decoded,
                 &mut ScalarWork::new(Some(work)),
-            )
-            .map_err(ScalarStateError::into_kernel_failure)?;
+            )?;
             core::merge_decoded(&mut state.values, decoded, &mut ScalarWork::new(Some(work)))
-                .map_err(ScalarStateError::into_kernel_failure)
         });
         if result.is_err() {
             state.latch_failure();
@@ -267,9 +262,8 @@ impl PreparedAggregateKernel for CountDistinctKernel {
     {
         observed(control, |work| {
             let expected = states.len();
-            let mut builder = BinaryBuilder::new();
+            let mut builder = crate::aggregate_scalar::BinaryResultBuilder::new();
             let mut count = 0;
-            let mut bytes = 0usize;
             for state in states {
                 if count == expected {
                     return Err(internal(
@@ -281,16 +275,9 @@ impl PreparedAggregateKernel for CountDistinctKernel {
                 }
                 let scratch = HostVec::<u8, _>::new_in(state.values.allocator.clone());
                 let buffer =
-                    core::serialize_set(&state.values, scratch, &mut ScalarWork::new(Some(work)))
-                        .map_err(ScalarStateError::into_kernel_failure)?;
-                bytes = bytes
-                    .checked_add(buffer.len())
-                    .filter(|v| *v <= i32::MAX as usize)
-                    .ok_or_else(|| {
-                        invalid("COUNT DISTINCT state batch exceeds the Binary offset domain")
-                    })?;
+                    core::serialize_set(&state.values, scratch, &mut ScalarWork::new(Some(work)))?;
                 work.flush()?;
-                builder.append_value(buffer.bytes());
+                builder.append_value(buffer.bytes())?;
                 work.flush()?;
                 count += 1;
                 work.step()?;
@@ -301,7 +288,7 @@ impl PreparedAggregateKernel for CountDistinctKernel {
                 ));
             }
             work.flush()?;
-            let array = Arc::new(builder.finish());
+            let array = Arc::new(builder.finish()?);
             work.flush()?;
             Ok(array as ArrayRef)
         })
@@ -328,7 +315,7 @@ impl PreparedAggregateKernel for CountDistinctKernel {
                     return Err(KernelFailure::InstanceFailed);
                 }
                 work.step()?;
-                builder.append_value(core::finalize_count(&state.values));
+                builder.append_value(core::finalize_count(&state.values)?);
                 count += 1;
             }
             if count != expected {

@@ -45,7 +45,10 @@
 //! once, and the partition's rows are emitted with their call values. A whole
 //! partition is held in memory (no spill, ADR-0162).
 
-use std::collections::VecDeque;
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
@@ -76,14 +79,58 @@ use super::sort::creation::{CreatedSortConverter, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
-fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
-    ExecutionFailure::from(format!("{context}: {error}"))
+#[derive(Clone, Copy, Debug)]
+enum WindowArrowOperation {
+    EncodeKeys,
+    ConcatenatePartitions,
+}
+#[derive(Debug)]
+struct WindowArrowFailure {
+    operation: WindowArrowOperation,
+    source: arrow::error::ArrowError,
+}
+impl std::fmt::Display for WindowArrowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compiled window {:?}: {}", self.operation, self.source)
+    }
+}
+impl std::error::Error for WindowArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for WindowArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        let (class, reason) = match &self.source {
+            arrow::error::ArrowError::MemoryError(_) => (
+                novarocks_failure_contract::FailureClass::Resource,
+                crate::runtime::fragment::ExecutionReason::WindowArrowAllocation,
+            ),
+            _ => (
+                novarocks_failure_contract::FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::WindowArrow,
+            ),
+        };
+        novarocks_failure_contract::FailureFact::new(class, reason.reason())
+    }
+}
+fn arrow_failure(
+    operation: WindowArrowOperation,
+    source: arrow::error::ArrowError,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(WindowArrowFailure { operation, source })
 }
 
 /// One call's exact prepared kernel, its explicit frame and its roots.
@@ -121,12 +168,15 @@ impl CompiledWindowProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let at = node.index();
         let nodes = program.graph().nodes();
-        let graph_node = nodes
-            .get(at)
-            .ok_or_else(|| format!("compiled Analytic node {at} is absent"))?;
+        let graph_node = nodes.get(at).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled Analytic node {at} is absent"),
+            )
+        })?;
         let ProgramNodeKind::Analytic {
             input,
             partition_exprs,
@@ -135,7 +185,10 @@ impl CompiledWindowProcessorFactory {
             output_columns,
         } = graph_node.kind()
         else {
-            return Err(format!("compiled local node {at} is not an Analytic"));
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled local node {at} is not an Analytic"),
+            ));
         };
         let key = |count: usize, role: fn(u32) -> ProgramNodeExpressionRole| {
             (0..count)
@@ -146,10 +199,13 @@ impl CompiledWindowProcessorFactory {
                             role: role(key),
                         })
                         .map_err(|_| {
-                            format!("compiled Analytic at local node {at} has too many keys")
+                            program_binding_failure(
+                                PlanBindingKind::InvalidAssignment,
+                                format!("compiled Analytic at local node {at} has too many keys"),
+                            )
                         })
                 })
-                .collect::<Result<Vec<_>, String>>()
+                .collect::<ExecutionResult<Vec<_>>>()
         };
         let mut sites = key(partition_exprs.len(), |key| {
             ProgramNodeExpressionRole::WindowPartition { key }
@@ -159,44 +215,64 @@ impl CompiledWindowProcessorFactory {
         })?);
         let mut calls = Vec::with_capacity(functions.len());
         for (ordinal, function) in functions.iter().enumerate() {
-            let call = u32::try_from(ordinal)
-                .map_err(|_| format!("compiled Analytic at local node {at} has too many calls"))?;
+            let call = novarocks_local_program::checked_program_ordinal(ordinal)
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             if !matches!(function.kind, WindowFunctionKind::Prepared) {
-                return Err(format!(
-                    "compiled Analytic call {call} at local node {at} is not a prepared window call"
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled Analytic call {call} at local node {at} is not a prepared window call"
+                    ),
                 ));
             }
             let frame = function.frame.ok_or_else(|| {
-                format!("compiled Analytic call {call} at local node {at} has no explicit frame")
+                program_binding_failure(
+                    PlanBindingKind::MissingAssignment,
+                    format!(
+                        "compiled Analytic call {call} at local node {at} has no explicit frame"
+                    ),
+                )
             })?;
-            admit_frame(&frame).map_err(|error| {
-                format!("compiled Analytic call {call} at local node {at}: {error}")
-            })?;
+            admit_compiled_frame(at, call, &frame)?;
             let Some(ProgramStateTemplate::WindowPartition { kernel, .. }) =
                 program.state_template(ProgramCallSite::Window { node, call })
             else {
-                return Err(format!(
-                    "compiled Analytic call {call} at local node {at} has no prepared window kernel"
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled Analytic call {call} at local node {at} has no prepared window kernel"
+                    ),
                 ));
             };
             let kernel = Arc::clone(kernel);
             let contract = kernel.contract();
             if contract.order_argument_types().len() != 0 {
-                return Err(format!(
-                    "compiled Analytic call {call} at local node {at} with function ORDER BY is not executable"
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled Analytic call {call} at local node {at} with function ORDER BY is not executable"
+                    ),
                 ));
             }
             let roots = contract.logical_argument_types().len();
             if function.args.len() != roots {
-                return Err(format!(
-                    "compiled Analytic call {call} at local node {at} has {} roots for {roots} channels",
-                    function.args.len()
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled Analytic call {call} at local node {at} has {} roots for {roots} channels",
+                        function.args.len()
+                    ),
                 ));
             }
             let first_root = sites.len();
             for argument in 0..roots {
                 let argument = u32::try_from(argument).map_err(|_| {
-                    format!("compiled Analytic call {call} at local node {at} has too many inputs")
+                    program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        format!(
+                            "compiled Analytic call {call} at local node {at} has too many inputs"
+                        ),
+                    )
                 })?;
                 sites.push(ProgramExpressionRootSite::Node {
                     node,
@@ -212,7 +288,12 @@ impl CompiledWindowProcessorFactory {
         }
         let input_slots = nodes
             .get(input.index())
-            .ok_or_else(|| format!("compiled Analytic at local node {at} has no input node"))?
+            .ok_or_else(|| {
+                program_binding_failure(
+                    PlanBindingKind::MissingAssignment,
+                    format!("compiled Analytic at local node {at} has no input node"),
+                )
+            })?
             .output_layout()
             .slots();
         let mut columns = Vec::with_capacity(output_columns.len());
@@ -223,25 +304,28 @@ impl CompiledWindowProcessorFactory {
                         .iter()
                         .position(|candidate| candidate == slot)
                         .ok_or_else(|| {
-                            format!(
+                            program_binding_failure(PlanBindingKind::MissingAssignment, format!(
                                 "compiled Analytic at local node {at} outputs slot {} its input lacks",
                                 slot.as_u32()
-                            )
+                            ))
                         })?,
                 ),
                 AnalyticOutputColumn::Window(call) if *call < calls.len() => {
                     OutputSource::Call(*call)
                 }
                 AnalyticOutputColumn::Window(call) => {
-                    return Err(format!(
+                    return Err(program_binding_failure(PlanBindingKind::InvalidAssignment, format!(
                         "compiled Analytic at local node {at} outputs absent call {call}"
-                    ));
+                    )));
                 }
             });
         }
         if graph_node.output_layout().schema().fields().len() != columns.len() {
-            return Err(format!(
-                "compiled Analytic at local node {at} output width differs from its columns"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled Analytic at local node {at} output width differs from its columns"
+                ),
             ));
         }
         let (partition_keys, order_keys) = (partition_exprs.len(), order_by_exprs.len());
@@ -295,9 +379,7 @@ impl CompiledWindowProcessorFactory {
             order_rows: None,
             last_partition: None,
             open: Vec::new(),
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
+            emission: None,
             failed: None,
             original_function_major: self.original_function_major,
             invocation_input: None,
@@ -312,7 +394,7 @@ impl OperatorFactory for CompiledWindowProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(self.create_processor())
+        Box::new(Transform::hydrating(self.create_processor()))
     }
 }
 
@@ -346,13 +428,21 @@ struct CompiledWindowProcessor {
     /// The partition keys of the last arrived row.
     last_partition: Option<CreatedPartitionKey>,
     open: Vec<Piece>,
-    pending: VecDeque<Chunk>,
-    finishing: bool,
-    finished: bool,
+    emission: Option<WindowOutputCursor>,
     failed: Option<ExecutionFailure>,
     original_function_major: bool,
     invocation_input: Option<InvocationInputBuffer>,
     partition_ordinal: usize,
+}
+
+/// The complete relation is computed in the original function-major order.
+/// Only one original arrival-sized wrapper is constructed per output step.
+struct WindowOutputCursor {
+    output: Chunk,
+    lengths: Vec<usize>,
+    index: usize,
+    offset: usize,
+    _length_storage: ValueTypeStorageLifetime,
 }
 
 /// The row encoding owns shared converter fields independently of the converter.
@@ -390,7 +480,7 @@ fn encode(
     let rows = converter
         .converter()
         .convert_columns(keys)
-        .map_err(|error| failure("compiled window key row encoding", error))?;
+        .map_err(|error| arrow_failure(WindowArrowOperation::EncodeKeys, error))?;
     Ok(CreatedWindowRows {
         rows,
         storage: converter.storage_lifetime(),
@@ -494,6 +584,18 @@ fn original_peer_groups(
 }
 
 impl CompiledWindowProcessor {
+    fn release_owned(&mut self) {
+        self.emission = None;
+        self.instances = None;
+        self.invocation_input = None;
+        self.partition_rows = None;
+        self.order_rows = None;
+        self.last_partition = None;
+        self.partition_key_types = None;
+        self.order_key_types = None;
+        drop(std::mem::take(&mut self.open));
+    }
+
     fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
         self.output.as_ref().ok_or_else(|| {
             crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into()
@@ -508,17 +610,7 @@ impl CompiledWindowProcessor {
             Ok(value) => Ok(value),
             Err(cause) => {
                 self.failed = Some(cause);
-                self.finishing = true;
-                self.finished = true;
-                self.instances = None;
-                self.invocation_input = None;
-                self.partition_rows = None;
-                self.order_rows = None;
-                self.last_partition = None;
-                self.partition_key_types = None;
-                self.order_key_types = None;
-                drop(std::mem::take(&mut self.open));
-                drop(std::mem::take(&mut self.pending));
+                self.release_owned();
                 Err(self
                     .failed
                     .as_ref()
@@ -795,8 +887,9 @@ impl CompiledWindowProcessor {
                         .iter()
                         .map(|array| array.as_ref())
                         .collect::<Vec<&dyn Array>>();
-                    concat(&parts)
-                        .map_err(|error| failure("compiled window partition concat", error))?
+                    concat(&parts).map_err(|error| {
+                        arrow_failure(WindowArrowOperation::ConcatenatePartitions, error)
+                    })?
                 };
                 results.try_push(
                     CallOutput {
@@ -831,12 +924,40 @@ impl CompiledWindowProcessor {
         )?;
         // Keep original arrival chunk boundaries; changing them would alter
         // batch-sensitive downstream legacy semantics independently of BY.
-        let outputs = super::analytic_shared::split_analytic_output_chunks(
-            Arc::clone(self.prepared_output()?),
-            &columns,
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_input_construction(&ordered)?;
+        let creation = SortCreation::new(factory.as_ref(), self.prepared_output()?);
+        let mut lengths = creation.vector::<usize>(input.len(), owner.as_ref())?;
+        lengths.extend(
+            input
+                .iter()
+                .filter(|chunk| !chunk.is_empty())
+                .map(Chunk::len),
+        );
+        let mut output_columns = creation.vector::<ArrayRef>(columns.len(), owner.as_ref())?;
+        output_columns.extend(columns.iter().cloned());
+        let storage = Chunk::source_set_storage_lifetime_observed::<ConstructionFailure>(
             input,
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
         )?;
-        self.pending = outputs;
+        let output = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            self.prepared_output()?.clone(),
+            output_columns,
+            rows,
+            storage,
+            |step| owner.observe(0, &[], step),
+        )?;
+        self.emission = Some(WindowOutputCursor {
+            output,
+            lengths,
+            index: 0,
+            offset: 0,
+            _length_storage: owner.storage_lifetime(),
+        });
         self.partition_rows = None;
         self.order_rows = None;
         self.partition_key_types = None;
@@ -845,7 +966,7 @@ impl CompiledWindowProcessor {
     }
     /// Evaluate every root over the arriving rows, then split them at the
     /// partition boundaries; every partition the rows close is evaluated.
-    fn consume(&mut self, chunk: &Chunk) -> ExecutionResult<()> {
+    fn consume(&mut self, chunk: &Chunk) -> ExecutionResult<Option<Chunk>> {
         instances(
             &mut self.instances,
             &self.program,
@@ -1079,9 +1200,9 @@ impl CompiledWindowProcessor {
     }
 
     /// Emit the partitions one arrival closed as one chunk, in partition order.
-    fn publish(&mut self, closed: Vec<Chunk>) -> ExecutionResult<()> {
+    fn publish(&mut self, closed: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
         let output = match closed.len() {
-            0 => return Ok(()),
+            0 => return Ok(None),
             1 => closed.into_iter().next().expect("one closed partition"),
             _ => {
                 let factory = self
@@ -1094,8 +1215,7 @@ impl CompiledWindowProcessor {
                 creation.publish(batch, &closed[0], retained.as_ref())?
             }
         };
-        self.pending.push_back(output);
-        Ok(())
+        Ok(Some(output))
     }
 }
 
@@ -1176,16 +1296,13 @@ fn evaluate_call(
     let output = partition.evaluate_evaluated(Selection::all(rows), rows, control)?;
     partition.finish_evaluated(control)?;
     let (_, values, errors) = output.into_parts();
-    if !errors.is_empty() {
-        return Err(ExecutionFailure::from(
-            "compiled window kernel returned row errors on a channel without row masking",
-        ));
-    }
-    if values.len() != rows {
-        return Err(ExecutionFailure::from(
-            "compiled window kernel output differs from its partition rows",
-        ));
-    }
+    validate_unmasked_window_output(
+        call_ordinal,
+        partition_ordinal,
+        rows,
+        values.len(),
+        errors.len(),
+    )?;
     Ok(CallOutput {
         values,
         carrier: None,
@@ -1290,7 +1407,7 @@ fn validate_complete_output(
     Ok(())
 }
 
-impl Operator for CompiledWindowProcessor {
+impl OperatorLifecycle for CompiledWindowProcessor {
     #[cfg(any(test, novarocks_dev_controls))]
     fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> {
         self.output.clone()
@@ -1348,80 +1465,116 @@ impl Operator for CompiledWindowProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.release_owned();
+        Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.release_owned();
+    }
+    fn on_driver_failure(&mut self) {
+        self.release_owned();
     }
 }
 
-impl ProcessorOperator for CompiledWindowProcessor {
-    fn need_input(&self) -> bool {
-        self.failed.is_none() && !self.finishing && !self.finished
-    }
-    fn has_output(&self) -> bool {
-        self.failed.is_none() && !self.pending.is_empty()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledWindowProcessor {}
+impl TransformKernel for CompiledWindowProcessor {
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
         }
-        let result = if self.output.is_none() {
-            Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into())
-        } else if self.finishing || self.finished {
-            Err("compiled Analytic received input after finishing".into())
-        } else if chunk.is_empty() {
-            Ok(())
-        } else if self.original_function_major {
-            self.consume_invocation(chunk)
-        } else {
-            self.consume(&chunk)
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let result = (|| {
+            self.prepared_output()?;
+            if chunk.is_empty() {
+                Ok(None)
+            } else if self.original_function_major {
+                self.consume_invocation(chunk)?;
+                Ok(None)
+            } else {
+                self.consume(&chunk)
+            }
+        })();
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+        }
+        let output = self.failure_result(result)?;
+        Ok(StepResult::new(output, NextStep::NeedInput, rows))
+    }
+
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(cause) = &self.failed {
+            return Err(cause.clone());
+        }
+        let Some(cursor) = &self.emission else {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         };
-        self.failure_result(result)
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if let Some(cause) = &self.failed {
-            return Err(cause.clone());
-        }
-        let output = self.pending.pop_front();
-        if self.finishing && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if let Some(cause) = &self.failed {
-            return Err(cause.clone());
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
         let result = (|| {
-            if self.finishing || self.finished {
-                return Ok(());
-            }
-            self.finishing = true;
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            slice_body(
+                &cursor.output,
+                cursor.offset,
+                cursor.lengths[cursor.index],
+                factory.as_ref(),
+            )
+        })();
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+        }
+        let output = self.failure_result(result)?;
+        let cursor = self.emission.as_mut().expect("live output cursor");
+        cursor.offset += cursor.lengths[cursor.index];
+        cursor.index += 1;
+        let next = if cursor.index == cursor.lengths.len() {
+            self.release_owned();
+            NextStep::Finished
+        } else {
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(Some(output), next, 0))
+    }
+
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(cause) = &self.failed {
+            return Err(cause.clone());
+        }
+        let result: ExecutionResult<StepResult> = (|| {
+            self.prepared_output()?;
             if self.original_function_major {
                 self.finish_invocation()?;
                 self.instances = None;
-                if self.pending.is_empty() {
-                    self.finished = true;
+                if self.emission.is_some() {
+                    return Ok(StepResult::new(None, NextStep::Runnable, 0));
                 }
-                return Ok(());
-            }
-            let closed = if self.open.is_empty() {
-                Vec::new()
+                self.release_owned();
+                Ok(StepResult::new(None, NextStep::Finished, 0))
             } else {
-                vec![self.close()?]
-            };
-            self.publish(closed)?;
-            self.instances = None;
-            if self.pending.is_empty() {
-                self.finished = true;
+                let output = if self.open.is_empty() {
+                    None
+                } else {
+                    Some(self.close()?)
+                };
+                self.release_owned();
+                Ok(StepResult::new(output, NextStep::Finished, 0))
             }
-            Ok(())
         })();
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+        }
         self.failure_result(result)
     }
 }
@@ -1557,4 +1710,120 @@ pub fn prepare_window_factory_for_test(
     Ok(CompiledWindowProcessorFactory::try_new(
         program, node, error,
     )?)
+}
+
+#[derive(Debug)]
+struct WindowFrameFailure {
+    node: usize,
+    call: u32,
+    source: super::compiled_window_geometry::WindowGeometryError,
+}
+impl std::fmt::Display for WindowFrameFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "compiled Analytic call {} at local node {}: {}",
+            self.call, self.node, self.source
+        )
+    }
+}
+impl std::error::Error for WindowFrameFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for WindowFrameFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.source)
+    }
+}
+fn admit_compiled_frame(node: usize, call: u32, frame: &WindowFrame) -> ExecutionResult<()> {
+    admit_frame(frame)
+        .map_err(|source| ExecutionFailure::from_domain(WindowFrameFailure { node, call, source }))
+}
+#[derive(Debug)]
+enum WindowOutputViolation {
+    RowErrors { count: usize },
+    Length { expected: usize, actual: usize },
+}
+#[derive(Debug)]
+struct WindowOutputFailure {
+    call: usize,
+    partition: usize,
+    violation: WindowOutputViolation,
+}
+impl std::fmt::Display for WindowOutputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.violation {
+            WindowOutputViolation::RowErrors { .. } => {
+                "compiled window kernel returned row errors on a channel without row masking"
+            }
+            WindowOutputViolation::Length { .. } => {
+                "compiled window kernel output differs from its partition rows"
+            }
+        })
+    }
+}
+impl std::error::Error for WindowOutputFailure {}
+impl novarocks_failure_contract::FailureProjection for WindowOutputFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::WindowKernelOutputContract.reason(),
+        )
+    }
+}
+fn validate_unmasked_window_output(
+    call: usize,
+    partition: usize,
+    expected: usize,
+    actual: usize,
+    row_errors: usize,
+) -> ExecutionResult<()> {
+    // WindowCallContract::try_window admits NotRowEvaluated exclusively.
+    // A journal here violates that already checked kernel declaration.
+    let violation = if row_errors != 0 {
+        WindowOutputViolation::RowErrors { count: row_errors }
+    } else if expected != actual {
+        WindowOutputViolation::Length { expected, actual }
+    } else {
+        return Ok(());
+    };
+    Err(ExecutionFailure::from_domain(WindowOutputFailure {
+        call,
+        partition,
+        violation,
+    }))
+}
+#[cfg(test)]
+mod frame_source_properties {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    #[test]
+    fn actual_frame_admission_refusal_preserves_geometry_source_and_local_site() {
+        let frame = WindowFrame {
+            start: Some(novarocks_local_program::WindowBoundary::Preceding(-1)),
+            end: None,
+            window_type: novarocks_local_program::WindowType::Rows,
+        };
+        let original = admit_frame(&frame).unwrap_err();
+        let error = admit_compiled_frame(7, 3, &frame).unwrap_err();
+        assert_eq!(error.failure_fact(), original.failure_fact());
+        let source = error
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<WindowFrameFailure>()
+            .unwrap();
+        assert_eq!((source.node, source.call), (7, 3));
+        assert_eq!(source.source, original);
+        assert!(
+            source
+                .source()
+                .unwrap()
+                .is::<super::super::compiled_window_geometry::WindowGeometryError>()
+        );
+    }
 }

@@ -756,7 +756,11 @@ impl PureCompileControl for Stop {
             StopAt::AggregatePrepared => count(&self.counts.aggregate) > 0,
             StopAt::AdapterPrepared => count(&self.counts.adapter) > 0,
         };
-        if stop { Err(self.failure) } else { Ok(()) }
+        if stop {
+            Err(self.failure.clone())
+        } else {
+            Ok(())
+        }
     }
 }
 #[test]
@@ -776,7 +780,7 @@ fn controls_before_and_after_adapter_preserve_typed_failures_and_no_publication(
                 let control = Stop {
                     at,
                     counts: owner.counts.clone(),
-                    failure,
+                    failure: failure.clone(),
                 };
                 assert!(
                     matches!(owner.specialize(frozen, &control), Err(FunctionSpecializationFailure::Control(actual)) if actual == failure)

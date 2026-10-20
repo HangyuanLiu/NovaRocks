@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::exec::expr::function::array::common as array_common;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, ListArray, StringArray, make_array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -28,37 +31,38 @@ fn eval_reverse_list<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     list: &ListArray,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list.data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "reverse ARRAY output must be List, got {other:?}"
+            )));
+        }
+        None => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("reverse ARRAY output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "reverse ARRAY output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
     let target_item_type = output_field.data_type().clone();
     let mut values = list.values().clone();
     if values.data_type() != &target_item_type {
-        values = cast(&values, &target_item_type).map_err(|e| {
-            format!(
-                "reverse ARRAY failed to cast element type {:?} -> {:?}: {}",
-                values.data_type(),
-                target_item_type,
-                e
-            )
-        })?;
+        values = cast(&values, &target_item_type)
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
+    array_common::validate_rows(list.len(), chunk.len(), "reverse ARRAY input")?;
     let values_data = values.to_data();
     let mut mutable = MutableArrayData::new(vec![&values_data], false, 0);
     let offsets = list.value_offsets();
     let mut out_offsets = Vec::with_capacity(chunk.len() + 1);
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
@@ -72,23 +76,28 @@ fn eval_reverse_list<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let start = offsets[row_idx] as usize;
         let end = offsets[row_idx + 1] as usize;
         for idx in (start..end).rev() {
+            let next =
+                novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
             mutable.extend(0, idx, idx + 1);
-            current += 1;
-        }
-        if current > i32::MAX as i64 {
-            return Err(("reverse ARRAY offset overflow".to_string()).into());
+            current = next;
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "reverse ARRAY constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }
 
@@ -97,16 +106,23 @@ pub fn eval_reverse<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "reverse requires exactly one prepared argument",
+        ));
+    }
     let input = arena.eval(args[0], chunk)?;
     if let Some(list) = input.as_any().downcast_ref::<ListArray>() {
-        return Ok((eval_reverse_list(arena, expr, list, chunk))?);
+        return eval_reverse_list(arena, expr, list, chunk);
     }
 
     let s_arr = input
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "reverse expects string or array".to_string())?;
+        .ok_or_else(|| expression_contract("reverse expects string or array"))?;
+    array_common::validate_rows(s_arr.len(), chunk.len(), "reverse string input")?;
+    let mut output_offset = 0;
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         let row_idx = if s_arr.len() == 1 { 0 } else { row };
@@ -114,6 +130,10 @@ pub fn eval_reverse<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             out.push(None);
             continue;
         }
+        output_offset = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+            output_offset,
+            s_arr.value(row_idx).len(),
+        )?;
         let val = novarocks_functions::string_reverse_shared::reverse_utf8(s_arr.value(row_idx));
         out.push(Some(val));
     }

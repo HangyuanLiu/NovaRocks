@@ -66,7 +66,7 @@ impl SqlFoldDependencyObserver for Probe {
         _: &dyn PureCompileControl,
     ) -> Result<(), CompileControlError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        if let Some(cause) = self.refuse {
+        if let Some(cause) = self.refuse.clone() {
             return Err(cause);
         }
         let mut sources = self.sources.lock().unwrap();
@@ -322,7 +322,7 @@ fn sql_published_source_actual_dml_loans_writer_and_finish_same_owner() {
 #[test]
 fn sql_published_source_query_preserves_three_typed_control_causes() {
     for cause in causes() {
-        let probe = Probe::new(Some(cause));
+        let probe = Probe::new(Some(cause.clone()));
         let error = query("SELECT 7 AS original_name", control(&probe)).unwrap_err();
         let SqlCompileProgressError::Compile(error) = error else {
             panic!("unexpected source error: {error:?}");
@@ -335,7 +335,7 @@ fn sql_published_source_query_preserves_three_typed_control_causes() {
 #[test]
 fn sql_published_source_actual_dml_preserves_three_typed_control_causes() {
     for cause in causes() {
-        let probe = Probe::new(Some(cause));
+        let probe = Probe::new(Some(cause.clone()));
         let error = dml("SELECT CAST(7 AS BIGINT) AS order_id", control(&probe)).unwrap_err();
         assert_compile_cause(&error, cause);
         assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
@@ -379,7 +379,7 @@ fn sql_published_source_original_query_failure_precedes_refusing_observer() {
     )
     .unwrap_err();
     for cause in causes() {
-        let probe = Probe::new(Some(cause));
+        let probe = Probe::new(Some(cause.clone()));
         let actual = query("SELECT missing_publication_column", control(&probe)).unwrap_err();
         assert_eq!(actual.to_string(), original.to_string());
         assert_eq!(probe.calls.load(Ordering::Relaxed), 0);
@@ -393,7 +393,7 @@ fn sql_published_source_original_dml_data_error_precedes_refusing_observer() {
     )
     .unwrap_err();
     for cause in causes() {
-        let probe = Probe::new(Some(cause));
+        let probe = Probe::new(Some(cause.clone()));
         let actual = dml(
             "SELECT 7 AS order_id, 8 AS unexpected_column",
             control(&probe),

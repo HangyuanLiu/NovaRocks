@@ -191,7 +191,7 @@ impl std::error::Error for StaticValuesError {}
 
 /// Pure construction preserves structural diagnostics and the caller's original
 /// interruption separately. Neither branch grants backing memory admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValuesCompileError {
     Values(StaticValuesError),
     Control(CompileControlError),
@@ -221,7 +221,7 @@ impl std::error::Error for ValuesCompileError {
         match self {
             Self::Values(error) => Some(error),
             Self::Control(error) => Some(error),
-            Self::Resource(_) => None,
+            Self::Resource(source) => Some(source),
         }
     }
 }
@@ -735,7 +735,7 @@ mod tests {
             assert_eq!(phase, CompilePhase::LowerProgram);
             let mut calls = self.calls.lock().unwrap();
             calls.push(units);
-            if let Some((call, error)) = self.refusal
+            if let Some((call, error)) = self.refusal.clone()
                 && calls.len() == call
             {
                 return Err(error);
@@ -824,10 +824,10 @@ mod tests {
                 let (batch, layout) = input();
                 let control = Control {
                     calls: Default::default(),
-                    refusal: Some((call, cause)),
+                    refusal: Some((call, cause.clone())),
                 };
                 let error = StaticValues::try_new_for_compile(batch, layout, &control).unwrap_err();
-                assert_eq!(error, ValuesCompileError::Control(cause));
+                assert_eq!(error, ValuesCompileError::Control(cause.clone()));
                 assert_eq!(
                     error
                         .source()
@@ -1019,7 +1019,7 @@ mod tests {
             for call in 1..=observed {
                 let control = Control {
                     calls: Default::default(),
-                    refusal: Some((call, cause)),
+                    refusal: Some((call, cause.clone())),
                 };
                 let error = StaticValues::try_new_with_cells_for_compile(
                     3,
@@ -1029,7 +1029,7 @@ mod tests {
                     &control,
                 )
                 .unwrap_err();
-                assert_eq!(error, ValuesCompileError::Control(cause));
+                assert_eq!(error, ValuesCompileError::Control(cause.clone()));
                 assert_eq!(control.calls.lock().unwrap().len(), call);
             }
         }

@@ -565,7 +565,7 @@ fn aggregate_signature(
         AggregateOverloadIdentity::try_new(function.overload.as_str()).map_err(|error| {
             FragmentCompileError::Owner {
                 phase: "aggregate window overload identity",
-                error: Box::new(error),
+                error: novarocks_failure_contract::SharedFailureCause::new(error),
             }
         })?;
     work.flush()?;

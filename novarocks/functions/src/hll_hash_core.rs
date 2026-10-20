@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original scalar HLL_HASH carrier reader and array projection. No expression/name/environment access.
-use arrow_array::builder::BinaryBuilder;
+use crate::KernelFailure;
+use crate::aggregate_scalar::BinaryResultBuilder;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
@@ -170,14 +171,14 @@ impl<'a> Input<'a> {
         }
     }
 }
-pub fn array(input: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn array(input: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
     // Preserve original output builder creation before the type admission.
-    let mut builder = BinaryBuilder::new();
-    let reader = Input::try_new(input).map_err(|failure| failure.to_string())?;
+    let mut builder = BinaryResultBuilder::new();
+    let reader = Input::try_new(input).map_err(UnsupportedCarrier::into_failure)?;
     for row in 0..input.len() {
-        builder.append_value(reader.row(row));
+        builder.append_value(reader.row(row))?;
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    Ok(Arc::new(builder.finish()?) as ArrayRef)
 }
 
 #[cfg(test)]
@@ -217,9 +218,15 @@ mod tests {
     fn hll_hash_original_core_admission_before_empty() {
         for n in [0, 1] {
             let a = Arc::new(NullArray::new(n)) as ArrayRef;
+            let error = array(&a).unwrap_err();
             assert_eq!(
-                array(&a).unwrap_err(),
-                "hll_hash expects scalar input, got Null"
+                novarocks_failure_contract::FailureProjection::failure_fact(&error).class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("hll_hash expects scalar input, got Null")
             );
         }
     }
@@ -238,3 +245,30 @@ mod tests {
         assert!(calls > 100);
     }
 }
+
+impl UnsupportedCarrier<'_> {
+    /// The owned refusal retains a bounded diagnostic, never the Arrow schema graph.
+    pub fn into_failure(self) -> KernelFailure {
+        KernelFailure::from_domain(HllHashCarrierFailure(
+            novarocks_failure_contract::BoundedDetail::truncating_display(self),
+        ))
+    }
+}
+#[derive(Debug)]
+struct HllHashCarrierFailure(novarocks_failure_contract::BoundedDetail);
+impl fmt::Display for HllHashCarrierFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for HllHashCarrierFailure {}
+impl novarocks_failure_contract::FailureProjection for HllHashCarrierFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(390).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for HllHashCarrierFailure {}

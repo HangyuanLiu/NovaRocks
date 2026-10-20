@@ -34,6 +34,7 @@ pub(super) enum BuildError {
     Constant(novarocks_functions::ConstantError),
     Copy(novarocks_functions::selected_copy::CopyError),
     Kernel(novarocks_functions::KernelFailure),
+    ArrayProjection(novarocks_functions::array_projection::ArrayProjectionFailure),
     Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     ValueType(novarocks_type_contract::ExecutionValueTypeError),
     InvalidSource(&'static str),
@@ -51,6 +52,7 @@ impl fmt::Display for BuildError {
             Self::Constant(error) => error.fmt(f),
             Self::Copy(error) => error.fmt(f),
             Self::Kernel(error) => error.fmt(f),
+            Self::ArrayProjection(error) => error.fmt(f),
             Self::Layout(error) => write!(f, "COW construction layout: {error:?}"),
             Self::ValueType(error) => error.fmt(f),
             Self::InvalidSource(reason) => f.write_str(reason),
@@ -68,6 +70,7 @@ impl std::error::Error for BuildError {
             Self::Constant(error) => Some(error),
             Self::Copy(error) => Some(error),
             Self::Kernel(error) => Some(error),
+            Self::ArrayProjection(error) => Some(error),
             Self::ValueType(error) => Some(error),
             _ => None,
         }
@@ -76,6 +79,11 @@ impl std::error::Error for BuildError {
 impl From<String> for BuildError {
     fn from(value: String) -> Self {
         Self::OriginalSemantic(value)
+    }
+}
+impl From<novarocks_functions::array_projection::ArrayProjectionFailure> for BuildError {
+    fn from(error: novarocks_functions::array_projection::ArrayProjectionFailure) -> Self {
+        Self::ArrayProjection(error)
     }
 }
 impl From<novarocks_functions::KernelFailure> for BuildError {

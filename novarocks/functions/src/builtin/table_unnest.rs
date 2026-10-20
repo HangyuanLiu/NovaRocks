@@ -104,12 +104,7 @@ fn finish<T>(
     work: EvaluationCheckpoints<'_>,
     result: Result<T, KernelFailure>,
 ) -> Result<T, KernelFailure> {
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
+    if result.as_ref().is_err_and(KernelFailure::is_interruption) {
         return result;
     }
     work.finish()?;
@@ -250,18 +245,7 @@ impl Cursor<'_> {
             );
             match preflight {
                 Ok(()) => work.flush()?,
-                Err(crate::selected_copy::CopyError::Control(cause)) => return Err(cause),
-                Err(crate::selected_copy::CopyError::Extent) => {
-                    return Err(KernelFailure::ResourceExhausted);
-                }
-                Err(crate::selected_copy::CopyError::Invalid(message)) => {
-                    work.flush()?;
-                    return Err(invalid(message));
-                }
-                Err(crate::selected_copy::CopyError::Unsupported(_)) => {
-                    work.flush()?;
-                    return Err(invalid("UNNEST selected child copy carrier is unsupported"));
-                }
+                Err(source) => return Err(source.into_kernel()),
             }
             work.flush()?;
             let data = list.values().to_data();

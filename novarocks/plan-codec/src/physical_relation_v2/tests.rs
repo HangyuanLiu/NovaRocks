@@ -54,7 +54,7 @@ impl PureCompileControl for Control {
         assert!(u <= 256);
         let mut t = self.trace.lock().unwrap();
         let at = t.len();
-        let s = *self.stop.lock().unwrap();
+        let s = self.stop.lock().unwrap().clone();
         if let Some((s, _)) = s {
             assert!(at <= s, "callback after refusal");
         }
@@ -670,7 +670,7 @@ fn run(
                 v.kind.clear();
             }
             let defs = [raw];
-            c.arm(stop);
+            c.arm(stop.clone());
             decode_relations(&defs, &rs, &ts, SOURCE, limits()).map(|_| ())
         } else {
             let ids = if bad {
@@ -679,7 +679,7 @@ fn run(
                 [0, u32::MAX, 42]
             };
             let input = inputs(sources, &ids);
-            c.arm(stop);
+            c.arm(stop.clone());
             encode_relations(&input, reads, types, SOURCE, limits()).map(|_| ())
         }
     })
@@ -697,8 +697,8 @@ fn relation_namespace_success_ordinary_and_native_kind_failure_every_actual_call
             for at in 0..positive.len() {
                 for cause in CAUSES {
                     let refusal = Control::default();
-                    let r = run(&refusal, Some((at, cause)), decode, bad);
-                    assert!(matches!(r,Err(Error::Control(c)) if c==cause), "{r:?}");
+                    let r = run(&refusal, Some((at, cause.clone())), decode, bad);
+                    assert!(matches!(&r,Err(Error::Control(c)) if c==&cause), "{r:?}");
                     assert_eq!(trace(&refusal), positive[..=at]);
                 }
             }
@@ -725,7 +725,7 @@ fn relation_namespace_real_occurrences_cross_quantum_preserve_sparse_layout_with
         let positive = trace(&c);
         let at = positive.iter().position(|(_,u)| *u==256).expect("real relation operations quantum");
         for cause in CAUSES {
-            c.arm(Some((at,cause)));
+            c.arm(Some((at,cause.clone())));
             assert!(matches!(encode_relations(&input, reads, types, SOURCE, limits()), Err(Error::Control(c)) if c==cause));
             assert_eq!(trace(&c), positive[..=at]);
         }
@@ -740,7 +740,7 @@ fn relation_namespace_real_occurrences_cross_quantum_preserve_sparse_layout_with
         let positive = trace(&c);
         let at = positive.iter().position(|(_,u)| *u==256).expect("real receiving guarantee quantum");
         for cause in CAUSES {
-            c.arm(Some((at,cause)));
+            c.arm(Some((at,cause.clone())));
             assert!(matches!(decode_relations(encoded.as_wire(), &rs, &ts, SOURCE, limits()), Err(Error::Control(c)) if c==cause));
             assert_eq!(trace(&c), positive[..=at]);
         }

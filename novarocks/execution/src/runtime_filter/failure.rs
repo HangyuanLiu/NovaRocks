@@ -30,6 +30,7 @@ use std::{error::Error, fmt};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterFailure {
     Contract(RuntimeFilterContractViolation),
+    Schema(novarocks_local_program::FilterMembershipSchemaError),
     Boundary(AggregateTopNBoundaryError),
     Tuple(OrderedTupleError),
     Codec(ContributionCodecError),
@@ -38,6 +39,7 @@ impl RuntimeFilterFailure {
     pub fn detail(&self) -> &str {
         match self {
             Self::Contract(cause) => cause.detail(),
+            Self::Schema(cause) => cause.detail(),
             Self::Boundary(AggregateTopNBoundaryError::InvalidCandidateValue(detail)) => detail,
             Self::Boundary(_) => "aggregate TopN runtime filter boundary failed",
             Self::Tuple(_) => "runtime filter order tuple failed",
@@ -49,6 +51,7 @@ impl fmt::Display for RuntimeFilterFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Contract(cause) => cause.fmt(f),
+            Self::Schema(cause) => cause.fmt(f),
             Self::Boundary(cause) => cause.fmt(f),
             Self::Tuple(cause) => cause.fmt(f),
             Self::Codec(cause) => cause.fmt(f),
@@ -59,6 +62,7 @@ impl Error for RuntimeFilterFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(match self {
             Self::Contract(cause) => cause,
+            Self::Schema(cause) => cause,
             Self::Boundary(cause) => cause,
             Self::Tuple(cause) => cause,
             Self::Codec(cause) => cause,
@@ -80,6 +84,7 @@ macro_rules! raw_cause {
     };
 }
 raw_cause!(RuntimeFilterContractViolation, Contract);
+raw_cause!(novarocks_local_program::FilterMembershipSchemaError, Schema);
 raw_cause!(AggregateTopNBoundaryError, Boundary);
 raw_cause!(OrderedTupleError, Tuple);
 raw_cause!(ContributionCodecError, Codec);
@@ -105,6 +110,18 @@ impl From<ControlledContributionCodecError> for ExecutionFailure {
         match cause {
             ControlledContributionCodecError::Codec(cause) => cause.into(),
             ControlledContributionCodecError::Kernel(cause) => cause.into(),
+        }
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for RuntimeFilterFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Contract(cause) => cause.failure_fact(),
+            Self::Schema(cause) => cause.failure_fact(),
+            Self::Boundary(cause) => cause.failure_fact(),
+            Self::Tuple(cause) => cause.failure_fact(),
+            Self::Codec(cause) => cause.failure_fact(),
         }
     }
 }

@@ -41,7 +41,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         if let Some((stop, _)) = stop {
@@ -361,7 +361,7 @@ fn sql_selected_port_preserves_every_original_compile_failure_prefix() {
     assert!(!trace.is_empty());
     for at in 0..trace.len() {
         for cause in CAUSES {
-            control.reset(Some((at, cause)));
+            control.reset(Some((at, cause.clone())));
             let direct = EngineFunctionCatalog::prepare_fresh_selected(
                 &catalog,
                 call,
@@ -370,9 +370,9 @@ fn sql_selected_port_preserves_every_original_compile_failure_prefix() {
                 &control,
             )
             .unwrap_err();
-            assert_original_cause(&direct, cause);
+            assert_original_cause(&direct, cause.clone());
             assert_eq!(control.trace(), trace[..=at]);
-            control.reset(Some((at, cause)));
+            control.reset(Some((at, cause.clone())));
             let projected = snapshot
                 .prepare_fresh_selected(call, selected.clone(), options(), &control)
                 .unwrap_err();
@@ -418,12 +418,35 @@ fn sql_missing_selected_implementation_keeps_ordinary_tail_and_every_control_pre
         direct,
         FunctionSpecializationFailure::MissingPureImplementation(_)
     ));
-    // Keep the original dispatcher's completed attachment lookup on an
-    // ordinary missing-owner exit, rather than appending an adapter tail.
+    // Missing ownership is already an authored error. A later optional
+    // checkpoint must not replace that exact selected-overload refusal.
     assert_eq!(
-        trace.last(),
-        Some(&(CompilePhase::FunctionSpecialization, 1))
+        trace.first(),
+        Some(&(CompilePhase::FunctionSpecialization, 0))
     );
+    for cause in CAUSES {
+        control.reset(Some((trace.len(), cause.clone())));
+        let original = EngineFunctionCatalog::prepare_fresh_selected(
+            &catalog,
+            call,
+            selected.clone(),
+            options(),
+            &control,
+        )
+        .unwrap_err();
+        assert!(matches!(original,
+            FunctionSpecializationFailure::MissingPureImplementation(ref id)
+                if id == &selected.overload));
+        assert_eq!(control.trace(), trace);
+        control.reset(Some((trace.len(), cause)));
+        let original = snapshot
+            .prepare_fresh_selected(call, selected.clone(), options(), &control)
+            .unwrap_err();
+        assert!(matches!(original,
+            FunctionSpecializationFailure::MissingPureImplementation(ref id)
+                if id == &selected.overload));
+        assert_eq!(control.trace(), trace);
+    }
     control.reset(None);
     let projected = snapshot
         .prepare_fresh_selected(call, selected.clone(), options(), &control)
@@ -432,7 +455,7 @@ fn sql_missing_selected_implementation_keeps_ordinary_tail_and_every_control_pre
     assert_eq!(control.trace(), trace);
     for at in 0..trace.len() {
         for cause in CAUSES {
-            control.reset(Some((at, cause)));
+            control.reset(Some((at, cause.clone())));
             let direct = EngineFunctionCatalog::prepare_fresh_selected(
                 &catalog,
                 call,
@@ -441,9 +464,9 @@ fn sql_missing_selected_implementation_keeps_ordinary_tail_and_every_control_pre
                 &control,
             )
             .unwrap_err();
-            assert_original_cause(&direct, cause);
+            assert_original_cause(&direct, cause.clone());
             assert_eq!(control.trace(), trace[..=at]);
-            control.reset(Some((at, cause)));
+            control.reset(Some((at, cause.clone())));
             let projected = snapshot
                 .prepare_fresh_selected(call, selected.clone(), options(), &control)
                 .unwrap_err();
@@ -517,7 +540,7 @@ fn sql_declaration_only_snapshot_refuses_without_fabricating_effects() {
     ));
     assert_eq!(control.trace(), [(CompilePhase::FunctionSpecialization, 0)]);
     for cause in CAUSES {
-        control.reset(Some((0, cause)));
+        control.reset(Some((0, cause.clone())));
         assert!(
             matches!(DeclarationOnly.snapshot().prepare_fresh_selected(call, selected.clone(), options(), &control), Err(FunctionSpecializationFailure::Control(actual)) if actual == cause)
         );

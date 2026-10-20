@@ -389,19 +389,87 @@ impl RoundSplitAssignment {
         }
     }
 
-    /// Idempotent. Closes the driver and every source exactly once.
-    pub(crate) fn close(&mut self) {
+    /// Close every source once, isolating each provider hook. Normal domain
+    /// errors are facts; only the outer original job proves physical exit.
+    fn close_sources(
+        &mut self,
+        collect_profile: bool,
+    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
         if self.closed {
-            return;
+            return Ok(SplitSourceProfile::default());
         }
         self.closed = true;
         self.stop.stop();
         self.driver.close();
+        let mut total = SplitSourceProfile::default();
+        let mut first_error = None;
         for entry in self.sources.iter_mut().flatten() {
-            // An in-flight source is moved out of this collection. The serial
-            // pump adopts it before normal close, while an abandoned owner
-            // sends it through the separate protected reaper.
-            let _ = entry.source.close();
+            if collect_profile {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    entry.source.profile_snapshot()
+                })) {
+                    Ok(profile) => {
+                        total.files_considered = total
+                            .files_considered
+                            .saturating_add(profile.files_considered);
+                        total.files_pruned =
+                            total.files_pruned.saturating_add(profile.files_pruned);
+                        total.files_expanded =
+                            total.files_expanded.saturating_add(profile.files_expanded);
+                        total.splits_emitted =
+                            total.splits_emitted.saturating_add(profile.splits_emitted);
+                    }
+                    Err(payload) => {
+                        first_error.get_or_insert_with(|| {
+                            source_close_panic(entry.scan, SourceClosePanic::Profile)
+                        });
+                        // This runs on the same original blocking job. A real
+                        // payload destructor panic escapes to its existing
+                        // supervisor and cannot mint the normal join proof.
+                        drop(payload);
+                    }
+                }
+            }
+            // SupervisedSplitSource sets its once-close flag before entering
+            // the provider. Its Drop will never rerun this interrupted hook.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.source.close())) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert_with(|| SplitAssignmentDriverError::SourceClose {
+                        scan: entry.scan,
+                        fact: error.failure_fact(),
+                        detail: SafeDetail::truncating("closing the connector split source failed"),
+                    });
+                    // Preserve only neutral facts across the thread boundary;
+                    // the original error and any captured owners retire here.
+                    drop(error);
+                }
+                Err(payload) => {
+                    first_error.get_or_insert_with(|| {
+                        source_close_panic(entry.scan, SourceClosePanic::Close)
+                    });
+                    drop(payload);
+                }
+            }
+        }
+        first_error.map_or(Ok(total), Err)
+    }
+
+    /// Consumes the original assignment so its actual sources, transport and
+    /// captures have all retired before this original blocking job returns.
+    pub(crate) fn close_with_profile(
+        mut self,
+    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
+        let result = self.close_sources(true);
+        drop(self);
+        result
+    }
+
+    /// Idempotent fallback for owners that have not reached serial close.
+    pub(crate) fn close(&mut self) {
+        if let Err(error) = self.close_sources(false) {
+            tracing::warn!(error = %error, "closing the original split assignment failed");
         }
     }
 }
@@ -584,5 +652,45 @@ mod tests {
         assignment.close();
 
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceClosePanic {
+    Profile,
+    Close,
+}
+impl novarocks_execution_contract::failure::FailureProjection for SourceClosePanic {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        FailureFact::new(
+            FailureClass::Unexpected,
+            FailureReason::new(
+                domain::QUERY,
+                std::num::NonZeroU16::new(match self {
+                    Self::Profile => 180,
+                    Self::Close => 181,
+                })
+                .unwrap(),
+            ),
+        )
+    }
+}
+fn source_close_panic(
+    scan: super::ScanNodeKey,
+    cause: SourceClosePanic,
+) -> SplitAssignmentDriverError {
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    SplitAssignmentDriverError::SourceClose {
+        scan,
+        fact: cause.failure_fact(),
+        detail: SafeDetail::truncating(match cause {
+            SourceClosePanic::Profile => {
+                "the connector split source profile hook panicked during close"
+            }
+            SourceClosePanic::Close => "the connector split source close hook panicked",
+        }),
     }
 }

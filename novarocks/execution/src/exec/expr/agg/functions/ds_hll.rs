@@ -32,19 +32,94 @@ use crate::runtime::mem_tracker::MemTracker;
 use super::super::*;
 use super::AggregateFunction;
 
-#[cfg(test)]
-const DEFAULT_LOG_K: u8 = 17;
-#[cfg(test)]
-const DEFAULT_TARGET_TYPE: HllTargetType = HllTargetType::Hll6;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use novarocks_functions::builtin::aggregate_ds_hll_core::{DEFAULT_LOG_K, DEFAULT_TARGET_TYPE};
+use novarocks_functions::builtin::aggregate_ds_hll_failure::{
+    DsHllFailureSink, DsHllInputContext, DsHllInputDetail, DsHllInputRecipe,
+};
+use novarocks_functions::builtin::{
+    aggregate_ds_hll_core as core, aggregate_ds_hll_state as state_core,
+};
+use novarocks_functions::datasketches_hll_failure::{
+    HllFailureRecipe, HllFailureSink, HllInvariantRecipe, HllObservation,
+};
+
+#[derive(Debug)]
+enum NativeDsHllContract {
+    MissingStateAllocator,
+    UnexpectedKind(novarocks_failure_contract::BoundedDetail),
+}
+impl std::fmt::Display for NativeDsHllContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingStateAllocator => {
+                f.write_str("DS HLL operation has no exact state allocator")
+            }
+            Self::UnexpectedKind(kind) => {
+                write!(f, "unexpected DS HLL aggregate kind: {}", kind.as_str())
+            }
+        }
+    }
+}
+impl std::error::Error for NativeDsHllContract {}
+impl novarocks_failure_contract::FailureProjection for NativeDsHllContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            match self {
+                Self::MissingStateAllocator => ExecutionReason::DsHllStateAllocator,
+                Self::UnexpectedKind(_) => ExecutionReason::DsHllAggregateKind,
+            }
+            .reason(),
+        )
+    }
+}
+struct NativeDsHllSink {
+    allocator: Option<AggregateAllocator>,
+}
+impl NativeDsHllSink {
+    fn new(allocator: Option<AggregateAllocator>) -> Self {
+        Self { allocator }
+    }
+}
+impl HllFailureSink for NativeDsHllSink {
+    type Error = ExecutionFailure;
+    fn failure(&mut self, source: HllFailureRecipe) -> ExecutionFailure {
+        ExecutionFailure::from_domain(source)
+    }
+    fn invariant(&mut self, source: HllInvariantRecipe) -> ExecutionFailure {
+        ExecutionFailure::from_domain(source)
+    }
+    fn observe(&mut self, _: HllObservation) -> ExecutionResult<()> {
+        Ok(())
+    }
+}
+impl DsHllFailureSink for NativeDsHllSink {
+    type Temporary = super::super::allocation::AggregateTransientReservation;
+    fn kernel(&mut self, cause: novarocks_functions::KernelFailure) -> ExecutionFailure {
+        cause.into()
+    }
+    fn reserve_temporary(&mut self, bytes: usize) -> ExecutionResult<Self::Temporary> {
+        self.allocator
+            .as_ref()
+            .ok_or_else(|| {
+                ExecutionFailure::from_domain(NativeDsHllContract::MissingStateAllocator)
+            })?
+            .reserve_transient(bytes, "reserve DS HLL temporary value")
+            .map_err(Into::into)
+    }
+    fn input(&mut self, recipe: DsHllInputRecipe<'_>) -> ExecutionFailure {
+        ExecutionFailure::from_domain(recipe.into_failure())
+    }
+}
 
 pub(super) struct DsHllAgg;
-
 struct DsHllState {
+    // The actual sketch backing is destroyed before its retained charge.
     handle: Option<HllHandle>,
     retained_charge: AggregateRetainedCharge,
     allocator: AggregateAllocator,
 }
-
 impl DsHllState {
     fn new(tracker: Arc<MemTracker>) -> Self {
         let allocator = AggregateAllocator::new(tracker);
@@ -54,50 +129,49 @@ impl DsHllState {
             allocator,
         }
     }
-
+    #[cfg(test)]
     fn ensure_handle(
         &mut self,
         log_k: u8,
         target: HllTargetType,
-    ) -> Result<&mut HllHandle, String> {
-        novarocks_functions::builtin::aggregate_ds_hll_state::ensure_handle(
+    ) -> ExecutionResult<&mut HllHandle> {
+        state_core::ensure_handle(
             &mut self.handle,
             &mut self.retained_charge,
             log_k,
             target,
-            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+            &mut NativeDsHllSink::new(Some(self.allocator.clone())),
         )
     }
-    fn ensure_handle_from_payload(&mut self, payload: &[u8]) -> Result<&mut HllHandle, String> {
-        novarocks_functions::builtin::aggregate_ds_hll_state::ensure_handle_from_payload(
+    #[cfg(test)]
+    fn ensure_handle_from_payload(&mut self, payload: &[u8]) -> ExecutionResult<&mut HllHandle> {
+        state_core::ensure_handle_from_payload(
             &mut self.handle,
             &mut self.retained_charge,
             payload,
-            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+            &mut NativeDsHllSink::new(Some(self.allocator.clone())),
         )
     }
-    fn update_hash(&mut self, hash: u64) -> Result<(), String> {
-        novarocks_functions::builtin::aggregate_ds_hll_state::update_hash(
+    #[cfg(test)]
+    fn update_hash(&mut self, hash: u64) -> ExecutionResult<()> {
+        state_core::update_hash(
             &mut self.handle,
             &mut self.retained_charge,
             hash,
-            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+            &mut NativeDsHllSink::new(Some(self.allocator.clone())),
         )
     }
-    fn merge_payload(&mut self, payload: &[u8]) -> Result<(), String> {
-        novarocks_functions::builtin::aggregate_ds_hll_state::merge_payload(
+    #[cfg(test)]
+    fn merge_payload(&mut self, payload: &[u8]) -> ExecutionResult<()> {
+        state_core::merge_payload(
             &mut self.handle,
             &mut self.retained_charge,
             payload,
-            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+            &mut NativeDsHllSink::new(Some(self.allocator.clone())),
         )
     }
 }
-impl
-    novarocks_functions::builtin::aggregate_ds_hll_state::DsHllRetainedPort<
-        novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
-    > for AggregateRetainedCharge
-{
+impl state_core::DsHllRetainedPort<NativeDsHllSink> for AggregateRetainedCharge {
     type Reservation = super::super::allocation::AggregateTransientReservation;
     fn payload_error_headroom(
         &self,
@@ -108,30 +182,29 @@ impl
     fn reserve(
         &self,
         bytes: usize,
-        operation: novarocks_functions::builtin::aggregate_ds_hll_state::DsHllRetainedOperation,
-        _: &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
-    ) -> Result<Self::Reservation, String> {
+        operation: state_core::DsHllRetainedOperation,
+        _: &mut NativeDsHllSink,
+    ) -> ExecutionResult<Self::Reservation> {
         self.reserve_operation(bytes, operation.label())
+            .map_err(Into::into)
     }
     fn reconcile(
         &mut self,
         bytes: usize,
         reservation: &mut Self::Reservation,
-        _: &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
-    ) -> Result<(), String> {
+        _: &mut NativeDsHllSink,
+    ) -> ExecutionResult<()> {
         self.reconcile_under_reservation(bytes, reservation)
+            .map_err(Into::into)
     }
 }
-
 unsafe fn get_state<'a>(ptr: *const u8) -> &'a DsHllState {
     unsafe { &*(ptr as *const DsHllState) }
 }
-
 unsafe fn get_state_mut<'a>(ptr: *mut u8) -> &'a mut DsHllState {
     unsafe { &mut *(ptr as *mut DsHllState) }
 }
-
-impl novarocks_functions::builtin::aggregate_ds_hll_core::DsHllStorage for DsHllState {
+impl core::TypedDsHllStorage<NativeDsHllSink> for DsHllState {
     type Allocator = AggregateAllocator;
     fn allocator(&self) -> AggregateAllocator {
         self.allocator.clone()
@@ -139,42 +212,142 @@ impl novarocks_functions::builtin::aggregate_ds_hll_core::DsHllStorage for DsHll
     fn handle(&self) -> Option<&HllHandle> {
         self.handle.as_ref()
     }
-    fn ensure_handle(&mut self, log_k: u8, target: HllTargetType) -> Result<(), String> {
-        DsHllState::ensure_handle(self, log_k, target).map(|_| ())
+    fn ensure_handle(
+        &mut self,
+        log_k: u8,
+        target: HllTargetType,
+        sink: &mut NativeDsHllSink,
+    ) -> ExecutionResult<()> {
+        state_core::ensure_handle(
+            &mut self.handle,
+            &mut self.retained_charge,
+            log_k,
+            target,
+            sink,
+        )
+        .map(|_| ())
     }
-    fn update_hash(&mut self, hash: u64) -> Result<(), String> {
-        DsHllState::update_hash(self, hash)
+    fn update_hash(&mut self, hash: u64, sink: &mut NativeDsHllSink) -> ExecutionResult<()> {
+        state_core::update_hash(&mut self.handle, &mut self.retained_charge, hash, sink)
     }
-    fn merge_payload(&mut self, payload: &[u8]) -> Result<(), String> {
-        DsHllState::merge_payload(self, payload)
+    fn merge_payload(&mut self, payload: &[u8], sink: &mut NativeDsHllSink) -> ExecutionResult<()> {
+        state_core::merge_payload(&mut self.handle, &mut self.retained_charge, payload, sink)
     }
 }
 struct StateAccess<'a> {
     offset: usize,
     pointers: &'a [AggStatePtr],
 }
-impl novarocks_functions::builtin::aggregate_ds_hll_core::DsHllStateAccess for StateAccess<'_> {
+impl StateAccess<'_> {
+    fn allocator(&self) -> Option<AggregateAllocator> {
+        self.pointers.first().map(|base| {
+            unsafe { get_state((*base as *const u8).add(self.offset)) }
+                .allocator
+                .clone()
+        })
+    }
+}
+impl core::TypedDsHllStateAccess<NativeDsHllSink> for StateAccess<'_> {
     type State = DsHllState;
     fn len(&self) -> usize {
         self.pointers.len()
+    }
+    fn source_row(&self, ordinal: usize) -> usize {
+        ordinal
     }
     fn with_state<T>(
         &mut self,
         ordinal: usize,
-        visit: impl FnOnce(&mut DsHllState) -> Result<T, String>,
-    ) -> Result<T, String> {
+        visit: impl FnOnce(&mut DsHllState) -> ExecutionResult<T>,
+    ) -> ExecutionResult<T> {
         let ptr = unsafe { (self.pointers[ordinal] as *mut u8).add(self.offset) };
         visit(unsafe { get_state_mut(ptr) })
     }
 }
-impl novarocks_functions::builtin::aggregate_ds_hll_core::DsHllStateReadAccess for StateAccess<'_> {
-    type State = DsHllState;
+impl core::DsHllEmissionStates for StateAccess<'_> {
     fn len(&self) -> usize {
         self.pointers.len()
     }
-    fn state(&self, ordinal: usize) -> &DsHllState {
-        let ptr = unsafe { (self.pointers[ordinal] as *const u8).add(self.offset) };
-        unsafe { get_state(ptr) }
+    fn handle(&self, ordinal: usize) -> Option<&HllHandle> {
+        unsafe { get_state((self.pointers[ordinal] as *const u8).add(self.offset)) }
+            .handle
+            .as_ref()
+    }
+}
+struct NativeHllPayload {
+    // Preserve backing-before-charge destruction for each serialized payload.
+    bytes: Vec<u8>,
+    charge: AggregateRetainedCharge,
+}
+impl AsRef<[u8]> for NativeHllPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+struct NativeHllEmission {
+    allocator: AggregateAllocator,
+}
+impl NativeHllEmission {
+    fn payload(
+        &mut self,
+        handle: &HllHandle,
+        sink: &mut NativeDsHllSink,
+    ) -> ExecutionResult<NativeHllPayload> {
+        let preflight = handle.serialization_allocation_preflight_observed(&mut || {
+            sink.observe(HllObservation::Step)
+        })?;
+        let mut charge = AggregateRetainedCharge::new(self.allocator.clone());
+        let mut lease = charge.reserve_operation(
+            preflight.bounds().additional_headroom_bytes,
+            "reserve DS HLL serialization",
+        )?;
+        let bytes = handle.serialize_under_reservation_with_failure(&preflight, &lease, sink)?;
+        charge.reconcile_under_reservation(bytes.capacity(), &mut lease)?;
+        Ok(NativeHllPayload { bytes, charge })
+    }
+}
+impl core::DsHllEmissionPort<NativeDsHllSink> for NativeHllEmission {
+    type Payload = NativeHllPayload;
+    fn empty_payload(&mut self, sink: &mut NativeDsHllSink) -> ExecutionResult<NativeHllPayload> {
+        let mut state = DsHllState {
+            handle: None,
+            retained_charge: AggregateRetainedCharge::new(self.allocator.clone()),
+            allocator: self.allocator.clone(),
+        };
+        state_core::ensure_handle(
+            &mut state.handle,
+            &mut state.retained_charge,
+            DEFAULT_LOG_K,
+            DEFAULT_TARGET_TYPE,
+            sink,
+        )?;
+        self.payload(state.handle.as_ref().expect("DS HLL initialized"), sink)
+    }
+    fn serialize(
+        &mut self,
+        handle: &HllHandle,
+        sink: &mut NativeDsHllSink,
+    ) -> ExecutionResult<NativeHllPayload> {
+        self.payload(handle, sink)
+    }
+    fn clone_empty(
+        &mut self,
+        empty: &NativeHllPayload,
+        _: &mut NativeDsHllSink,
+    ) -> ExecutionResult<NativeHllPayload> {
+        let mut charge = AggregateRetainedCharge::new(self.allocator.clone());
+        let mut lease =
+            charge.reserve_operation(empty.bytes.len(), "reserve DS HLL empty payload copy")?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(empty.bytes.len())
+            .map_err(|source| {
+                self.allocator
+                    .allocation_error("copy DS HLL empty payload", source)
+            })?;
+        bytes.extend_from_slice(&empty.bytes);
+        charge.reconcile_under_reservation(bytes.capacity(), &mut lease)?;
+        Ok(NativeHllPayload { bytes, charge })
     }
 }
 
@@ -184,9 +357,13 @@ impl AggregateFunction for DsHllAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         let Some(_input_type) = input_type else {
-            return Err("ds_hll expects input".to_string());
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "ds_hll expects input",
+                ),
+            );
         };
 
         let fe_output_is_binary = func
@@ -208,7 +385,14 @@ impl AggregateFunction for DsHllAgg {
             "ds_hll_count_distinct_merge"
             | "ds_hll_count_distinct"
             | "approx_count_distinct_hll_sketch" => AggKind::DsHllCount,
-            other => return Err(format!("unsupported ds_hll aggregate function: {}", other)),
+            other => {
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "unsupported ds_hll aggregate function: {}",
+                        other
+                    )),
+                );
+            }
         };
 
         Ok(AggSpec {
@@ -237,10 +421,10 @@ impl AggregateFunction for DsHllAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "ds_hll input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("ds_hll input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -248,10 +432,10 @@ impl AggregateFunction for DsHllAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "ds_hll merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("ds_hll merge input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -264,9 +448,11 @@ impl AggregateFunction for DsHllAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked ds_hll requires an aggregate memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked ds_hll requires an aggregate memory tracker",
+            )
         })?;
         unsafe {
             std::ptr::write(ptr as *mut DsHllState, DsHllState::new(tracker));
@@ -294,19 +480,18 @@ impl AggregateFunction for DsHllAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("ds_hll input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "ds_hll input type mismatch",
+            ));
         };
-        if novarocks_functions::builtin::aggregate_ds_hll_core::update_struct_if_present(
-            array,
-            &mut StateAccess {
-                offset,
-                pointers: state_ptrs,
-            },
-        )?
-        .is_some()
-        {
+        let mut access = StateAccess {
+            offset,
+            pointers: state_ptrs,
+        };
+        let mut sink = NativeDsHllSink::new(access.allocator());
+        if core::update_struct_if_present_with_sink(array, &mut access, &mut sink)?.is_some() {
             return Ok(());
         }
         let mode = match &spec.kind {
@@ -319,16 +504,17 @@ impl AggregateFunction for DsHllAgg {
             AggKind::DsHllCount => {
                 novarocks_functions::builtin::aggregate_ds_hll_core::DsHllUpdateMode::Count
             }
-            other => return Err(format!("unexpected ds_hll aggregate kind: {:?}", other)),
+            other => {
+                return Err(ExecutionFailure::from_domain(
+                    NativeDsHllContract::UnexpectedKind(
+                        novarocks_failure_contract::BoundedDetail::truncating_display(
+                            format_args!("{other:?}"),
+                        ),
+                    ),
+                ));
+            }
         };
-        novarocks_functions::builtin::aggregate_ds_hll_core::update_nonstruct_batch(
-            mode,
-            array,
-            &mut StateAccess {
-                offset,
-                pointers: state_ptrs,
-            },
-        )
+        core::update_nonstruct_batch_with_sink(mode, array, &mut access, &mut sink)
     }
 
     fn merge_batch(
@@ -337,18 +523,18 @@ impl AggregateFunction for DsHllAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("ds_hll merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "ds_hll merge input type mismatch",
+            ));
         };
-        novarocks_functions::builtin::aggregate_ds_hll_core::merge_batch(
-            array,
-            &mut StateAccess {
-                offset,
-                pointers: state_ptrs,
-            },
-            "ds_hll_merge",
-        )
+        let mut access = StateAccess {
+            offset,
+            pointers: state_ptrs,
+        };
+        let mut sink = NativeDsHllSink::new(access.allocator());
+        core::merge_batch_with_sink(array, &mut access, DsHllInputContext::Merge, &mut sink)
     }
 
     fn build_array(
@@ -357,19 +543,40 @@ impl AggregateFunction for DsHllAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let output_type = if output_intermediate {
             &spec.intermediate_type
         } else {
             &spec.output_type
         };
 
-        novarocks_functions::builtin::aggregate_ds_hll_core::build_array(
+        let access = StateAccess {
+            offset,
+            pointers: group_states,
+        };
+        if group_states.is_empty() {
+            return match output_type {
+                DataType::Binary | DataType::Int64 => {
+                    Ok(arrow::array::new_empty_array(output_type))
+                }
+                other => Err(ExecutionFailure::from_domain(
+                    DsHllInputRecipe {
+                        context: DsHllInputContext::Merge,
+                        detail: DsHllInputDetail::Output(other),
+                    }
+                    .into_failure(),
+                )),
+            };
+        }
+        let allocator = access.allocator().ok_or_else(|| {
+            ExecutionFailure::from_domain(NativeDsHllContract::MissingStateAllocator)
+        })?;
+        let mut sink = NativeDsHllSink::new(Some(allocator.clone()));
+        core::build_array_with_sink(
             output_type,
-            &StateAccess {
-                offset,
-                pointers: group_states,
-            },
+            &access,
+            &mut NativeHllEmission { allocator },
+            &mut sink,
         )
     }
 }
@@ -418,7 +625,8 @@ mod tests {
             .expect("install exact current limit");
 
         let error = state.update_hash(7).expect_err("dense allocation rejected");
-        assert!(error.contains("ResourceExhausted"));
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
         assert_eq!(tracker.current(), state.retained_charge.bytes() as i64);
         assert_eq!(
             state
@@ -430,6 +638,92 @@ mod tests {
             before_estimate
         );
     }
+
+    #[test]
+    fn serialized_payload_keeps_its_backing_charge_and_refuses_copy_before_mutation() {
+        use super::core::DsHllEmissionPort;
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        let tracker = MemTracker::new_root("DS HLL serialized payload source");
+        let weak = Arc::downgrade(&tracker);
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut sink = NativeDsHllSink::new(Some(allocator.clone()));
+        let mut emission = NativeHllEmission { allocator };
+        let payload = emission.empty_payload(&mut sink).unwrap();
+        let retained = tracker.current();
+        assert_eq!(
+            retained,
+            payload.bytes.capacity() as i64,
+            "temporary handle and scratch have exited while payload remains live"
+        );
+        assert_eq!(payload.charge.bytes(), payload.bytes.capacity());
+        let original = payload.bytes.clone();
+        tracker.install_limit_once(retained).unwrap();
+        let error = match emission.clone_empty(&payload, &mut sink) {
+            Err(error) => error,
+            Ok(_) => panic!("copy must be admitted before allocating or publishing payload"),
+        };
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().domain(), domain::MEMORY.get());
+        assert_eq!(fact.reason().code(), 8);
+        let resource = fact.resource().unwrap();
+        assert_eq!(resource.requested, Some(payload.bytes.len() as u64));
+        assert_eq!(resource.limit, Some(retained as u64));
+        assert_eq!(
+            resource.committed,
+            Some(retained as u64 + payload.bytes.len() as u64)
+        );
+        assert_eq!(payload.bytes, original);
+        assert_eq!(tracker.current(), retained);
+        drop(payload);
+        assert_eq!(tracker.current(), 0);
+        drop(emission);
+        drop(sink);
+        drop(tracker);
+        assert!(
+            weak.upgrade().is_none(),
+            "the retained cause owns no tracker"
+        );
+        assert_eq!(error.failure_fact(), fact);
+    }
+
+    #[test]
+    fn malformed_payload_keeps_original_header_source_without_owning_input_or_state() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        use novarocks_functions::datasketches_hll_failure::HllFailureDetail;
+        let tracker = MemTracker::new_root("DS HLL malformed source");
+        let mut state = DsHllState::new(tracker.clone());
+        let payload = Arc::new(vec![1u8, 2, 3]);
+        let weak = Arc::downgrade(&payload);
+        let error = match state.ensure_handle_from_payload(payload.as_slice()) {
+            Err(error) => error,
+            Ok(_) => panic!("short payload must be refused before constructing a handle"),
+        };
+        assert!(state.handle.is_none());
+        assert_eq!(state.retained_charge.bytes(), 0);
+        assert_eq!(tracker.current(), 0);
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Data);
+        assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+        assert_eq!(fact.reason().code(), 42);
+        let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = error.cause() else {
+            panic!("the original HLL domain source must survive the execution boundary");
+        };
+        let source = source.downcast_ref::<HllFailureRecipe>().unwrap();
+        assert!(matches!(
+            source.detail,
+            HllFailureDetail::Length {
+                required: 8,
+                actual: 3
+            }
+        ));
+        drop(payload);
+        drop(state);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(error.failure_fact(), fact);
+    }
+
     // Use the sealed catalog selection and the production aggregate adapters.
     // Exact estimates below come from the pinned Java 6.2.0 byte-domain oracle.
     fn prepared_binary_hll_parts(

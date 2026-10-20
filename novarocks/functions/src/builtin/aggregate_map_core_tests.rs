@@ -139,13 +139,13 @@ fn update(
     state: &mut MapAggState<HostAggregateAllocator>,
     input: &MapUpdateInput,
     control: &Control,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     let mut checkpoints = EvaluationCheckpoints::new(control);
     let mut work = ScalarWork::new(Some(&mut checkpoints));
     for row in 0..input.keys.len() {
         update_row(state, input, row, &mut work)?;
     }
-    work.flush()
+    work.flush().map_err(Into::into)
 }
 #[test]
 fn map_agg_core_actual_host_first_wins_partial_roundtrip_and_last_drop() {
@@ -208,9 +208,7 @@ fn map_agg_core_every_update_callback_preserves_seven_causes_and_no_footer() {
                 ..Default::default()
             };
             let error = update(&mut state, &input, &control).unwrap_err();
-            let ScalarStateError::Kernel(actual) = error else {
-                panic!("true callback cause");
-            };
+            let actual = error;
             assert_eq!(actual, cause);
             assert_eq!(control.trace.lock().unwrap().len(), stop + 1);
             drop(state);
@@ -235,15 +233,13 @@ fn map_agg_core_every_actual_host_frontier_preserves_seven_causes_and_drop() {
                 ..Default::default()
             });
             let result = match HostAggregateAllocator::try_new(host.clone()) {
-                Err(error) => Err(ScalarStateError::Kernel(error)),
+                Err(error) => Err(error),
                 Ok(allocator) => {
                     let mut state = MapAggState::new(allocator);
                     update(&mut state, &input, &Control::default())
                 }
             };
-            let ScalarStateError::Kernel(actual) = result.unwrap_err() else {
-                panic!("actual host cause");
-            };
+            let actual = result.unwrap_err();
             assert_eq!(actual, cause);
             assert_eq!(host.ledger.lock().unwrap().attempts, stop + 1);
             assert_eq!(host.ledger.lock().unwrap().bytes, 0);
@@ -251,7 +247,7 @@ fn map_agg_core_every_actual_host_frontier_preserves_seven_causes_and_drop() {
     }
 }
 #[test]
-fn map_agg_core_duplicate_value_full_data_precedes_lookup_and_has_no_control_tail() {
+fn map_agg_core_duplicate_value_contract_precedes_lookup_and_has_no_control_tail() {
     let host = Arc::new(Host::default());
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
     let mut state = MapAggState::new(allocator);
@@ -260,12 +256,67 @@ fn map_agg_core_duplicate_value_full_data_precedes_lookup_and_has_no_control_tai
     let input = MapUpdateInput { keys, values: vals };
     let control = Control::default();
     let error = update(&mut state, &input, &control).unwrap_err();
-    let ScalarStateError::Legacy(message) = error else {
-        panic!("original semantic Data");
-    };
-    assert_eq!(message, "unsupported tracked scalar type: UInt32");
+    let cause = error;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(cause.failure_fact().reason().code(), 313);
+    assert_eq!(cause.to_string(), "unsupported tracked scalar type: UInt32");
     assert_eq!(state.entries.len(), 1);
     assert!(state.entries[0].1.is_none());
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}
+
+#[test]
+fn map_agg_actual_constructor_refusal_keeps_arrow_source_and_releases_schema() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let state = MapAggState::new(allocator);
+    let entries = Arc::new(Field::new(
+        "ResourceExhausted",
+        DataType::Struct(
+            vec![
+                Field::new("key", DataType::Utf8, true),
+                Field::new("value", DataType::Utf8, true),
+            ]
+            .into(),
+        ),
+        true,
+    ));
+    let weak = Arc::downgrade(&entries);
+    let ty = DataType::Map(entries.clone(), false);
+    let error = build_array(&ty, std::iter::once(&state), &mut ScalarWork::new(None)).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 344);
+    let KernelFailure::Source(source) = error else {
+        panic!("actual constructor source required")
+    };
+    assert!(
+        source
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .is::<arrow_schema::ArrowError>()
+    );
+    drop(ty);
+    drop(entries);
+    assert!(weak.upgrade().is_none());
+    drop(state);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}
+
+#[test]
+fn map_agg_actual_wrong_carrier_is_an_outer_contract_without_input_ownership() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let input: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let weak = Arc::downgrade(&input);
+    let error = update_input(&input).err().expect("wrong carrier must fail");
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 343);
+    assert_eq!(error.to_string(), "map_agg expects struct input");
+    drop(input);
+    assert!(weak.upgrade().is_none());
 }

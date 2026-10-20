@@ -272,7 +272,7 @@ mod work_tests {
             fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
                 self.trace.lock().unwrap().push(units);
                 if units == 256 {
-                    Err(self.cause)
+                    Err(self.cause.clone())
                 } else {
                     Ok(())
                 }
@@ -289,7 +289,7 @@ mod work_tests {
         ] {
             let control = LateControl {
                 trace: Mutex::new(Vec::new()),
-                cause,
+                cause: cause.clone(),
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             // Load the caller's pending meter seam; this is not a claim about

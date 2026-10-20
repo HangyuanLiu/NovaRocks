@@ -534,7 +534,7 @@ mod tests {
             null_allowed: true,
         };
         let error = decode_domain(&raw, root()).expect_err("a non-comparable domain");
-        assert_eq!(error.kind(), crate::ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &crate::ProtocolErrorKind::InvalidValue);
         assert!(
             error.to_string().contains("non-comparable"),
             "unexpected detail: {error}"
@@ -575,7 +575,7 @@ mod tests {
             decode_tuple_domain(&contradictory, root())
                 .expect_err("contradictory")
                 .kind(),
-            crate::ProtocolErrorKind::InconsistentFields
+            &crate::ProtocolErrorKind::InconsistentFields
         );
     }
 
@@ -598,7 +598,7 @@ mod tests {
             decode_tuple_domain(&duplicated, root())
                 .expect_err("duplicate")
                 .kind(),
-            crate::ProtocolErrorKind::InconsistentFields
+            &crate::ProtocolErrorKind::InconsistentFields
         );
     }
 
@@ -611,7 +611,7 @@ mod tests {
             ValidatedColumnHandle::parse(empty, root())
                 .expect_err("absent")
                 .kind(),
-            crate::ProtocolErrorKind::MissingField
+            &crate::ProtocolErrorKind::MissingField
         );
     }
 
@@ -625,7 +625,7 @@ mod tests {
             decode_bound(&raw, ConnectorValueType::BigInt, root())
                 .expect_err("stray value")
                 .kind(),
-            crate::ProtocolErrorKind::InconsistentFields
+            &crate::ProtocolErrorKind::InconsistentFields
         );
     }
 
@@ -661,7 +661,7 @@ mod tests {
             decode_connector_expression(&encoded_deep, FieldPath::root("expression"))
                 .expect_err("too deep")
                 .kind(),
-            crate::ProtocolErrorKind::OutOfRange
+            &crate::ProtocolErrorKind::OutOfRange
         );
     }
 }

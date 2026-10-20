@@ -265,13 +265,13 @@ fn nested_interleave_rejects_exact_type_source_choice_and_static_extent_failures
     ));
     assert!(matches!(
         guarded_result_extent(sources[0].data_type(), usize::MAX),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     let struct_type =
         DataType::Struct(vec![Arc::new(Field::new("wide", DataType::Int64, true))].into());
     assert!(matches!(
         guarded_result_extent(&struct_type, isize::MAX as usize / 8 + 1),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
 }
 #[test]

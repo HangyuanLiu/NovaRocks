@@ -65,7 +65,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -94,11 +94,14 @@ impl KernelEvaluationControl for RuntimeControl {
         panic!("Theta never waits")
     }
 }
-fn compile_causes() -> [CompileControlError; 3] {
+fn compile_causes() -> [CompileControlError; 4] {
     [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
+        CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        ),
     ]
 }
 fn runtime_causes() -> [KernelFailure; 7] {
@@ -1055,11 +1058,14 @@ fn theta_pure_original_compile_causes_preserve_all_actual_success_and_ordinary_p
             for cause in compile_causes() {
                 let control = CompileControl {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 let result = run(&control);
                 let actual = match result {
                     Err(FunctionSpecializationFailure::Control(actual)) => actual,
+                    Err(FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(
+                        actual,
+                    ))) => actual,
                     Err(FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled)) => {
                         CompileControlError::Cancelled
                     }
@@ -1072,6 +1078,18 @@ fn theta_pure_original_compile_causes_preserve_all_actual_success_and_ordinary_p
                     other => panic!("original compile refusal was lost: {other:?}"),
                 };
                 assert_eq!(actual, cause);
+                if let (
+                    CompileControlError::Source(actual),
+                    CompileControlError::Source(original),
+                ) = (&actual, &cause)
+                {
+                    type Source =
+                        novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+                    assert!(std::ptr::eq(
+                        actual.downcast_ref::<Source>().unwrap(),
+                        original.downcast_ref::<Source>().unwrap()
+                    ));
+                }
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
             }
         }

@@ -51,10 +51,16 @@ pub(super) fn setup(inputs: &[ArrayRef]) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     (arena, args, Chunk::new_with_chunk_schema(batch, cs))
 }
-pub(super) fn call(arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> Result<ArrayRef, String> {
+pub(super) fn call(
+    arena: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     super::function::string::eval_string_function("field", arena, ExprId(usize::MAX), args, chunk)
 }
-pub(super) fn raw(inputs: &[ArrayRef]) -> Result<ArrayRef, String> {
+pub(super) fn raw(
+    inputs: &[ArrayRef],
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, chunk) = setup(inputs);
     call(&arena, &args, &chunk)
 }
@@ -233,21 +239,27 @@ fn field_original_null_first_still_demands_candidates_but_ignores_their_types() 
     );
     let (arena, mut args, chunk) = setup(&[null]);
     args.push(ExprId(usize::MAX));
-    assert_eq!(call(&arena, &args, &chunk).unwrap_err(), "invalid ExprId");
+    assert_eq!(
+        (call(&arena, &args, &chunk).unwrap_err()).to_string(),
+        "invalid ExprId"
+    );
 }
 #[test]
 fn field_original_arity_before_children_and_match_does_not_skip_tail() {
     let (arena, _, chunk) = setup(&[]);
     for args in [vec![], vec![ExprId(usize::MAX)]] {
         assert_eq!(
-            call(&arena, &args, &chunk).unwrap_err(),
+            (call(&arena, &args, &chunk).unwrap_err()).to_string(),
             "field requires a value and an INT-bounded candidate list"
         );
     }
     let source: ArrayRef = Arc::new(Int32Array::from(vec![7]));
     let (arena, mut args, chunk) = setup(&[source.clone(), source]);
     args.push(ExprId(usize::MAX));
-    assert_eq!(call(&arena, &args, &chunk).unwrap_err(), "invalid ExprId");
+    assert_eq!(
+        (call(&arena, &args, &chunk).unwrap_err()).to_string(),
+        "invalid ExprId"
+    );
 }
 #[test]
 fn field_original_pool_nonzero_ordinal_broadcast_preserves_first_candidate() {
@@ -285,8 +297,7 @@ fn field_original_pool_nonzero_ordinal_broadcast_preserves_first_candidate() {
 }
 
 #[test]
-fn field_original_complete_mismatch_data_precedes_later_child_and_is_not_truncated_layout_boundary_and_complete_diagnostic()
- {
+fn field_frozen_mismatch_precedes_later_child_and_preserves_bounded_detail() {
     // Keep the original oversized input as a real construction refusal.
     let oversized = DataType::Timestamp(
         TimeUnit::Microsecond,
@@ -314,5 +325,20 @@ fn field_original_complete_mismatch_data_precedes_later_child_and_is_not_truncat
     assert!(expected.len() > 512);
     let (arena, mut args, chunk) = setup(&[a, b]);
     args.push(ExprId(usize::MAX));
-    assert_eq!(call(&arena, &args, &chunk).unwrap_err(), expected);
+    let failure = call(&arena, &args, &chunk).unwrap_err();
+    use novarocks_failure_contract::{
+        BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(365).unwrap())
+        )
+    );
+    assert_eq!(
+        failure.detail(),
+        BoundedDetail::truncating(&expected).as_str()
+    );
+    assert!(failure.detail().len() <= 512);
 }

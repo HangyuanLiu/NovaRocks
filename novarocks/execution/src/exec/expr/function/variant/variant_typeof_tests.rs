@@ -22,6 +22,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_types::SlotId;
+use novarocks_types::value::variant::VariantValue;
 
 fn input(array: ArrayRef, ty: FunctionValueType) -> (ExprArena, ExprId, Chunk) {
     let schema = Arc::new(Schema::new(vec![ty.try_to_field("document").unwrap()]));
@@ -143,26 +144,15 @@ fn variant_typeof_never_turns_an_argument_runtime_refusal_into_a_null_row() {
         calls: std::cell::Cell<usize>,
     }
     impl ExprEvaluation for Failing {
-        type Error = ExecutionFailure;
         fn arena(&self) -> &ExprArena {
             &self.arena
         }
-        fn eval(&self, _: ExprId, _: &Chunk) -> Result<ArrayRef, Self::Error> {
+        fn eval(&self, _: ExprId, _: &Chunk) -> Result<ArrayRef, ExecutionFailure> {
             self.calls.set(self.calls.get() + 1);
             Err(self.original.clone())
         }
-        fn slice_input(&self, _: &Chunk, _: usize, _: usize) -> Result<Chunk, Self::Error> {
+        fn slice_input(&self, _: &Chunk, _: usize, _: usize) -> Result<Chunk, ExecutionFailure> {
             panic!("no retry after argument failure")
-        }
-        fn recoverable_error(&self, _: &Self::Error) -> bool {
-            false
-        }
-        fn annotate_error(
-            &self,
-            error: Self::Error,
-            _: impl FnOnce(&str) -> String,
-        ) -> Self::Error {
-            error
         }
     }
     let array: ArrayRef = Arc::new(StringArray::from(vec!["{}"]));
@@ -185,4 +175,35 @@ fn variant_typeof_never_turns_an_argument_runtime_refusal_into_a_null_row() {
         original
     );
     assert_eq!(failing.calls.get(), 1);
+}
+
+#[test]
+fn variant_typeof_preserves_representation_extent_and_the_original_domain_source() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_types::value::variant::VariantFailure;
+    // The declared extent is rejected by the real decoder before any payload
+    // read; malformed-row NULL must not erase this distinct refusal.
+    let header = (16_u32 * 1024 * 1024 + 1).to_le_bytes();
+    let original = VariantValue::from_serialized(&header).unwrap_err();
+    let array: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(header.as_slice())]));
+    let ty = FunctionValueType::try_with_logical_type(
+        arrow::datatypes::DataType::LargeBinary,
+        false,
+        ValueLogicalType::Variant,
+    )
+    .unwrap();
+    let (arena, argument, chunk) = input(array, ty);
+    let failure = eval_variant_typeof(&arena, argument, &[argument], &chunk).unwrap_err();
+    assert_eq!(failure.failure_fact(), original.failure_fact());
+    assert_eq!(failure.failure_fact().class(), FailureClass::Representation);
+    let mut source: &dyn std::error::Error = &failure;
+    loop {
+        if let Some(domain) = source.downcast_ref::<VariantFailure>() {
+            assert_eq!(domain, &original);
+            break;
+        }
+        source = source
+            .source()
+            .expect("the real Variant decoder source survives projection");
+    }
 }

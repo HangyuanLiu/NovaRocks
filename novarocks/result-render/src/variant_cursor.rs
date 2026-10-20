@@ -22,8 +22,9 @@ use std::ops::Range;
 
 fn invalid() -> RenderError {
     RenderError {
-        kind: RenderErrorKind::UnsupportedPresentation,
+        kind: RenderErrorKind::InvalidVariant,
         output_ordinal: None,
+        required: None,
     }
 }
 pub(crate) fn read(data: &[u8], at: usize, width: usize) -> Result<u32, RenderError> {

@@ -981,7 +981,7 @@ mod tests {
             if self.fail_check == Some(checks.len())
                 || self.fail_after_work.is_some_and(|limit| work >= limit)
             {
-                return Err(self.reason);
+                return Err(self.reason.clone());
             }
             Ok(())
         }
@@ -1003,6 +1003,9 @@ mod tests {
         reason: novarocks_type_contract::CompileControlError,
     ) {
         match reason {
+            novarocks_type_contract::CompileControlError::Source(source) => {
+                assert_eq!(error.source_failure(), Some(&source));
+            }
             novarocks_type_contract::CompileControlError::Cancelled => {
                 assert!(matches!(error, crate::compiler::SqlCompileError::Cancelled))
             }
@@ -1057,10 +1060,10 @@ mod tests {
                 (None, Some(256)),
                 (Some(check_count), None),
             ] {
-                let control = checked_control(check, work, reason);
+                let control = checked_control(check, work, reason.clone());
                 let error =
                     left_project_items(&left, &mut ScalarArena::new(), &control).unwrap_err();
-                assert_original_control(error, reason);
+                assert_original_control(error, reason.clone());
             }
         }
     }
@@ -1118,9 +1121,13 @@ mod tests {
             novarocks_type_contract::CompileControlError::DeadlineExceeded,
             novarocks_type_contract::CompileControlError::ResourceExhausted,
         ] {
-            let error =
-                remap_column_refs(&mut arena, pair, &mut |_, _| Err(reason.into()), control)
-                    .unwrap_err();
+            let error = remap_column_refs(
+                &mut arena,
+                pair,
+                &mut |_, _| Err(reason.clone().into()),
+                control,
+            )
+            .unwrap_err();
             assert_original_control(error, reason);
         }
     }

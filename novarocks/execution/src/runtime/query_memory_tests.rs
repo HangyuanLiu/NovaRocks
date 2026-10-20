@@ -77,9 +77,9 @@ fn mem_a1_driver_bindings_share_the_installed_account_and_never_mint_domains() {
     let binding =
         QueryMemoryBinding::try_new(execution(1), authority.clone(), account.clone()).unwrap();
     let before = authority.root().committed_bytes();
-    let first = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), None)
+    let first = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink))
         .with_query_memory(Some(binding.clone()));
-    let second = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), None)
+    let second = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink))
         .with_query_memory(Some(binding));
     // Constructing bindings retains account capabilities only, not grants.
     drop(first);
@@ -115,24 +115,28 @@ fn mem_a1_actual_runtime_builder_and_driver_transport_validate_identity_before_u
         execution_runtime: Some(runtime.clone()),
         query_memory: Some(binding.clone()),
         task_identity: task,
+        task_control: task.map(crate::runtime::task_control::test_support::control_for),
         #[cfg(novarocks_dev_controls)]
         exchange_test_observer: None,
     };
     assert_eq!(
         build_runtime_state(inputs(Some(identity(2)), Some(execution(1).query_id())))
             .unwrap_err()
+            .to_string()
             .as_str(),
         "query memory task attempt mismatch"
     );
     assert_eq!(
         build_runtime_state(inputs(None, Some(execution(1).query_id())))
             .unwrap_err()
+            .to_string()
             .as_str(),
         "query memory binding requires task identity"
     );
     assert_eq!(
         build_runtime_state(inputs(Some(identity(1)), Some(QueryId::new(1, 2))))
             .unwrap_err()
+            .to_string()
             .as_str(),
         "query memory invocation query identity mismatch"
     );
@@ -149,14 +153,14 @@ fn mem_a1_actual_runtime_builder_and_driver_transport_validate_identity_before_u
             .id(),
         account.id()
     );
-    let bindings = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), Some(vec![]))
+    let bindings = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink))
         .with_query_memory(state.query_memory().cloned());
     assert_eq!(
         bindings.query_memory().unwrap().account().id(),
         account.id()
     );
     let driver =
-        PipelineDriver::new_with_event_sink(1, vec![], None, vec![], state.clone(), None, bindings);
+        PipelineDriver::from_prepared(1, vec![], None, vec![], state.clone(), None, bindings);
     assert_eq!(driver.query_memory().unwrap().account().id(), account.id());
     let other = PipelineDriver::new(2, vec![], None, vec![], state, None);
     assert_eq!(other.query_memory().unwrap().account().id(), account.id());

@@ -57,7 +57,10 @@ fn fixture(inputs: Vec<ArrayRef>, rows: usize) -> (ExprArena, Vec<ExprId>, Chunk
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
 
-fn raw_round(inputs: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw_round(
+    inputs: Vec<ArrayRef>,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = inputs[0].len();
     let (mut arena, args, chunk) = fixture(inputs, rows);
     let expr = output.map_or(ExprId(usize::MAX), |ty| {
@@ -126,10 +129,22 @@ fn legacy_round_full_static_decimal_digits_error_precedes_null_mask() {
     let input = decimal(vec![None; 3], -39);
     let expected = arrow::compute::cast(&input, &DataType::Int64).unwrap_err();
     let output = raw_round(vec![float(vec![None; 3]), input], Some(DataType::Float64)).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(output.failure_fact().class(), FailureClass::Data);
     assert_eq!(
-        output,
-        format!("round: failed to cast decimals to Int64: {expected}")
+        output.failure_fact().reason(),
+        crate::runtime::fragment::ExecutionReason::ArrayCastData.reason()
     );
+    let mut source: &(dyn std::error::Error + 'static) = &output;
+    loop {
+        if let Some(original) = source.downcast_ref::<arrow::error::ArrowError>() {
+            assert_eq!(original.to_string(), expected.to_string());
+            break;
+        }
+        source = source
+            .source()
+            .expect("static digits CAST must preserve original Arrow refusal before NULL mask");
+    }
 }
 #[test]
 fn legacy_round_raw_slice_and_empty_keep_original_decimal_carrier() {

@@ -41,7 +41,7 @@ pub(crate) fn cross_join_batches(
     left: &Chunk,
     right: &Chunk,
     output_schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>, String> {
+) -> crate::runtime::fragment::ExecutionResult<Vec<RecordBatch>> {
     let left_rows = left.len();
     let right_rows = right.len();
     if left_rows == 0 || right_rows == 0 {
@@ -56,11 +56,18 @@ pub(crate) fn cross_join_batches(
     let mut output_batches = Vec::new();
 
     for l in 0..left_rows {
-        let left_row = u32::try_from(l).map_err(|_| "join left row id overflow".to_string())?;
+        let left_row = u32::try_from(l).map_err(|_| {
+            crate::runtime::fragment::ExecutionFailure::from_domain(
+                super::join_hash_map::method::JoinCursorFailure::RowIdExtent,
+            )
+        })?;
         for r in 0..right_rows {
             left_indices.push(left_row);
-            right_indices
-                .push(u32::try_from(r).map_err(|_| "join right row id overflow".to_string())?);
+            right_indices.push(u32::try_from(r).map_err(|_| {
+                crate::runtime::fragment::ExecutionFailure::from_domain(
+                    super::join_hash_map::method::JoinCursorFailure::RowIdExtent,
+                )
+            })?);
             if left_indices.len() == MAX_JOIN_OUTPUT_ROWS_PER_BATCH {
                 if let Some(batch) =
                     gather_join_batch(left, right, &left_indices, &right_indices, output_schema)?

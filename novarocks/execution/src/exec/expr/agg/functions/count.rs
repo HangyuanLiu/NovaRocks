@@ -25,9 +25,13 @@ use super::AggregateFunction;
 
 pub(super) struct CountAgg;
 
-fn count_input_error(error: count_core::CountVisitError<std::convert::Infallible>) -> String {
+fn count_input_error(
+    error: count_core::CountVisitError<std::convert::Infallible>,
+) -> crate::runtime::fragment::ExecutionFailure {
     match error {
-        count_core::CountVisitError::Invalid(message) => message.to_owned(),
+        count_core::CountVisitError::Invalid(source) => {
+            crate::runtime::fragment::ExecutionFailure::from_domain(source)
+        }
         count_core::CountVisitError::Control(never) => match never {},
     }
 }
@@ -48,7 +52,7 @@ impl AggregateFunction for CountAgg {
         _func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         Ok(count_fallback(input_type.is_none()))
     }
 
@@ -63,13 +67,13 @@ impl AggregateFunction for CountAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         if spec.count_all {
             Ok(AggInputView::None)
         } else {
-            let arr = array
-                .as_ref()
-                .ok_or_else(|| "count input missing".to_string())?;
+            let arr = array.as_ref().ok_or_else(|| {
+                crate::exec::expr::agg::views::aggregate_input_contract("count input missing")
+            })?;
             Ok(AggInputView::Any(arr))
         }
     }
@@ -78,10 +82,10 @@ impl AggregateFunction for CountAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "count input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("count input missing")
+        })?;
         Ok(AggInputView::Int(IntArrayView::new(arr)?))
     }
 
@@ -105,7 +109,7 @@ impl AggregateFunction for CountAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         match input {
             AggInputView::None => {
                 unsafe { count_core::update_legacy_batch(true, None, offset, state_ptrs) }
@@ -120,7 +124,9 @@ impl AggregateFunction for CountAgg {
                 )
             }
             .map_err(count_input_error),
-            _ => Err("count batch input type mismatch".to_string()),
+            _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "count batch input type mismatch",
+            )),
         }
     }
     fn merge_batch(
@@ -129,13 +135,17 @@ impl AggregateFunction for CountAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let source = match input {
             AggInputView::Int(IntArrayView::Int64(a)) => count_core::CountMergeArray::Int64(a),
             AggInputView::Int(IntArrayView::Int32(a)) => count_core::CountMergeArray::Int32(a),
             AggInputView::Int(IntArrayView::Int16(a)) => count_core::CountMergeArray::Int16(a),
             AggInputView::Int(IntArrayView::Int8(a)) => count_core::CountMergeArray::Int8(a),
-            _ => return Err("count merge batch input type mismatch".to_string()),
+            _ => {
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    "count merge batch input type mismatch",
+                ));
+            }
         };
         unsafe { count_core::merge_legacy_batch(source, offset, state_ptrs) };
         Ok(())
@@ -147,7 +157,7 @@ impl AggregateFunction for CountAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let values = group_states
             .iter()
             .map(|&base| Ok(unsafe { *((base as *mut u8).add(offset) as *const i64) }));

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 use arrow::array::ArrayRef;
 use std::collections::HashMap;
 
@@ -45,19 +45,21 @@ pub fn eval_struct_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let canonical = STRUCT_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "row" => Ok((super::struct_func::eval_row(arena, expr, args, chunk))?),
-        "named_struct" => Ok((super::struct_func::eval_named_struct(arena, expr, args, chunk))?),
+        "row" => super::struct_func::eval_row(arena, expr, args, chunk),
+        "named_struct" => super::struct_func::eval_named_struct(arena, expr, args, chunk),
         "__struct_subfield" | "subfield" => {
-            Ok((super::subfield::eval_subfield(arena, expr, args, chunk))?)
+            super::subfield::eval_subfield(arena, expr, args, chunk)
         }
-        other => Err((format!("unsupported struct function: {}", other)).into()),
+        other => Err(expression_contract(format_args!(
+            "unsupported struct function: {other}"
+        ))),
     }
 }
 

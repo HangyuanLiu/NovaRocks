@@ -40,9 +40,12 @@
 //! objects only. It never matches a provider variant and never downcasts, so it
 //! compiles with no provider crate in the dependency graph.
 
+use novarocks_execution::runtime::fragment::connector_failure::{
+    ConnectorCallFailure, ConnectorOperation,
+};
+use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::RuntimeFilterSessionResolver;
 use crate::ScanStreamHost;
@@ -68,15 +71,15 @@ use novarocks_types::SlotId;
 mod stream;
 
 type PageProviderFactory =
-    Arc<dyn Fn() -> Result<Arc<dyn ConnectorReadPageSourceProvider>, String> + Send + Sync>;
+    Arc<dyn Fn() -> ExecutionResult<Arc<dyn ConnectorReadPageSourceProvider>> + Send + Sync>;
 type SystemProviderFactory =
-    Arc<dyn Fn() -> Result<Arc<dyn ConnectorReadSystemTableProvider>, String> + Send + Sync>;
+    Arc<dyn Fn() -> ExecutionResult<Arc<dyn ConnectorReadSystemTableProvider>> + Send + Sync>;
 
 /// Decode retains only construction work. Admission installs the real tracker
 /// before `ScanSource::bind` calls this factory and opens a provider.
 enum ReadProvider<P: ?Sized> {
     Ready(Arc<P>),
-    Deferred(Arc<dyn Fn() -> Result<Arc<P>, String> + Send + Sync>),
+    Deferred(Arc<dyn Fn() -> ExecutionResult<Arc<P>> + Send + Sync>),
 }
 
 impl<P: ?Sized> Clone for ReadProvider<P> {
@@ -89,7 +92,7 @@ impl<P: ?Sized> Clone for ReadProvider<P> {
 }
 
 impl<P: ?Sized> ReadProvider<P> {
-    fn resolve(&self) -> Result<Arc<P>, String> {
+    fn resolve(&self) -> ExecutionResult<Arc<P>> {
         match self {
             Self::Ready(provider) => Ok(Arc::clone(provider)),
             Self::Deferred(factory) => factory(),
@@ -148,19 +151,16 @@ impl TypedConnectorScanShared {
         &self,
         chunk: Chunk,
         factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
+    ) -> ExecutionResult<Chunk> {
         materialize_output(self.output_materialization.as_ref(), chunk, factory)
     }
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
-    fn check_liveness(&self, action: &str) -> Result<(), String> {
-        if self.request.is_cancelled() {
-            return Err(format!("typed connector scan {action} was cancelled"));
-        }
-        if Instant::now() >= self.request.deadline() {
-            return Err(format!("typed connector scan {action} deadline elapsed"));
-        }
-        Ok(())
+    fn check_liveness(&self, operation: ConnectorOperation) -> ExecutionResult<()> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        self.request
+            .check_active()
+            .map_err(|cause| ConnectorCallFailure::new(operation, cause).into())
     }
 }
 
@@ -171,7 +171,7 @@ fn materialize_output(
     materialization: Option<&OutputMaterialization>,
     chunk: Chunk,
     factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
-) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
+) -> ExecutionResult<Chunk> {
     let Some(materialization) = materialization else {
         return Ok(chunk);
     };
@@ -371,16 +371,16 @@ impl TypedConnectorScanSource {
     /// Absent session or absent contract both mean this scan receives no
     /// feedback, and it keeps the truthful unconstrained filter rather than
     /// claiming one that could never narrow.
-    fn live_dynamic_filter(&self) -> Result<Option<Arc<ConnectorReadDynamicFilter>>, String> {
+    fn live_dynamic_filter(&self) -> ExecutionResult<Option<Arc<ConnectorReadDynamicFilter>>> {
         if self.shared.runtime_filter_contracts.is_empty() {
             return Ok(None);
         }
-        let session = (self.shared.runtime_filter)()?;
+        let session = (self.shared.runtime_filter)().map_err(ExecutionFailure::from_domain)?;
         self.shared
             .live_dynamic_filter_factory
             .build(session.as_ref(), &self.shared.runtime_filter_contracts)
             .map(Some)
-            .map_err(|error| format!("create typed scan live runtime filter: {error}"))
+            .map_err(Into::into)
     }
 
     fn with_substituted_filter(&self, dynamic_filter: Arc<ConnectorReadDynamicFilter>) -> Self {
@@ -412,22 +412,21 @@ impl TypedConnectorScanSource {
 }
 
 impl ScanSource for TypedConnectorScanSource {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+    fn bind(&self, ranges: BoundScanRanges) -> ExecutionResult<Arc<dyn ScanOp>> {
         match ranges {
             // Typed scans carry no frozen range: their work arrives as splits.
             BoundScanRanges::None => {}
             BoundScanRanges::SchemaSelection { .. } => {
-                return Err(
-                    "typed connector scan source requires an empty range binding".to_string(),
-                );
+                return Err(TypedScanBindingFailure::WrongRangeKind.into());
             }
         }
         if self.shared.output_materialization.is_none()
             && self.shared.slot_ids.as_slice() != self.shared.output_schema.slot_ids()
         {
-            return Err("typed scan read slots do not match the frozen output slots".to_string());
+            return Err(TypedScanBindingFailure::OutputSlots.into());
         }
-        self.shared.check_liveness("provider open")?;
+        self.shared
+            .check_liveness(ConnectorOperation::PrepareReader)?;
         // Created empty on first use, and born closed when the attempt is
         // already terminal, so a late bind observes termination instead of
         // parking on a queue nobody will ever serve.
@@ -519,7 +518,7 @@ impl ScanOp for TypedConnectorScanOp {
 
     /// Stops every operation of the scan without waiting for it: the
     /// scan's stream observes their exit when it is closed.
-    fn terminate(&self) -> Result<(), String> {
+    fn terminate(&self) -> ExecutionResult<()> {
         self.flow.stop();
         // Idempotent, drops anything still queued, and wakes a stream parked
         // on the queue through its observer.
@@ -578,21 +577,16 @@ impl TypedSystemTableScanShared {
         &self,
         chunk: Chunk,
         factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
+    ) -> ExecutionResult<Chunk> {
         materialize_output(self.output_materialization.as_ref(), chunk, factory)
     }
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
-    fn check_liveness(&self, action: &str) -> Result<(), String> {
-        if self.request.is_cancelled() {
-            return Err(format!("typed system relation scan {action} was cancelled"));
-        }
-        if Instant::now() >= self.request.deadline() {
-            return Err(format!(
-                "typed system relation scan {action} deadline elapsed"
-            ));
-        }
-        Ok(())
+    fn check_liveness(&self, operation: ConnectorOperation) -> ExecutionResult<()> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        self.request
+            .check_active()
+            .map_err(|cause| ConnectorCallFailure::new(operation, cause).into())
     }
 }
 
@@ -700,21 +694,20 @@ impl TypedConnectorSystemTableScanSource {
 }
 
 impl ScanSource for TypedConnectorSystemTableScanSource {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+    fn bind(&self, ranges: BoundScanRanges) -> ExecutionResult<Arc<dyn ScanOp>> {
         match ranges {
             BoundScanRanges::None => {}
             BoundScanRanges::SchemaSelection { .. } => {
-                return Err(
-                    "typed system relation scan source requires an empty range binding".to_string(),
-                );
+                return Err(TypedScanBindingFailure::WrongRangeKind.into());
             }
         }
         if self.shared.output_materialization.is_none()
             && self.shared.slot_ids.as_slice() != self.shared.output_schema.slot_ids()
         {
-            return Err("typed scan read slots do not match the frozen output slots".to_string());
+            return Err(TypedScanBindingFailure::OutputSlots.into());
         }
-        self.shared.check_liveness("provider open")?;
+        self.shared
+            .check_liveness(ConnectorOperation::PrepareReader)?;
         let mut shared = Arc::new(TypedSystemTableScanShared {
             descriptor: self.shared.descriptor.clone(),
             provider: self.shared.provider.clone(),
@@ -759,10 +752,49 @@ impl ScanOp for TypedConnectorSystemTableScanOp {
 
     /// Seals the task source, which stops the relation's reads; the stream
     /// observes their exit when it is closed.
-    fn terminate(&self) -> Result<(), String> {
+    fn terminate(&self) -> ExecutionResult<()> {
         if let Some(operations) = self.shared.request.source_operations() {
             operations.seal();
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum TypedScanBindingFailure {
+    WrongRangeKind,
+    OutputSlots,
+    ReclaimedStream,
+    MissingExecutionSource,
+}
+impl std::fmt::Display for TypedScanBindingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WrongRangeKind => "typed scan source requires an empty range binding",
+            Self::OutputSlots => "typed scan read slots do not match the frozen output slots",
+            Self::ReclaimedStream => "typed scan stream is already claimed",
+            Self::MissingExecutionSource => {
+                "typed runtime scan requires its exact Task execution source"
+            }
+        })
+    }
+}
+impl std::error::Error for TypedScanBindingFailure {}
+impl novarocks_execution_contract::failure::FailureProjection for TypedScanBindingFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::WrongRangeKind => R::ScanWrongRangeKind,
+            Self::OutputSlots => R::ScanOutputSlots,
+            Self::ReclaimedStream => R::ScanStreamReclaimed,
+            Self::MissingExecutionSource => R::ScanMissingExecutionSource,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<TypedScanBindingFailure> for ExecutionFailure {
+    fn from(cause: TypedScanBindingFailure) -> Self {
+        Self::from_domain(cause)
     }
 }

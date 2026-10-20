@@ -78,7 +78,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((refusal, cause)) if refusal == at => Err(cause),
             _ => Ok(()),
         }
@@ -520,7 +520,7 @@ fn assert_prefixes(
 ) {
     for cause in CAUSES {
         for at in positions.clone() {
-            let c = Control::refusing(at, cause);
+            let c = Control::refusing(at, cause.clone());
             assert!(
                 matches!(encode_recursive_pool(pool,invoice(pool),bounds,&c),Err(TypeCodecError::Control(actual)) if actual==cause)
             );

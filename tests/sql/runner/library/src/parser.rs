@@ -406,7 +406,7 @@ fn parse_meta_with_sql_error_descriptors(
             "expect_sql_phase" => {
                 meta.expect_sql_phase = Some(SqlErrorPhase::parse(&raw_value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid expect_sql_phase: {raw_value}; expected Lex, Parse, Validate, Analyze, or Admit"
+                        "invalid expect_sql_phase: {raw_value}; expected Lex, Parse, Validate, Analyze, Admit, or Execution"
                     )
                 })?);
             }
@@ -833,8 +833,12 @@ fn validate_sql_error_expectations(
     meta: &QueryMeta,
     sql_error_descriptors: &[SqlErrorDescriptor],
 ) -> Result<()> {
+    let descriptor = meta
+        .expect_sql_code
+        .as_deref()
+        .and_then(|code| lookup_sql_error_descriptor(sql_error_descriptors, code));
     if let Some(code) = meta.expect_sql_code.as_deref()
-        && lookup_sql_error_descriptor(sql_error_descriptors, code).is_none()
+        && descriptor.is_none()
     {
         bail!("unknown expect_sql_code: {code}");
     }
@@ -847,9 +851,18 @@ fn validate_sql_error_expectations(
         if meta.expect_sql_code.is_none() {
             bail!("@expect_error_tier=target requires @expect_sql_code");
         }
-        if meta.expect_error_at.is_none() {
+        // Execution facts have no source SQL span. The manifest owns this
+        // distinction; an expected phase cannot exempt another phase's span.
+        if !descriptor.is_some_and(|descriptor| descriptor.phase == SqlErrorPhase::Execution)
+            && meta.expect_error_at.is_none()
+        {
             bail!("@expect_error_tier=target requires @expect_error_at");
         }
+    }
+    if descriptor.is_some_and(|descriptor| descriptor.phase == SqlErrorPhase::Execution)
+        && meta.expect_error_at.is_some()
+    {
+        bail!("Execution error expectations cannot carry @expect_error_at");
     }
 
     Ok(())
@@ -1913,6 +1926,42 @@ mod opt5_directive_tests {
             crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
         )
         .expect_err("target tier without location must fail");
+        assert!(error.to_string().contains("requires @expect_error_at"));
+    }
+
+    #[test]
+    fn execution_target_uses_manifest_phase_without_a_sql_location() {
+        let re = meta_re();
+        let lines = [
+            "-- @expect_error_tier=target".to_string(),
+            "-- @expect_sql_code=query.execution.numeric_out_of_range".to_string(),
+            "-- @expect_sql_phase=Execution".to_string(),
+            "-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]"
+                .to_string(),
+        ];
+        let meta = parse_meta(&lines, &re).expect("execution target has no source location");
+        assert_eq!(meta.expect_sql_phase, Some(SqlErrorPhase::Execution));
+        assert!(meta.expect_error_at.is_none());
+        validate_sql_error_expectations(&meta, production_sql_error_descriptors())
+            .expect("merged execution target has no source location");
+        let mut located = lines.to_vec();
+        located.push("-- @expect_error_at=1:1".to_string());
+        let located = parse_meta(&located, &re).expect("metadata is syntactically valid");
+        let error = validate_sql_error_expectations(&located, production_sql_error_descriptors())
+            .expect_err("execution cannot invent a SQL span");
+        assert!(error.to_string().contains("cannot carry @expect_error_at"));
+
+        let mislabeled = QueryMeta {
+            expect_error_tier: Some(SqlErrorTier::Target),
+            expect_sql_code: Some("sql.test.fixture".to_string()),
+            expect_sql_phase: Some(SqlErrorPhase::Execution),
+            ..QueryMeta::default()
+        };
+        let error = validate_sql_error_expectations(
+            &mislabeled,
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect_err("declared phase cannot erase the manifest-owned parser location");
         assert!(error.to_string().contains("requires @expect_error_at"));
     }
 

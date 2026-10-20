@@ -615,7 +615,7 @@ mod tests {
                 // wide parent interner starts. Refuse that parent's first
                 // full work quantum, rather than a completed leaf's tail.
                 if !self.positive_only || units == 256 {
-                    Err(self.reason)
+                    Err(self.reason.clone())
                 } else {
                     Ok(())
                 }
@@ -653,13 +653,13 @@ mod tests {
                     col(101, "mv_a"),
                 )]);
                 let control = Stop {
-                    reason,
+                    reason: reason.clone(),
                     positive_only,
                     calls: Mutex::new(Vec::new()),
                 };
                 assert_eq!(
                     map.rewrite(&mut arena, source, &names(&[(1, "a")]), &control),
-                    Err(crate::compiler::SqlCompileError::from(reason))
+                    Err(crate::compiler::SqlCompileError::from(reason.clone()))
                 );
                 let calls = control.calls.lock().unwrap();
                 if positive_only {

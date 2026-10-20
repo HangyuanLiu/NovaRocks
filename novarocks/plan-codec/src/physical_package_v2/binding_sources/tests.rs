@@ -55,7 +55,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        if let Some((stop, cause)) = self.stop
+        if let Some((stop, cause)) = self.stop.clone()
             && at == stop
         {
             return Err(cause);
@@ -930,7 +930,7 @@ fn actual_small_consumer_success_callbacks_preserve_three_primary_causes_without
     for at in 0..trace.len() {
         for cause in CAUSES {
             let c = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert!(
@@ -1015,7 +1015,7 @@ fn foreign_equal_package_ordinary_tail_and_each_actual_callback_preserve_three_c
     for at in 0..trace.len() {
         for cause in CAUSES {
             let c = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert!(
@@ -1503,7 +1503,7 @@ fn actual_wide_count_observes_256_before_reserve_or_fill_lookup_and_keeps_primar
     assert_eq!(trace[start], 256);
     for cause in CAUSES {
         let c = Control {
-            stop: Some((start, cause)),
+            stop: Some((start, cause.clone())),
             ..Default::default()
         };
         let (result, actual_start) = run(&c, false);

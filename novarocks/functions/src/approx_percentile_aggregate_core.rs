@@ -21,7 +21,7 @@ use crate::aggregate_scalar::AggScalarValue;
 use crate::approx_percentile_core as percentile;
 use crate::approx_percentile_failure::{
     ApproxPercentileDataRecipe as DataRecipe, ApproxPercentileFailureSink,
-    ApproxPercentileObservation as Observation, LegacyApproxPercentileFailure,
+    ApproxPercentileObservation as Observation, RequiredApproxPercentileFailure,
 };
 use crate::percentile_input::{self, PercentileInputDiagnostic};
 use allocator_api2::alloc::Allocator;
@@ -48,32 +48,36 @@ impl<A: Allocator> QuantileBuffer for allocator_api2::vec::Vec<f64, A> {
 }
 pub trait QuantileScratch {
     type Buffer: QuantileBuffer;
-    fn prepare(&self, count: usize) -> Result<Self::Buffer, ()>;
+    type Error: crate::allocation_failure::AllocationRefusalSource;
+    fn prepare(&self, count: usize) -> Result<Self::Buffer, Self::Error>;
 }
 pub struct LegacyQuantileScratch;
 impl QuantileScratch for LegacyQuantileScratch {
     type Buffer = Vec<f64>;
-    fn prepare(&self, count: usize) -> Result<Self::Buffer, ()> {
+    type Error = std::collections::TryReserveError;
+    fn prepare(&self, count: usize) -> Result<Self::Buffer, Self::Error> {
         let mut out = Vec::new();
-        out.try_reserve_exact(count).map_err(|_| ())?;
+        out.try_reserve_exact(count)?;
         Ok(out)
     }
 }
 pub struct AllocatedQuantileScratch<A: Allocator + Clone>(pub A);
 impl<A: Allocator + Clone> QuantileScratch for AllocatedQuantileScratch<A> {
     type Buffer = allocator_api2::vec::Vec<f64, A>;
-    fn prepare(&self, count: usize) -> Result<Self::Buffer, ()> {
+    type Error = allocator_api2::collections::TryReserveError;
+    fn prepare(&self, count: usize) -> Result<Self::Buffer, Self::Error> {
         let mut out = allocator_api2::vec::Vec::new_in(self.0.clone());
-        out.try_reserve_exact(count).map_err(|_| ())?;
+        out.try_reserve_exact(count)?;
         Ok(out)
     }
 }
-fn legacy_data<T, S: ApproxPercentileFailureSink>(
-    result: Result<T, String>,
+fn reader_result<T, S: ApproxPercentileFailureSink>(
+    result: Result<T, crate::KernelFailure>,
     sink: &mut S,
 ) -> Result<T, S::Error> {
-    result.map_err(|text| sink.data(DataRecipe::Existing(&text)))
+    result.map_err(|source| sink.kernel(source))
 }
+
 use arrow_array::{Array, ArrayRef, ListArray, StructArray};
 use arrow_schema::DataType;
 
@@ -103,36 +107,38 @@ fn numeric_value_at(
     array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<f64>, String> {
-    percentile_input::numeric_value_at(
-        array,
-        row,
-        PercentileInputDiagnostic::LegacyLabel(context.as_str()),
-    )
+) -> Result<Option<f64>, crate::KernelFailure> {
+    percentile_input::numeric_value_at_with_failure(array, row, &mut |source| {
+        source.into_failure(PercentileInputDiagnostic::LegacyLabel(context.as_str()))
+    })
 }
 fn payload_bytes_at<'a>(
     array: &'a ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<&'a [u8]>, String> {
-    percentile_input::payload_bytes_at(
-        array,
-        row,
-        PercentileInputDiagnostic::LegacyLabel(context.as_str()),
-    )
+) -> Result<Option<&'a [u8]>, crate::KernelFailure> {
+    percentile_input::payload_bytes_at_with_failure(array, row, &mut |source| {
+        source.into_failure(PercentileInputDiagnostic::LegacyLabel(context.as_str()))
+    })
 }
 fn integer_value_at(
     array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<i64>, crate::KernelFailure> {
     Ok(numeric_value_at(array, row, context)?.map(|value| value as i64))
 }
-fn validate_quantile(context: ApproxPercentileDiagnostic, quantile: f64) -> Result<(), String> {
+fn validate_quantile(
+    context: ApproxPercentileDiagnostic,
+    quantile: f64,
+) -> Result<(), crate::KernelFailure> {
     if !(0.0..=1.0).contains(&quantile) {
-        return Err(format!(
-            "{context}: percentile parameter must be between 0 and 1, got {}",
-            quantile
+        return Err(crate::approx_percentile_failure::value_failure(
+            format_args!(
+                "{context}: percentile parameter must be between 0 and 1, got {}",
+                quantile
+            ),
+            crate::DataFailureReason::InvalidValue,
         ));
     }
     Ok(())
@@ -143,14 +149,14 @@ fn apply_quantiles<A: Allocator + Clone>(
     array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     apply_quantiles_with_sink(
         state,
         array,
         row,
         context,
         &LegacyQuantileScratch,
-        &mut LegacyApproxPercentileFailure,
+        &mut RequiredApproxPercentileFailure,
     )
 }
 fn apply_quantiles_with_sink<
@@ -167,7 +173,7 @@ fn apply_quantiles_with_sink<
 ) -> Result<(), S::Error> {
     if matches!(array.data_type(), DataType::List(_)) {
         let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-            sink.data(DataRecipe::Arguments(format_args!(
+            sink.kernel(crate::approx_percentile_failure::contract(format_args!(
                 "{context}: failed to downcast percentile array input"
             )))
         })?;
@@ -185,26 +191,37 @@ fn apply_quantiles_with_sink<
                 percentile::MAX_QUANTILE_COUNT
             ))));
         }
-        let mut quantiles = scratch.prepare(count).map_err(|_| {
-            sink.allocation(DataRecipe::Arguments(format_args!(
-                "ResourceExhausted: {context} quantile array"
-            )))
+        let mut quantiles = scratch.prepare(count).map_err(|source| {
+            sink.allocation(
+                DataRecipe::Arguments(format_args!("ResourceExhausted: {context} quantile array")),
+                source,
+            )
         })?;
         for (idx, value_row) in (start..end).enumerate() {
             sink.observe(Observation::Step)?;
-            let Some(q) = legacy_data(numeric_value_at(values, value_row, context), sink)? else {
+            let Some(q) = reader_result(numeric_value_at(values, value_row, context), sink)? else {
                 return Err(sink.data(DataRecipe::Arguments(format_args!(
                     "{context}: percentile array element[{idx}] cannot be null"
                 ))));
             };
-            legacy_data(validate_quantile(context, q), sink)?;
+            if !(0.0..=1.0).contains(&q) {
+                return Err(sink.data(DataRecipe::Arguments(format_args!(
+                    "{context}: percentile parameter must be between 0 and 1, got {}",
+                    q
+                ))));
+            }
             quantiles.push(q);
         }
         return percentile::set_quantiles_with_sink(state, quantiles.values(), sink);
     }
-    match legacy_data(numeric_value_at(array, row, context), sink)? {
+    match reader_result(numeric_value_at(array, row, context), sink)? {
         Some(q) => {
-            legacy_data(validate_quantile(context, q), sink)?;
+            if !(0.0..=1.0).contains(&q) {
+                return Err(sink.data(DataRecipe::Arguments(format_args!(
+                    "{context}: percentile parameter must be between 0 and 1, got {}",
+                    q
+                ))));
+            }
             percentile::set_quantile_with_sink(state, q, sink)
         }
         None => Ok(()),
@@ -216,13 +233,13 @@ fn apply_compression<A: Allocator + Clone>(
     array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     apply_compression_with_sink(
         state,
         array,
         row,
         context,
-        &mut LegacyApproxPercentileFailure,
+        &mut RequiredApproxPercentileFailure,
     )
 }
 fn apply_compression_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
@@ -232,7 +249,7 @@ fn apply_compression_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureS
     context: ApproxPercentileDiagnostic,
     sink: &mut S,
 ) -> Result<(), S::Error> {
-    if let Some(value) = legacy_data(numeric_value_at(array, row, context), sink)? {
+    if let Some(value) = reader_result(numeric_value_at(array, row, context), sink)? {
         percentile::set_compression_with_sink(state, value, sink)?;
     }
     Ok(())
@@ -247,12 +264,12 @@ impl UnweightedInput {
     pub fn try_new(
         array: &StructArray,
         context: ApproxPercentileDiagnostic,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::KernelFailure> {
         let fields = array.columns();
         if fields.len() < 2 {
-            return Err(format!(
+            return Err(crate::approx_percentile_failure::contract(format_args!(
                 "{context}: percentile_approx expects STRUCT(value, quantile[, compression]) input"
-            ));
+            )));
         }
         let values = fields[0].clone();
         let quantiles = fields[1].clone();
@@ -272,7 +289,7 @@ impl UnweightedInput {
         state: &mut percentile::PercentileState<A>,
         row: usize,
         context: ApproxPercentileDiagnostic,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::KernelFailure> {
         self.update_addresses(state, row, row, row, context)
     }
     /// Borrow the same original already-evaluated channels, without building
@@ -295,7 +312,7 @@ impl UnweightedInput {
         quantile_row: usize,
         compression_row: usize,
         context: ApproxPercentileDiagnostic,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::KernelFailure> {
         self.update_addresses_with_sink(
             state,
             value_row,
@@ -303,7 +320,7 @@ impl UnweightedInput {
             compression_row,
             context,
             &LegacyQuantileScratch,
-            &mut LegacyApproxPercentileFailure,
+            &mut RequiredApproxPercentileFailure,
         )
     }
     pub fn update_addresses_with_sink<
@@ -330,7 +347,7 @@ impl UnweightedInput {
         match values.data_type() {
             DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
                 if let Some(payload) =
-                    legacy_data(payload_bytes_at(values, value_row, context), sink)?
+                    reader_result(payload_bytes_at(values, value_row, context), sink)?
                 {
                     percentile::merge_bounded_serialized_state_into_with_sink(
                         state, payload, sink,
@@ -339,7 +356,7 @@ impl UnweightedInput {
             }
             _ => {
                 if let Some(value) =
-                    legacy_data(numeric_value_at(values, value_row, context), sink)?
+                    reader_result(numeric_value_at(values, value_row, context), sink)?
                 {
                     percentile::add_value_with_sink(state, value, sink)?;
                     percentile::validate_state_with_sink(state, sink)?;
@@ -360,12 +377,12 @@ impl WeightedInput {
     pub fn try_new(
         array: &StructArray,
         context: ApproxPercentileDiagnostic,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::KernelFailure> {
         let fields = array.columns();
         if fields.len() < 3 {
-            return Err(format!(
+            return Err(crate::approx_percentile_failure::contract(format_args!(
                 "{context}: percentile_approx_weighted expects STRUCT(value, weight, quantile[, compression]) input"
-            ));
+            )));
         }
         let values = fields[0].clone();
         let weights = fields[1].clone();
@@ -387,7 +404,7 @@ impl WeightedInput {
         state: &mut percentile::PercentileState<A>,
         row: usize,
         context: ApproxPercentileDiagnostic,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::KernelFailure> {
         self.update_addresses(state, row, row, row, row, context)
     }
     /// Borrow the same original already-evaluated channels, without building
@@ -413,7 +430,7 @@ impl WeightedInput {
         quantile_row: usize,
         compression_row: usize,
         context: ApproxPercentileDiagnostic,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::KernelFailure> {
         self.update_addresses_with_sink(
             state,
             value_row,
@@ -422,7 +439,7 @@ impl WeightedInput {
             compression_row,
             context,
             &LegacyQuantileScratch,
-            &mut LegacyApproxPercentileFailure,
+            &mut RequiredApproxPercentileFailure,
         )
     }
     pub fn update_addresses_with_sink<
@@ -448,11 +465,11 @@ impl WeightedInput {
         if let Some(compression) = compression {
             apply_compression_with_sink(state, compression, compression_row, context, sink)?;
         }
-        let Some(value) = legacy_data(numeric_value_at(values, value_row, context), sink)? else {
+        let Some(value) = reader_result(numeric_value_at(values, value_row, context), sink)? else {
             return Ok(());
         };
-        let weight =
-            legacy_data(integer_value_at(weights, weight_row, context), sink)?.unwrap_or_default();
+        let weight = reader_result(integer_value_at(weights, weight_row, context), sink)?
+            .unwrap_or_default();
         if weight < 0 {
             return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "{context}: percentile weight must be non-negative, got {}",
@@ -469,13 +486,13 @@ pub fn payload_for_merge<'a>(
     array: &'a ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<&'a [u8]>, String> {
+) -> Result<Option<&'a [u8]>, crate::KernelFailure> {
     payload_bytes_at(array, row, context)
 }
 pub fn merge_payload<A: Allocator + Clone>(
     state: &mut percentile::PercentileState<A>,
     payload: &[u8],
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     percentile::merge_bounded_serialized_state_into(state, payload)
 }
 pub fn merge_row<A: Allocator + Clone>(
@@ -483,13 +500,13 @@ pub fn merge_row<A: Allocator + Clone>(
     array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     merge_row_with_sink(
         state,
         array,
         row,
         context,
-        &mut LegacyApproxPercentileFailure,
+        &mut RequiredApproxPercentileFailure,
     )
 }
 pub fn merge_row_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
@@ -499,7 +516,7 @@ pub fn merge_row_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>
     context: ApproxPercentileDiagnostic,
     sink: &mut S,
 ) -> Result<(), S::Error> {
-    let Some(payload) = legacy_data(payload_for_merge(array, row, context), sink)? else {
+    let Some(payload) = reader_result(payload_for_merge(array, row, context), sink)? else {
         return Ok(());
     };
     percentile::merge_bounded_serialized_state_into_with_sink(state, payload, sink)
@@ -514,7 +531,7 @@ pub enum ScalarOutput {
 pub fn scalar_output<A: Allocator + Clone>(
     state: &percentile::PercentileState<A>,
     output: ScalarOutput,
-) -> Result<Option<AggScalarValue>, String> {
+) -> Result<Option<AggScalarValue>, crate::KernelFailure> {
     scalar_output_with_policy(state, output, &mut percentile::OriginalDerivedClone)
 }
 /// Allocation policy is fixed by the actual v1/pure consumer, not inferred
@@ -523,25 +540,53 @@ pub fn scalar_output_with_policy<A: Allocator + Clone, P: percentile::TDigestClo
     state: &percentile::PercentileState<A>,
     output: ScalarOutput,
     policy: &mut P,
-) -> Result<Option<AggScalarValue>, String> {
-    match output {
-        ScalarOutput::Float64 => Ok(percentile::quantile_from_state_with_policy(
-            state, None, policy,
-        )?
-        .map(AggScalarValue::Float64)),
-        ScalarOutput::List => Ok(
-            percentile::quantiles_from_state_with_policy(state, policy)?.map(|items| {
-                AggScalarValue::List(
-                    items
-                        .into_iter()
-                        .map(|item| Some(AggScalarValue::Float64(item)))
-                        .collect(),
-                )
-            }),
-        ),
-    }
+) -> Result<Option<AggScalarValue>, crate::KernelFailure> {
+    scalar_output_with_sink(
+        state,
+        output,
+        &mut percentile::OriginalCloneLoan(policy),
+        &mut RequiredApproxPercentileFailure,
+    )
 }
 
 #[cfg(test)]
 #[path = "approx_percentile_aggregate_core_tests.rs"]
 mod tests;
+
+/// Emission uses the same mathematical authors and the actual caller sink;
+/// an operation/allocator failure never makes a round trip through Data text.
+pub fn scalar_output_with_sink<
+    A: Allocator + Clone,
+    S: ApproxPercentileFailureSink,
+    P: percentile::ObservedTDigestClone<A, S>,
+>(
+    state: &percentile::PercentileState<A>,
+    output: ScalarOutput,
+    policy: &mut P,
+    sink: &mut S,
+) -> Result<Option<AggScalarValue>, S::Error> {
+    match output {
+        ScalarOutput::Float64 => Ok(percentile::quantile_from_state_with_sink(
+            state, None, policy, sink,
+        )?
+        .map(AggScalarValue::Float64)),
+        ScalarOutput::List => {
+            let Some(items) = percentile::quantiles_from_state_with_sink(state, policy, sink)?
+            else {
+                return Ok(None);
+            };
+            let mut output = Vec::new();
+            output.try_reserve_exact(items.len()).map_err(|source| {
+                sink.allocation(
+                    DataRecipe::Static("reserve percentile list scalar results"),
+                    source,
+                )
+            })?;
+            for item in items {
+                sink.observe(Observation::Step)?;
+                output.push(Some(AggScalarValue::Float64(item)));
+            }
+            Ok(Some(AggScalarValue::List(output)))
+        }
+    }
+}

@@ -34,4 +34,5 @@ pub mod pipeline;
 pub mod row_position;
 pub mod runtime_filter;
 pub mod sketch_hash;
+pub(crate) mod variant_failure;
 pub mod variant_read;

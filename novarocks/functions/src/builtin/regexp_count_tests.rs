@@ -364,7 +364,7 @@ impl PureCompileControl for CompileTrace {
         calls.push((phase, units));
         if let Some((fail, cause)) = &self.refusal {
             if *fail == at {
-                return Err(*cause);
+                return Err(cause.clone());
             }
         }
         Ok(())
@@ -384,13 +384,13 @@ fn regexp_count_every_actual_compile_checkpoint_preserves_three_causes() {
             ] {
                 let ctl = CompileTrace {
                     calls: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared(source, &ctl).unwrap_err();
                 // Preparation retains the established KernelFailure boundary;
                 // binding and effect callbacks retain CompileControlError.
                 let actual = match &error {
-                    FunctionSpecializationFailure::Control(actual) => Some(*actual),
+                    FunctionSpecializationFailure::Control(actual) => Some(actual.clone()),
                     FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
                         Some(CompileControlError::Cancelled)
                     }

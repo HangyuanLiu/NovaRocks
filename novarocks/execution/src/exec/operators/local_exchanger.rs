@@ -413,45 +413,38 @@ impl LocalExchanger {
     #[cfg(test)]
     pub(crate) fn accept(
         self: &Arc<Self>,
-        state: &RuntimeState,
+        queue_tracker: Option<&Arc<MemTracker>>,
         chunk: Chunk,
-        _sink_driver_seq: usize,
-    ) -> Result<(), String> {
-        self.accept_with(state, chunk, _sink_driver_seq, |chunk| {
-            self.partition_chunk(chunk)
-        })
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.accept_with(queue_tracker, chunk, |chunk| self.partition_chunk(chunk))
     }
-
     pub(crate) fn accept_created(
         self: &Arc<Self>,
-        state: &RuntimeState,
+        queue_tracker: Option<&Arc<MemTracker>>,
         chunk: Chunk,
-        driver: usize,
-        factory: Option<&dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        ctx: &crate::exec::pipeline::step_context::StepContext<'_>,
     ) -> crate::runtime::fragment::ExecutionResult<()> {
-        self.accept_with(state, chunk, driver, |chunk| {
-            let factory = factory
-                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-            let control =
-                super::compiled_expression::RuntimeKernelControl::new(state.error_state());
-            self.partition_chunk_created(chunk, factory, &control)
+        ctx.checkpoint()?;
+        self.accept_with(queue_tracker, chunk, |chunk| {
+            self.partition_chunk_created(chunk, factory, ctx)
         })
     }
-
-    fn accept_with<E: From<String>>(
+    fn accept_with(
         self: &Arc<Self>,
-        state: &RuntimeState,
+        queue_tracker: Option<&Arc<MemTracker>>,
         chunk: Chunk,
-        _driver: usize,
-        mut partition: impl FnMut(&Chunk) -> Result<Vec<(usize, Chunk)>, E>,
-    ) -> Result<(), E> {
+        mut partition: impl FnMut(
+            &Chunk,
+        )
+            -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>>,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if chunk.is_empty() || self.all_consumers_closed() {
             return Ok(());
         }
-        let queue_tracker = self.queue_mem_tracker(state);
         if self.partition_count <= 1 {
             let mut chunk = chunk;
-            if let Some(tracker) = queue_tracker.as_ref() {
+            if let Some(tracker) = queue_tracker {
                 chunk.transfer_to(tracker);
             }
             self.push_chunk_to_partition(0, chunk);
@@ -462,7 +455,7 @@ impl LocalExchanger {
             if part_chunk.is_empty() {
                 continue;
             }
-            if let Some(tracker) = queue_tracker.as_ref() {
+            if let Some(tracker) = queue_tracker {
                 part_chunk.transfer_to(tracker);
             }
             self.push_chunk_to_partition(idx, part_chunk);
@@ -470,8 +463,16 @@ impl LocalExchanger {
         Ok(())
     }
 
+    pub(crate) fn next_chunk(&self, partition: usize) -> crate::exec::pipeline::shape::SourceRead {
+        self.read_chunk_from_partition(partition)
+    }
+
+    #[cfg(test)]
     pub(crate) fn pop_chunk(&self, partition: usize) -> Option<Chunk> {
-        self.pop_chunk_from_partition(partition)
+        match self.next_chunk(partition) {
+            crate::exec::pipeline::shape::SourceRead::Chunk(chunk) => Some(chunk),
+            _ => None,
+        }
     }
 
     pub(crate) fn source_observable(&self) -> Arc<Observable> {
@@ -547,7 +548,7 @@ impl LocalExchanger {
         }
     }
 
-    fn queue_mem_tracker(&self, state: &RuntimeState) -> Option<Arc<MemTracker>> {
+    pub(crate) fn queue_mem_tracker(&self, state: &RuntimeState) -> Option<Arc<MemTracker>> {
         let root = state.mem_tracker()?;
         let tracker = self.queue_tracker.get_or_init(|| {
             let label = format!("local_exchange_queue_{}", self.exchange_id);
@@ -560,7 +561,7 @@ impl LocalExchanger {
         &self,
         chunk: &Chunk,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &super::compiled_expression::RuntimeKernelControl,
+        control: &dyn crate::exec::expr::ExprEvaluationControl,
     ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
         let partitioned = match &self.partition_spec {
             LocalExchangePartitionSpec::Exprs(exprs) => {
@@ -595,39 +596,44 @@ impl LocalExchanger {
                 )?
             }
             LocalExchangePartitionSpec::Single => {
-                return Err("local exchange partition spec missing".into());
+                return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                    LocalPartitionContract,
+                ));
             }
         };
         Ok(partitioned.into_iter().enumerate().collect())
     }
 
     #[cfg(test)]
-    fn partition_chunk(&self, chunk: &Chunk) -> Result<Vec<(usize, Chunk)>, String> {
+    fn partition_chunk(
+        &self,
+        chunk: &Chunk,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
         let partitioned = match &self.partition_spec {
             LocalExchangePartitionSpec::Exprs(exprs) => {
-                partition_chunk_by_hash(chunk, exprs, &self.arena, self.partition_count, false)
-                    .map_err(|e| e.to_string())?
+                partition_chunk_by_hash(chunk, exprs, &self.arena, self.partition_count, false)?
             }
             LocalExchangePartitionSpec::InputSlotIds(slot_ids) => {
                 let mut arrays = Vec::with_capacity(slot_ids.len());
                 for slot_id in slot_ids {
-                    arrays.push(
-                        chunk
-                            .column_by_slot_id(*slot_id)
-                            .map_err(|e| e.to_string())?,
-                    );
+                    arrays.push(chunk.column_by_slot_id(*slot_id)?);
                 }
-                partition_chunk_by_hash_arrays(chunk, &arrays, self.partition_count, false)
-                    .map_err(|e| e.to_string())?
+                partition_chunk_by_hash_arrays(chunk, &arrays, self.partition_count, false)?
             }
             LocalExchangePartitionSpec::Single => {
-                return Err("local exchange partition spec missing".to_string());
+                return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                    LocalPartitionContract,
+                ));
             }
         };
         Ok(partitioned.into_iter().enumerate().collect())
     }
 
-    fn pop_chunk_from_partition(&self, partition: usize) -> Option<Chunk> {
+    fn read_chunk_from_partition(
+        &self,
+        partition: usize,
+    ) -> crate::exec::pipeline::shape::SourceRead {
+        use crate::exec::pipeline::shape::SourceRead;
         let notify = self.sink_observable.defer_notify();
         let mut popped_rows = 0u64;
         let mut popped_chunks = 0u64;
@@ -654,7 +660,13 @@ impl LocalExchanger {
             if was_full && !is_full {
                 notify_sink = true;
             }
-            chunk
+            match chunk {
+                Some(chunk) => SourceRead::Chunk(chunk),
+                None if self.remaining_producers.load(Ordering::Acquire) == 0 => {
+                    SourceRead::Finished
+                }
+                None => SourceRead::Pending,
+            }
         };
         if notify_sink {
             notify.arm();
@@ -848,5 +860,23 @@ mod tests {
         assert!(Arc::ptr_eq(&source, &exchanger.source_observable()));
         assert!(Arc::ptr_eq(&sink, &exchanger.sink_observable()));
         assert!(!Arc::ptr_eq(&source, &sink));
+    }
+}
+
+#[derive(Debug)]
+struct LocalPartitionContract;
+impl std::fmt::Display for LocalPartitionContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local exchange partition spec missing")
+    }
+}
+impl std::error::Error for LocalPartitionContract {}
+impl novarocks_failure_contract::FailureProjection for LocalPartitionContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::LocalPartitionContract.reason(),
+        )
     }
 }

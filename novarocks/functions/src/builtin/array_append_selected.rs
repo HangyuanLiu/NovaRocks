@@ -209,7 +209,7 @@ fn checked_rows(
 fn failure(error: AppendFailure<KernelFailure>) -> KernelFailure {
     match error {
         AppendFailure::Control(cause) => cause,
-        AppendFailure::Data(message) => internal(&message),
+        AppendFailure::Operation(cause) => cause,
     }
 }
 #[cfg(test)]

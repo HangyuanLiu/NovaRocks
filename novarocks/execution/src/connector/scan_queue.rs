@@ -131,6 +131,7 @@ pub struct SplitQueueError {
     plan_node_id: i32,
     sequence_id: Option<u64>,
     detail: String,
+    resource: Option<novarocks_failure_contract::ResourceFacts>,
 }
 
 impl SplitQueueError {
@@ -145,6 +146,7 @@ impl SplitQueueError {
             plan_node_id,
             sequence_id,
             detail: detail.into(),
+            resource: None,
         }
     }
 
@@ -180,6 +182,72 @@ impl fmt::Display for SplitQueueError {
 }
 
 impl std::error::Error for SplitQueueError {}
+
+impl novarocks_failure_contract::FailureProjection for SplitQueueError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason as R;
+        use novarocks_failure_contract::*;
+        let (class, reason) = match self.kind {
+            SplitQueueErrorKind::PlanNodeMismatch => {
+                (FailureClass::Invariant, R::SplitPlanNodeMismatch)
+            }
+            SplitQueueErrorKind::SequenceConflict => {
+                (FailureClass::Invariant, R::SplitSequenceConflict)
+            }
+            SplitQueueErrorKind::AfterNoMoreSplits => {
+                (FailureClass::Invariant, R::SplitAfterNoMore)
+            }
+            SplitQueueErrorKind::Closed => {
+                return FailureFact::stop_observation(R::SplitQueueClosed.reason());
+            }
+            SplitQueueErrorKind::ResourceExhausted => (FailureClass::Resource, R::SplitQueueBytes),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        match self.resource {
+            Some(resource) => fact.with_resource(resource),
+            None => fact,
+        }
+    }
+}
+
+/// The queue owns the facts that refuse a controlled consumption reservation.
+#[cfg(novarocks_dev_controls)]
+#[derive(Debug)]
+pub enum TestConsumptionGateFailure {
+    Closed { plan_node_id: i32 },
+    AlreadyHeld { plan_node_id: i32 },
+}
+#[cfg(novarocks_dev_controls)]
+impl fmt::Display for TestConsumptionGateFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed { plan_node_id } => write!(
+                f,
+                "cannot gate closed split queue for plan node {plan_node_id}"
+            ),
+            Self::AlreadyHeld { plan_node_id } => write!(
+                f,
+                "split queue for plan node {plan_node_id} already has a held consumption gate"
+            ),
+        }
+    }
+}
+#[cfg(novarocks_dev_controls)]
+impl std::error::Error for TestConsumptionGateFailure {}
+#[cfg(novarocks_dev_controls)]
+impl novarocks_failure_contract::FailureProjection for TestConsumptionGateFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason as R;
+        use novarocks_failure_contract::*;
+        match self {
+            Self::Closed { .. } => FailureFact::stop_observation(R::SplitQueueClosed.reason()),
+            Self::AlreadyHeld { .. } => FailureFact::new(
+                FailureClass::Invariant,
+                R::SplitConsumptionGateAlreadyHeld.reason(),
+            ),
+        }
+    }
+}
 
 /// Budgets one plan-node queue enforces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -449,7 +517,7 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
         }
 
         let mut decisions = Vec::with_capacity(splits.len());
-        let mut added_queued_bytes: u64 = 0;
+        let mut added_queued_bytes: u128 = 0;
         let mut previous: Option<u64> = None;
 
         for split in &splits {
@@ -492,21 +560,36 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                     ));
                 }
                 let retained = split.retained_size_in_bytes();
-                added_queued_bytes = added_queued_bytes.saturating_add(retained);
+                added_queued_bytes += u128::from(retained);
                 decisions.push(SplitDecision::Enqueue { retained });
             }
         }
 
-        let projected_queued = state.queued_bytes.saturating_add(added_queued_bytes);
-        if projected_queued > self.config.max_queued_bytes {
-            return Err(self.error(
+        let projected_queued = u128::from(state.queued_bytes) + added_queued_bytes;
+        if projected_queued > u128::from(self.config.max_queued_bytes) {
+            let mut error = self.error(
                 SplitQueueErrorKind::ResourceExhausted,
                 None,
                 format!(
                     "offer would retain {projected_queued} queued bytes, above the ceiling of {}",
                     self.config.max_queued_bytes
                 ),
-            ));
+            );
+            // These are the queue owner's retained charges, not physical live
+            // heap bytes. A request outside the wire quantity range stays
+            // unknown in that field; it is never silently saturated to fit.
+            use novarocks_failure_contract::{ResourceDimension, ResourceFacts, ResourceScope};
+            error.resource = Some(ResourceFacts {
+                request_scope: Some(ResourceScope::Task),
+                constraint_scope: Some(ResourceScope::Task),
+                dimension: ResourceDimension::Bytes,
+                requested: u64::try_from(added_queued_bytes).ok(),
+                required_growth: u64::try_from(added_queued_bytes).ok(),
+                committed: Some(state.queued_bytes),
+                limit: Some(self.config.max_queued_bytes),
+                live: None,
+            });
+            return Err(error);
         }
         let mut outcome = SplitOfferOutcome::default();
         for (split, decision) in splits.into_iter().zip(decisions) {
@@ -542,17 +625,23 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
     /// Reserves a real input-consumption pause before a test-faulted enqueue.
     /// A closed queue can never be reopened, including by a controlled test.
     #[cfg(novarocks_dev_controls)]
-    pub fn reserve_test_consumption_gate(&self) -> Result<Arc<TestSplitConsumptionGate>, String> {
+    pub fn reserve_test_consumption_gate(
+        &self,
+    ) -> Result<Arc<TestSplitConsumptionGate>, TestConsumptionGateFailure> {
         let mut state = self.state.lock().expect("split queue lock");
         if state.closed {
-            return Err("cannot gate a closed split queue".into());
+            return Err(TestConsumptionGateFailure::Closed {
+                plan_node_id: self.plan_node_id,
+            });
         }
         if state
             .consumption_gate
             .as_ref()
             .is_some_and(|gate| gate.is_held())
         {
-            return Err("split queue already has a held consumption gate".into());
+            return Err(TestConsumptionGateFailure::AlreadyHeld {
+                plan_node_id: self.plan_node_id,
+            });
         }
         let gate = Arc::new(TestSplitConsumptionGate {
             held: AtomicBool::new(true),
@@ -1324,6 +1413,11 @@ mod tests {
             .offer_splits(NODE, vec![TestSplit::new(2, NODE, b"b")], false)
             .expect_err("a closed queue accepts nothing");
         assert_eq!(error.kind(), SplitQueueErrorKind::Closed);
+        use novarocks_failure_contract::{FailureEvidence, FailureProjection};
+        assert_eq!(
+            error.failure_fact().evidence(),
+            FailureEvidence::StopObservation
+        );
     }
 
     #[test]
@@ -1333,6 +1427,42 @@ mod tests {
             .offer_splits(NODE + 1, Vec::new(), false)
             .expect_err("plan node mismatch");
         assert_eq!(error.kind(), SplitQueueErrorKind::PlanNodeMismatch);
+    }
+
+    #[test]
+    fn an_offer_above_the_counter_range_is_rejected_without_saturation() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let queue: Arc<SplitQueue<TestSplit>> = SplitQueue::new(
+            NODE,
+            SplitQueueConfig {
+                max_queued_bytes: u64::MAX,
+            },
+        );
+        let error = queue
+            .offer_splits(
+                NODE,
+                vec![
+                    TestSplit::new(1, NODE, b"a").with_retained(u64::MAX),
+                    TestSplit::new(2, NODE, b"b").with_retained(u64::MAX),
+                ],
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        let resource = error.failure_fact().resource().unwrap();
+        assert_eq!(resource.requested, None);
+        assert_eq!(resource.required_growth, None);
+        assert_eq!(resource.committed, Some(0));
+        assert_eq!(resource.limit, Some(u64::MAX));
+        assert_eq!(queue.stats().queued_splits, 0);
+        assert_eq!(queue.stats().queued_bytes, 0);
+        assert_eq!(
+            queue
+                .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], false)
+                .unwrap()
+                .enqueued,
+            vec![1]
+        );
     }
 
     #[test]
@@ -1360,6 +1490,12 @@ mod tests {
             )
             .expect_err("the ceiling must reject the offer");
         assert_eq!(error.kind(), SplitQueueErrorKind::ResourceExhausted);
+        use novarocks_failure_contract::FailureProjection;
+        let resource = error.failure_fact().resource().unwrap();
+        assert_eq!(resource.requested, Some(32));
+        assert_eq!(resource.committed, Some(48));
+        assert_eq!(resource.limit, Some(64));
+        assert_eq!(resource.live, None);
         // Rejected in full: the queue and watermark do not move.
         assert_eq!(queue.stats().queued_splits, 1);
 

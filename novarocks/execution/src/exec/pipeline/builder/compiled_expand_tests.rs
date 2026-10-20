@@ -19,6 +19,7 @@
 //! ChangeEventExpand, each compiled by local-compiler and run through the
 //! compiled pipeline. Every oracle is computed from the literal rows.
 
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use std::sync::Arc;
 
 use arrow::array::{Array, Int8Array, Int32Array, Int64Array, ListArray, MapArray, StringArray};
@@ -175,13 +176,94 @@ fn compiled_repeat_expands_each_row_per_grouping_set_with_exact_grouping_values(
 }
 
 #[test]
+fn compiled_repeat_steps_drain_one_accepted_input_before_eos_without_replaying_sets() {
+    use crate::exec::pipeline::{
+        input::RawInput,
+        operator_factory::OperatorFactory,
+        step::{InputResult, NextStep},
+        step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
+    let program = repeat_program();
+    let factory = CompiledRepeatProcessorFactory::try_new(&program, ProgramNodeId::new(1)).unwrap();
+    let runtime = RuntimeState::default();
+    let control = runtime.error_state();
+    let tracker = MemTracker::new_root("repeat cursor steps");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        control.clone(),
+    ));
+    operator.prepare().unwrap();
+    operator.bind_runtime_state(&runtime).unwrap();
+    let layout = program.graph().nodes()[0].output_layout();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        layout.schema().clone(),
+        vec![
+            Arc::new(Int64Array::from(
+                REPEAT_ROWS.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef,
+            Arc::new(Int64Array::from(
+                REPEAT_ROWS.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                REPEAT_ROWS.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let input = Chunk::try_new_with_chunk_schema(
+        batch,
+        crate::exec::chunk::ChunkSchema::from_compiled_layout(layout).unwrap(),
+    )
+    .unwrap();
+    let second = input.clone();
+    let original = second.columns()[0].clone();
+    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut ctx = StepContext::new(&control, &mut turn);
+    let step = operator.as_mut();
+    assert!(matches!(
+        step.try_push(&mut ctx, RawInput::for_test(input)),
+        InputResult::Accepted(Ok(_))
+    ));
+    let installed = step.drive(&mut ctx).unwrap();
+    assert!(installed.output.is_none());
+    assert_eq!(installed.committed_rows, 2);
+    let InputResult::Deferred {
+        input: returned, ..
+    } = step.try_push(&mut ctx, RawInput::for_test(second))
+    else {
+        panic!("the active repeat cursor must defer another original input");
+    };
+    assert!(Arc::ptr_eq(&original, &returned.original().columns()[0]));
+    step.finish(&mut ctx).unwrap();
+    let mut outputs = Vec::new();
+    for _ in 0..3 {
+        let output = step.drive(&mut ctx).unwrap();
+        assert!(matches!(output.next, NextStep::Runnable));
+        outputs.push(output.output.expect("one complete grouping set"));
+    }
+    let ended = step.drive(&mut ctx).unwrap();
+    assert!(ended.output.is_none());
+    assert!(matches!(ended.next, NextStep::Finished));
+    step.finish(&mut ctx).unwrap();
+    assert!(step.drive(&mut ctx).unwrap().output.is_none());
+    assert_eq!(int64_rows(&outputs), repeat_oracle());
+    assert!(matches!(
+        step.drive(&mut ctx).unwrap().next,
+        NextStep::Finished
+    ));
+}
+
+#[test]
 fn compiled_repeat_factory_refuses_a_node_that_is_not_a_repeat() {
     let program = repeat_program();
     let error = match CompiledRepeatProcessorFactory::try_new(&program, ProgramNodeId::new(0)) {
         Ok(_) => panic!("a Values node is not a Repeat"),
         Err(error) => error,
     };
-    assert!(error.contains("is not a Repeat"), "{error}");
+    assert!(error.to_string().contains("is not a Repeat"), "{error}");
 }
 
 #[test]
@@ -220,10 +302,14 @@ fn compiled_repeat_prepare_requires_actual_creator_and_releases_schema_at_last_r
         crate::exec::chunk::ChunkSchema::from_compiled_layout(layout).unwrap(),
     )
     .unwrap();
-    let processor = operator.as_processor_mut().unwrap();
     let state = crate::runtime::runtime_state::RuntimeState::default();
-    processor.push_chunk(&state, input).unwrap();
-    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
+    processor.accept_without_output(input).unwrap();
+    let output = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
     let schema = output.chunk_schema_ref();
     assert!(
         schema
@@ -232,6 +318,7 @@ fn compiled_repeat_prepare_requires_actual_creator_and_releases_schema_at_last_r
             .all(|slot| slot.field_ref().metadata().capacity() == 0)
     );
     drop(output);
+    drop(processor);
     drop(operator);
     drop(factory);
     drop(program);
@@ -509,7 +596,7 @@ fn compiled_unpivot_factory_refuses_a_node_that_is_not_an_unpivot() {
         Ok(_) => panic!("a Values node is not an Unpivot"),
         Err(error) => error,
     };
-    assert!(error.contains("is not an Unpivot"), "{error}");
+    assert!(error.to_string().contains("is not an Unpivot"), "{error}");
 }
 
 #[test]
@@ -543,13 +630,19 @@ fn compiled_unpivot_retains_original_column_metadata_through_actual_input_exit()
         operator.set_construction_factory(construction);
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
-        let processor = operator.as_processor_mut().unwrap();
-        processor.push_chunk(&state, chunk).unwrap();
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
+        processor.accept_without_output(chunk).unwrap();
         assert_eq!(tracker.current(), charged);
         let mut output = Vec::new();
         if drain {
-            while processor.has_output() {
-                output.push(processor.pull_chunk(&state).unwrap().unwrap());
+            while matches!(processor.next(), NextStep::Runnable | NextStep::Yield) {
+                output.push(
+                    processor
+                        .advance_to_boundary()
+                        .map(|step| step.output)
+                        .unwrap()
+                        .unwrap(),
+                );
             }
             assert_eq!(
                 tracker.current(),
@@ -578,6 +671,7 @@ fn compiled_unpivot_retains_original_column_metadata_through_actual_input_exit()
             expected.sort();
             assert_eq!(actual, expected);
         }
+        drop(processor);
         drop(operator);
         assert_eq!(
             tracker.current(),
@@ -719,6 +813,79 @@ fn compiled_change_events_emit_selected_rows_per_event_with_exact_effects() {
 }
 
 #[test]
+fn compiled_change_event_steps_keep_one_input_until_each_event_is_delivered() {
+    use crate::exec::pipeline::{
+        input::RawInput,
+        operator_factory::OperatorFactory,
+        step::{InputResult, NextStep},
+        step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
+    let program = change_program();
+    let runtime = RuntimeState::default();
+    let control = runtime.error_state();
+    let tracker = MemTracker::new_root("change event cursor steps");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let input = super::family_fixture::paid_input(&program, &tracker);
+    let duplicate = input.clone();
+    let original = duplicate.columns()[0].clone();
+    let factory = CompiledChangeEventProcessorFactory::try_new(
+        program,
+        ProgramNodeId::new(1),
+        control.clone(),
+    )
+    .unwrap();
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        control.clone(),
+    ));
+    operator.prepare().unwrap();
+    operator.bind_runtime_state(&runtime).unwrap();
+    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut ctx = StepContext::new(&control, &mut turn);
+    let step = operator.as_mut();
+    assert!(matches!(
+        step.try_push(&mut ctx, RawInput::for_test(input)),
+        InputResult::Accepted(Ok(_))
+    ));
+    let installed = step.drive(&mut ctx).unwrap();
+    assert!(installed.output.is_none());
+    assert_eq!(installed.committed_rows, CHANGE_ROWS.len() as u64);
+    let InputResult::Deferred {
+        input: returned, ..
+    } = step.try_push(&mut ctx, RawInput::for_test(duplicate))
+    else {
+        panic!("one accepted input owns both events");
+    };
+    assert!(Arc::ptr_eq(&original, &returned.original().columns()[0]));
+    step.finish(&mut ctx).unwrap();
+    for (length, effect) in [
+        (2, ConnectorRowMutationEffect::Delete as i8),
+        (4, ConnectorRowMutationEffect::Insert as i8),
+    ] {
+        let result = step.drive(&mut ctx).unwrap();
+        assert!(matches!(result.next, NextStep::Runnable));
+        let output = result.output.expect("one event per work call");
+        assert_eq!(output.len(), length);
+        let effects = output.columns()[2]
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap();
+        assert!(effects.values().iter().all(|value| *value == effect));
+    }
+    let ended = step.drive(&mut ctx).unwrap();
+    assert!(ended.output.is_none());
+    assert!(matches!(ended.next, NextStep::Finished));
+    assert!(step.drive(&mut ctx).unwrap().output.is_none());
+    drop(returned);
+    drop(original);
+    drop(operator);
+    drop(factory);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
 fn compiled_change_event_factory_refuses_a_node_that_is_not_an_expansion() {
     let program = change_program();
     let error = match CompiledChangeEventProcessorFactory::try_new(
@@ -729,7 +896,10 @@ fn compiled_change_event_factory_refuses_a_node_that_is_not_an_expansion() {
         Ok(_) => panic!("a Values node is not a ChangeEventExpand"),
         Err(error) => error,
     };
-    assert!(error.contains("is not a ChangeEventExpand"), "{error}");
+    assert!(
+        error.to_string().contains("is not a ChangeEventExpand"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -759,15 +929,17 @@ fn compiled_change_prepare_refuses_missing_owner_and_first_real_memory_limit() {
     let baseline = tracker.current();
     assert!(baseline > 0);
     tracker.install_limit_once(baseline + 1).unwrap();
+    let first = operator.prepare().unwrap_err();
     assert!(matches!(
-        operator.prepare().unwrap_err().cause(),
+        first.cause(),
         ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
     ));
-    assert!(matches!(
-        operator.prepare().unwrap_err().cause(),
-        ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::InstanceFailed)
-    ));
-    assert!(operator.is_finished());
+    assert_eq!(operator.prepare().unwrap_err(), first);
+    assert!(
+        operator
+            .drive_for_test(&crate::runtime::runtime_state::RuntimeState::default())
+            .is_err()
+    );
     assert_eq!(tracker.current(), baseline);
     drop(operator);
     assert_eq!(tracker.current(), 0);

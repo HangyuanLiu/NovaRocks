@@ -33,7 +33,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push(units);
-        if let Some((index, cause)) = self.stop
+        if let Some((index, cause)) = self.stop.clone()
             && index == at
         {
             return Err(cause);
@@ -335,7 +335,7 @@ fn observed_read_recipe_success_and_ordinary_failure_keep_all_three_actual_contr
             ] {
                 let control = Control {
                     trace: Mutex::new(vec![]),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 let result = invoke(
                     &binding,
@@ -431,7 +431,7 @@ fn observed_read_recipe_actual_wide_chunk_copy_and_source_counts_observe_quantum
         ] {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             let result = invoke(
                 &binding,

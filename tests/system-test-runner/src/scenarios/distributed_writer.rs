@@ -51,9 +51,15 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use mysql::prelude::Queryable;
 use mysql::{Row, Value};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::{
+    QueryLifecycleFailureSite, QueryLifecycleStructuredSnapshot, ServerHandle,
+};
 use novarocks_connector_iceberg::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
+use novarocks_execution_contract::{
+    TaskFailurePhase,
+    failure::{FailureClass, FailureFact, FailureReason, domain},
+};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::thread;
@@ -2065,28 +2071,20 @@ impl WriteFault {
         }
     }
 
-    /// The text the injected failure puts in the statement's own error, where
-    /// the injection is a typed connector rejection rather than a lifecycle
-    /// event. It proves the fault fired rather than merely having been bound.
-    const fn injected_error_text(&self) -> Option<&'static str> {
-        match self {
-            Self::WriterEgress => Some("injected connector write writer failure"),
-            Self::RootValidation => Some("injected connector write root failure"),
-            Self::PartialAggregateUpdate => {
-                Some("injected connector write connector-write-partial-update-failure")
-            }
-            Self::PartialAggregateFinalize => {
-                Some("injected connector write connector-write-partial-finalize-failure")
-            }
-            Self::FinalAggregateMerge => {
-                Some("injected connector write connector-write-final-merge-failure")
-            }
-            Self::FinalAggregateFinalize => {
-                Some("injected connector write connector-write-final-finalize-failure")
-            }
-            Self::DeadlineAbort => Some("query timed out after"),
-            Self::SeveredWriterStream | Self::FetchAbort => None,
-        }
+    fn originating_connector_fact(&self) -> Option<FailureFact> {
+        let (class, code) = match self {
+            Self::RootValidation => (FailureClass::Data, 9),
+            Self::WriterEgress
+            | Self::PartialAggregateUpdate
+            | Self::PartialAggregateFinalize
+            | Self::FinalAggregateMerge
+            | Self::FinalAggregateFinalize => (FailureClass::Unexpected, 10),
+            Self::SeveredWriterStream | Self::FetchAbort | Self::DeadlineAbort => return None,
+        };
+        Some(FailureFact::new(
+            class,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(code).unwrap()),
+        ))
     }
 
     /// Which of the scenario's two write statements this case runs.
@@ -2334,21 +2332,40 @@ impl Scenario for DistributedWriterFaults {
             let before = all_write_counters(context)?;
             let before_injections = fault.injection_marker_count(context, &selected)?;
 
-            let outcome =
-                run_faulted_write(context, &fault, &user, port, &statements, selected.clone())?;
+            let (outcome, accepted, original_window) = run_faulted_write(
+                context,
+                &fault,
+                &user,
+                port,
+                &statements,
+                selected.clone(),
+                capture_original_write_window,
+            )?;
+            if let Some(expected) = fault.originating_connector_fact() {
+                assert_connector_failure(context, &outcome, accepted.as_ref(), expected, case)?;
+            }
             let Err(error) = outcome else {
                 bail!("{case} did not fail the write");
             };
-            let error = format!("{error}");
-            if let Some(expected) = fault.injected_error_text()
-                && !error.contains(expected)
-            {
-                bail!("{case} failed with {error:?}, which does not carry {expected:?}");
+            if matches!(&fault, WriteFault::DeadlineAbort) {
+                let mysql::Error::MySqlError(error) = &error else {
+                    bail!(
+                        "{case} did not return its complete public SQL deadline error: {error:?}"
+                    );
+                };
+                anyhow::ensure!(
+                    error.code == 1317
+                        && error.state == "70100"
+                        && error.message
+                            == "[query.execution.deadline_exceeded] statement execution was stopped by its control owner",
+                    "{case} lost its original deadline descriptor, errno, SQLSTATE or safe detail: {error:?}"
+                );
             }
 
-            let after_terminals = publication_terminals(context, WRITE_FAMILY)?;
-            let after = all_write_counters(context)?;
-            let delta = write_delta(&before, &after);
+            // SELECT 1 reentry has now completed independently. Its successful
+            // Root is outside this captured original-writer observation.
+            let after_terminals = original_window.publication;
+            let delta = write_delta(&before, &original_window.counters);
             let commits = assert_commit_never_invoked(before_terminals, after_terminals, case)?;
             println!(
                 "distributed-writer-faults case={case:?} commit_invocations={commits} \
@@ -2423,6 +2440,48 @@ impl Scenario for DistributedWriterFaults {
     }
 }
 
+/// A closed observation interval for one writer, before any reentry SQL.
+struct OriginalWriteWindow {
+    publication: PublicationTerminals,
+    counters: Vec<WriteCounters>,
+}
+fn capture_original_write_window(context: &mut ScenarioContext) -> Result<OriginalWriteWindow> {
+    Ok(OriginalWriteWindow {
+        publication: publication_terminals(context, WRITE_FAMILY)?,
+        counters: all_write_counters(context)?,
+    })
+}
+
+/// Observe the original SQL while its same connection remains idle. Regardless
+/// of observation failure, settle releases the single gate and joins the actor.
+fn settle_observed_writer(
+    write: WriterActor,
+    context: &mut ScenarioContext,
+    primary: Result<mysql::Result<()>>,
+    before_reentry: impl FnOnce(&mut ScenarioContext) -> Result<OriginalWriteWindow>,
+) -> Result<(
+    mysql::Result<()>,
+    Option<QueryLifecycleStructuredSnapshot>,
+    OriginalWriteWindow,
+)> {
+    let (window, observed) = if primary.is_ok() {
+        match before_reentry(context) {
+            Ok(window) => (Some(window), Ok(())),
+            Err(error) => (None, Err(error)),
+        }
+    } else {
+        (None, Ok(()))
+    };
+    let primary = retain_write_result(primary, observed);
+    write.settle(context, primary).map(|outcome| {
+        (
+            outcome,
+            None,
+            window.expect("a successful observation precedes reentry"),
+        )
+    })
+}
+
 /// Run only the selected write after its actual idle connection is bound.
 fn run_faulted_write(
     context: &mut ScenarioContext,
@@ -2431,7 +2490,12 @@ fn run_faulted_write(
     port: u16,
     statements: &WriteStatements<'_>,
     selected: SelectedStatement,
-) -> Result<Result<(), mysql::Error>> {
+    before_reentry: impl FnOnce(&mut ScenarioContext) -> Result<OriginalWriteWindow>,
+) -> Result<(
+    Result<(), mysql::Error>,
+    Option<QueryLifecycleStructuredSnapshot>,
+    OriginalWriteWindow,
+)> {
     let case = fault.case();
     let insert = fault.statement(statements);
     match fault {
@@ -2455,7 +2519,7 @@ fn run_faulted_write(
                     .recv_timeout(context.remaining("await the aborted write result")?)
                     .context("aborted write session did not finish")
             })();
-            write.settle(context, primary)
+            settle_observed_writer(write, context, primary, before_reentry)
         }
         WriteFault::DeadlineAbort => {
             const QUERY_TIMEOUT_SECS: u64 = 10;
@@ -2479,7 +2543,7 @@ fn run_faulted_write(
                 await_deadline_abort_terminals(context, &writer_baseline)?;
                 Ok(outcome)
             })();
-            write.settle(context, primary)
+            settle_observed_writer(write, context, primary, before_reentry)
         }
         _ => {
             let deadline = context.deadline();
@@ -2491,36 +2555,151 @@ fn run_faulted_write(
                 }
             };
             let outcome = connection.query_drop(insert);
-            let observed = match &outcome {
-                Ok(()) => {
-                    let terminal = context
-                        .handle()
-                        .await_query_lifecycle_statement_observation(&observation, true, deadline)
-                        .map(|_| ());
-                    let drain = context
-                        .handle()
-                        .drain_query_lifecycle_statement_observation(&observation);
-                    writer_statement_actor::combine(terminal, drain)
-                }
-                Err(mysql::Error::MySqlError(_)) => {
-                    let reentry =
-                        writer_statement_actor::require_public_error_reentry(&mut connection);
-                    let drain = context
-                        .handle()
-                        .drain_query_lifecycle_statement_binding(&observation, deadline);
-                    writer_statement_actor::combine(reentry, drain)
-                }
-                Err(_) => context
+            let mut accepted = None;
+            let terminal = match &outcome {
+                Ok(()) => context
                     .handle()
-                    .drain_query_lifecycle_statement_binding(&observation, deadline),
+                    .await_query_lifecycle_statement_observation(&observation, true, deadline)
+                    .map(|_| ()),
+                Err(mysql::Error::MySqlError(_)) => context
+                    .handle()
+                    .await_query_lifecycle_statement_observation(&observation, false, deadline)
+                    .map(|snapshot| accepted = Some(snapshot)),
+                Err(_) => Ok(()),
+            };
+            // Keep the original connection idle until its writer-only facts
+            // are frozen. Do not subtract an assumed Root for later SELECT 1.
+            let original_window = terminal.and_then(|_| before_reentry(context));
+            let reentry = if matches!(&outcome, Err(mysql::Error::MySqlError(_))) {
+                writer_statement_actor::require_public_error_reentry(&mut connection)
+            } else {
+                Ok(())
+            };
+            let drain = if outcome.is_ok() {
+                context
+                    .handle()
+                    .drain_query_lifecycle_statement_observation(&observation)
+            } else {
+                context
+                    .handle()
+                    .drain_query_lifecycle_statement_binding(&observation, deadline)
+            };
+            let (original_window, observed) = match original_window {
+                Ok(window) => (Some(window), Ok(())),
+                Err(error) => (None, Err(error)),
             };
             let primary = match outcome {
                 Err(error) if !matches!(&error, mysql::Error::MySqlError(_)) => Err(error.into()),
                 outcome => Ok(outcome),
             };
-            retain_write_result(retain_write_result(primary, observed), connection.finish())
+            let cleanup = writer_statement_actor::combine(
+                observed,
+                writer_statement_actor::combine(reentry, drain),
+            );
+            retain_write_result(retain_write_result(primary, cleanup), connection.finish()).map(
+                |outcome| {
+                    (
+                        outcome,
+                        accepted,
+                        original_window.expect("a successful observation precedes reentry"),
+                    )
+                },
+            )
         }
     }
+}
+
+// SQL receives the Task owner's neutral summary, never Connector Display.
+// The optional suffix is exactly the original driver-owned operator location.
+fn connector_neutral_detail(detail: &str, expected: FailureFact) -> bool {
+    let base = format!(
+        "{:?} failure (reason {})",
+        expected.class(),
+        expected.reason()
+    );
+    if detail == base {
+        return true;
+    }
+    let Some(location) = detail.strip_prefix(&format!("{base} at operator ")) else {
+        return false;
+    };
+    let Some((ordinal, operation)) = location.split_once(" during ") else {
+        return false;
+    };
+    ordinal
+        .parse::<usize>()
+        .is_ok_and(|value| value.to_string() == ordinal)
+        && matches!(
+            operation,
+            "Control" | "Preparation" | "Push" | "Pull" | "Finishing" | "Admission"
+        )
+}
+
+fn assert_connector_failure(
+    context: &mut ScenarioContext,
+    outcome: &Result<(), mysql::Error>,
+    snapshot: Option<&QueryLifecycleStructuredSnapshot>,
+    expected: FailureFact,
+    case: &str,
+) -> Result<()> {
+    let snapshot = snapshot.context("connector fault has no exact accepted statement snapshot")?;
+    anyhow::ensure!(
+        snapshot.failure_fact == Some(expected)
+            && snapshot.attempt_id == 1
+            && snapshot.worker_contexts_converged,
+        "{case}: original Connector fact or physical context convergence changed: {snapshot:?}"
+    );
+    let Some(QueryLifecycleFailureSite::Task { identity, phase }) = &snapshot.failure_site else {
+        bail!("{case}: Connector failure lost its actual Task site");
+    };
+    anyhow::ensure!(
+        *phase == TaskFailurePhase::Execution,
+        "{case}: Task phase changed: {phase:?}"
+    );
+    let execution = identity.query_execution_id();
+    let execution_text = format!(
+        "{}:{}:{}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get()
+    );
+    anyhow::ensure!(
+        execution.attempt_id().get() == 1
+            && u64::from_ne_bytes(execution.query_id().high().to_ne_bytes())
+                == snapshot.process_namespace
+            && execution.query_id().low() as u64 == snapshot.local_sequence
+            && snapshot.execution_id.as_deref() == Some(execution_text.as_str()),
+        "{case}: accepted Task belongs to another immutable execution"
+    );
+    let processes = (0..context.handle().be_count())
+        .map(|index| context.handle().backend_process_id(index))
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        processes.contains(&identity.backend_process_id()),
+        "{case}: accepted Task belongs to another backend process"
+    );
+    let detail = snapshot
+        .failure_detail
+        .as_deref()
+        .context("accepted Connector failure has no safe detail")?;
+    anyhow::ensure!(
+        connector_neutral_detail(detail, expected),
+        "{case}: accepted detail is not its exact neutral fact/location summary: {detail:?}"
+    );
+    let Err(mysql::Error::MySqlError(error)) = outcome else {
+        bail!("{case}: expected the original complete public SQL execution error, got {outcome:?}");
+    };
+    let descriptor = match expected.class() {
+        FailureClass::Unexpected => "query.execution.unexpected",
+        FailureClass::Data => "query.execution.invalid_data",
+        class => bail!("{case}: no declared SQL descriptor for fixture Connector class {class:?}"),
+    };
+    let public_message = format!("[{descriptor}] {detail}");
+    anyhow::ensure!(
+        error.code == 1105 && error.state == "HY000" && error.message == public_message,
+        "{case}: SQL code/state/detail differs from the accepted Connector failure: {error:?}"
+    );
+    Ok(())
 }
 
 const WRITE_FAULTS: [WriteFault; 9] = [

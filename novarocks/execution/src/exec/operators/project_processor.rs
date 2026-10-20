@@ -27,6 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::collections::HashMap;
@@ -45,8 +46,14 @@ use crate::exec::expr::dict_peel::{
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_types::SlotId;
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::runtime_state::RuntimeState;
 
 #[cfg(test)]
@@ -55,7 +62,7 @@ fn projected_slot_schema(
     slot_id: SlotId,
     data_type: &DataType,
     actual_nullable: bool,
-) -> Result<ChunkSlotSchema, String> {
+) -> ExecutionResult<ChunkSlotSchema> {
     let derived = if existing.metadata_origins().is_some()
         && crate::exec::chunk::type_compatibility::check_exact(existing.data_type(), data_type)
             .is_ok()
@@ -65,7 +72,7 @@ fn projected_slot_schema(
         existing
             .with_type_and_nullable(data_type.clone(), existing.nullable() || actual_nullable)?
     };
-    derived.with_slot_id(slot_id)
+    Ok(derived.with_slot_id(slot_id)?)
 }
 
 #[cfg(test)]
@@ -73,34 +80,23 @@ fn synthetic_slot_schema(
     slot_id: SlotId,
     name: String,
     data_type: &DataType,
-) -> Result<ChunkSlotSchema, String> {
-    use novarocks_types::arrow_metadata_owner::{
-        ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
-    };
-    let owner = ArrowMetadataOwner::try_new(
-        Vec::new(),
-        MetadataOwnerLimits {
-            entries: 0,
-            construction_bytes: 0,
-        },
-    )
-    .map_err(|_| "project synthetic field metadata construction failed")?
-    .into_field(name, data_type.clone(), true);
-    let field = Arc::clone(owner.field());
-    let origins = FieldMetadataOrigins::try_new(vec![owner], 1)
-        .map_err(|_| "project synthetic metadata origin construction failed")?;
-    if let Ok(scoped) = origins.for_field_tree(&field, 65536, 64) {
-        ChunkSlotSchema::try_new_with_metadata_origins(slot_id, field, scoped, None, None)
-    } else {
-        ChunkSlotSchema::try_new_with_field_ref(slot_id, field, None, None)
-    }
+) -> ExecutionResult<ChunkSlotSchema> {
+    // This fixture creates no receipt for the caller's nested field maps.
+    // Publish an explicitly unknown source instead of claiming a complete
+    // field tree from the fresh root's empty metadata alone.
+    Ok(ChunkSlotSchema::try_new_with_field_ref(
+        slot_id,
+        Arc::new(arrow::datatypes::Field::new(name, data_type.clone(), true)),
+        None,
+        None,
+    )?)
 }
 
 #[cfg(test)]
 fn projected_chunk_schema(
     slots: Vec<ChunkSlotSchema>,
     declared: &ChunkSchema,
-) -> Result<ChunkSchemaRef, String> {
+) -> ExecutionResult<ChunkSchemaRef> {
     let schema = if let Some(source) = declared.schema_metadata_origin() {
         ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
     } else if let Some(source) = declared.metadata_materializations() {
@@ -127,7 +123,7 @@ fn cast_project_output_to_slot(
     array: ArrayRef,
     slot_schema: Option<&ChunkSlotSchema>,
     validate_final_result_input: bool,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let Some(slot_schema) = slot_schema else {
         return Ok(array);
     };
@@ -139,16 +135,7 @@ fn cast_project_output_to_slot(
     {
         return Ok(array);
     }
-    cast_array_to_target(&array, slot_schema.data_type()).map_err(|e| {
-        format!(
-            "project output slot {} (`{}`) cast from {:?} to {:?} failed: {}",
-            slot_schema.slot_id(),
-            slot_schema.name(),
-            array.data_type(),
-            slot_schema.data_type(),
-            e
-        )
-    })
+    cast_array_to_target(&array, slot_schema.data_type())
 }
 
 /// Upgrade slot schemas to nullable where the actual array data contains null values.
@@ -163,31 +150,55 @@ fn cast_project_output_to_slot(
 fn slots_adjusted_for_actual_nullability(
     slot_schemas: &[ChunkSlotSchema],
     columns: &[ArrayRef],
-) -> Result<Vec<ChunkSlotSchema>, String> {
+) -> ExecutionResult<Vec<ChunkSlotSchema>> {
     slot_schemas
         .iter()
         .zip(columns.iter())
         .map(|(schema, array)| {
-            schema.with_type_and_nullable(
+            Ok(schema.with_type_and_nullable(
                 schema.data_type().clone(),
                 schema.nullable() || array.null_count() > 0,
-            )
+            )?)
         })
         .collect()
 }
 
 /// Factory for projection processors that evaluate expression lists into projected chunks.
+#[derive(Debug)]
+struct IdentityInputFailure(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for IdentityInputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for IdentityInputFailure {}
+impl novarocks_failure_contract::FailureProjection for IdentityInputFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::FinalIdentityInput.reason(),
+        )
+    }
+}
+fn identity_input_failure(
+    detail: impl std::fmt::Display,
+) -> crate::runtime::fragment::ExecutionFailure {
+    crate::runtime::fragment::ExecutionFailure::from_domain(IdentityInputFailure(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+
 pub(crate) fn validate_final_result_identity_input_source(
     chunk: &Chunk,
     output: &ChunkSchema,
     identity_layout: bool,
     pair_count: usize,
-    pairs: impl Iterator<Item = Result<(SlotId, SlotId), String>>,
-) -> Result<(), String> {
+    pairs: impl Iterator<Item = ExecutionResult<(SlotId, SlotId)>>,
+) -> ExecutionResult<()> {
     use novarocks_type_contract::ValueLogicalType;
     use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
 
-    fn marker(field: &arrow::datatypes::Field) -> Result<Option<ValueLogicalType>, String> {
+    fn marker(field: &arrow::datatypes::Field) -> ExecutionResult<Option<ValueLogicalType>> {
         let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
             return Ok(None);
         };
@@ -203,22 +214,26 @@ pub(crate) fn validate_final_result_identity_input_source(
                 return Ok(Some(domain));
             }
         }
-        Err("final result input contains an unknown logical domain marker".into())
+        Err(identity_input_failure(
+            "final result input contains an unknown logical domain marker",
+        ))
     }
 
     fn check_field(
         source: &arrow::datatypes::Field,
         target: &arrow::datatypes::Field,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         let actual = marker(source)?;
         let expected = marker(target)?;
         if actual.is_some() && actual != expected {
-            return Err("final result input logical domain differs from output domain".into());
+            return Err(identity_input_failure(
+                "final result input logical domain differs from output domain",
+            ));
         }
         check_type(source.data_type(), target.data_type())
     }
 
-    fn check_type(source: &DataType, target: &DataType) -> Result<(), String> {
+    fn check_type(source: &DataType, target: &DataType) -> ExecutionResult<()> {
         use DataType as D;
         match (source, target) {
             (D::Dictionary(_, values), D::Utf8 | D::LargeUtf8)
@@ -246,24 +261,30 @@ pub(crate) fn validate_final_result_identity_input_source(
             | (
                 _,
                 D::List(_) | D::LargeList(_) | D::FixedSizeList(_, _) | D::Map(_, _) | D::Struct(_),
-            ) => Err("final result input carrier differs from output carrier".into()),
+            ) => Err(identity_input_failure(
+                "final result input carrier differs from output carrier",
+            )),
             // Native result descriptors do not admit these opaque recursive carriers.
             (D::Union(_, _) | D::RunEndEncoded(_, _), _)
-            | (_, D::Union(_, _) | D::RunEndEncoded(_, _)) => {
-                Err("final result input carrier differs from output carrier".into())
-            }
+            | (_, D::Union(_, _) | D::RunEndEncoded(_, _)) => Err(identity_input_failure(
+                "final result input carrier differs from output carrier",
+            )),
             _ if source == target => Ok(()),
-            _ => Err("final result input carrier differs from output carrier".into()),
+            _ => Err(identity_input_failure(
+                "final result input carrier differs from output carrier",
+            )),
         }
     }
 
     fn check_cached(
         source: &novarocks_type_contract::ValueTypeRef,
         target: &arrow::datatypes::Field,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         let actual = source.domain();
         if actual.is_some() && actual != marker(target)? {
-            return Err("final result input logical domain differs from output domain".into());
+            return Err(identity_input_failure(
+                "final result input logical domain differs from output domain",
+            ));
         }
         if source.child_count() == 0 {
             return Ok(());
@@ -279,18 +300,22 @@ pub(crate) fn validate_final_result_identity_input_source(
             DataType::Struct(children) if children.len() == source.child_count() => children,
             DataType::Map(entries, _) => {
                 let DataType::Struct(children) = entries.data_type() else {
-                    return Err(
-                        "final result input semantic shape differs from output shape".into(),
-                    );
+                    return Err(identity_input_failure(
+                        "final result input semantic shape differs from output shape",
+                    ));
                 };
                 if children.len() != 2 || source.child_count() != 2 {
-                    return Err(
-                        "final result input semantic shape differs from output shape".into(),
-                    );
+                    return Err(identity_input_failure(
+                        "final result input semantic shape differs from output shape",
+                    ));
                 }
                 children
             }
-            _ => return Err("final result input semantic shape differs from output shape".into()),
+            _ => {
+                return Err(identity_input_failure(
+                    "final result input semantic shape differs from output shape",
+                ));
+            }
         };
         for (index, target) in children.iter().enumerate() {
             check_cached(source.child_type_at(index).expect("checked child"), target)?;
@@ -299,13 +324,17 @@ pub(crate) fn validate_final_result_identity_input_source(
     }
 
     if !identity_layout || pair_count != output.slots().len() {
-        return Err("final result input validation requires an identity output layout".into());
+        return Err(identity_input_failure(
+            "final result input validation requires an identity output layout",
+        ));
     }
     let batch_schema = chunk.record_batch().schema();
     for (pair, target) in pairs.zip(output.slots()) {
         let (source_slot, output_slot) = pair?;
         if output_slot != target.slot_id() || source_slot != output_slot {
-            return Err("final result input validation requires exact identity slots".into());
+            return Err(identity_input_failure(
+                "final result input validation requires exact identity slots",
+            ));
         }
         let expected = if target.is_typed() {
             target.field_schema().logical_type()
@@ -313,39 +342,41 @@ pub(crate) fn validate_final_result_identity_input_source(
             marker(target.field())?
         };
         if target.field_schema().logical_type() != expected {
-            return Err("final result output contains conflicting logical domain facts".into());
+            return Err(identity_input_failure(
+                "final result output contains conflicting logical domain facts",
+            ));
         }
         let index = chunk
             .slot_id_to_index()
             .get(&source_slot)
             .copied()
-            .ok_or("final result input source slot is missing")?;
+            .ok_or_else(|| identity_input_failure("final result input source slot is missing"))?;
         let actual_field = batch_schema
             .fields()
             .get(index)
-            .ok_or("final result input batch field is missing")?;
+            .ok_or_else(|| identity_input_failure("final result input batch field is missing"))?;
         let actual_slot = chunk
             .chunk_schema()
             .slot(source_slot)
-            .ok_or("final result input slot field is missing")?;
+            .ok_or_else(|| identity_input_failure("final result input slot field is missing"))?;
         if target.is_typed() {
             if !actual_slot.is_typed() {
-                return Err(
-                    "typed final result input requires its explicit typed source binding".into(),
-                );
+                return Err(identity_input_failure(
+                    "typed final result input requires its explicit typed source binding",
+                ));
             }
             let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 actual_slot.typed_binding().clone(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             let expected = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 target.typed_binding().clone(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             if !actual.fits_value_type(&expected) {
-                return Err(
-                    "typed final result input semantics differ from output semantics".into(),
-                );
+                return Err(identity_input_failure(
+                    "typed final result input semantics differ from output semantics",
+                ));
             }
             check_type(actual_field.data_type(), target.data_type())?;
             check_type(actual_slot.data_type(), target.data_type())?;
@@ -357,7 +388,7 @@ pub(crate) fn validate_final_result_identity_input_source(
         let array = chunk
             .columns()
             .get(index)
-            .ok_or("final result input array is missing")?;
+            .ok_or_else(|| identity_input_failure("final result input array is missing"))?;
         check_type(array.data_type(), target.data_type())?;
     }
     Ok(())
@@ -368,22 +399,22 @@ pub(crate) fn materialize_project_output(
     final_columns: Vec<ArrayRef>,
     output_chunk_schema: &ChunkSchema,
     validate_final_result_input: bool,
-) -> Result<Chunk, String> {
+) -> ExecutionResult<Chunk> {
     // Infer schema from final columns
     if output_chunk_schema.slot_ids().len() != final_columns.len() {
-        return Err(format!(
+        return Err(identity_input_failure(format_args!(
             "project output slots mismatch: slots={} columns={}",
             output_chunk_schema.slot_ids().len(),
             final_columns.len()
-        ));
+        )));
     }
 
     let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(final_columns.len());
     let mut slots = Vec::with_capacity(final_columns.len());
     for (array, slot_id) in final_columns.iter().zip(output_chunk_schema.slot_ids()) {
-        let declared = output_chunk_schema
-            .slot(*slot_id)
-            .ok_or_else(|| format!("project output slot {slot_id} is missing"))?;
+        let declared = output_chunk_schema.slot(*slot_id).ok_or_else(|| {
+            identity_input_failure(format_args!("project output slot {slot_id} is missing"))
+        })?;
         let array = cast_project_output_to_slot(
             Arc::clone(array),
             Some(declared),
@@ -408,8 +439,10 @@ pub(crate) fn materialize_project_output(
     }
     let output_chunk_schema = projected_chunk_schema(slots, &output_chunk_schema)?;
 
-    Chunk::try_new_with_columns(output_chunk_schema, output_columns)
-        .map_err(|e| format!("Failed to create output batch: {}", e))
+    Ok(Chunk::try_new_with_columns(
+        output_chunk_schema,
+        output_columns,
+    )?)
 }
 
 /// Encoding provenance is signed by the actual producing operation. An array
@@ -521,11 +554,15 @@ fn project_binding_fits(
     let source = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
         source.clone_observed(work)?,
     )
-    .map_err(|error| ConstructionFailure::InvalidSource(error.to_string()))?;
+    .map_err(|source| {
+        ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
+    })?;
     let target = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
         target.clone_observed(work)?,
     )
-    .map_err(|error| ConstructionFailure::InvalidSource(error.to_string()))?;
+    .map_err(|source| {
+        ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
+    })?;
     source.fits_physical_binding_observed(&target, work)
 }
 
@@ -787,8 +824,8 @@ impl ProjectFixtureFactory {
 }
 #[cfg(test)]
 impl ProjectFixtureFactory {
-    fn create_operator(&self) -> ProjectFixtureOperator {
-        ProjectFixtureOperator {
+    fn create_operator(&self) -> ProjectFixtureKernel {
+        ProjectFixtureKernel {
             name: self.name.clone(),
             arena: self.arena.clone(),
             exprs: self.exprs.clone(),
@@ -804,9 +841,6 @@ impl ProjectFixtureFactory {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         }
     }
 }
@@ -817,12 +851,12 @@ impl OperatorFactory for ProjectFixtureFactory {
         &self.name
     }
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(self.create_operator())
+        Box::new(Transform::hydrating(self.create_operator()))
     }
 }
 
 #[cfg(test)]
-struct ProjectFixtureOperator {
+struct ProjectFixtureKernel {
     name: String,
     arena: Arc<ExprArena>,
     exprs: Vec<ExprId>,
@@ -839,13 +873,10 @@ struct ProjectFixtureOperator {
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: Option<super::compiled_expression::RuntimeKernelControl>,
     tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
-    pending_output: Option<Chunk>,
-    finishing: bool,
-    finished: bool,
 }
 
 #[cfg(test)]
-impl Operator for ProjectFixtureOperator {
+impl OperatorLifecycle for ProjectFixtureKernel {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -995,23 +1026,10 @@ impl Operator for ProjectFixtureOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
-
 #[cfg(test)]
-impl ProcessorOperator for ProjectFixtureOperator {
-    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+impl InputEncodingPolicy for ProjectFixtureKernel {
+    fn retains_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
         let supported_carrier = if self.validate_final_result_input {
             is_final_result_string_dictionary(data_type)
         } else {
@@ -1023,60 +1041,35 @@ impl ProcessorOperator for ProjectFixtureOperator {
         self.all_uses_accept_dictionary(slot_id, self.validate_final_result_input)
     }
 
-    fn accepts_encoded_path(
+    fn retains_encoded_path(
         &self,
         occurrence: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
     ) -> bool {
         if occurrence.path.is_empty() {
-            return self.accepts_encoded_column(occurrence.slot, occurrence.carrier);
+            return self.retains_encoded_column(occurrence.slot, occurrence.carrier);
         }
         // Nested occurrences have only the actual identity path. Root PEEL
         // cannot establish a capability for independently encoded children.
         is_final_result_string_dictionary(occurrence.carrier)
             && self.all_uses_accept_dictionary(occurrence.slot, true)
     }
-
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending_output.is_none()
-    }
-
-    fn has_output(&self) -> bool {
-        self.pending_output.is_some()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        if self.pending_output.is_some() {
-            return Err("project received input while output buffer is full"
-                .to_string()
-                .into());
-        }
-        let out = self.process_one(chunk)?;
-        self.pending_output = out;
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let out = self.pending_output.take();
-        if self.finishing && self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(out)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        if self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+}
+#[cfg(test)]
+impl TransformKernel for ProjectFixtureKernel {
+    fn apply(
+        &mut self,
+        _ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let output = self.project(chunk)?;
+        Ok(StepResult::new(Some(output), NextStep::NeedInput, rows))
     }
 }
 
 #[cfg(test)]
-impl ProjectFixtureOperator {
+impl ProjectFixtureKernel {
     fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
         if let Some(failure) = &self.prepare_failure {
             return Err(failure.clone());
@@ -1156,7 +1149,9 @@ impl ProjectFixtureOperator {
             ));
         }
         if self.validate_final_result_input {
-            return Err("final result requires identity expressions".into());
+            return Err(identity_input_failure(
+                "final result requires identity expressions",
+            ));
         }
         if let Some(peeled) =
             try_peel_dict_expr_owned(&self.arena, expr_id, chunk, output_name, owner, control)?
@@ -1235,19 +1230,7 @@ impl ProjectFixtureOperator {
                     CopyConstructionError::Resource(cause) => {
                         ConstructionFailure::Resource(cause).into()
                     }
-                    CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
-                    CopyConstructionError::Copy(CopyError::Extent) => {
-                        novarocks_functions::KernelFailure::ResourceExhausted.into()
-                    }
-                    CopyConstructionError::Copy(CopyError::Invalid(message)) => {
-                        ConstructionFailure::InvalidSource(message.into()).into()
-                    }
-                    CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
-                        ConstructionFailure::InvalidSource(format!(
-                            "HOUR public result does not support {ty:?}"
-                        ))
-                        .into()
-                    }
+                    CopyConstructionError::Copy(cause) => cause.into_kernel().into(),
                 }
             })?
         } else {
@@ -1332,15 +1315,17 @@ impl ProjectFixtureOperator {
                 .zip(&self.expr_slot_ids)
                 .map(|(expr, output)| match self.arena.node(*expr) {
                     Some(ExprNode::SlotId(source)) => Ok((*source, *output)),
-                    _ => Err("final result input validation requires identity expressions".into()),
+                    _ => Err(identity_input_failure(
+                        "final result input validation requires identity expressions",
+                    )),
                 }),
         )
         .map_err(Into::into)
     }
 
     #[cfg(test)]
-    fn legacy_fixture_empty_output_chunk(&self) -> Result<Chunk, String> {
-        let output = self.prepared_output().map_err(|error| error.to_string())?;
+    fn legacy_fixture_empty_output_chunk(&self) -> ExecutionResult<Chunk> {
+        let output = self.prepared_output()?;
         let mut columns = Vec::with_capacity(output.slots().len());
         let mut slots = Vec::with_capacity(output.slots().len());
         for slot in output.slots() {
@@ -1352,17 +1337,23 @@ impl ProjectFixtureOperator {
             )?);
             columns.push(new_empty_array(slot.data_type()));
         }
-        Chunk::try_new_with_columns(projected_chunk_schema(slots, &output)?, columns)
+        Ok(Chunk::try_new_with_columns(
+            projected_chunk_schema(slots, &output)?,
+            columns,
+        )?)
     }
 
-    fn process_one(&mut self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
+    fn project(&mut self, chunk: Chunk) -> ExecutionResult<Chunk> {
         use crate::exec::pipeline::operator::ConstructionFailure;
         let output = self.prepared_output()?.clone();
         if self.validate_final_result_input {
             self.validate_final_result_identity_input(&chunk)?;
         }
         if self.expr_slot_ids.len() != self.exprs.len() {
-            return Err("project expressions and slots have different widths".into());
+            return Err(ConstructionFailure::InvalidSource(
+                "project expressions and slots have different widths".into(),
+            )
+            .into());
         }
         let control = self
             .control
@@ -1400,14 +1391,14 @@ impl ProjectFixtureOperator {
                     novarocks_functions::selected_copy::CopyConstructionError::Copy(
                         novarocks_functions::selected_copy::CopyError::Control(error),
                     ) => crate::runtime::fragment::ExecutionFailure::from(error),
-                    other => crate::runtime::fragment::ExecutionFailure::from(format!(
-                        "project empty representation: {other:?}"
-                    )),
+                    novarocks_functions::selected_copy::CopyConstructionError::Copy(cause) => {
+                        crate::runtime::fragment::ExecutionFailure::from_domain(cause)
+                    }
                 })?;
                 columns.push(new_empty_array(target.data_type()));
                 crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
             }
-            return Ok(Some(materialize_project_output_owned(
+            return Ok(materialize_project_output_owned(
                 columns,
                 0,
                 output.clone(),
@@ -1434,7 +1425,7 @@ impl ProjectFixtureOperator {
                 |_| Ok(ProjectEncodingSource::Plain),
                 owner.storage_lifetime(),
                 owner.as_ref(),
-            )?));
+            )?);
         }
         let mut working = chunk.clone();
         let mut computed =
@@ -1521,7 +1512,7 @@ impl ProjectFixtureOperator {
                 owner.request(layout)
             })?
         };
-        Ok(Some(materialize_project_output_owned(
+        Ok(materialize_project_output_owned(
             columns,
             chunk.record_batch().num_rows(),
             output.clone(),
@@ -1536,12 +1527,13 @@ impl ProjectFixtureOperator {
             },
             storage,
             owner.as_ref(),
-        )?))
+        )?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::exec::pipeline::operator::OperatorLifecycle;
     use novarocks_type_contract::{
         ValueField, ValueKind, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
     };
@@ -1554,12 +1546,13 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::ProjectFixtureOperator;
+    use super::ProjectFixtureKernel;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::LiteralValue;
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::pipeline::operator::ProcessorOperator;
+    use crate::exec::pipeline::operator::InputEncodingPolicy;
+
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
@@ -1591,7 +1584,7 @@ mod tests {
             Ok(())
         }
     }
-    fn install_fixture_creator(op: &mut ProjectFixtureOperator) {
+    fn install_fixture_creator(op: &mut ProjectFixtureKernel) {
         use crate::exec::pipeline::operator::Operator;
         use crate::exec::pipeline::operator::input_construction::*;
         let factory = ObservedInputConstructionFactory::try_new(
@@ -1638,10 +1631,10 @@ mod tests {
         // The caller supplies the complete semantic declaration. The original
         // field supplies only its name/encoding facts, with NULL authored by
         // that same declaration. Generic attributes stay outside execution.
-        let actual = crate::exec::chunk::normalize_execution_field_observed::<String, _>(
-            slot.field_ref(),
-            |_| Ok(()),
-        )
+        let actual = crate::exec::chunk::normalize_execution_field_observed::<
+            crate::exec::chunk::ChunkConstructionFailure,
+            _,
+        >(slot.field_ref(), |_| Ok(()))
         .unwrap();
         let actual = Arc::new(actual.as_ref().clone().with_nullable(declared.nullable()));
         ChunkSlotSchema::try_new_typed(
@@ -1676,7 +1669,10 @@ mod tests {
         declarations: &[novarocks_type_contract::FunctionValueType],
     ) -> Chunk {
         let schema = fixture_schema(input.chunk_schema(), declarations);
-        Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             schema,
             input.columns().to_vec(),
             input.len(),
@@ -1686,7 +1682,7 @@ mod tests {
         .unwrap()
     }
     fn run_declared_physical_fixture(
-        op: &mut ProjectFixtureOperator,
+        op: &mut ProjectFixtureKernel,
         input: Chunk,
     ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         use novarocks_type_contract::FunctionValueType;
@@ -1740,7 +1736,7 @@ mod tests {
             ordinal += 1;
         }
         install_fixture_creator(op);
-        op.process_one(input)
+        op.project(input).map(Some)
     }
 
     fn typed_fixture_input_direct(
@@ -1758,7 +1754,10 @@ mod tests {
         )
         .unwrap();
         let rows = array.len();
-        Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             Arc::new(
                 ChunkSchema::try_new_typed(vec![slot], ValueTypeStorageLifetime::pure()).unwrap(),
             ),
@@ -1770,7 +1769,7 @@ mod tests {
         .unwrap()
     }
     fn configure_typed_identity(
-        op: &mut ProjectFixtureOperator,
+        op: &mut ProjectFixtureKernel,
         declaration: &novarocks_type_contract::FunctionValueType,
     ) {
         let source = match op.arena.node(op.exprs[0]) {
@@ -1893,7 +1892,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            let mut op = ProjectFixtureOperator {
+            let mut op = ProjectFixtureKernel {
                 name: "PROJECT".into(),
                 arena: Arc::new(arena),
                 exprs: vec![write, read],
@@ -1925,9 +1924,6 @@ mod tests {
                 construction: None,
                 control: None,
                 tracker: None,
-                pending_output: None,
-                finishing: false,
-                finished: false,
             };
             let output = run_declared_physical_fixture(&mut op, input)
                 .unwrap()
@@ -1996,14 +1992,20 @@ mod tests {
         )
         .unwrap();
         let compute = source_slot
-            .with_slot_id_typed_observed::<String>(SlotId::new(3), || Ok(()))
+            .with_slot_id_typed_observed::<crate::runtime::fragment::ExecutionFailure>(
+                SlotId::new(3),
+                || Ok(()),
+            )
             .unwrap();
         let duplicate = source_slot
-            .with_slot_id_typed_observed::<String>(SlotId::new(4), || Ok(()))
+            .with_slot_id_typed_observed::<crate::runtime::fragment::ExecutionFailure>(
+                SlotId::new(4),
+                || Ok(()),
+            )
             .unwrap();
         let mut arena = ExprArena::default();
         let expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), declaration.clone());
-        let mut op = ProjectFixtureOperator {
+        let mut op = ProjectFixtureKernel {
             name: "PROJECT".into(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -2025,15 +2027,15 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
         install_fixture_creator(&mut op);
         for values in [vec![Some("{}")], Vec::new()] {
             let array: ArrayRef = Arc::new(StringArray::from(values));
             let rows = array.len();
-            let input = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+            let input = Chunk::try_new_typed_with_columns_owned_observed::<
+                crate::runtime::fragment::ExecutionFailure,
+                _,
+            >(
                 Arc::new(
                     ChunkSchema::try_new_typed(
                         vec![source_slot.clone()],
@@ -2047,7 +2049,7 @@ mod tests {
                 |_| Ok(()),
             )
             .unwrap();
-            let output = op.process_one(input).unwrap().unwrap();
+            let output = op.project(input).unwrap();
             assert_eq!(output.len(), rows);
             assert_eq!(
                 output.chunk_schema().slot_ids(),
@@ -2085,7 +2087,7 @@ mod tests {
             },
             DataType::Utf8,
         );
-        let op = ProjectFixtureOperator {
+        let op = ProjectFixtureKernel {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower],
@@ -2101,15 +2103,12 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
 
         let dictionary_type =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
-        assert!(op.accepts_encoded_column(input_slot, &dictionary_type));
-        assert!(!op.accepts_encoded_column(input_slot, &DataType::Utf8));
+        assert!(op.retains_encoded_column(input_slot, &dictionary_type));
+        assert!(!op.retains_encoded_column(input_slot, &DataType::Utf8));
     }
 
     #[test]
@@ -2176,10 +2175,9 @@ mod tests {
                 output,
             )
             .with_final_result_input_validation(final_input);
-            let installed = factory.create(1, 0);
-            let processor = installed.as_processor_ref().unwrap();
+            let processor = factory.create_operator();
             assert_eq!(
-                processor.accepts_encoded_column(input_slot, &dictionary),
+                processor.retains_encoded_column(input_slot, &dictionary),
                 expected
             );
         }
@@ -2198,7 +2196,7 @@ mod tests {
             },
             DataType::Utf8,
         );
-        let mut op = ProjectFixtureOperator {
+        let mut op = ProjectFixtureKernel {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower],
@@ -2214,9 +2212,6 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
 
         let output = run_declared_physical_fixture(&mut op, dict_string_chunk(input_slot))
@@ -2284,7 +2279,7 @@ mod tests {
             ])
             .expect("output schema"),
         );
-        let mut op = ProjectFixtureOperator {
+        let mut op = ProjectFixtureKernel {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower, coalesce],
@@ -2300,9 +2295,6 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
 
         let output = run_declared_physical_fixture(&mut op, dict_string_chunk(input_slot))
@@ -2355,7 +2347,7 @@ mod tests {
             ])
             .expect("output schema"),
         );
-        let mut op = ProjectFixtureOperator {
+        let mut op = ProjectFixtureKernel {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower, read_overwritten],
@@ -2371,9 +2363,6 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
 
         let output = run_declared_physical_fixture(&mut op, dict_string_chunk(input_slot))
@@ -2415,7 +2404,7 @@ mod tests {
         let expr_write_slot17 =
             arena.push_typed(ExprNode::SlotId(SlotId::new(18)), DataType::Int32);
         let expr_read_slot17 = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), DataType::Int32);
-        let mut op = ProjectFixtureOperator {
+        let mut op = ProjectFixtureKernel {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![expr_write_slot17, expr_read_slot17],
@@ -2447,9 +2436,6 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
 
         let batch = RecordBatch::try_new(
@@ -2513,7 +2499,7 @@ mod tests {
             ValueTypeStorageLifetime::pure(),
         )
         .unwrap();
-        let mut op = ProjectFixtureOperator {
+        let mut op = ProjectFixtureKernel {
             name: "PROJECT".into(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -2531,9 +2517,6 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
         install_fixture_creator(&mut op);
         let input = typed_fixture_input_direct(
@@ -2543,7 +2526,7 @@ mod tests {
             SlotId::new(1),
         );
         let original = input.columns()[0].clone();
-        let output = op.process_one(input).unwrap().unwrap();
+        let output = op.project(input).unwrap();
         let slot = &output.chunk_schema().slots()[0];
         assert_eq!(slot.name(), "out");
         assert!(!slot.nullable());
@@ -2576,7 +2559,7 @@ mod tests {
             )])
             .expect("schema"),
         );
-        let mut op = ProjectFixtureOperator {
+        let mut op = ProjectFixtureKernel {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -2592,9 +2575,6 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
 
         let input_schema = Arc::new(Schema::new(vec![Field::new("in", DataType::Int64, false)]));
@@ -2625,18 +2605,18 @@ mod tests {
         assert_eq!(values.value(1), 2);
     }
 
-    fn final_identity_operator(data_type: DataType, domain: LogicalType) -> ProjectFixtureOperator {
+    fn final_identity_operator(data_type: DataType, domain: LogicalType) -> ProjectFixtureKernel {
         final_identity_operator_with_field(field_with_logical_type(
             Field::new("result", data_type, true),
             domain,
         ))
     }
 
-    fn final_identity_operator_with_field(field: Field) -> ProjectFixtureOperator {
+    fn final_identity_operator_with_field(field: Field) -> ProjectFixtureKernel {
         let slot = SlotId::new(1);
         let mut arena = ExprArena::default();
         let expr = arena.push_typed(ExprNode::SlotId(slot), field.data_type().clone());
-        ProjectFixtureOperator {
+        ProjectFixtureKernel {
             name: "FINAL RESULT".into(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -2657,9 +2637,6 @@ mod tests {
             construction: None,
             control: None,
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         }
     }
 
@@ -2758,10 +2735,9 @@ mod tests {
         ] {
             let mut op = final_identity_operator(DataType::Binary, LogicalType::Bitmap);
             let error = op
-                .process_one(final_binary_input(batch, slot, cached, false))
+                .project(final_binary_input(batch, slot, cached, false))
                 .unwrap_err();
             assert!(error.detail().contains("logical domain differs"), "{error}");
-            assert!(op.pending_output.is_none());
         }
     }
 
@@ -2772,14 +2748,14 @@ mod tests {
                 for (batch, slot) in [(Some(marker), None), (None, Some(marker))] {
                     let mut op = final_identity_operator(DataType::Binary, LogicalType::Bitmap);
                     let error = op
-                        .process_one(final_binary_input(batch, slot, None, empty))
+                        .project(final_binary_input(batch, slot, None, empty))
                         .unwrap_err();
                     assert!(error.detail().contains("unknown logical domain"), "{error}");
                 }
             }
             let mut op = final_identity_operator(DataType::Binary, LogicalType::Bitmap);
             assert!(
-                op.process_one(final_binary_input(Some("hll"), None, None, empty))
+                op.project(final_binary_input(Some("hll"), None, None, empty))
                     .is_err()
             );
         }
@@ -2816,7 +2792,7 @@ mod tests {
                 );
                 let mut op = final_identity_operator(DataType::Binary, LogicalType::Bitmap);
                 configure_typed_identity(&mut op, &declaration);
-                let output = op.process_one(input).unwrap().unwrap();
+                let output = op.project(input).unwrap();
                 assert_eq!(output.len(), usize::from(!empty));
                 assert_eq!(
                     output.chunk_schema().slots()[0]
@@ -2859,7 +2835,7 @@ mod tests {
         );
         let mut op = final_identity_operator(DataType::Utf8, LogicalType::Json);
         configure_typed_identity(&mut op, &declaration);
-        let output = op.process_one(input).unwrap().unwrap();
+        let output = op.project(input).unwrap();
         assert_eq!(output.len(), 4);
         assert!(Arc::ptr_eq(&array, &output.columns()[0]));
         assert_eq!(
@@ -2881,9 +2857,8 @@ mod tests {
         ] {
             let input = final_input_with_fields(field.clone(), field.clone(), None, array);
             let mut op = final_identity_operator(DataType::Binary, LogicalType::Bitmap);
-            let error = op.process_one(input).unwrap_err();
+            let error = op.project(input).unwrap_err();
             assert!(error.detail().contains("carrier differs"), "{error}");
-            assert!(op.pending_output.is_none());
         }
     }
 
@@ -2942,7 +2917,7 @@ mod tests {
                         final_struct_array(&plain, empty),
                     );
                     let mut op = final_identity_operator_with_field(target.clone());
-                    let error = op.process_one(input).unwrap_err();
+                    let error = op.project(input).unwrap_err();
                     assert!(error.detail().contains("logical domain"), "{error}");
                 }
             }
@@ -2976,7 +2951,7 @@ mod tests {
             );
             let mut op = final_identity_operator_with_field(target.clone());
             assert!(
-                op.process_one(input)
+                op.project(input)
                     .unwrap_err()
                     .detail()
                     .contains("logical domain differs")
@@ -3052,7 +3027,7 @@ mod tests {
                 let original = input.columns()[0].clone();
                 let mut op = final_identity_operator_with_field(final_struct_field(Some("bitmap")));
                 configure_typed_identity(&mut op, &declaration);
-                let output = op.process_one(input).unwrap().unwrap();
+                let output = op.project(input).unwrap();
                 assert_eq!(output.len(), usize::from(!empty));
                 assert_eq!(
                     output.chunk_schema().slots()[0]
@@ -3126,7 +3101,7 @@ mod tests {
             );
             let mut op = final_identity_operator_with_field(Field::new("target", target, true));
             assert!(
-                op.process_one(input)
+                op.project(input)
                     .unwrap_err()
                     .detail()
                     .contains("carrier differs")
@@ -3153,11 +3128,11 @@ mod tests {
         let mut op =
             final_identity_operator_with_field(Field::new("result", DataType::LargeUtf8, true));
         configure_typed_identity(&mut op, &declaration);
-        assert!(op.accepts_encoded_column(SlotId::new(1), array.data_type()));
+        assert!(op.retains_encoded_column(SlotId::new(1), array.data_type()));
         op.validate_final_result_input = false;
-        assert!(!op.accepts_encoded_column(SlotId::new(1), array.data_type()));
+        assert!(!op.retains_encoded_column(SlotId::new(1), array.data_type()));
         op.validate_final_result_input = true;
-        let output = op.process_one(input).unwrap().unwrap();
+        let output = op.project(input).unwrap();
         assert_eq!(output.columns()[0].data_type(), array.data_type());
         assert_eq!(original, output.columns()[0].to_data());
         assert_eq!(
@@ -3190,7 +3165,7 @@ mod tests {
         let mut op = final_identity_operator(DataType::Binary, LogicalType::Bitmap);
         op.output_indices = Some(vec![0]);
         assert!(
-            op.process_one(final_binary_input(None, None, None, false))
+            op.project(final_binary_input(None, None, None, false))
                 .unwrap_err()
                 .detail()
                 .contains("identity output layout")
@@ -3200,7 +3175,7 @@ mod tests {
         op.exprs[0] = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Binary);
         op.arena = Arc::new(arena);
         assert!(
-            op.process_one(final_binary_input(None, None, None, false))
+            op.project(final_binary_input(None, None, None, false))
                 .unwrap_err()
                 .detail()
                 .contains("identity expressions")
@@ -3228,7 +3203,7 @@ mod tests {
             Arc::new(BinaryArray::from(vec![&b"state"[..]])),
             SlotId::new(1),
         );
-        assert!(op.process_one(input).is_err());
+        assert!(op.project(input).is_err());
 
         use crate::exec::pipeline::operator_factory::OperatorFactory;
         let mut arena = ExprArena::default();
@@ -3268,14 +3243,12 @@ mod tests {
             Arc::new(BinaryArray::from(vec![&b"state"[..]])),
             SlotId::new(1),
         );
-        let error = operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(
-                &crate::runtime::runtime_state::RuntimeState::default(),
-                input,
-            )
-            .unwrap_err();
+        let error = crate::exec::pipeline::test_driver::TestDriver::new(
+            operator.as_mut(),
+            &crate::runtime::runtime_state::RuntimeState::default(),
+        )
+        .input_and_collect(input)
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3500,7 +3473,10 @@ mod owned_project_tests {
             ValueTypeStorageLifetime::pure(),
         )
         .unwrap();
-        let input = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        let input = Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             Arc::new(
                 ChunkSchema::try_new_typed(vec![input_slot], ValueTypeStorageLifetime::pure())
                     .unwrap(),
@@ -3565,7 +3541,10 @@ mod owned_project_tests {
             )
             .unwrap(),
         );
-        let input = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        let input = Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             input_schema,
             vec![Arc::new(arrow::array::Int64Array::from(vec![
                 Some(-1),
@@ -3635,13 +3614,7 @@ mod owned_project_tests {
         operator
             .bind_runtime_state(&RuntimeState::default())
             .unwrap();
-        operator
-            .push_chunk(&RuntimeState::default(), input)
-            .unwrap();
-        let output = operator
-            .pull_chunk(&RuntimeState::default())
-            .unwrap()
-            .unwrap();
+        let output = operator.project(input).unwrap();
         let values = output.columns()[0]
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -3782,9 +3755,7 @@ mod owned_project_tests {
             )
         );
         let original = input.columns()[0].clone();
-        let failure_after_input = operator
-            .push_chunk(&RuntimeState::default(), input)
-            .unwrap_err();
+        let failure_after_input = operator.project(input).unwrap_err();
         assert_eq!(failure_after_input, failure);
         assert_eq!(
             original
@@ -3794,7 +3765,7 @@ mod owned_project_tests {
                 .value(0),
             "{}"
         );
-        assert!(operator.pending_output.is_none());
+
         assert!(operator.expr_slot_schemas.is_empty());
     }
 
@@ -3817,16 +3788,11 @@ mod owned_project_tests {
         assert_eq!(tracker.current(), baseline);
         let allocated = tracker.allocated();
         assert_eq!(operator.prepare().unwrap_err(), failure);
-        assert_eq!(
-            operator
-                .push_chunk(&RuntimeState::default(), input)
-                .unwrap_err(),
-            failure
-        );
+        assert_eq!(operator.project(input).unwrap_err(), failure);
         assert_eq!(tracker.allocated(), allocated);
         assert!(operator.output_chunk_schema.is_none());
         assert!(operator.expr_slot_schemas.is_empty());
-        assert!(operator.pending_output.is_none());
+
         drop(operator);
         drop(creation);
         drop(factory);
@@ -3980,7 +3946,10 @@ mod owned_project_tests {
             ValueTypeStorageLifetime::pure(),
         )
         .unwrap();
-        Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             Arc::new(
                 ChunkSchema::try_new_typed(vec![slot], ValueTypeStorageLifetime::pure()).unwrap(),
             ),
@@ -4283,7 +4252,7 @@ mod owned_project_tests {
             )
             .is_err()
         );
-        let op = ProjectFixtureOperator {
+        let op = ProjectFixtureKernel {
             name: "TEST_PROJECT".into(),
             arena: Arc::new(wrong_arena),
             exprs: vec![wrong_source],
@@ -4303,9 +4272,6 @@ mod owned_project_tests {
                 )),
             ),
             tracker: None,
-            pending_output: None,
-            finishing: false,
-            finished: false,
         };
         assert!(
             op.eval_project_expr(wrong_source, &signed, "alias", &owner)

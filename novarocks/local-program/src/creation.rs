@@ -51,7 +51,7 @@ impl<C: std::error::Error + 'static, H: std::error::Error + 'static> std::error:
         match self {
             Self::Control(e) => Some(e),
             Self::Creator(e) => Some(e),
-            Self::Resource(_) => None,
+            Self::Resource(source) => Some(source),
             Self::Capacity(e) => Some(e),
             Self::Owner(e) => Some(e),
         }
@@ -218,5 +218,60 @@ impl<H> novarocks_type_contract::ValueSchemaCreationFactory<H> for NoFactory {
         _: &mut dyn FnMut(Layout) -> Result<(), O>,
     ) -> Result<Self::Scope<'_>, novarocks_type_contract::ValueSchemaScopeBeginFailure<O, H>> {
         match *self {}
+    }
+}
+
+impl<
+    C: novarocks_failure_contract::FailureProjection,
+    H: novarocks_failure_contract::FailureProjection,
+> novarocks_failure_contract::FailureProjection for ProgramCreationFailure<C, H>
+{
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        match self {
+            Self::Control(source) => source.failure_fact(),
+            Self::Creator(source) => source.failure_fact(),
+            Self::Resource(source) => source.failure_fact(),
+            Self::Owner(source) => source.failure_fact(),
+            // The publisher observed a real reserve refusal. The SDK does
+            // not expose a capacity measurement; those values remain unknown.
+            Self::Capacity(_) => FailureFact::new(
+                FailureClass::Resource,
+                FailureReason::new(
+                    domain::LOCAL_PROGRAM,
+                    std::num::NonZeroU16::new(430).unwrap(),
+                ),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod creation_source_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    use std::{convert::Infallible, error::Error};
+    #[test]
+    fn program_publication_keeps_real_reserve_and_geometry_sources() {
+        let source = Vec::<u64>::new().try_reserve_exact(usize::MAX).unwrap_err();
+        let error: ProgramCreationFailure<Infallible, Infallible> =
+            ProgramCreationFailure::Capacity(source);
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().domain(), domain::LOCAL_PROGRAM.get());
+        assert_eq!(fact.reason().code(), 430);
+        assert_eq!(fact.resource(), None);
+        assert!(error.source().unwrap().is::<TryReserveError>());
+        let source = LayoutResourceError::SourceModel;
+        let error: ProgramCreationFailure<Infallible, Infallible> =
+            ProgramCreationFailure::Resource(source);
+        assert_eq!(error.failure_fact(), source.failure_fact());
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<LayoutResourceError>(),
+            Some(&source)
+        );
     }
 }

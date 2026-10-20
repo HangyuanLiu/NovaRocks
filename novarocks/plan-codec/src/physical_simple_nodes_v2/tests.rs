@@ -57,7 +57,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -890,7 +890,7 @@ fn simple_nodes_all_original_control_prefixes_and_nested_work_admission_are_obse
                 for stop in 0..trace.len() {
                     for cause in CAUSES {
                         let (result, actual) =
-                            control_case(decode, ordinary, at, Some((stop, cause)));
+                            control_case(decode, ordinary, at, Some((stop, cause.clone())));
                         assert!(matches!(result,Err(Error::Control(actual))if actual==cause));
                         assert_eq!(actual, trace[..=stop]);
                     }
@@ -908,9 +908,9 @@ fn simple_nodes_all_original_control_prefixes_and_nested_work_admission_are_obse
         // 320 real row headers, not a prescan or synthetic callback loop.
         node.kind=p::NodeKind::Values{rows:vec![Box::<[p::ExprId]>::default();320].into_boxed_slice()};
         c.arm(None);let(wire,_)=encode_simple_node(&node,values,expressions,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).unwrap();
-        for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(encode_simple_node(&node,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
+        for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(encode_simple_node(&node,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
         c.arm(None);decode_simple_node(&wire,read,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).unwrap();
-        for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(decode_simple_node(&wire,read,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
+        for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(decode_simple_node(&wire,read,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
     });
 }
 

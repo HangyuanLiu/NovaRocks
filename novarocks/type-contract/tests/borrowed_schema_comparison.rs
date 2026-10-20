@@ -100,7 +100,7 @@ fn capture<T>(call: impl FnOnce() -> T) -> (T, Requests) {
     ENABLED.with(|cell| cell.set(false));
     (result, REQUESTS.with(Cell::get))
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Failure {
     Type(ValueTypeError),
     Control(CompileControlError),
@@ -295,7 +295,7 @@ fn borrowed_observer_first_failure_stops_every_real_success_and_false_prefix() {
                 let observer = || {
                     let at = calls.get();
                     calls.set(at + 1);
-                    if let Some((stop, cause)) = fail
+                    if let Some((stop, cause)) = fail.clone()
                         && at == stop
                     {
                         return Err(Failure::Control(cause));
@@ -319,8 +319,8 @@ fn borrowed_observer_first_failure_stops_every_real_success_and_false_prefix() {
             for cause in CAUSES {
                 for stop in 0..total {
                     calls.set(0);
-                    let (result, requests) = capture(|| compare(Some((stop, cause))));
-                    assert_eq!(result, Err(Failure::Control(cause)));
+                    let (result, requests) = capture(|| compare(Some((stop, cause.clone()))));
+                    assert_eq!(result, Err(Failure::Control(cause.clone())));
                     // Observer calls have no payload: this exact count proves
                     // the complete prefix, including no retry after refusal.
                     assert_eq!(calls.get(), stop + 1);

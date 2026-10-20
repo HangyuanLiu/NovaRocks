@@ -17,3 +17,11 @@
 pub use novarocks_functions::legacy_decimal::{
     div_round_i128, div_round_i256, pow10_i128, pow10_i256,
 };
+
+impl From<novarocks_functions::legacy_decimal::DecimalMathFailure>
+    for crate::runtime::fragment::ExecutionFailure
+{
+    fn from(cause: novarocks_functions::legacy_decimal::DecimalMathFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}

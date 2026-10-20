@@ -39,6 +39,58 @@ use std::sync::{Arc, Mutex, Weak};
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::BackendProcessId;
 
+/// Refusal to install one attempt's process transport readiness registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeTransportRegistrationError {
+    Capacity { limit: usize },
+    IdentityExhausted,
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for NativeTransportRegistrationError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, ResourceDimension, ResourceFacts,
+            ResourceScope, domain,
+        };
+        let code = match self {
+            Self::Capacity { .. } => 104,
+            Self::IdentityExhausted => 105,
+        };
+        let fact = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        match self {
+            Self::Capacity { limit } => fact.with_resource(ResourceFacts {
+                request_scope: Some(ResourceScope::Request),
+                constraint_scope: Some(ResourceScope::Process),
+                dimension: ResourceDimension::Positions,
+                requested: Some(1),
+                required_growth: Some(1),
+                limit: u64::try_from(*limit).ok(),
+                live: None,
+                committed: None,
+            }),
+            Self::IdentityExhausted => fact,
+        }
+    }
+}
+
+impl NativeTransportRegistrationError {
+    pub(crate) fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        novarocks_execution_contract::SafeDetail::truncating(match self {
+            Self::Capacity { .. } => "native task transport waiter capacity is exhausted",
+            Self::IdentityExhausted => "native task transport waiter identity space is exhausted",
+        })
+    }
+}
+impl fmt::Display for NativeTransportRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.safe_detail().as_str())
+    }
+}
+impl std::error::Error for NativeTransportRegistrationError {}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeTransportSupervisorBudget {
     // Cumulative process windows, including queued and accepted sends.
@@ -220,7 +272,7 @@ impl NativeTransportSupervisor {
     pub(crate) fn register_waiter(
         &self,
         wake: Arc<dyn NativeTransportReadyWake>,
-    ) -> Result<NativeTransportWaiter, String> {
+    ) -> Result<NativeTransportWaiter, NativeTransportRegistrationError> {
         let mut state = self
             .inner
             .state
@@ -228,15 +280,14 @@ impl NativeTransportSupervisor {
             .expect("native transport supervisor");
         state.waiters.retain(|_, wake| wake.strong_count() > 0);
         if state.waiters.len() >= self.inner.budget.max_waiters {
-            return Err(format!(
-                "native task transport waiter capacity {} is exhausted",
-                self.inner.budget.max_waiters
-            ));
+            return Err(NativeTransportRegistrationError::Capacity {
+                limit: self.inner.budget.max_waiters,
+            });
         }
         let id = state
             .next_waiter_id
             .checked_add(1)
-            .ok_or_else(|| "native task transport waiter identity exhausted".to_owned())?;
+            .ok_or(NativeTransportRegistrationError::IdentityExhausted)?;
         state.next_waiter_id = id;
         state.waiters.insert(id, Arc::downgrade(&wake));
         Ok(NativeTransportWaiter {
@@ -948,17 +999,51 @@ mod tests {
         let first = supervisor
             .register_waiter(first_wake.clone())
             .expect("first waiter");
-        assert!(
-            supervisor
-                .register_waiter(Arc::new(CountingWake::default()))
-                .is_err()
+        let error = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            NativeTransportRegistrationError::Capacity { limit: 1 }
         );
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, ResourceDimension, ResourceScope,
+        };
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        let resource = fact.resource().unwrap();
+        assert_eq!(resource.constraint_scope, Some(ResourceScope::Process));
+        assert_eq!(resource.dimension, ResourceDimension::Positions);
+        assert_eq!(resource.requested, Some(1));
+        assert_eq!(resource.limit, Some(1));
+        assert_eq!(resource.live, None);
         drop(first);
         assert!(
             supervisor
                 .register_waiter(Arc::new(CountingWake::default()))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn exhausted_waiter_identity_does_not_install_a_registration_or_claim_closed() {
+        let supervisor = supervisor();
+        supervisor.inner.state.lock().unwrap().next_waiter_id = u64::MAX;
+        let error = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .unwrap_err();
+        assert_eq!(error, NativeTransportRegistrationError::IdentityExhausted);
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureEvidence, FailureProjection,
+        };
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(
+            error.failure_fact().evidence(),
+            FailureEvidence::Originating
+        );
+        assert_eq!(error.failure_fact().reason().code(), 105);
+        assert!(supervisor.inner.state.lock().unwrap().waiters.is_empty());
+        assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
     }
 
     #[test]

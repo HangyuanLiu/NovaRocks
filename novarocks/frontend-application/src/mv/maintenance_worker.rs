@@ -651,7 +651,7 @@ fn finish_automatic_action<T>(
             let original = result
                 .as_ref()
                 .err()
-                .and_then(|error| error.compile_control);
+                .and_then(|error| error.compile_control.clone());
             let control = original.or(error.compile_control_error());
             Err(error.with_compile_control(control))
         }
@@ -866,9 +866,9 @@ mod tests {
                 } else {
                     TerminalError::known_uncommitted("original failure")
                 }
-                .with_compile_control(Some(control));
+                .with_compile_control(Some(control.clone()));
                 let background = automatic_terminal_error(error);
-                assert_eq!(background.compile_control_error(), Some(control));
+                assert_eq!(background.compile_control_error(), Some(control.clone()));
                 assert_eq!(
                     background.kind(),
                     if before_dispatch {
@@ -878,12 +878,12 @@ mod tests {
                     }
                 );
                 let disposition = MvRefreshDisposition::from_background_error(background);
-                assert_eq!(disposition.compile_control_error(), Some(control));
+                assert_eq!(disposition.compile_control_error(), Some(control.clone()));
                 let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(
                     MvSchedulerConfig::new(true, 1, 1, 10, 40),
                 );
                 let decision = runtime.record(&7, disposition, 100);
-                assert_eq!(decision.compile_control_error(), Some(control));
+                assert_eq!(decision.compile_control_error(), Some(control.clone()));
                 assert_eq!(runtime.is_suppressed(&7, 100), !before_dispatch);
                 assert_eq!(
                     matches!(decision, MvRefreshRuntimeDecision::NoChange { .. }),
@@ -899,10 +899,10 @@ mod tests {
         for control in [C::Cancelled, C::DeadlineExceeded, C::ResourceExhausted] {
             let primary = || {
                 TerminalError::known_uncommitted("primary failure")
-                    .with_compile_control(Some(control))
+                    .with_compile_control(Some(control.clone()))
             };
             let recorded = finish_automatic_action::<()>(Err(primary()), Ok(())).unwrap_err();
-            assert_eq!(recorded.compile_control_error(), Some(control));
+            assert_eq!(recorded.compile_control_error(), Some(control.clone()));
             assert_eq!(
                 recorded.kind(),
                 MvBackgroundEngineErrorKind::TerminalFailure

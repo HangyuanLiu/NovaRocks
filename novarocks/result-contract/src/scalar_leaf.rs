@@ -570,3 +570,35 @@ pub(crate) fn decimal_in_range(bytes: &[u8], precision: u8) -> bool {
     }
     false
 }
+
+impl novarocks_failure_contract::FailureProjection for ScalarLeafError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self {
+            Self::Type => (FailureClass::Invariant, 1000),
+            Self::Nullability => (FailureClass::Invariant, 1001),
+            Self::ValueLimit => (FailureClass::Representation, 1002),
+            Self::InvalidValue => (FailureClass::Data, 1003),
+            Self::UnsupportedContainer => (FailureClass::Invariant, 1004),
+            Self::MalformedRecord => (FailureClass::Data, 1005),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        if matches!(self, Self::ValueLimit) {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::MinimumUnit,
+                layout: RepresentationLayout {
+                    domain: domain::RESULT,
+                    code: std::num::NonZeroU16::new(1000).unwrap(),
+                },
+                required: None,
+                extent_limit: Some(crate::SCALAR_RECORD_MAX_BYTES as u64),
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}

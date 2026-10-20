@@ -386,7 +386,7 @@ fn hll_payload_owner_four_phases_three_projections_and_null_empty_groups() {
     }
 }
 #[test]
-fn hll_payload_owner_unsupported_any_empty_null_whole_data_same_real_domain() {
+fn hll_payload_owner_unsupported_empty_and_null_are_carrier_contracts() {
     for name in ["hll_union", "hll_raw_agg", "hll_union_agg"] {
         for ty in [
             DataType::Null,
@@ -414,22 +414,13 @@ fn hll_payload_owner_unsupported_any_empty_null_whole_data_same_real_domain() {
                     &mapping,
                     &Control::default(),
                 );
-                let Err(EvaluationFailure::InvocationData(data)) = result else {
-                    panic!("original unsupported match is whole Data even NULL/empty")
-                };
+                let error = result.unwrap_err();
+                assert_hll_payload_contract(&error);
                 assert_eq!(
-                    data.message(),
-                    format!(
-                        "update aggregate state: hll aggregate expects HLL/BINARY payload input, got {ty:?}"
-                    )
+                    error.to_string(),
+                    format!("hll aggregate expects HLL/BINARY payload input, got {ty:?}")
                 );
-                assert_eq!(data.batch_rows(), rows);
-                assert_eq!(data.state_indices(), mapping);
-                assert!(std::ptr::eq(
-                    data.aggregate_contract(),
-                    c.handle().contract().as_ref()
-                ));
-                drop((data, c));
+                drop((error, c));
                 empty(&host);
             }
         }
@@ -615,7 +606,7 @@ struct CompileStop(CompileControlError);
 impl PureCompileControl for CompileStop {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        Err(self.0)
+        Err(self.0.clone())
     }
 }
 #[test]
@@ -657,7 +648,7 @@ fn hll_payload_owner_compile_three_causes_and_exact_declared_n1_profiles() {
                 CompileControlError::ResourceExhausted,
             ] {
                 assert!(
-                    matches!(catalog.pure_overload_declaration_observed(&bound.function_id, FunctionKind::Aggregate, &bound.selected.overload, &CompileStop(cause)), Err(FunctionSpecializationFailure::Control(actual)) if actual == cause)
+                    matches!(catalog.pure_overload_declaration_observed(&bound.function_id, FunctionKind::Aggregate, &bound.selected.overload, &CompileStop(cause.clone())), Err(FunctionSpecializationFailure::Control(actual)) if actual == cause)
                 );
             }
         }
@@ -729,9 +720,7 @@ fn hll_payload_empty_update_setup_real_host_and_seven_control_first_causes() {
     let baseline = Control::default();
     let result = hll_payload_empty_unsupported_probe(host.clone(), &baseline);
     let expected_trace = baseline.trace.lock().unwrap().clone();
-    assert!(
-        matches!(&result, Err(EvaluationFailure::InvocationData(data)) if data.batch_rows() == 0 && data.state_indices().is_empty() && data.message() == "update aggregate state: hll aggregate expects HLL/BINARY payload input, got Null")
-    );
+    assert_hll_payload_contract(&result.as_ref().unwrap_err());
     drop(result);
     empty(&host);
     for cause in causes() {
@@ -757,19 +746,19 @@ fn hll_payload_empty_update_setup_real_host_and_seven_control_first_causes() {
             1,
         );
         let input = arrow_array::new_null_array(&DataType::Null, 0);
-        // Arm after actual state setup. Carrier checking itself now requires
-        // the true lossless diagnostic host even though the selected domain is empty.
+        // Carrier rejection is bounded metadata and needs no diagnostic host request.
+        let before = host.ledger.lock().unwrap().attempts;
         arm_refusal(&host, 0, cause.clone());
-        assert_eq!(
-            update_column(
-                &mut column,
-                &input,
-                Selection::all(0),
-                &[],
-                &Control::default()
-            ),
-            Err(EvaluationFailure::Kernel(cause))
-        );
+        let error = update_column(
+            &mut column,
+            &input,
+            Selection::all(0),
+            &[],
+            &Control::default(),
+        )
+        .unwrap_err();
+        assert_hll_payload_contract(&error);
+        assert_eq!(host.ledger.lock().unwrap().attempts, before);
         drop(column);
         empty(&host);
     }
@@ -914,4 +903,13 @@ fn hll_payload_failed_emission_all_positions_preserves_real_healthy_prefix_only(
             empty(&host);
         }
     }
+}
+
+fn assert_hll_payload_contract(error: &EvaluationFailure) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let EvaluationFailure::Kernel(error) = error else {
+        panic!("HLL payload carrier must be an outer contract failure")
+    };
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 328);
 }

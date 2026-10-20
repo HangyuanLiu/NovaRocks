@@ -120,7 +120,7 @@ mod tests {
                 port,
             })
             .expect_err("an unaddressable endpoint must not parse");
-            assert_eq!(error.kind(), kind);
+            assert_eq!(error.kind(), &kind);
             assert_eq!(
                 error.path().to_string(),
                 format!("query_control_endpoint.{field}")
@@ -148,7 +148,7 @@ mod tests {
             ..Default::default()
         })
         .expect_err("an unattributed contribution must not parse");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
         assert_eq!(
             error.path().to_string(),
             "runtime_filter_contribution.participant_id"

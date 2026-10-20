@@ -255,7 +255,10 @@ impl CompiledSchemaMetadataScope for CompiledProjectMetadataHost<'_> {
         body: B,
     ) -> ExecutionResult<ChunkSchemaRef>
     where
-        B: FnOnce() -> Result<ChunkSchemaRef, String>,
+        B: FnOnce() -> Result<
+            ChunkSchemaRef,
+            novarocks_execution::exec::chunk::ChunkConstructionFailure,
+        >,
     {
         let node = self
             .source_node(program, site, layout)
@@ -277,7 +280,7 @@ impl CompiledSchemaMetadataScope for CompiledProjectMetadataHost<'_> {
             return body().map_err(Into::into);
         }
         let facts = original_compiled_schema_metadata_request(layout, self.control)
-            .map_err(PreparationMetadataFailure::Request)?;
+            .map_err(PreparationMetadataFailure::SchemaRequest)?;
         self.journal.facts = Some(facts);
         let control = WorkerPreparationMemoryControl {
             preparation: self.preparation,
@@ -319,7 +322,7 @@ impl novarocks_execution::runtime::preparation_metadata::CompiledSchemaPreparati
             .map_err(PreparationMetadataFailure::Request)?;
         self.journal.start(ProjectMetadataPhase::Prepare(node));
         let facts = original_compiled_schema_metadata_request(layout, self.control)
-            .map_err(PreparationMetadataFailure::Request)?;
+            .map_err(PreparationMetadataFailure::SchemaRequest)?;
         self.journal.facts = Some(facts);
         let control = WorkerPreparationMemoryControl {
             preparation: self.preparation,

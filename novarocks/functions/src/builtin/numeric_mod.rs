@@ -52,8 +52,7 @@ fn checked_view<'a>(
             "integer remainder input is not an installed numeric profile",
         ));
     }
-    NumericArrayView::new(array)
-        .map_err(|_| internal("integer remainder selected carrier cannot be downcast"))
+    NumericArrayView::new(array).map_err(KernelFailure::from_domain)
 }
 pub(super) fn evaluate_numeric_mod<'a>(
     op: NumericModOp,
@@ -125,12 +124,7 @@ pub(super) fn evaluate_numeric_mod<'a>(
         },
         || work.step(),
     )
-    .map_err(|error| match error {
-        NumericModError::RangeInvariant => {
-            internal("integer remainder exceeds its proven signed range")
-        }
-        NumericModError::Control(error) => error,
-    })?;
+    .map_err(NumericModError::into_kernel)?;
     let values = Arc::new(builder.finish()) as ArrayRef;
     work.finish()?;
     SelectedValues::try_new(selection, target.data_type(), values, Box::default())
@@ -521,7 +515,7 @@ mod tests {
         let mut wrong_shape = instance("mod", &types);
         assert!(matches!(
             wrong_shape.evaluate(selection, &wrong, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
 

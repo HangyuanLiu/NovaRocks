@@ -74,7 +74,10 @@ fn chunk(arrays: Vec<ArrayRef>) -> Chunk {
     let cs = ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &ids).unwrap();
     Chunk::new_with_chunk_schema(batch, cs)
 }
-pub(super) fn original(arrays: Vec<ArrayRef>, negated: bool) -> Result<ArrayRef, String> {
+pub(super) fn original(
+    arrays: Vec<ArrayRef>,
+    negated: bool,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let children = arrays
         .iter()
@@ -197,7 +200,7 @@ fn throwing(arena: &mut ExprArena, message: String) -> ExprId {
     )
 }
 #[test]
-fn between_original_lower_data_error_precedes_upper_full_error_without_clipping() {
+fn between_lower_assertion_precedes_upper_with_a_bounded_original_diagnostic() {
     let c = chunk(vec![Arc::new(Int64Array::from(vec![3]))]);
     for negated in [false, true] {
         let mut arena = ExprArena::default();
@@ -206,7 +209,22 @@ fn between_original_lower_data_error_precedes_upper_full_error_without_clipping(
         let low = throwing(&mut arena, message.clone());
         let high = throwing(&mut arena, "unreached upper".into());
         let root = expand(&mut arena, value, low, high, negated);
-        assert_eq!(arena.eval(root, &c).unwrap_err(), message);
+        let failure = arena.eval(root, &c).unwrap_err();
+        use novarocks_failure_contract::{
+            BoundedDetail, FailureClass, FailureFact, FailureProjection,
+        };
+        assert_eq!(
+            failure.failure_fact(),
+            FailureFact::new(
+                FailureClass::Data,
+                crate::runtime::fragment::ExecutionReason::AssertionFailed.reason()
+            )
+        );
+        assert_eq!(
+            failure.detail(),
+            BoundedDetail::truncating(&message).as_str()
+        );
+        assert!(failure.detail().len() <= 512);
     }
 }
 #[test]
@@ -222,7 +240,7 @@ fn between_original_value_boolean_dominance_does_not_skip_upper_evaluation() {
         );
         let root = expand(&mut arena, value, low, high, negated);
         assert_eq!(
-            arena.eval(root, &c).unwrap_err(),
+            (arena.eval(root, &c).unwrap_err()).to_string(),
             "required upper even after dominating lower"
         );
     }
@@ -238,10 +256,22 @@ fn between_original_first_comparison_error_precedes_upper_expression() {
     );
     let high = throwing(&mut arena, "unreached upper".into());
     let root = expand(&mut arena, operand, low, high, false);
+    let failure = arena.eval(root, &c).unwrap_err();
+    use novarocks_failure_contract::FailureProjection;
     assert_eq!(
-        arena.eval(root, &c).unwrap_err(),
-        "invalid date literal 'not-a-date'"
+        failure.failure_fact(),
+        novarocks_functions::DataFailureReason::InvalidValue.failure_fact()
     );
+    let mut source: &(dyn std::error::Error + 'static) = &failure;
+    loop {
+        if let Some(parse) = source.downcast_ref::<chrono::ParseError>() {
+            assert_eq!(parse.kind(), chrono::format::ParseErrorKind::Invalid);
+            break;
+        }
+        source = source.source().expect(
+            "comparison must retain the original date parser refusal before upper assertion",
+        );
+    }
 }
 #[derive(Debug)]
 struct ObservedSeed {

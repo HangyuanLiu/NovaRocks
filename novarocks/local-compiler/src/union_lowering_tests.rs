@@ -855,7 +855,7 @@ impl PureCompileControl for Trace {
         events.push((phase, units));
         if self.at == Some(at) {
             self.refused.store(true, Ordering::SeqCst);
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -897,7 +897,7 @@ fn union_all_every_small_complete_compiler_control_prefix_and_ordinary_tail() {
         }
         for cause in causes() {
             for at in 0..expected.len() {
-                let control = Trace::new(Some(at), cause);
+                let control = Trace::new(Some(at), cause.clone());
                 assert!(
                     matches!(compile(&source,&functions,&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
                 );
@@ -924,7 +924,7 @@ fn union_all_wide_real_mapping_work_keeps_order_and_quantum_prefix() {
         .expect("real source/mapping/flow work quantum");
     for cause in causes() {
         for at in [0, quantum, expected.len() - 1] {
-            let control = Trace::new(Some(at), cause);
+            let control = Trace::new(Some(at), cause.clone());
             assert!(
                 matches!(compile(&source,&functions,&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
             );

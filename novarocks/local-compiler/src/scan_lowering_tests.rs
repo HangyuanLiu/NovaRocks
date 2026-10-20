@@ -91,7 +91,7 @@ impl PureCompileControl for Trace {
             assert!(at <= stop, "callback after the original refusal");
         }
         events.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -1412,7 +1412,7 @@ fn every_scan_compile_callback_keeps_the_original_control_cause() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Trace::new(Some((at, cause)));
+            let control = Trace::new(Some((at, cause.clone())));
             assert!(matches!(
                 compile_with(&fixture, Sink::Gather, &control),
                 Err(FragmentCompileError::Control(actual)) if actual == cause

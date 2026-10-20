@@ -17,6 +17,11 @@
 
 //! Task status, cursor, subscription, and final task info codec.
 
+use novarocks_execution_contract::failure::{
+    FailureClass, FailureEvidence, FailureFact, FailureReason, FailureRowPosition,
+    RepresentationBoundary, RepresentationFacts, RepresentationLayout, ResourceDimension,
+    ResourceFacts, ResourceScope,
+};
 use std::time::Duration;
 
 use novarocks_execution_contract::task_execution::domain::DomainVersion;
@@ -24,9 +29,9 @@ use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
     FinalTaskInfo, OPERATOR_COUNTER_BUDGET, OperatorCounter, OperatorStatistics,
-    SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure, TaskFailureCategory, TaskFailurePhase,
-    TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion,
-    TaskWriterFacts, TerminationDetail,
+    SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure, TaskFailurePhase, TaskOutputFacts,
+    TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion, TaskWriterFacts,
+    TerminationDetail,
 };
 use novarocks_proto_models::novarocks;
 
@@ -116,36 +121,255 @@ pub(crate) fn encode_abort_cause(value: AbortCause) -> i32 {
     encoded as i32
 }
 
-fn decode_failure_category(
-    value: i32,
-    path: FieldPath,
-) -> Result<TaskFailureCategory, ProtocolError> {
-    match novarocks::TaskFailureCategory::try_from(value) {
-        Ok(novarocks::TaskFailureCategory::Execution) => Ok(TaskFailureCategory::Execution),
-        Ok(novarocks::TaskFailureCategory::ResourceExhausted) => {
-            Ok(TaskFailureCategory::ResourceExhausted)
-        }
-        Ok(novarocks::TaskFailureCategory::Exchange) => Ok(TaskFailureCategory::Exchange),
-        Ok(novarocks::TaskFailureCategory::Protocol) => Ok(TaskFailureCategory::Protocol),
-        Ok(novarocks::TaskFailureCategory::Internal) => Ok(TaskFailureCategory::Internal),
-        Ok(novarocks::TaskFailureCategory::Unsupported) => Ok(TaskFailureCategory::Unsupported),
-        Ok(novarocks::TaskFailureCategory::Unspecified) | Err(_) => Err(invalid_enum(
+use std::num::NonZeroU16;
+
+fn decode_failure_class(value: i32, path: FieldPath) -> Result<FailureClass, ProtocolError> {
+    match novarocks::FailureClass::try_from(value) {
+        Ok(novarocks::FailureClass::Data) => Ok(FailureClass::Data),
+        Ok(novarocks::FailureClass::Dependency) => Ok(FailureClass::Dependency),
+        Ok(novarocks::FailureClass::Resource) => Ok(FailureClass::Resource),
+        Ok(novarocks::FailureClass::Representation) => Ok(FailureClass::Representation),
+        Ok(novarocks::FailureClass::Invariant) => Ok(FailureClass::Invariant),
+        Ok(novarocks::FailureClass::Unexpected) => Ok(FailureClass::Unexpected),
+        Ok(novarocks::FailureClass::Control) => Ok(FailureClass::Control),
+        Ok(novarocks::FailureClass::Unsupported) => Ok(FailureClass::Unsupported),
+        _ => Err(invalid_enum(
             path,
-            "failure category must be a known non-default value",
+            "failure_class must be a known non-default value",
         )),
     }
 }
-
-fn encode_failure_category(value: TaskFailureCategory) -> i32 {
-    let encoded = match value {
-        TaskFailureCategory::Execution => novarocks::TaskFailureCategory::Execution,
-        TaskFailureCategory::ResourceExhausted => novarocks::TaskFailureCategory::ResourceExhausted,
-        TaskFailureCategory::Exchange => novarocks::TaskFailureCategory::Exchange,
-        TaskFailureCategory::Protocol => novarocks::TaskFailureCategory::Protocol,
-        TaskFailureCategory::Internal => novarocks::TaskFailureCategory::Internal,
-        TaskFailureCategory::Unsupported => novarocks::TaskFailureCategory::Unsupported,
+fn encode_failure_class(value: FailureClass) -> i32 {
+    match value {
+        FailureClass::Data => novarocks::FailureClass::Data as i32,
+        FailureClass::Dependency => novarocks::FailureClass::Dependency as i32,
+        FailureClass::Resource => novarocks::FailureClass::Resource as i32,
+        FailureClass::Representation => novarocks::FailureClass::Representation as i32,
+        FailureClass::Invariant => novarocks::FailureClass::Invariant as i32,
+        FailureClass::Unexpected => novarocks::FailureClass::Unexpected as i32,
+        FailureClass::Control => novarocks::FailureClass::Control as i32,
+        FailureClass::Unsupported => novarocks::FailureClass::Unsupported as i32,
+    }
+}
+fn decode_failure_evidence(value: i32, path: FieldPath) -> Result<FailureEvidence, ProtocolError> {
+    match novarocks::FailureEvidence::try_from(value) {
+        Ok(novarocks::FailureEvidence::Originating) => Ok(FailureEvidence::Originating),
+        Ok(novarocks::FailureEvidence::StopObservation) => Ok(FailureEvidence::StopObservation),
+        _ => Err(invalid_enum(
+            path,
+            "failure_evidence must be a known non-default value",
+        )),
+    }
+}
+fn encode_failure_evidence(value: FailureEvidence) -> i32 {
+    match value {
+        FailureEvidence::Originating => novarocks::FailureEvidence::Originating as i32,
+        FailureEvidence::StopObservation => novarocks::FailureEvidence::StopObservation as i32,
+    }
+}
+fn decode_resource_scope(value: i32, path: FieldPath) -> Result<ResourceScope, ProtocolError> {
+    match novarocks::FailureResourceScope::try_from(value) {
+        Ok(novarocks::FailureResourceScope::Request) => Ok(ResourceScope::Request),
+        Ok(novarocks::FailureResourceScope::Operator) => Ok(ResourceScope::Operator),
+        Ok(novarocks::FailureResourceScope::Driver) => Ok(ResourceScope::Driver),
+        Ok(novarocks::FailureResourceScope::Task) => Ok(ResourceScope::Task),
+        Ok(novarocks::FailureResourceScope::Query) => Ok(ResourceScope::Query),
+        Ok(novarocks::FailureResourceScope::Process) => Ok(ResourceScope::Process),
+        _ => Err(invalid_enum(
+            path,
+            "resource_scope must be a known non-default value",
+        )),
+    }
+}
+fn encode_resource_scope(value: ResourceScope) -> i32 {
+    match value {
+        ResourceScope::Request => novarocks::FailureResourceScope::Request as i32,
+        ResourceScope::Operator => novarocks::FailureResourceScope::Operator as i32,
+        ResourceScope::Driver => novarocks::FailureResourceScope::Driver as i32,
+        ResourceScope::Task => novarocks::FailureResourceScope::Task as i32,
+        ResourceScope::Query => novarocks::FailureResourceScope::Query as i32,
+        ResourceScope::Process => novarocks::FailureResourceScope::Process as i32,
+    }
+}
+fn decode_resource_dimension(
+    value: i32,
+    path: FieldPath,
+) -> Result<ResourceDimension, ProtocolError> {
+    match novarocks::FailureResourceDimension::try_from(value) {
+        Ok(novarocks::FailureResourceDimension::Bytes) => Ok(ResourceDimension::Bytes),
+        Ok(novarocks::FailureResourceDimension::Items) => Ok(ResourceDimension::Items),
+        Ok(novarocks::FailureResourceDimension::Positions) => Ok(ResourceDimension::Positions),
+        _ => Err(invalid_enum(
+            path,
+            "resource_dimension must be a known non-default value",
+        )),
+    }
+}
+fn encode_resource_dimension(value: ResourceDimension) -> i32 {
+    match value {
+        ResourceDimension::Bytes => novarocks::FailureResourceDimension::Bytes as i32,
+        ResourceDimension::Items => novarocks::FailureResourceDimension::Items as i32,
+        ResourceDimension::Positions => novarocks::FailureResourceDimension::Positions as i32,
+    }
+}
+fn decode_representation_boundary(
+    value: i32,
+    path: FieldPath,
+) -> Result<RepresentationBoundary, ProtocolError> {
+    match novarocks::FailureRepresentationBoundary::try_from(value) {
+        Ok(novarocks::FailureRepresentationBoundary::MinimumUnit) => {
+            Ok(RepresentationBoundary::MinimumUnit)
+        }
+        Ok(novarocks::FailureRepresentationBoundary::SingleOutput) => {
+            Ok(RepresentationBoundary::SingleOutput)
+        }
+        _ => Err(invalid_enum(
+            path,
+            "representation_boundary must be a known non-default value",
+        )),
+    }
+}
+fn encode_representation_boundary(value: RepresentationBoundary) -> i32 {
+    match value {
+        RepresentationBoundary::MinimumUnit => {
+            novarocks::FailureRepresentationBoundary::MinimumUnit as i32
+        }
+        RepresentationBoundary::SingleOutput => {
+            novarocks::FailureRepresentationBoundary::SingleOutput as i32
+        }
+    }
+}
+fn decode_nonzero_u16(value: u32, path: FieldPath) -> Result<NonZeroU16, ProtocolError> {
+    u16::try_from(value)
+        .ok()
+        .and_then(NonZeroU16::new)
+        .ok_or_else(|| out_of_range(path, "identifier must be a nonzero u16"))
+}
+/// Decode the canonical neutral failure vocabulary without a Task envelope.
+pub fn decode_failure_fact(
+    src: &novarocks::FailureFact,
+    path: FieldPath,
+) -> Result<FailureFact, ProtocolError> {
+    let class = decode_failure_class(src.class, path.clone().field("class"))?;
+    let evidence = decode_failure_evidence(src.evidence, path.clone().field("evidence"))?;
+    let reason = src.reason.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("reason"),
+            "failure fact requires a reason",
+        )
+    })?;
+    let reason = FailureReason::new(
+        decode_nonzero_u16(reason.domain, path.clone().field("reason").field("domain"))?,
+        decode_nonzero_u16(reason.code, path.clone().field("reason").field("code"))?,
+    );
+    let mut fact = match evidence {
+        FailureEvidence::Originating => FailureFact::new(class, reason),
+        FailureEvidence::StopObservation => {
+            if class != FailureClass::Control {
+                return Err(inconsistent(
+                    path.clone().field("class"),
+                    "stop observation requires Control class",
+                ));
+            }
+            FailureFact::stop_observation(reason)
+        }
     };
-    encoded as i32
+    if let Some(row) = &src.row_position {
+        fact = fact.with_row_position(FailureRowPosition {
+            selected_ordinal: row.selected_ordinal,
+            batch_row: row.batch_row,
+        });
+    }
+    if let Some(r) = &src.resource {
+        fact = fact.with_resource(decode_resource_facts(r, path.clone().field("resource"))?);
+    }
+    if let Some(r) = &src.representation {
+        let p = path.field("representation");
+        let layout = r.layout.as_ref().ok_or_else(|| {
+            missing(
+                p.clone().field("layout"),
+                "representation requires a layout",
+            )
+        })?;
+        fact = fact.with_representation(RepresentationFacts {
+            boundary: decode_representation_boundary(r.boundary, p.clone().field("boundary"))?,
+            layout: RepresentationLayout {
+                domain: decode_nonzero_u16(
+                    layout.domain,
+                    p.clone().field("layout").field("domain"),
+                )?,
+                code: decode_nonzero_u16(layout.code, p.field("layout").field("code"))?,
+            },
+            required: r.required,
+            extent_limit: r.extent_limit,
+            representable_prefix: r.representable_prefix,
+        });
+    }
+    Ok(fact)
+}
+pub(crate) fn decode_resource_facts(
+    r: &novarocks::FailureResourceFacts,
+    p: FieldPath,
+) -> Result<ResourceFacts, ProtocolError> {
+    Ok(ResourceFacts {
+        request_scope: r
+            .request_scope
+            .map(|v| decode_resource_scope(v, p.clone().field("request_scope")))
+            .transpose()?,
+        constraint_scope: r
+            .constraint_scope
+            .map(|v| decode_resource_scope(v, p.clone().field("constraint_scope")))
+            .transpose()?,
+        dimension: decode_resource_dimension(r.dimension, p.field("dimension"))?,
+        requested: r.requested,
+        required_growth: r.required_growth,
+        limit: r.limit,
+        live: r.live,
+        committed: r.committed,
+    })
+}
+pub(crate) fn encode_resource_facts(r: ResourceFacts) -> novarocks::FailureResourceFacts {
+    novarocks::FailureResourceFacts {
+        request_scope: r.request_scope.map(encode_resource_scope),
+        constraint_scope: r.constraint_scope.map(encode_resource_scope),
+        dimension: encode_resource_dimension(r.dimension),
+        requested: r.requested,
+        required_growth: r.required_growth,
+        limit: r.limit,
+        live: r.live,
+        committed: r.committed,
+    }
+}
+
+/// Encode the canonical neutral failure vocabulary without reclassification.
+pub fn encode_failure_fact(fact: FailureFact) -> novarocks::FailureFact {
+    novarocks::FailureFact {
+        class: encode_failure_class(fact.class()),
+        evidence: encode_failure_evidence(fact.evidence()),
+        reason: Some(novarocks::FailureReason {
+            domain: u32::from(fact.reason().domain()),
+            code: u32::from(fact.reason().code()),
+        }),
+        row_position: fact
+            .row_position()
+            .map(|row| novarocks::FailureRowPosition {
+                selected_ordinal: row.selected_ordinal,
+                batch_row: row.batch_row,
+            }),
+        resource: fact.resource().map(encode_resource_facts),
+        representation: fact
+            .representation()
+            .map(|r| novarocks::FailureRepresentationFacts {
+                boundary: encode_representation_boundary(r.boundary),
+                layout: Some(novarocks::FailureRepresentationLayout {
+                    domain: u32::from(r.layout.domain.get()),
+                    code: u32::from(r.layout.code.get()),
+                }),
+                required: r.required,
+                extent_limit: r.extent_limit,
+                representable_prefix: r.representable_prefix,
+            }),
+    }
 }
 
 fn decode_failure_phase(value: i32, path: FieldPath) -> Result<TaskFailurePhase, ProtocolError> {
@@ -196,14 +420,19 @@ fn decode_termination(
         }
         novarocks::task_termination::Cause::Failed(failure) => {
             let failure_path = path.field("failed");
-            let category =
-                decode_failure_category(failure.category, failure_path.clone().field("category"))?;
+            let fact = failure.fact.as_ref().ok_or_else(|| {
+                missing(
+                    failure_path.clone().field("fact"),
+                    "task failure requires producer facts",
+                )
+            })?;
+            let fact = decode_failure_fact(fact, failure_path.clone().field("fact"))?;
             let detail = decode_safe_detail(
                 &failure.safe_detail,
                 failure_path.clone().field("safe_detail"),
             )?;
             let phase = decode_failure_phase(failure.phase, failure_path.field("phase"))?;
-            TerminationDetail::Failed(TaskFailure::new_in_phase(category, detail, phase))
+            TerminationDetail::Failed(TaskFailure::new_in_phase(fact, detail, phase))
         }
     })
 }
@@ -218,7 +447,7 @@ fn encode_termination(value: &TerminationDetail) -> novarocks::TaskTermination {
         }
         TerminationDetail::Failed(failure) => {
             novarocks::task_termination::Cause::Failed(novarocks::TaskFailure {
-                category: encode_failure_category(failure.category()),
+                fact: Some(encode_failure_fact(failure.fact())),
                 safe_detail: failure.detail().as_str().to_owned(),
                 phase: encode_failure_phase(failure.phase()),
             })

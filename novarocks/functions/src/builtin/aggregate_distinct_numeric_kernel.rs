@@ -18,6 +18,7 @@
 //! Selected four-phase numeric DISTINCT through the shared v1 computation.
 use super::aggregate_distinct_numeric::{self as core, NumericDistinctSet};
 use super::aggregate_distinct_storage::NumericDistinctState;
+use crate::aggregate_scalar::ScalarStateAllocator;
 use crate::kernel_control::{KernelControlObservation, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
@@ -276,14 +277,9 @@ impl PreparedAggregateKernel for DistinctNumericKernel {
                     let mut buffer = state.buffer();
                     core::serialize_set_into(state, &mut buffer, work)
                         .map_err(core::DistinctComputationError::into_kernel_failure)?;
-                    payload_bytes = payload_bytes
-                        .checked_add(buffer.bytes.len())
-                        .filter(|n| *n <= i32::MAX as usize)
-                        .ok_or_else(|| {
-                            KernelFailure::Operational(KernelDiagnostic::new(
-                                "distinct state batch exceeds the Binary offset domain",
-                            ))
-                        })?;
+                    payload_bytes =
+                        core::checked_state_batch_bytes(payload_bytes, buffer.bytes.len())
+                            .map_err(core::DistinctComputationError::into_kernel_failure)?;
                     work.flush()?;
                     // Arrow output is an opaque host-scoped allocation, as in v1.
                     builder.append_value(buffer.bytes.as_slice());
@@ -330,9 +326,11 @@ impl PreparedAggregateKernel for DistinctNumericKernel {
                 ));
             }
             let mut arrays = HostVec::new_in(first.allocator.clone());
-            arrays
-                .try_reserve_exact(expected)
-                .map_err(|_| arrays.allocator().take_failure())?;
+            arrays.try_reserve_exact(expected).map_err(|source| {
+                arrays
+                    .allocator()
+                    .scalar_allocation_error("reserve numeric distinct output arrays", source)
+            })?;
             work.flush()?;
             for state in std::iter::once(first).chain(states) {
                 if state.failed {
@@ -361,16 +359,19 @@ impl PreparedAggregateKernel for DistinctNumericKernel {
                 ));
             }
             let mut references = HostVec::new_in(first.allocator.clone());
-            references
-                .try_reserve_exact(expected)
-                .map_err(|_| references.allocator().take_failure())?;
+            references.try_reserve_exact(expected).map_err(|source| {
+                references
+                    .allocator()
+                    .scalar_allocation_error("reserve numeric distinct output references", source)
+            })?;
             for array in &arrays {
                 references.push(array.as_ref());
                 work.step()?;
             }
             work.flush()?;
-            let output = arrow_select::concat::concat(&references)
-                .map_err(|e| KernelFailure::Operational(KernelDiagnostic::new(&e.to_string())))?;
+            let output = arrow_select::concat::concat(&references).map_err(|source| {
+                core::DistinctComputationError::OutputConcat(source).into_kernel_failure()
+            })?;
             work.flush()?;
             Ok(output)
         })
@@ -416,7 +417,7 @@ pub(super) fn validate_contract(
             ty,
         )
         .ok_or_else(|| invalid("numeric DISTINCT decimal output is unsupported"))?,
-        (ty @ DataType::Decimal256(..), DistinctOperation::Avg) => ty.clone().clone(),
+        (ty @ DataType::Decimal256(..), DistinctOperation::Avg) => ty.clone(),
         _ => {
             return Err(invalid(&format!(
                 "{} has no installed numeric DISTINCT input profile for {:?}",

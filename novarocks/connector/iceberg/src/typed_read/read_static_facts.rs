@@ -88,6 +88,15 @@ impl Work<'_> {
         self.flush()?;
         Ok(result)
     }
+    fn opaque_source<T>(
+        &mut self,
+        operation: impl FnOnce() -> Result<T, ConnectorError>,
+    ) -> Result<T, ReadStaticFactsError> {
+        self.flush()?;
+        let value = operation()?;
+        self.flush()?;
+        Ok(value)
+    }
     fn copy(&mut self, input: &[u8]) -> Result<Vec<u8>, ReadStaticFactsError> {
         let mut output = self.opaque(|| Vec::with_capacity(input.len()))?;
         for bytes in input.chunks(256) {
@@ -119,11 +128,9 @@ pub(crate) fn iceberg_final_static_facts_for_compile(
         CompilePhase::ProviderValidation,
     )?));
     let result = project(relation, &mut work);
-    if matches!(&result, Err(ReadStaticFactsError::Control(_))) {
-        return result;
-    }
-    work.flush()?;
-    result
+    work.0
+        .expect("compile projection retains its original checkpoint scope")
+        .finish_result(result, ReadStaticFactsError::Control)
 }
 
 fn project(
@@ -154,18 +161,18 @@ fn project(
             let frozen = work.opaque(|| reference.to_proto().encode_to_vec())?;
             let properties = match reference.system_table_type().distribution() {
                 SystemTableDistribution::AllNodes => unconstrained_read_properties(work)?,
-                SystemTableDistribution::SingleCoordinator => work.opaque(|| {
+                SystemTableDistribution::SingleCoordinator => work.opaque_source(|| {
                     ConnectorReadProperties::try_new(
                         ConnectorReadDistribution::Singleton,
                         Vec::new(),
                     )
-                })??,
+                })?,
             };
             let input_digest =
                 static_digest(b"iceberg-final-static-system-table-v1", &frozen, work)?;
             let selection_digest =
                 static_digest(b"iceberg-final-static-system-table-v1", &frozen, work)?;
-            work.opaque(|| {
+            work.opaque_source(|| {
                 ConnectorReadStaticFacts::try_new(
                     ConnectorReadInputVersion::try_new(input_digest.as_slice())?,
                     selection_digest,
@@ -173,8 +180,7 @@ fn project(
                     ConnectorReadArtifactCoverage::NoArtifactInputs,
                     frozen,
                 )
-            })?
-            .map_err(Into::into)
+            })
         }
         IcebergRuntimeRelation::ChangeWindow(handle) => {
             let frozen = work.opaque(|| handle.to_proto().encode_to_vec())?;
@@ -196,13 +202,13 @@ fn project(
                     let content_digest =
                         decode_hex(rewrite.artifact().artifact_digest_hex(), work)?;
                     let evidence = work.opaque(|| rewrite.artifact().evidence())?;
-                    work.opaque(|| {
+                    work.opaque_source(|| {
                         ConnectorReadArtifactCoverage::exact(
                             selection_digest,
                             content_digest,
                             evidence,
                         )
-                    })??
+                    })?
                 }
                 Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
                     ConnectorReadArtifactCoverage::NoArtifactInputs
@@ -214,7 +220,7 @@ fn project(
                 work,
             )?;
             let properties = unconstrained_read_properties(work)?;
-            work.opaque(|| {
+            work.opaque_source(|| {
                 ConnectorReadStaticFacts::try_new(
                     ConnectorReadInputVersion::try_new(input_digest.as_slice())?,
                     selection_digest,
@@ -222,8 +228,7 @@ fn project(
                     artifact_coverage,
                     Vec::new(),
                 )
-            })?
-            .map_err(Into::into)
+            })
         }
         IcebergRuntimeRelation::TableFunction(_) => Err(unsupported(
             "iceberg table-function relations do not publish final static read facts",
@@ -246,7 +251,7 @@ fn static_facts_from_bytes(
 ) -> Result<ConnectorReadStaticFacts<IcebergColumnHandle>, ReadStaticFactsError> {
     let input_digest = static_digest(domain, input_identity, work)?;
     let selection_digest = static_digest(domain, selection, work)?;
-    work.opaque(|| {
+    work.opaque_source(|| {
         ConnectorReadStaticFacts::try_new(
             ConnectorReadInputVersion::try_new(input_digest.as_slice())?,
             selection_digest,
@@ -254,17 +259,15 @@ fn static_facts_from_bytes(
             artifact_coverage,
             Vec::new(),
         )
-    })?
-    .map_err(Into::into)
+    })
 }
 
 fn unconstrained_read_properties(
     work: &mut Work<'_>,
 ) -> Result<ConnectorReadProperties<IcebergColumnHandle>, ReadStaticFactsError> {
-    work.opaque(|| {
+    work.opaque_source(|| {
         ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, Vec::new())
-    })?
-    .map_err(Into::into)
+    })
 }
 
 fn static_digest(
@@ -308,9 +311,9 @@ fn decode_hex(value: &str, work: &mut Work<'_>) -> Result<[u8; 32], ReadStaticFa
             .and_then(|pair| {
                 u8::from_str_radix(pair, 16)
                     .map_err(|_| invalid("iceberg artifact digest is not valid hexadecimal"))
-            });
+            })?;
         work.step()?;
-        *byte = parsed?;
+        *byte = parsed;
     }
     Ok(digest)
 }
@@ -341,7 +344,7 @@ mod tests {
             assert!(units <= 256);
             let mut calls = self.calls.lock().unwrap();
             calls.push(units);
-            if let Some((index, error)) = self.refusal {
+            if let Some((index, error)) = self.refusal.clone() {
                 assert!(
                     calls.len() <= index,
                     "control must not be called after refusal"
@@ -512,7 +515,7 @@ mod tests {
         for cause in causes() {
             let control = Control {
                 calls: Default::default(),
-                refusal: Some((1, cause)),
+                refusal: Some((1, cause.clone())),
             };
             assert!(
                 matches!(iceberg_final_static_facts_for_compile(&rewrite(), &control),
@@ -536,7 +539,7 @@ mod tests {
         for cause in causes() {
             let control = Control {
                 calls: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(iceberg_final_static_facts_for_compile(&relation, &control),
@@ -547,28 +550,108 @@ mod tests {
         }
     }
     #[test]
-    fn unsupported_source_keeps_legacy_diagnostic_but_observes_ordinary_error_tail() {
+    fn unsupported_source_preserves_first_authored_error_and_prior_control_prefix() {
+        use novarocks_failure_contract::FailureProjection;
         let relation = unsupported_function();
-        let legacy = iceberg_final_static_facts(&relation).unwrap_err();
-        let error =
-            iceberg_final_static_facts_for_compile(&relation, &Control::default()).unwrap_err();
-        let ReadStaticFactsError::Source(error) = error else {
-            panic!("ordinary source error expected")
+        let original = iceberg_final_static_facts(&relation).unwrap_err();
+        let baseline = Control::default();
+        let Err(ReadStaticFactsError::Source(actual)) =
+            iceberg_final_static_facts_for_compile(&relation, &baseline)
+        else {
+            panic!("ordinary source error expected");
         };
-        assert_eq!(error.kind(), legacy.kind());
-        assert_eq!(error.to_string(), legacy.to_string());
+        assert_eq!(actual, original);
+        let trace = baseline.calls.lock().unwrap().clone();
+        assert_eq!(trace, [0]);
         for cause in causes() {
-            let control = Control {
+            let early = Control {
+                calls: Default::default(),
+                refusal: Some((1, cause.clone())),
+            };
+            assert!(
+                matches!(iceberg_final_static_facts_for_compile(&relation, &early), Err(ReadStaticFactsError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*early.calls.lock().unwrap(), trace);
+            let late = Control {
                 calls: Default::default(),
                 refusal: Some((2, cause)),
             };
-            assert!(
-                matches!(iceberg_final_static_facts_for_compile(&relation, &control),
-                Err(ReadStaticFactsError::Control(error)) if error == cause)
-            );
-            assert_eq!(*control.calls.lock().unwrap(), [0, 0]);
+            let Err(ReadStaticFactsError::Source(actual)) =
+                iceberg_final_static_facts_for_compile(&relation, &late)
+            else {
+                panic!("late callback replaced the source error");
+            };
+            assert_eq!(actual, original);
+            assert_eq!(actual.failure_fact(), original.failure_fact());
+            assert_eq!(*late.calls.lock().unwrap(), trace);
         }
     }
+    #[test]
+    fn opaque_source_returns_original_error_before_late_control_but_still_observes_success() {
+        use std::cell::Cell;
+        for cause in causes() {
+            let late = Control {
+                calls: Default::default(),
+                refusal: Some((3, cause.clone())),
+            };
+            let mut work = Work(Some(
+                CompileCheckpoints::try_new(&late, CompilePhase::ProviderValidation).unwrap(),
+            ));
+            let original = invalid("original source refusal");
+            let Err(ReadStaticFactsError::Source(actual)) =
+                work.opaque_source(|| Err::<(), _>(original.clone()))
+            else {
+                panic!("late control replaced original source");
+            };
+            assert_eq!(actual, original);
+            assert_eq!(*late.calls.lock().unwrap(), [0, 0]);
+            for at in [2, 3] {
+                let control = Control {
+                    calls: Default::default(),
+                    refusal: Some((at, cause.clone())),
+                };
+                let mut work = Work(Some(
+                    CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation)
+                        .unwrap(),
+                ));
+                let called = Cell::new(false);
+                let result = work.opaque_source(|| {
+                    called.set(true);
+                    Ok(7)
+                });
+                assert!(
+                    matches!(result, Err(ReadStaticFactsError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(called.get(), at == 3);
+                assert_eq!(*control.calls.lock().unwrap(), vec![0; at]);
+            }
+        }
+    }
+
+    #[test]
+    fn already_latched_control_remains_first_when_finishing_an_authored_source_error() {
+        for cause in causes() {
+            let control = Control {
+                calls: Default::default(),
+                refusal: Some((2, cause.clone())),
+            };
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation).unwrap();
+            work.step().unwrap();
+            assert_eq!(work.flush(), Err(cause.clone()));
+            let result: Result<(), ReadStaticFactsError> = work.finish_result(
+                Err(ReadStaticFactsError::Source(invalid(
+                    "later source refusal",
+                ))),
+                ReadStaticFactsError::Control,
+            );
+            assert!(
+                matches!(result, Err(ReadStaticFactsError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.calls.lock().unwrap(), [0, 1]);
+        }
+    }
+
     #[test]
     fn successful_source_fact_tail_refusal_never_publishes() {
         let relation = system(IcebergSystemTableType::Snapshots);
@@ -578,7 +661,7 @@ mod tests {
         for cause in causes() {
             let control = Control {
                 calls: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(iceberg_final_static_facts_for_compile(&relation, &control),

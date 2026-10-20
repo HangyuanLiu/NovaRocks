@@ -27,15 +27,21 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::sync::{Arc, Mutex};
 
 use crate::exec::chunk::Chunk;
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{SinkKernel, SinkStep, Transform},
+    step::NextStep,
+    step_context::StepContext,
+};
 
 #[derive(Clone)]
 /// Shared handle that stores buffered result chunks and terminal status for client fetch.
@@ -105,11 +111,10 @@ impl OperatorFactory for ResultSinkFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(ResultSinkOperator {
+        Box::new(Transform::hydrating(ResultSinkOperator {
             name: self.name.clone(),
             handle: self.handle.clone(),
-            finished: false,
-        })
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -124,51 +129,27 @@ impl OperatorFactory for ResultSinkFactory {
 struct ResultSinkOperator {
     name: String,
     handle: ResultSinkHandle,
-    finished: bool,
 }
 
-impl Operator for ResultSinkOperator {
+impl OperatorLifecycle for ResultSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
 }
-
-impl ProcessorOperator for ResultSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.is_finished()
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        let mut guard = self.handle.inner.lock().expect("result_sink lock");
-        guard.push(chunk);
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finished = true;
-        Ok(())
+impl InputEncodingPolicy for ResultSinkOperator {}
+impl SinkKernel for ResultSinkOperator {
+    fn consume(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        self.handle
+            .inner
+            .lock()
+            .expect("result_sink lock")
+            .push(chunk);
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
 }

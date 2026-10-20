@@ -181,7 +181,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("unsupported key type Binary"));
+        assert!(err.to_string().contains("unsupported key type Binary"));
     }
 
     #[test]
@@ -199,6 +199,6 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("unsupported key type List"));
+        assert!(err.to_string().contains("unsupported key type List"));
     }
 }

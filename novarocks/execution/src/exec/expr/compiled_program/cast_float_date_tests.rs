@@ -118,7 +118,7 @@ fn float_date_actual_compiler_all_profiles_root_nullability_allow_policies_slice
                                             .find(|e| e.selected_ordinal() == ordinal)
                                             .unwrap()
                                             .message(),
-                                        message
+                                        message.detail()
                                     );
                                 }
                             }
@@ -197,7 +197,7 @@ fn float_date_actual_compiler_native_float_constant_negative_zero_is_original_er
                 assert_eq!(result.errors().len(), 2);
                 for (ordinal, error) in result.errors().iter().enumerate() {
                     assert_eq!(error.selected_ordinal(), ordinal);
-                    assert_eq!(error.message(), message);
+                    assert_eq!(error.message(), message.detail());
                 }
             }
         }
@@ -267,7 +267,7 @@ fn float_date_actual_compiler_all_three_compile_causes_preserve_real_callback_pr
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = CompileCallbacks::new(cause, at);
+                let control = CompileCallbacks::new(cause.clone(), at);
                 assert!(
                     matches!(compile(&functions,package.clone(),&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
                 );

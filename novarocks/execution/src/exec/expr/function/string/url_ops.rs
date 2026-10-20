@@ -19,66 +19,10 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, StringArray};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
-fn url_encode_impl(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len().saturating_mul(3));
-    for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            escaped.push(char::from(b));
-            continue;
-        }
-        escaped.push('%');
-        escaped.push(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
-        escaped.push(char::from(b"0123456789ABCDEF"[(b & 0x0F) as usize]));
-    }
-    escaped
-}
-
-fn decode_hex_char(ch: u8) -> Option<u8> {
-    match ch {
-        b'0'..=b'9' => Some(ch - b'0'),
-        b'A'..=b'F' => Some(ch - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn url_decode_impl(value: &str) -> Result<String, String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return Err("decode string contains illegal hex chars: %".to_string());
-            }
-            let l = bytes[i + 1];
-            let r = bytes[i + 2];
-            let lh = decode_hex_char(l).ok_or_else(|| {
-                format!(
-                    "decode string contains illegal hex chars: {}{}",
-                    char::from(l),
-                    char::from(r)
-                )
-            })?;
-            let rh = decode_hex_char(r).ok_or_else(|| {
-                format!(
-                    "decode string contains illegal hex chars: {}{}",
-                    char::from(l),
-                    char::from(r)
-                )
-            })?;
-            out.push((lh << 4) | rh);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|e| format!("url_decode utf8 decode failed: {e}"))
-}
-
-fn extract_host_impl(url: &str) -> Option<String> {
+fn extract_host_impl(url: &str) -> Option<&str> {
     let scheme_pos = url.find("://")?;
     let mut authority = &url[(scheme_pos + 3)..];
     let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
@@ -95,7 +39,7 @@ fn extract_host_impl(url: &str) -> Option<String> {
 
     if authority.starts_with('[') {
         let closing = authority.find(']')?;
-        return Some(authority[1..closing].to_string());
+        return Some(&authority[1..closing]);
     }
 
     let host = if let Some(colon_idx) = authority.rfind(':') {
@@ -108,45 +52,7 @@ fn extract_host_impl(url: &str) -> Option<String> {
     } else {
         authority
     };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
-}
-
-fn eval_url_unary<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
-    arena: &__Eval,
-    args: &[ExprId],
-    chunk: &Chunk,
-    fn_name: &str,
-    f: F,
-) -> Result<ArrayRef, __Eval::Error>
-where
-    F: Fn(&str) -> Result<String, String>,
-{
-    let arr = arena.eval(args[0], chunk)?;
-    let arr = arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("{fn_name} expects string"))?;
-
-    let rows = arr.len().max(chunk.len());
-    if arr.len() != 1 && arr.len() != rows {
-        return Err((format!("{fn_name} input length mismatch: {} vs {rows}", arr.len())).into());
-    }
-
-    let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let idx = if arr.len() == 1 { 0 } else { row };
-        if arr.is_null(idx) {
-            out.push(None);
-            continue;
-        }
-        let value = arr.value(idx);
-        out.push(Some(f(value)?));
-    }
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    if host.is_empty() { None } else { Some(host) }
 }
 
 pub fn eval_url_encode<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -154,17 +60,30 @@ pub fn eval_url_encode<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_url_unary(arena, args, chunk, "url_encode", |v| Ok(url_encode_impl(v))))?)
+) -> ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(expression_contract(
+            "url_encode requires exactly one prepared argument",
+        ));
+    };
+    let input = arena.eval(*argument, chunk)?;
+    novarocks_functions::builtin::evaluate_required_url_encode(&input, chunk.len())
+        .map_err(ExecutionFailure::from)
 }
-
 pub fn eval_url_decode<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_url_unary(arena, args, chunk, "url_decode", url_decode_impl))?)
+) -> ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(expression_contract(
+            "url_decode requires exactly one prepared argument",
+        ));
+    };
+    let input = arena.eval(*argument, chunk)?;
+    novarocks_functions::builtin::evaluate_required_url_decode(&input, chunk.len())
+        .map_err(ExecutionFailure::from)
 }
 
 pub fn eval_url_extract_host<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -172,30 +91,42 @@ pub fn eval_url_extract_host<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let arr = arena.eval(args[0], chunk)?;
+) -> ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(expression_contract(
+            "url_extract_host requires exactly one prepared argument",
+        ));
+    };
+    let arr = arena.eval(*argument, chunk)?;
     let arr = arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "url_extract_host expects string".to_string())?;
+        .ok_or_else(|| expression_contract("url_extract_host expects string"))?;
 
     let rows = arr.len().max(chunk.len());
     if arr.len() != 1 && arr.len() != rows {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "url_extract_host input length mismatch: {} vs {rows}",
             arr.len()
-        ))
-        .into());
+        )));
     }
 
     let mut out = Vec::with_capacity(rows);
+    let mut output_offset = 0;
     for row in 0..rows {
         let idx = if arr.len() == 1 { 0 } else { row };
         if arr.is_null(idx) {
             out.push(None);
             continue;
         }
-        out.push(extract_host_impl(arr.value(idx)));
+        let host = extract_host_impl(arr.value(idx));
+        if let Some(host) = host {
+            output_offset = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+                output_offset,
+                host.len(),
+            )?;
+        }
+        out.push(host.map(str::to_owned));
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }

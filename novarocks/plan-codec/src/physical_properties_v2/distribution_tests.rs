@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -176,7 +176,7 @@ fn prefixes<T>(call: impl Fn(&Control) -> Result<T, Error>, good: bool, phase: C
         for cause in CAUSES {
             let ctrl = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
             };
             assert!(matches!(call(&ctrl),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(*ctrl.trace.lock().unwrap(), trace[..=stop]);
@@ -644,7 +644,7 @@ fn distribution_real_wide_key_copy_quantum_preserves_original_prefix() {
             for cause in CAUSES {
                 let ctrl = Control {
                     trace: Mutex::new(vec![]),
-                    stop: Some((stop, cause)),
+                    stop: Some((stop, cause.clone())),
                 };
                 assert!(matches!(call(&ctrl),Err(Error::Control(actual)) if actual==cause));
                 assert_eq!(*ctrl.trace.lock().unwrap(), trace[..=stop]);

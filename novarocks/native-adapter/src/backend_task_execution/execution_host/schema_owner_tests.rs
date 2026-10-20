@@ -379,7 +379,7 @@ fn candidate_schema_original_namespace_gate_precedes_first_real_scope_refusal() 
         &mut work,
     );
     assert!(
-        matches!(result,Err(ProjectionFailure::Host(NativeTypeConstructionError::Capacity(ref error))) if error.contains("schema first real scope refusal"))
+        matches!(result,Err(ProjectionFailure::Host(NativeTypeConstructionError::Capacity(ref error))) if error.detail().contains("schema first real scope refusal"))
     );
     let stopped = control.0.load(Ordering::SeqCst);
     drop(result);

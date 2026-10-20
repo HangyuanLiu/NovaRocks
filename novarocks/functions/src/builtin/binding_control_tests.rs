@@ -48,7 +48,7 @@ impl PureCompileControl for Control {
         let mut seen = self.seen.lock().unwrap();
         seen.push((phase, work));
         if self.stop == Some(seen.len()) {
-            Err(self.error)
+            Err(self.error.clone())
         } else {
             Ok(())
         }
@@ -145,7 +145,7 @@ fn actual_scalar_dynamic_aggregate_table_families_preserve_original_controls() {
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = Control::new(Some(stop), error);
+                let control = Control::new(Some(stop), error.clone());
                 assert!(
                     matches!(bind(&control),Err(FunctionBindingError::Control(actual)) if actual==error),
                     "{name} stop {stop}"
@@ -181,7 +181,7 @@ fn frozen_family_validation_observes_actual_channels_and_completed_tail() {
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = Control::new(Some(stop), error);
+                let control = Control::new(Some(stop), error.clone());
                 assert!(
                     matches!(catalog.validate_bound(&bound,request(&args),&control),Err(FunctionBindingError::Control(actual)) if actual==error)
                 );
@@ -209,7 +209,7 @@ fn exact_scalar_signature_passes_use_the_original_control() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::new(Some(stop), error);
+            let control = Control::new(Some(stop), error.clone());
             assert!(
                 matches!(resolver::resolve_scalar_value_signature_with_overload("coalesce",&types,&control),Err(FunctionResolutionError::Control(actual)) if actual==error)
             );
@@ -246,7 +246,7 @@ fn conversion_real_nested_domain_walk_and_selected_validation_are_controlled() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::new(Some(stop), error);
+            let control = Control::new(Some(stop), error.clone());
             assert!(
                 matches!(value_conversion::resolve_value_conversion(&source,&target,&control),Err(FunctionBindingError::Control(actual)) if actual==error)
             );
@@ -351,12 +351,51 @@ fn scalar_request_value_lambda_gate_preserves_original_refusal_and_control_prefi
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = Control::new(Some(stop), cause);
+                let control = Control::new(Some(stop), cause.clone());
                 assert!(
                     matches!(bind(&control), Err(FunctionBindingError::Control(actual)) if actual == cause)
                 );
                 assert_eq!(control.seen(), seen[..stop]);
             }
         }
+    }
+}
+
+#[test]
+fn real_unknown_binding_and_resolver_errors_precede_armed_completion_control() {
+    let catalog = builtin_engine_function_catalog();
+    for source in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+        CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        ),
+    ] {
+        let control = Control::new(Some(2), source.clone());
+        assert!(matches!(
+            catalog.resolve_bound_user(
+                "fixture_missing_first_cause",
+                FunctionKind::Scalar,
+                request(&[]),
+                &control
+            ),
+            Err(FunctionBindingError::UnknownFunction)
+        ));
+        assert_eq!(control.seen(), [(CompilePhase::FunctionSpecialization, 0)]);
+        let control = Control::new(Some(2), source.clone());
+        assert!(matches!(
+            resolver::resolve_scalar_value_signature_with_overload(
+                "fixture_missing_first_cause",
+                &[],
+                &control
+            ),
+            Err(FunctionResolutionError::UnknownFunction)
+        ));
+        assert_eq!(control.seen(), [(CompilePhase::FunctionSpecialization, 0)]);
+        let control = Control::new(Some(1), source.clone());
+        assert!(
+            matches!(catalog.resolve_bound_user("fixture_missing_first_cause",FunctionKind::Scalar,request(&[]),&control),Err(FunctionBindingError::Control(actual)) if actual==source)
+        );
     }
 }

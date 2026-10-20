@@ -66,7 +66,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -174,7 +174,7 @@ fn prefixes(call: impl Fn(&Control) -> Result<(), BindingCodecError>, success: b
             let control = Control {
                 active: AtomicBool::new(false),
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(BindingCodecError::Control(actual)) if actual == cause),
@@ -481,7 +481,7 @@ fn receiving_aggregate_long_state_and_index_have_actual_quantum_without_new_cap(
             let control = Control {
                 active: AtomicBool::new(false),
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(check(&definitions, SOURCE, limits(), &control), Err(BindingCodecError::Control(actual)) if actual == cause)

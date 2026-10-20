@@ -18,6 +18,7 @@
 use super::common::{NumericArrayView, value_at_f64};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::{Array, Float64Array, StringArray, TimestampMicrosecondArray};
@@ -40,13 +41,13 @@ fn eval_greatest_least<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     greatest: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     // Legacy owns eager child evaluation and its original output carrier lookup.
     let mut arrays = Vec::with_capacity(args.len());
     for arg in args {
         arrays.push(arena.eval(*arg, chunk)?);
     }
-    Ok((scalar_extrema::evaluate_legacy(
+    scalar_extrema::evaluate_legacy(
         if greatest {
             ExtremaOperation::Greatest
         } else {
@@ -55,23 +56,24 @@ fn eval_greatest_least<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         &arrays,
         chunk.len(),
         arena.data_type(expr),
-    ))?)
+    )
+    .map_err(ExecutionFailure::from)
 }
 pub fn eval_greatest<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_greatest_least(arena, expr, args, chunk, true))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_greatest_least(arena, expr, args, chunk, true)
 }
 pub fn eval_least<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_greatest_least(arena, expr, args, chunk, false))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_greatest_least(arena, expr, args, chunk, false)
 }
 #[cfg(test)]
 mod legacy_extrema_contract_tests {
@@ -91,7 +93,7 @@ mod legacy_extrema_contract_tests {
         inputs: Vec<ArrayRef>,
         result_type: DataType,
         child_policy: Option<DecimalOverflowPolicy>,
-    ) -> Result<ArrayRef, String> {
+    ) -> Result<ArrayRef, ExecutionFailure> {
         let fields = inputs
             .iter()
             .enumerate()
@@ -557,8 +559,12 @@ mod legacy_extrema_contract_tests {
                 );
             } else {
                 let error = named_zone.unwrap_err();
-                assert!(error.starts_with("math: failed to cast output:"));
-                assert!(error.contains("only offset based timezones supported without chrono-tz"));
+                assert!(error.detail().starts_with("math: failed to cast output:"));
+                assert!(
+                    error
+                        .detail()
+                        .contains("only offset based timezones supported without chrono-tz")
+                );
             }
             let error = evaluate(
                 name,
@@ -567,7 +573,7 @@ mod legacy_extrema_contract_tests {
                 None,
             )
             .unwrap_err();
-            assert!(error.starts_with("math: failed to cast output:"));
+            assert!(error.detail().starts_with("math: failed to cast output:"));
         }
     }
 
@@ -620,7 +626,10 @@ mod legacy_extrema_contract_tests {
             ] {
                 let error = evaluate(name, vec![numeric.clone(), other], DataType::Float64, None)
                     .unwrap_err();
-                assert!(error.contains("unsupported numeric type"), "{error}");
+                assert!(
+                    error.detail().contains("unsupported numeric type"),
+                    "{error}"
+                );
             }
             let output = evaluate(
                 name,
@@ -670,7 +679,7 @@ mod legacy_extrema_contract_tests {
                 ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
             let error = arena.eval(call, &chunk).unwrap_err();
             assert!(
-                error.contains("expects 1 to") && error.contains("got 0"),
+                error.detail().contains("expects 1 to") && error.detail().contains("got 0"),
                 "{error}"
             );
             // This direct legacy helper intentionally bypasses the real

@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex, Weak};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemTrackerLimitExceeded {
     detail: String,
+    requested: u64,
+    limit: u64,
+    committed: u64,
 }
 impl MemTrackerLimitExceeded {
     pub fn detail(&self) -> &str {
@@ -35,6 +38,72 @@ impl std::fmt::Display for MemTrackerLimitExceeded {
     }
 }
 impl std::error::Error for MemTrackerLimitExceeded {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemTrackerLimitInstallError {
+    InvalidLimit { requested: i64 },
+    ConflictingLimit { installed: i64, requested: i64 },
+    Exceeded(MemTrackerLimitExceeded),
+}
+impl std::fmt::Display for MemTrackerLimitInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLimit { requested } => write!(
+                f,
+                "memory tracker requires a positive limit, got {requested}"
+            ),
+            Self::ConflictingLimit {
+                installed,
+                requested,
+            } => write!(
+                f,
+                "memory tracker already has limit {installed}, cannot install {requested}"
+            ),
+            Self::Exceeded(source) => std::fmt::Display::fmt(source, f),
+        }
+    }
+}
+impl std::error::Error for MemTrackerLimitInstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Exceeded(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MemTrackerLimitInstallError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let code = match self {
+            Self::Exceeded(source) => return source.failure_fact(),
+            Self::InvalidLimit { .. } => 10,
+            Self::ConflictingLimit { .. } => 11,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::MEMORY, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
+/// The allocation callback keeps every known limit measurement without
+/// allocating a diagnostic or retaining the tracker that owns the counter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MemTrackerLimitFact {
+    pub(crate) requested: u64,
+    pub(crate) limit: u64,
+    pub(crate) committed: u64,
+}
+impl std::fmt::Display for MemTrackerLimitFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "memory limit exceeded: requested={}, limit={}, committed={}",
+            self.requested, self.limit, self.committed
+        )
+    }
+}
+impl std::error::Error for MemTrackerLimitFact {}
 
 /// Tracks a logically accounted byte buffer that can be transferred across trackers.
 ///
@@ -58,11 +127,15 @@ impl TrackedBytes {
     ///
     /// The charge is rolled back when admission fails because no
     /// `TrackedBytes` owner is returned to retain the corresponding buffer.
-    pub fn try_new(bytes: usize, tracker: Arc<MemTracker>) -> Result<Self, String> {
-        let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
-        if let Err(error) = tracker.consume_and_check_limit(bytes) {
+    pub fn try_new(
+        bytes: usize,
+        tracker: Arc<MemTracker>,
+    ) -> Result<Self, MemoryAccountingFailure> {
+        let bytes = i64::try_from(bytes)
+            .map_err(|_| MemoryAccountingFailure::BytesOutOfRange { requested: bytes })?;
+        if let Err(error) = tracker.consume_and_check_limit_typed(bytes) {
             tracker.release(bytes);
-            return Err(error);
+            return Err(MemoryAccountingFailure::Limit(error));
         }
         Ok(Self { bytes, tracker })
     }
@@ -84,6 +157,66 @@ impl TrackedBytes {
 impl Drop for TrackedBytes {
     fn drop(&mut self) {
         self.tracker.release(self.bytes);
+    }
+}
+
+/// A retained buffer charge either exceeds the tracker's counter range or
+/// is refused by an installed hierarchy limit. Neither is a SQL value error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryAccountingFailure {
+    BytesOutOfRange { requested: usize },
+    Limit(MemTrackerLimitExceeded),
+}
+impl MemoryAccountingFailure {
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::BytesOutOfRange { .. } => "retained memory charge exceeds the i64 counter range",
+            Self::Limit(error) => error.detail(),
+        }
+    }
+}
+impl std::fmt::Display for MemoryAccountingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BytesOutOfRange { requested } => write!(
+                f,
+                "retained memory charge of {requested} bytes exceeds the i64 counter range"
+            ),
+            Self::Limit(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl std::error::Error for MemoryAccountingFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Limit(error) => Some(error),
+            Self::BytesOutOfRange { .. } => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MemoryAccountingFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, ResourceDimension, ResourceFacts,
+            ResourceScope, domain,
+        };
+        match self {
+            Self::Limit(error) => error.failure_fact(),
+            Self::BytesOutOfRange { requested } => FailureFact::new(
+                FailureClass::Resource,
+                FailureReason::new(domain::MEMORY, std::num::NonZeroU16::new(9).unwrap()),
+            )
+            .with_resource(ResourceFacts {
+                request_scope: Some(ResourceScope::Request),
+                constraint_scope: Some(ResourceScope::Request),
+                dimension: ResourceDimension::Bytes,
+                requested: u64::try_from(*requested).ok(),
+                required_growth: None,
+                limit: Some(i64::MAX as u64),
+                live: None,
+                committed: None,
+            }),
+        }
     }
 }
 
@@ -163,12 +296,9 @@ impl MemTracker {
     /// Replaying the same query contract is idempotent. A different limit is
     /// rejected so independently admitted fragments cannot silently change a
     /// query-scoped resource contract.
-    pub fn install_limit_once(&self, limit: i64) -> Result<(), String> {
+    pub fn install_limit_once(&self, limit: i64) -> Result<(), MemTrackerLimitInstallError> {
         if limit <= 0 {
-            return Err(format!(
-                "memory tracker {} requires a positive limit, got {limit}",
-                self.label
-            ));
+            return Err(MemTrackerLimitInstallError::InvalidLimit { requested: limit });
         }
         match self
             .limit
@@ -177,16 +307,23 @@ impl MemTracker {
             Ok(_) => {
                 let current = self.current();
                 if current > limit {
-                    Err(self.limit_exceeded_detail(current, limit))
+                    Err(MemTrackerLimitInstallError::Exceeded(
+                        MemTrackerLimitExceeded {
+                            detail: self.limit_exceeded_detail(current, limit),
+                            requested: 0,
+                            limit: limit as u64,
+                            committed: current as u64,
+                        },
+                    ))
                 } else {
                     Ok(())
                 }
             }
             Err(existing) if existing == limit => Ok(()),
-            Err(existing) => Err(format!(
-                "memory tracker {} already has limit {existing}, cannot install {limit}",
-                self.label
-            )),
+            Err(existing) => Err(MemTrackerLimitInstallError::ConflictingLimit {
+                installed: existing,
+                requested: limit,
+            }),
         }
     }
 
@@ -241,13 +378,23 @@ impl MemTracker {
         self.consume_with_limit_projection(bytes, |tracker, current, limit| {
             MemTrackerLimitExceeded {
                 detail: tracker.limit_exceeded_detail(current, limit),
+                requested: bytes as u64,
+                limit: limit as u64,
+                committed: current as u64,
             }
         })
     }
 
     /// The original accounting verdict without constructing an unadmitted diagnostic.
-    pub(crate) fn consume_and_check_limit_nominal(&self, bytes: i64) -> Result<(), ()> {
-        self.consume_with_limit_projection(bytes, |_, _, _| ())
+    pub(crate) fn consume_and_check_limit_nominal(
+        &self,
+        bytes: i64,
+    ) -> Result<(), MemTrackerLimitFact> {
+        self.consume_with_limit_projection(bytes, |_, committed, limit| MemTrackerLimitFact {
+            requested: bytes as u64,
+            limit: limit as u64,
+            committed: committed as u64,
+        })
     }
 
     fn consume_with_limit_projection<E>(
@@ -358,6 +505,9 @@ impl MemTracker {
             if limit > 0 && next > limit {
                 return Err(MemTrackerLimitExceeded {
                     detail: self.limit_exceeded_detail(next, limit),
+                    requested: bytes as u64,
+                    limit: limit as u64,
+                    committed: current as u64,
                 });
             }
             match self.current.compare_exchange_weak(
@@ -499,7 +649,7 @@ pub fn query_tracker_label(high: i64, low: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::MemTracker;
+    use super::{MemTracker, MemTrackerLimitInstallError};
 
     #[test]
     fn nominal_limit_projection_preserves_every_ancestor_counter() {
@@ -633,6 +783,32 @@ mod tests {
     }
 
     #[test]
+    fn installing_policy_over_actual_charge_keeps_source_and_counter_facts() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let tracker = MemTracker::new_root("policy source");
+        tracker.consume(32);
+        let error = tracker
+            .install_limit_once(8)
+            .expect_err("already charged bytes exceed installed policy");
+        assert!(matches!(error, MemTrackerLimitInstallError::Exceeded(_)));
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        let resource = fact.resource().unwrap();
+        assert_eq!(resource.requested, Some(0));
+        assert_eq!(resource.committed, Some(32));
+        assert_eq!(resource.limit, Some(8));
+        assert_eq!(resource.live, None);
+        assert_eq!(tracker.current(), 32);
+        assert_eq!(tracker.limit(), 8);
+        tracker.release(32);
+        assert_eq!(tracker.current(), 0);
+        assert!(matches!(
+            MemTracker::new_root("invalid policy").install_limit_once(0),
+            Err(MemTrackerLimitInstallError::InvalidLimit { requested: 0 })
+        ));
+    }
+
+    #[test]
     fn immutable_limit_is_idempotent_and_rejects_drift() {
         let tracker = MemTracker::new_root("query");
         tracker.install_limit_once(64).expect("install limit");
@@ -640,7 +816,15 @@ mod tests {
         let error = tracker
             .install_limit_once(65)
             .expect_err("different limit must fail");
-        assert!(error.contains("already has limit 64"), "{error}");
+        assert_eq!(
+            error,
+            MemTrackerLimitInstallError::ConflictingLimit {
+                installed: 64,
+                requested: 65
+            }
+        );
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(tracker.limit(), 64);
     }
 
@@ -724,5 +908,110 @@ mod tests {
         tracker.consume(1);
         tracker.release(1);
         tracker.release(1);
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for MemTrackerLimitExceeded {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&MemTrackerLimitFact {
+            requested: self.requested,
+            limit: self.limit,
+            committed: self.committed,
+        })
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for MemTrackerLimitFact {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, ResourceDimension, ResourceFacts, domain,
+        };
+        FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::MEMORY, std::num::NonZeroU16::new(8).unwrap()),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: None,
+            constraint_scope: None,
+            dimension: ResourceDimension::Bytes,
+            requested: Some(self.requested),
+            required_growth: None,
+            limit: Some(self.limit),
+            live: None,
+            committed: Some(self.committed),
+        })
+    }
+}
+
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    #[test]
+    fn nominal_refusal_keeps_post_charge_facts_without_retaining_its_tracker() {
+        let nominal = MemTracker::new_root("nominal capacity source");
+        let rich = MemTracker::new_root("rich capacity source");
+        nominal.install_limit_once(8).unwrap();
+        rich.install_limit_once(8).unwrap();
+        let weak = Arc::downgrade(&nominal);
+        let original = nominal.consume_and_check_limit_nominal(16).unwrap_err();
+        let comparison = rich.consume_and_check_limit_typed(16).unwrap_err();
+        assert_eq!(original.failure_fact(), comparison.failure_fact());
+        assert_eq!(nominal.current(), 16);
+        nominal.release(16);
+        rich.release(16);
+        drop(nominal);
+        assert!(weak.upgrade().is_none());
+        let resource = original.failure_fact().resource().unwrap();
+        assert_eq!(
+            (resource.requested, resource.limit, resource.committed),
+            (Some(16), Some(8), Some(16))
+        );
+    }
+    #[test]
+    fn post_charge_limit_fact_preserves_actual_request_and_committed_bytes() {
+        let tracker = MemTracker::new_root("receiver limit");
+        tracker.install_limit_once(8).unwrap();
+        let error = tracker.consume_and_check_limit_typed(16).unwrap_err();
+        let fact = error.failure_fact().resource().unwrap();
+        assert_eq!(
+            (fact.requested, fact.limit, fact.committed),
+            (Some(16), Some(8), Some(16))
+        );
+        assert_eq!(fact.live, None);
+        assert_eq!(tracker.current(), 16);
+        tracker.release(16);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[cfg(test)]
+mod retained_accounting_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn retained_charge_refusals_keep_facts_and_roll_back_every_charge() {
+        let tracker = MemTracker::new_root("retained charge fixture");
+        tracker.install_limit_once(8).unwrap();
+        let error = TrackedBytes::try_new(16, Arc::clone(&tracker)).unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.resource().unwrap().requested, Some(16));
+        assert_eq!(fact.resource().unwrap().limit, Some(8));
+        assert_eq!(tracker.current(), 0);
+        if usize::BITS >= 64 {
+            let error = TrackedBytes::try_new(usize::MAX, Arc::clone(&tracker)).unwrap_err();
+            assert!(matches!(
+                error,
+                MemoryAccountingFailure::BytesOutOfRange { .. }
+            ));
+            let fact = error.failure_fact();
+            assert_eq!(
+                fact.resource().unwrap().requested,
+                u64::try_from(usize::MAX).ok()
+            );
+            assert_eq!(fact.resource().unwrap().limit, Some(i64::MAX as u64));
+            assert_eq!(tracker.current(), 0);
+        }
     }
 }

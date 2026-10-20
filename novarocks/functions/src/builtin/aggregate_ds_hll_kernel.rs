@@ -24,7 +24,6 @@ use super::aggregate_ds_hll_state::{
 };
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::ScalarStateError;
 use crate::datasketches_hll::{HllHandle, HllTargetType};
 use crate::datasketches_hll_failure::*;
 use crate::kernel_control::{compile_failure, internal, invalid};
@@ -35,7 +34,7 @@ use allocator_api2::vec::Vec as HostVec;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
-use std::{fmt::Write, sync::Arc};
+use std::sync::Arc;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum DsHllOperation {
     Hash,
@@ -159,7 +158,11 @@ struct FailureSink<'a, 'host> {
     host: &'a Arc<dyn AggregateStateAllocator>,
 }
 impl FailureSink<'_, '_> {
-    fn diagnostic<T: std::fmt::Display + ?Sized>(&mut self, original: &T) -> EvaluationFailure {
+    fn diagnostic<T: std::fmt::Display + ?Sized>(
+        &mut self,
+        original: &T,
+        reason: crate::DataFailureReason,
+    ) -> EvaluationFailure {
         use crate::aggregate_format::AggregateFailureStage;
         let stage = match &self.domain {
             FailureDomain::Mutation {
@@ -190,18 +193,23 @@ impl FailureSink<'_, '_> {
                     phase,
                     selection,
                     mapping,
-                } => InvocationData::prepare_aggregate(
+                } => InvocationData::prepare_aggregate_with_reason(
                     self.allocator,
                     Arc::clone(contract),
                     *phase,
                     *selection,
                     mapping,
                     text,
+                    reason,
                     work,
                 ),
-                FailureDomain::Emission(context) => {
-                    InvocationData::prepare_emission(self.allocator, context, text, work)
-                }
+                FailureDomain::Emission(context) => InvocationData::prepare_emission_with_reason(
+                    self.allocator,
+                    context,
+                    text,
+                    reason,
+                    work,
+                ),
             }
         })();
         match result {
@@ -213,11 +221,18 @@ impl FailureSink<'_, '_> {
 
 impl HllFailureSink for FailureSink<'_, '_> {
     type Error = EvaluationFailure;
-    fn data(&mut self, recipe: HllDataRecipe<'_>) -> EvaluationFailure {
-        self.diagnostic(&recipe)
+    fn failure(&mut self, recipe: HllFailureRecipe) -> EvaluationFailure {
+        match recipe.classify() {
+            crate::datasketches_hll_failure::ClassifiedHllFailure::Value(value) => {
+                self.diagnostic(&value, value.reason())
+            }
+            crate::datasketches_hll_failure::ClassifiedHllFailure::Outer(cause) => {
+                KernelFailure::from_domain(cause).into()
+            }
+        }
     }
     fn invariant(&mut self, recipe: HllInvariantRecipe) -> EvaluationFailure {
-        internal(recipe.message()).into()
+        KernelFailure::from_domain(recipe).into()
     }
     fn observe(&mut self, event: HllObservation) -> Result<(), EvaluationFailure> {
         match event {
@@ -233,15 +248,9 @@ impl DsHllFailureSink for FailureSink<'_, '_> {
         cause.into()
     }
     fn input(&mut self, recipe: DsHllInputRecipe<'_>) -> EvaluationFailure {
-        self.diagnostic(&recipe)
+        KernelFailure::from_domain(recipe.into_failure()).into()
     }
-    fn scalar(&mut self, error: ScalarStateError) -> EvaluationFailure {
-        match error {
-            ScalarStateError::Kernel(cause) => cause.into(),
-            ScalarStateError::OutputAllocation(_) => KernelFailure::ResourceExhausted.into(),
-            ScalarStateError::Legacy(message) => self.diagnostic(&message),
-        }
-    }
+
     fn reserve_temporary(&mut self, bytes: usize) -> Result<OpaqueReservation, EvaluationFailure> {
         let charge = OpaqueRetainedCharge::try_new(Arc::clone(self.host))?;
         charge.reserve_operation(bytes).map_err(Into::into)

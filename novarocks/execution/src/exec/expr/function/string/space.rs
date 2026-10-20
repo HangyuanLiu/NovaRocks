@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{ArrayRef, StringArray};
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ pub fn eval_space<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let num_arr = arena.eval(args[0], chunk)?;
     let arr = downcast_int_arg_array(&num_arr, "space")?;

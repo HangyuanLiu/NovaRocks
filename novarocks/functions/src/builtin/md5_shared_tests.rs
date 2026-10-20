@@ -182,13 +182,13 @@ fn md5_family_selected_compact_and_scalar_addresses_skip_null_without_delimiters
         } else {
             DataType::FixedSizeBinary(16)
         };
-        let expected = evaluate_legacy(op, &[input], 2, Some(&target)).unwrap();
+        let expected = evaluate_required(op, &[input], 2, Some(&target)).unwrap();
         assert_eq!(output.values().to_data(), expected.to_data());
         assert!(output.errors().is_empty());
     }
 }
 #[test]
-fn md5_family_raw_errors_keep_full_output_cast_text_and_original_unsupported_input_error() {
+fn required_digest_failure_preserves_full_sdk_source_and_bounded_original_prefix() {
     let input = to_owned_bytes_array(
         Arc::new(StringArray::from(vec!["hello"])),
         "md5sum_numeric",
@@ -203,24 +203,43 @@ fn md5_family_raw_errors_keep_full_output_cast_text_and_original_unsupported_inp
         ))]
         .into(),
     );
-    let raw = evaluate_legacy(Operation::Md5sumNumeric, &[input.clone()], 1, None).unwrap();
+    let raw = evaluate_required(Operation::Md5sumNumeric, &[input.clone()], 1, None).unwrap();
     let expected = arrow_cast::cast(&raw, &target)
         .map_err(|error| format!("md5sum_numeric: failed to cast output: {}", error))
         .unwrap_err();
     assert!(expected.len() > 512);
+    use std::error::Error;
+    let failure =
+        evaluate_required(Operation::Md5sumNumeric, &[input], 1, Some(&target)).unwrap_err();
     assert_eq!(
-        evaluate_legacy(Operation::Md5sumNumeric, &[input], 1, Some(&target)).unwrap_err(),
+        failure.to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(&expected).to_string()
+    );
+    let sdk = failure
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<arrow_schema::ArrowError>()
+        .unwrap();
+    assert_eq!(
+        format!("md5sum_numeric: failed to cast output: {sdk}"),
         expected
     );
     assert_eq!(
         to_owned_bytes_array(Arc::new(Int64Array::from(vec![1])), "md5", 0)
             .err()
-            .unwrap(),
+            .unwrap()
+            .to_string(),
         "md5: arg0 must be VARCHAR or VARBINARY"
     );
 }
 #[test]
-fn md5_normalizer_core_is_label_free_and_compatibility_preserves_original_prefixes() {
+fn digest_reader_core_is_label_free_and_required_boundary_preserves_original_prefixes() {
     let source = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
     assert!(matches!(
         to_owned_bytes_array_observed(source.clone(), 3, &mut |_| Ok(()))
@@ -232,48 +251,68 @@ fn md5_normalizer_core_is_label_free_and_compatibility_preserves_original_prefix
         assert_eq!(
             to_owned_bytes_array(source.clone(), label, 3)
                 .err()
-                .unwrap(),
+                .unwrap()
+                .to_string(),
             format!("{label}: arg3 must be VARCHAR or VARBINARY")
         );
     }
 }
 #[test]
-fn md5_varchar_fallback_keeps_original_typed_admission_failure() {
-    let fields = vec![Arc::new(arrow_schema::Field::new(
-        "x",
+fn digest_varchar_conversion_retains_the_actual_failed_sdk_conversion() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    let field = Arc::new(arrow_schema::Field::new(
+        "ResourceExhausted",
         DataType::Int64,
         false,
-    ))]
-    .into();
-    let source = Arc::new(StructArray::new(
-        fields,
+    ));
+    let weak_field = Arc::downgrade(&field);
+    let source: ArrayRef = Arc::new(StructArray::new(
+        vec![field].into(),
         vec![Arc::new(Int64Array::from(vec![1]))],
         None,
-    )) as ArrayRef;
-    assert!(arrow_cast::cast(&source, &DataType::Utf8).is_err());
-    assert!(matches!(
-        to_owned_bytes_array_with_varchar_cast_observed(source.clone(), 4, &mut |_| Ok(()))
-            .err()
-            .unwrap(),
-        CoreError::BytesRequired { arg_idx: 4 }
     ));
+    let expected = arrow_cast::cast(&source, &DataType::Utf8)
+        .unwrap_err()
+        .to_string();
+    let weak = Arc::downgrade(&source);
+    let error = to_owned_bytes_array_with_varchar_cast_observed(source.clone(), 4, &mut |_| Ok(()))
+        .err()
+        .unwrap();
+    let CoreError::InputCast {
+        arg_idx: 4,
+        source: actual,
+    } = error
+    else {
+        panic!("actual Arrow conversion cause");
+    };
+    assert_eq!(actual.to_string(), expected);
+    let failure = to_owned_bytes_array_with_varchar_cast(source, "md5sum", 4)
+        .err()
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(weak_field.upgrade().is_none());
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 370);
+    let sdk = failure
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<arrow_schema::ArrowError>()
+        .unwrap();
+    assert_eq!(sdk.to_string(), expected);
     assert_eq!(
-        to_owned_bytes_array_with_varchar_cast(source, "md5sum", 4)
-            .err()
-            .unwrap(),
-        "md5sum: arg4 must be VARCHAR or VARBINARY"
+        failure.to_string(),
+        format!("md5sum: failed to cast arg4 to VARCHAR: {expected}")
     );
 }
 #[test]
-fn md5_typed_error_projection_never_changes_original_largeint_cause_or_kernel_failure() {
-    let message = "original carrier error ".repeat(90);
-    assert_eq!(
-        compatibility::error_text(
-            CoreError::LargeIntCarrier(message.clone()),
-            "md5sum_numeric"
-        ),
-        message
-    );
+fn md5_typed_error_projection_preserves_actual_cast_and_kernel_failure() {
     let source = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
     let target = DataType::Struct(
         vec![Arc::new(arrow_schema::Field::new(
@@ -290,7 +329,7 @@ fn md5_typed_error_projection_never_changes_original_largeint_cause_or_kernel_fa
     let expected = arrow_cast::cast(&source, &target).unwrap_err().to_string();
     assert_eq!(cause.to_string(), expected);
     assert_eq!(
-        compatibility::error_text(CoreError::OutputCast(cause), "aes_encrypt"),
+        into_kernel(CoreError::OutputCast(cause), "aes_encrypt").to_string(),
         format!("aes_encrypt: failed to cast output: {expected}")
     );
     for cause in causes() {
@@ -321,4 +360,66 @@ fn md5_typed_error_projection_never_changes_original_largeint_cause_or_kernel_fa
             assert_eq!(actual, cause);
         }
     }
+}
+
+#[test]
+fn digest_large_readers_keep_original_buffers_and_null_readers_allocate_no_text_carrier() {
+    let backing: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+        Some(b"unused".as_slice()),
+        Some(b"abc".as_slice()),
+        None,
+        Some(b"".as_slice()),
+    ]));
+    let input = backing.slice(1, 3);
+    let original = input.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+    let reader = to_owned_bytes_array(input.clone(), "md5", 0).unwrap();
+    let OwnedBytesArray::LargeBinary(view) = &reader else {
+        panic!("original i64 offset reader");
+    };
+    assert_eq!(view.value_data().as_ptr(), original.value_data().as_ptr());
+    assert_eq!(reader.bytes(0).as_ptr(), original.value(0).as_ptr());
+    let output = evaluate_required(Operation::Md5, &[reader], 3, None).unwrap();
+    assert_eq!(
+        output
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![
+            Some("900150983cd24fb0d6963f7d28e17f72"),
+            None,
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        ]
+    );
+    let source: ArrayRef = Arc::new(arrow_array::NullArray::new(3));
+    let reader = to_owned_bytes_array(source, "md5", 0).unwrap();
+    assert!(matches!(&reader, OwnedBytesArray::Null { len: 3 }));
+    let output = evaluate_required(Operation::Md5, &[reader], 3, None).unwrap();
+    assert_eq!(output.null_count(), 3);
+}
+
+#[test]
+fn real_digest_cast_failure_prevents_a_subsequent_observer_from_replacing_it() {
+    let source: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let target = DataType::Struct(
+        vec![Arc::new(arrow_schema::Field::new(
+            "x",
+            DataType::Int64,
+            true,
+        ))]
+        .into(),
+    );
+    let mut calls = 0;
+    let failure = cast_output_observed(source, Some(&target), &mut |_| {
+        calls += 1;
+        assert_eq!(
+            calls, 1,
+            "a real originating SDK failure has no optional footer"
+        );
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert!(matches!(failure, CoreError::OutputCast(_)));
 }

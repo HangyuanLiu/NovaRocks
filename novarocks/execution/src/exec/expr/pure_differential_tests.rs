@@ -253,13 +253,34 @@ fn facts<'a>(result: &'a FunctionValueType, rows: &'a [usize]) -> SelectionCompa
     }
 }
 
+#[derive(Debug)]
+struct AuthoredReferenceData(String, novarocks_functions::DataFailureReason);
+impl std::fmt::Display for AuthoredReferenceData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for AuthoredReferenceData {}
+impl FailureProjection for AuthoredReferenceData {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.1.failure_fact()
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for AuthoredReferenceData {}
+fn reference_data(message: &str) -> ReferenceFailure {
+    ReferenceFailure::Source(Box::new(KernelFailure::from_domain(AuthoredReferenceData(
+        message.into(),
+        novarocks_functions::DataFailureReason::InvalidValue,
+    ))))
+}
+
 #[test]
 fn pure_differential_error_rule_accepts_exact_attribution_and_rejects_every_violation() {
     let result = value(DataType::Int64);
     let rows = [0, 1, 2];
     // Legacy fails the batch because of row 1 only; pure raises at ordinal 1.
     let legacy_row = |row: usize| match row {
-        1 => Err("overflow in row: value 9".to_string()),
+        1 => Err(reference_data("overflow in row: value 9")),
         row => Ok(ints(&[Some(row as i64 * 10)])),
     };
     let exact = PureSelection {
@@ -269,7 +290,7 @@ fn pure_differential_error_rule_accepts_exact_attribution_and_rejects_every_viol
     let mut found = Vec::new();
     let outcome = compare_selection(
         facts(&result, &rows),
-        Err("batch failed: overflow in row: value 9".into()),
+        Err(reference_data("batch failed: overflow in row: value 9")),
         legacy_row,
         &exact,
         &mut found,
@@ -286,7 +307,7 @@ fn pure_differential_error_rule_accepts_exact_attribution_and_rejects_every_viol
     let mut found = Vec::new();
     compare_selection(
         facts(&result, &rows),
-        Err("batch failed".into()),
+        Err(reference_data("batch failed")),
         legacy_row,
         &swallowed,
         &mut found,
@@ -309,7 +330,7 @@ fn pure_differential_error_rule_accepts_exact_attribution_and_rejects_every_viol
     let mut found = Vec::new();
     compare_selection(
         facts(&result, &rows),
-        Err("batch failed".into()),
+        Err(reference_data("batch failed")),
         legacy_row,
         &extra,
         &mut found,
@@ -341,9 +362,9 @@ fn pure_differential_error_rule_accepts_exact_attribution_and_rejects_every_viol
     let mut found = Vec::new();
     compare_selection(
         facts(&result, &rows),
-        Err("batch failed".into()),
+        Err(reference_data("batch failed")),
         |row| match row {
-            1 => Err("something else".to_string()),
+            1 => Err(reference_data("something else")),
             row => Ok(ints(&[Some(row as i64 * 10)])),
         },
         &exact,
@@ -358,7 +379,7 @@ fn pure_differential_error_rule_accepts_exact_attribution_and_rejects_every_viol
     let mut found = Vec::new();
     compare_selection(
         facts(&result, &rows),
-        Err("batch-only failure".into()),
+        Err(reference_data("batch-only failure")),
         |row| Ok(ints(&[Some(row as i64 * 10)])),
         &PureSelection {
             values: ints(&[Some(0), Some(10), Some(20)]),
@@ -970,4 +991,62 @@ fn pure_differential_null_carrier_comparison_counts_logical_sql_null() {
     );
     let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1)]));
     assert!(super::compare_value(&nulls, 0, &values, 0, FloatComparison::Exact).is_err());
+}
+
+#[test]
+fn scalar_observer_never_uses_diagnostic_text_as_data_or_origin_authority() {
+    let result = value(DataType::Int64);
+    let rows = [0];
+    let pure = PureSelection {
+        values: ints(&[None]),
+        errors: vec![RowDataError::new(0, "same diagnostic")],
+    };
+    for reference in [
+        ReferenceFailure::Fixture("same diagnostic".into()),
+        ReferenceFailure::Panicked("same diagnostic".into()),
+        ReferenceFailure::Source(Box::new(KernelFailure::ResourceExhausted)),
+    ] {
+        let mut found = Vec::new();
+        compare_selection(
+            facts(&result, &rows),
+            Err(reference),
+            |_| Err(reference_data("same diagnostic")),
+            &pure,
+            &mut found,
+        );
+        assert!(
+            !found.is_empty(),
+            "a fixture, panic or Resource cannot authorize row Data"
+        );
+    }
+    let mut found = Vec::new();
+    let outcome = compare_selection(
+        facts(&result, &rows),
+        Err(reference_data("same diagnostic")),
+        |_| {
+            Err(ReferenceFailure::Source(Box::new(
+                KernelFailure::from_domain(AuthoredReferenceData(
+                    "same diagnostic".into(),
+                    novarocks_functions::DataFailureReason::NumericOutOfRange,
+                )),
+            )))
+        },
+        &pure,
+        &mut found,
+    );
+    assert!(
+        found
+            .iter()
+            .any(|line| line.contains("original Data reasons differ"))
+    );
+    assert_eq!(outcome.attributed_row_errors, 0);
+    let original = KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+        "same diagnostic",
+    ));
+    let reference = ReferenceFailure::Source(Box::new(original.clone()));
+    assert!(reference.matches_kernel(&original));
+    assert!(!reference.matches_kernel(&KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new("same diagnostic")
+    )));
+    assert!(!ReferenceFailure::Fixture(original.to_string()).matches_kernel(&original));
 }

@@ -36,7 +36,7 @@ impl AggregateFunction for AvgStateAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         SumStateAgg.build_spec_from_type(func, input_type, input_is_intermediate)
     }
 
@@ -48,7 +48,7 @@ impl AggregateFunction for AvgStateAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         SumStateAgg.build_input_view(spec, array)
     }
 
@@ -56,7 +56,7 @@ impl AggregateFunction for AvgStateAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         SumStateAgg.build_merge_view(spec, array)
     }
 
@@ -82,7 +82,7 @@ impl AggregateFunction for AvgStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         SumStateAgg.update_batch(spec, offset, state_ptrs, input)
     }
 
@@ -92,7 +92,7 @@ impl AggregateFunction for AvgStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         SumStateAgg.merge_batch(spec, offset, state_ptrs, input)
     }
 
@@ -102,7 +102,7 @@ impl AggregateFunction for AvgStateAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         SumStateAgg.build_array(spec, offset, group_states, output_intermediate)
     }
 }
@@ -113,7 +113,7 @@ impl AggregateFunction for AvgStateSignedAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         SumStateSignedAgg.build_spec_from_type(func, input_type, input_is_intermediate)
     }
 
@@ -125,7 +125,7 @@ impl AggregateFunction for AvgStateSignedAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         SumStateSignedAgg.build_input_view(spec, array)
     }
 
@@ -133,7 +133,7 @@ impl AggregateFunction for AvgStateSignedAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         SumStateSignedAgg.build_merge_view(spec, array)
     }
 
@@ -159,7 +159,7 @@ impl AggregateFunction for AvgStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         SumStateSignedAgg.update_batch(spec, offset, state_ptrs, input)
     }
 
@@ -169,7 +169,7 @@ impl AggregateFunction for AvgStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         SumStateSignedAgg.merge_batch(spec, offset, state_ptrs, input)
     }
 
@@ -179,7 +179,7 @@ impl AggregateFunction for AvgStateSignedAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         SumStateSignedAgg.build_array(spec, offset, group_states, output_intermediate)
     }
 }
@@ -446,18 +446,25 @@ mod tests {
         let err = AvgStateAgg
             .build_spec_from_type(&agg_func("avg_state"), Some(&DataType::Float64), false)
             .unwrap_err();
-        assert!(err.contains("sum_state does not support Float64"));
+        assert!(
+            err.to_string()
+                .contains("sum_state does not support Float64")
+        );
 
         let input = Arc::new(Float64Array::from(vec![Some(1.0)])) as ArrayRef;
         let input_slot = Some(input);
         let spec = AvgStateAgg
             .build_spec_from_type(&agg_func("avg_state"), Some(&DataType::Int64), false)
             .unwrap();
-        let err: String = match AvgStateAgg.build_input_view(&spec, &input_slot) {
-            Ok(_) => panic!("avg_state float input unexpectedly built a view"),
-            Err(err) => err,
-        };
-        assert!(err.contains("sum_state does not support Float64"));
+        let err: crate::runtime::fragment::ExecutionFailure =
+            match AvgStateAgg.build_input_view(&spec, &input_slot) {
+                Ok(_) => panic!("avg_state float input unexpectedly built a view"),
+                Err(err) => err,
+            };
+        assert!(
+            err.to_string()
+                .contains("sum_state does not support Float64")
+        );
     }
 
     #[test]
@@ -473,7 +480,11 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(output_err.contains("state combinator output_type must be Binary"));
+        assert!(
+            output_err
+                .to_string()
+                .contains("state combinator output_type must be Binary")
+        );
 
         let intermediate_err = crate::exec::expr::agg::spec::build_spec_from_type(
             &agg_func_with_signature(
@@ -486,6 +497,10 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(intermediate_err.contains("state combinator intermediate_type must be Binary"));
+        assert!(
+            intermediate_err
+                .to_string()
+                .contains("state combinator intermediate_type must be Binary")
+        );
     }
 }

@@ -51,7 +51,7 @@ impl PureCompileControl for CompileControl {
         assert!(work <= 256);
         self.work.lock().unwrap().push(work);
         if !self.positive_only || work > 0 {
-            self.failure.map_or(Ok(()), Err)
+            self.failure.clone().map_or(Ok(()), Err)
         } else {
             Ok(())
         }
@@ -960,7 +960,7 @@ fn prepare_cannot_replace_value_equal_call_or_body_authority_and_compile_entry_i
     ] {
         let owner = Owner::new(EvaluationDemand::Value);
         let control = CompileControl {
-            failure: Some(failure),
+            failure: Some(failure.clone()),
             ..Default::default()
         };
         assert!(
@@ -1273,6 +1273,8 @@ fn retained_success_error_growth_and_immutable_bound_drift_preserve_primary_cont
         Mode::Drift(None),
         Mode::Drift(Some(kernel_error())),
         Mode::Failure(kernel_error()),
+        Mode::Grow(Some(actual_lifecycle_source())),
+        Mode::Drift(Some(actual_lifecycle_source())),
     ] {
         let owner = owner_with(mode.clone(), Init::Good);
         let (mut instance, mut body) = instantiate(&owner);
@@ -1290,10 +1292,11 @@ fn retained_success_error_growth_and_immutable_bound_drift_preserve_primary_cont
                 &RuntimeControl::default(),
             )
             .unwrap_err();
-        if matches!(mode, Mode::Failure(_)) {
-            assert_eq!(error, kernel_error());
-        } else {
-            assert!(matches!(error, KernelFailure::Internal(_)));
+        match &mode {
+            Mode::Failure(original) | Mode::Grow(Some(original)) | Mode::Drift(Some(original)) => {
+                assert_eq!(&error, original)
+            }
+            _ => assert!(matches!(error, KernelFailure::Internal(_))),
         }
         assert_eq!(
             instance
@@ -1384,7 +1387,11 @@ impl PureCompileControl for CompileQuantumControl {
     fn checkpoint(&self, phase: CompilePhase, work: u32) -> Result<(), CompileControlError> {
         assert_eq!(phase, CompilePhase::FunctionSpecialization);
         assert!(work <= 256);
-        if work == 256 { Err(self.0) } else { Ok(()) }
+        if work == 256 {
+            Err(self.0.clone())
+        } else {
+            Ok(())
+        }
     }
 }
 #[test]
@@ -1404,7 +1411,7 @@ fn compile_capture_quantum_and_initialization_entry_postcreate_controls_preserve
         let mut options = owner.options();
         options.capture_types = vec![i32_type(false); 300].into_boxed_slice();
         assert!(
-            matches!(specialize_higher_order(&owner,owner.input(),owner.selected.clone(),options,&CompileQuantumControl(compile_failure)),Err(FunctionSpecializationFailure::Kernel(error)) if error==runtime_failure)
+            matches!(specialize_higher_order(&owner,owner.input(),owner.selected.clone(),options,&CompileQuantumControl(compile_failure.clone())),Err(FunctionSpecializationFailure::Control(error)) if error==compile_failure)
         );
         assert_eq!(owner.prepares.load(Ordering::Relaxed), 0);
         let owner = Owner::new(EvaluationDemand::Value);
@@ -1550,4 +1557,69 @@ fn selected_capture_null_and_full_argument_quantum_fail_before_owner_private_wor
             }
         }
     }
+}
+
+fn actual_lifecycle_source() -> KernelFailure {
+    let source = crate::aggregate_scalar::build_scalar_array(
+        &DataType::Boolean,
+        vec![Some(crate::aggregate_scalar::AggScalarValue::Int64(1))],
+        &mut crate::aggregate_scalar::ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&source);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 315);
+    assert!(matches!(&source, KernelFailure::Source(_)));
+    source
+}
+
+#[test]
+fn actual_source_higher_order_error_has_no_late_cancel_callback_or_replay() {
+    struct LaterCancel<'a> {
+        config: &'a Config,
+        after: AtomicUsize,
+    }
+    impl KernelEvaluationControl for LaterCancel<'_> {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            if self.config.evaluations.load(Ordering::Relaxed) != 0 {
+                self.after.fetch_add(1, Ordering::Relaxed);
+                Err(KernelFailure::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("no higher-order wait")
+        }
+    }
+    let original = actual_lifecycle_source();
+    let owner = owner_with(Mode::Failure(original.clone()), Init::Good);
+    let (mut instance, mut body) = instantiate(&owner);
+    let columns = columns(false);
+    let arguments = values_args(&columns);
+    let captures = values_captures(&columns);
+    let selection = Selection::try_sparse(5, &[1, 3]).unwrap();
+    let late = LaterCancel {
+        config: &owner.config,
+        after: AtomicUsize::new(0),
+    };
+    assert_eq!(
+        instance
+            .evaluate(selection, &arguments, &captures, &mut body, &late)
+            .unwrap_err(),
+        original
+    );
+    assert_eq!(late.after.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        instance
+            .evaluate(selection, &arguments, &captures, &mut body, &late)
+            .unwrap_err(),
+        KernelFailure::InstanceFailed
+    );
+    assert_eq!(owner.config.evaluations.load(Ordering::Relaxed), 1);
+    drop(instance);
+    assert_eq!(owner.config.drops.load(Ordering::Relaxed), 1);
 }

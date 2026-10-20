@@ -21,6 +21,7 @@ mod internal_result;
 mod query_registry;
 mod root_result_relay;
 mod scheduler;
+mod statement_native_attempt;
 #[allow(
     dead_code,
     reason = "Wired into execute_round by the typed producer cut in the same PR."

@@ -2644,7 +2644,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 cx.array::<u8>(target.trim().len())
             })?;
             result = novarocks_type_contract::variant_get_target_type(target)
-                .map_err(|message| FunctionBindingError::InvalidBinding(message.into()))?;
+                .map_err(FunctionBindingError::VariantTargetType)?;
         }
     }
     let nullable = match name {
@@ -6525,3 +6525,53 @@ mod explicit_domain_owner_regression_tests {
 #[cfg(test)]
 #[path = "scalar_type_recipe_tests.rs"]
 mod scalar_type_recipe_tests;
+
+/// Test-only loan of actual installed COUNT metadata and its resolver author.
+/// This adds no alternate binding rules or production registration path.
+#[cfg(test)]
+pub(super) fn count_compile_owner_parts_for_test()
+-> (FunctionBindingDeclaration, Arc<BuiltinAggregateResolver>) {
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let original = catalog
+        .definition("count", FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap();
+    let binding = FunctionBindingDeclaration::try_new(
+        original.function_id().clone(),
+        original.kind(),
+        original.overloads().iter().cloned(),
+    )
+    .unwrap();
+    let declaration = builtin_aggregate_declarations()
+        .into_iter()
+        .find(|declaration| declaration.name == "count")
+        .unwrap();
+    (binding, Arc::new(BuiltinAggregateResolver { declaration }))
+}
+
+/// Test-only original installed NDV metadata and the real binding author.
+/// This lends no alternate selection rules or runtime HLL state capability.
+#[cfg(test)]
+pub(super) fn ndv_compile_owner_parts_for_test(
+    name: &str,
+) -> (FunctionBindingDeclaration, Arc<BuiltinAggregateResolver>) {
+    assert!(matches!(name, "ndv" | "approx_count_distinct"));
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let original = catalog
+        .definition(name, FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap();
+    let binding = FunctionBindingDeclaration::try_new(
+        original.function_id().clone(),
+        original.kind(),
+        original.overloads().iter().cloned(),
+    )
+    .unwrap();
+    let declaration = builtin_aggregate_declarations()
+        .into_iter()
+        .find(|declaration| declaration.name == name)
+        .unwrap();
+    (binding, Arc::new(BuiltinAggregateResolver { declaration }))
+}

@@ -45,7 +45,7 @@ impl PureCompileControl for Control {
             assert!(ordinal <= stop, "callback after original refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if ordinal == stop => Err(cause),
             _ => Ok(()),
         }
@@ -53,14 +53,17 @@ impl PureCompileControl for Control {
 }
 fn failures() -> [(CompileControlError, KernelFailure); 3] {
     [
-        (CompileControlError::Cancelled, KernelFailure::Cancelled),
+        (
+            CompileControlError::Cancelled,
+            KernelFailure::CompileControl(CompileControlError::Cancelled),
+        ),
         (
             CompileControlError::DeadlineExceeded,
-            KernelFailure::DeadlineExceeded,
+            KernelFailure::CompileControl(CompileControlError::DeadlineExceeded),
         ),
         (
             CompileControlError::ResourceExhausted,
-            KernelFailure::ResourceExhausted,
+            KernelFailure::CompileControl(CompileControlError::ResourceExhausted),
         ),
     ]
 }

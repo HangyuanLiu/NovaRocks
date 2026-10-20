@@ -37,6 +37,27 @@ pub enum FunctionSpecializationFailure {
     MissingPureImplementation(crate::FunctionOverloadId),
     InvalidInput(&'static str),
 }
+impl From<KernelFailure> for FunctionSpecializationFailure {
+    fn from(error: KernelFailure) -> Self {
+        match error {
+            KernelFailure::CompileControl(cause) => Self::Control(cause),
+            other => Self::Kernel(other),
+        }
+    }
+}
+impl FunctionSpecializationFailure {
+    pub(crate) fn is_interruption(&self) -> bool {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        matches!(
+            self,
+            Self::Control(_) | Self::Binding(FunctionBindingError::Control(_))
+        ) || matches!(self, Self::Kernel(cause) if cause.is_interruption())
+            || matches!(
+                self.failure_fact().class(),
+                FailureClass::Control | FailureClass::Resource
+            )
+    }
+}
 impl fmt::Display for FunctionSpecializationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -53,7 +74,17 @@ impl fmt::Display for FunctionSpecializationFailure {
         }
     }
 }
-impl std::error::Error for FunctionSpecializationFailure {}
+impl std::error::Error for FunctionSpecializationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Binding(cause) => Some(cause),
+            Self::Effects(cause) => Some(cause),
+            Self::Control(cause) => Some(cause),
+            Self::Kernel(cause) => Some(cause),
+            Self::MissingPureImplementation(_) | Self::InvalidInput(_) => None,
+        }
+    }
+}
 
 pub(crate) fn refine_once_for_specialization<
     'a,

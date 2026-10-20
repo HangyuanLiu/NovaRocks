@@ -91,8 +91,9 @@ pub struct PlanAddFilesRequest {
     pub execution: QueryExecutionContext,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AddFilesFailureKind {
+    Interrupted(novarocks_type_contract::CompileControlError),
     InvalidRequest,
     NotFound,
     AlreadyExists,
@@ -112,6 +113,16 @@ pub enum AddFilesFailureKind {
 pub struct AddFilesFailure {
     pub kind: AddFilesFailureKind,
     pub message: String,
+}
+impl AddFilesFailure {
+    pub(crate) fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        match &self.kind {
+            AddFilesFailureKind::Interrupted(cause) => Some(cause.clone()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -543,6 +554,11 @@ fn project_uncommitted(
 fn project_connector_error(error: ConnectorError) -> AddFilesFailure {
     AddFilesFailure {
         kind: match error.kind() {
+            ConnectorErrorKind::Interrupted => AddFilesFailureKind::Interrupted(
+                novarocks_type_contract::CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::new(error.clone()),
+                ),
+            ),
             ConnectorErrorKind::InvalidRequest => AddFilesFailureKind::InvalidRequest,
             ConnectorErrorKind::NotFound => AddFilesFailureKind::NotFound,
             ConnectorErrorKind::PermissionDenied => AddFilesFailureKind::PermissionDenied,
@@ -561,6 +577,11 @@ fn project_connector_error(error: ConnectorError) -> AddFilesFailure {
 fn project_mutation_failure(failure: ConnectorMutationFailure) -> AddFilesFailure {
     AddFilesFailure {
         kind: match failure.kind() {
+            ConnectorMutationFailureKind::Interrupted => AddFilesFailureKind::Interrupted(
+                novarocks_type_contract::CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::new(failure.clone()),
+                ),
+            ),
             ConnectorMutationFailureKind::InvalidRequest => AddFilesFailureKind::InvalidRequest,
             ConnectorMutationFailureKind::NotFound => AddFilesFailureKind::NotFound,
             ConnectorMutationFailureKind::AlreadyExists => AddFilesFailureKind::AlreadyExists,

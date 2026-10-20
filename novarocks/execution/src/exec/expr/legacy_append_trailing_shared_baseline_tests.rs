@@ -57,7 +57,7 @@ fn raw(
     b: ArrayRef,
     target: Option<DataType>,
     extra: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, ids, chunk) = setup(a, b);
     let mut args = ids.to_vec();
     if extra {
@@ -162,32 +162,34 @@ fn legacy_append_trailing_original_reader_error_and_child_evaluation_order() {
             (strings(vec![None]), bad.clone()),
         ] {
             assert_eq!(
-                raw(a, b, None, true).unwrap_err(),
+                (raw(a, b, None, true).unwrap_err()).to_string(),
                 "append_trailing_char_if_absent expects string"
             );
         }
         let (arena, ids, chunk) = setup(bad, strings(vec![None]));
         // Both child evaluations precede either downcast in the original author.
         assert_eq!(
-            eval_string_function(
+            (eval_string_function(
                 "append_trailing_char_if_absent",
                 &arena,
                 ExprId(usize::MAX),
                 &[ids[0], ExprId(usize::MAX)],
                 &chunk
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "invalid ExprId"
         );
         assert_eq!(
-            eval_string_function(
+            (eval_string_function(
                 "append_trailing_char_if_absent",
                 &arena,
                 ExprId(usize::MAX),
                 &[ExprId(usize::MAX), ids[1]],
                 &chunk
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "invalid ExprId"
         );
     }

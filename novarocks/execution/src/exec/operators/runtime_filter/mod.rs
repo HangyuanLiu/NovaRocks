@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -28,9 +29,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
 };
-use crate::exec::pipeline::operator::{
-    DriverBlockDeadline, Operator, ProcessorOperator, forward_observable,
-};
+use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator, forward_observable};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink, NoopFragmentEventSink};
@@ -45,6 +44,37 @@ mod live_cursor;
 #[cfg(test)]
 mod live_cursor_tests;
 pub(crate) use compiled::{CompiledRuntimeFilterConsumers, CompiledRuntimeFilterKeys};
+
+fn contract_failure(detail: impl Into<Arc<str>>) -> ExecutionFailure {
+    execution::RuntimeFilterContractViolation::new(
+        execution::RuntimeFilterContractViolationKind::ContractMismatch,
+        detail,
+    )
+    .into()
+}
+#[derive(Debug)]
+struct FilterArrowFailure(arrow::error::ArrowError);
+impl std::fmt::Display for FilterArrowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for FilterArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for FilterArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::FilterArrowApplication.reason(),
+        )
+    }
+}
+fn arrow_failure(source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(FilterArrowFailure(source))
+}
 
 pub(crate) struct NativeOrderedLiveConsumerSet {
     inner: Arc<NativeOrderedLiveConsumerInner>,
@@ -102,7 +132,7 @@ impl NativeOrderedLiveConsumerSet {
     pub(crate) fn from_plan(
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         validate_ordered_live_plan_specs(specs, &arena)?;
         Ok(Self {
             inner: Arc::new(NativeOrderedLiveConsumerInner {
@@ -121,7 +151,7 @@ impl NativeOrderedLiveConsumerSet {
         })
     }
 
-    pub(crate) fn bind(&self, state: &RuntimeState) -> Result<(), String> {
+    pub(crate) fn bind(&self, state: &RuntimeState) -> ExecutionResult<()> {
         let mut bindings = self
             .inner
             .bindings
@@ -137,10 +167,11 @@ impl NativeOrderedLiveConsumerSet {
             if bindings.is_empty() {
                 return Ok(());
             }
-            return Err(
-                "native ordered runtime-filter consumers require an installed execution context"
-                    .into(),
-            );
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::MissingSession,
+                "native ordered runtime-filter consumers require an installed execution context",
+            )
+            .into());
         };
         for binding in bindings.iter_mut() {
             if !matches!(binding.state, NativeOrderedLiveBindingState::Unbound) {
@@ -164,10 +195,10 @@ impl NativeOrderedLiveConsumerSet {
                     binding.state = NativeOrderedLiveBindingState::PassThrough;
                 }
                 Ok(_) => {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native ordered runtime-filter binding_id={} session returned a non-live subscription",
                         binding.spec.binding_id()
-                    ));
+                    )));
                 }
                 Err(error)
                     if error.kind()
@@ -175,13 +206,13 @@ impl NativeOrderedLiveConsumerSet {
                 {
                     binding.state = NativeOrderedLiveBindingState::PassThrough;
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(())
     }
 
-    pub(crate) fn poll_and_apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    pub(crate) fn poll_and_apply_chunk(&self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
         self.poll_and_apply_chunk_observed(chunk, None)
     }
 
@@ -189,12 +220,12 @@ impl NativeOrderedLiveConsumerSet {
         &self,
         chunk: Chunk,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
-    ) -> Result<Option<Chunk>, String> {
+    ) -> ExecutionResult<Option<Chunk>> {
         self.poll_updates()?;
         self.apply_latest_chunk_observed(chunk, event_sink)
     }
 
-    pub(crate) fn poll_updates(&self) -> Result<(), String> {
+    pub(crate) fn poll_updates(&self) -> ExecutionResult<()> {
         self.poll()
     }
 
@@ -202,16 +233,19 @@ impl NativeOrderedLiveConsumerSet {
         &self,
         chunk: Chunk,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
-    ) -> Result<Option<Chunk>, String> {
+    ) -> ExecutionResult<Option<Chunk>> {
         self.apply_latest_chunk_with(
             chunk,
             event_sink,
             |expr, input| self.inner.arena.eval(expr, input),
-            |input| crate::exec::chunk::hydrate_dictionary_columns_except(&input, |_, _| false),
+            |input| {
+                crate::exec::chunk::hydrate_dictionary_columns_except(&input, |_, _| false)
+                    .map_err(ExecutionFailure::from)
+            },
             |input, mask| {
-                let batch = filter_record_batch(input.record_batch(), mask)
-                    .map_err(|error| error.to_string())?;
-                Chunk::try_new_like(batch, input)
+                let batch =
+                    filter_record_batch(input.record_batch(), mask).map_err(arrow_failure)?;
+                Chunk::try_new_like(batch, input).map_err(ExecutionFailure::from)
             },
         )
     }
@@ -246,18 +280,18 @@ impl NativeOrderedLiveConsumerSet {
         )
     }
 
-    fn apply_latest_chunk_with<E: From<String>, F, H, C>(
+    fn apply_latest_chunk_with<F, H, C>(
         &self,
         chunk: Chunk,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
         evaluate: F,
         hydrate: H,
         filter: C,
-    ) -> Result<Option<Chunk>, E>
+    ) -> ExecutionResult<Option<Chunk>>
     where
-        F: FnMut(ExprId, &Chunk) -> Result<ArrayRef, E>,
-        H: FnMut(Chunk) -> Result<Chunk, E>,
-        C: FnMut(&Chunk, &arrow::array::BooleanArray) -> Result<Chunk, E>,
+        F: FnMut(ExprId, &Chunk) -> ExecutionResult<ArrayRef>,
+        H: FnMut(Chunk) -> ExecutionResult<Chunk>,
+        C: FnMut(&Chunk, &arrow::array::BooleanArray) -> ExecutionResult<Chunk>,
     {
         let (output, effects) = self.apply_chunk_inner(chunk, evaluate, hydrate, filter)?;
         if let Some(event_sink) = event_sink {
@@ -268,7 +302,7 @@ impl NativeOrderedLiveConsumerSet {
         Ok(output)
     }
 
-    fn poll(&self) -> Result<(), String> {
+    fn poll(&self) -> ExecutionResult<()> {
         let pending = {
             let bindings = self
                 .inner
@@ -279,7 +313,9 @@ impl NativeOrderedLiveConsumerSet {
                 .iter()
                 .any(|binding| matches!(binding.state, NativeOrderedLiveBindingState::Unbound))
             {
-                return Err("native ordered runtime-filter consumers must bind before poll".into());
+                return Err(contract_failure(
+                    "native ordered runtime-filter consumers must bind before poll",
+                ));
             }
             bindings
                 .iter()
@@ -307,14 +343,16 @@ impl NativeOrderedLiveConsumerSet {
         index: usize,
         spec: &RuntimeFilterConsumerBinding,
         outcome: execution::LivePollOutcome,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         let mut bindings = self
             .inner
             .bindings
             .lock()
             .expect("native ordered RF consumer lock");
         let Some(binding) = bindings.get_mut(index) else {
-            return Err("native ordered runtime-filter binding index drifted".into());
+            return Err(contract_failure(
+                "native ordered runtime-filter binding index drifted",
+            ));
         };
         let NativeOrderedLiveBindingState::BoundExecutionLive {
             observed,
@@ -331,32 +369,32 @@ impl NativeOrderedLiveConsumerSet {
                 binding.state = NativeOrderedLiveBindingState::PassThrough;
             }
             Err(live_cursor::LiveCursorViolation::NewerVersionWithoutArtifact) => {
-                return Err(format!(
+                return Err(contract_failure(format!(
                     "native ordered runtime-filter binding_id={} reported a newer live version without artifact",
                     spec.binding_id()
-                ));
+                )));
             }
             Err(live_cursor::LiveCursorViolation::Regressed) => {
-                return Err(format!(
+                return Err(contract_failure(format!(
                     "native ordered runtime-filter binding_id={} live cursor regressed",
                     spec.binding_id()
-                ));
+                )));
             }
         }
         Ok(())
     }
 
-    fn apply_chunk_inner<E: From<String>, F, H, C>(
+    fn apply_chunk_inner<F, H, C>(
         &self,
         chunk: Chunk,
         mut evaluate: F,
         mut hydrate: H,
         mut filter: C,
-    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), E>
+    ) -> ExecutionResult<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>)>
     where
-        F: FnMut(ExprId, &Chunk) -> Result<ArrayRef, E>,
-        H: FnMut(Chunk) -> Result<Chunk, E>,
-        C: FnMut(&Chunk, &arrow::array::BooleanArray) -> Result<Chunk, E>,
+        F: FnMut(ExprId, &Chunk) -> ExecutionResult<ArrayRef>,
+        H: FnMut(Chunk) -> ExecutionResult<Chunk>,
+        C: FnMut(&Chunk, &arrow::array::BooleanArray) -> ExecutionResult<Chunk>,
     {
         let active = {
             let bindings = self
@@ -397,7 +435,7 @@ impl NativeOrderedLiveConsumerSet {
                         snapshot.artifact_query().as_ref(),
                         &array,
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(ExecutionFailure::from)?;
                     match outcome.evaluation() {
                         execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } => {
                             effects.push(
@@ -448,16 +486,12 @@ pub(crate) enum RuntimeFilterGate {
 /// order and over which rows; a provider only supplies what a binding's key
 /// is, so the same state serves an ExprArena plan and a compiled program.
 pub(crate) trait RuntimeFilterKeyProvider {
-    /// A failure of preparation or key evaluation. Every failure the state
-    /// itself observes is reported through `From<String>`.
-    type Error: From<String>;
-
     /// The chunk every key is evaluated over and every mask selects from,
     /// prepared once for each chunk at least one binding applies to.
-    fn prepare_input(&mut self, chunk: Chunk) -> Result<Chunk, Self::Error>;
+    fn prepare_input(&mut self, chunk: Chunk) -> ExecutionResult<Chunk>;
 
     /// The key of the binding at position `binding` of the set over `input`.
-    fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> Result<ArrayRef, Self::Error>;
+    fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> ExecutionResult<ArrayRef>;
 
     /// The original decoder and mask application policy. A direct ordered
     /// Scan overrides only this policy to retain its controlled output stock.
@@ -466,31 +500,30 @@ pub(crate) trait RuntimeFilterKeyProvider {
         input: Chunk,
         array: &ArrayRef,
         snapshot: &execution::RuntimeFilterSnapshot,
-    ) -> Result<RuntimeFilterApplication, Self::Error> {
+    ) -> ExecutionResult<RuntimeFilterApplication> {
         apply_legacy_runtime_filter_snapshot(input, array, snapshot)
     }
 }
 
-fn apply_legacy_runtime_filter_snapshot<E: From<String>>(
+fn apply_legacy_runtime_filter_snapshot(
     input: Chunk,
     array: &ArrayRef,
     snapshot: &execution::RuntimeFilterSnapshot,
-) -> Result<RuntimeFilterApplication, E> {
+) -> ExecutionResult<RuntimeFilterApplication> {
     apply_runtime_filter_snapshot_with(input, array, snapshot, |input, mask| {
-        let batch =
-            filter_record_batch(input.record_batch(), mask).map_err(|error| error.to_string())?;
-        Ok(Chunk::try_new_like(batch, input)?)
+        let batch = filter_record_batch(input.record_batch(), mask).map_err(arrow_failure)?;
+        Chunk::try_new_like(batch, input).map_err(ExecutionFailure::from)
     })
 }
 
-fn apply_runtime_filter_snapshot_with<E: From<String>, F>(
+fn apply_runtime_filter_snapshot_with<F>(
     input: Chunk,
     array: &ArrayRef,
     snapshot: &execution::RuntimeFilterSnapshot,
     mut filter: F,
-) -> Result<RuntimeFilterApplication, E>
+) -> ExecutionResult<RuntimeFilterApplication>
 where
-    F: FnMut(&Chunk, &arrow::array::BooleanArray) -> Result<Chunk, E>,
+    F: FnMut(&Chunk, &arrow::array::BooleanArray) -> ExecutionResult<Chunk>,
 {
     let outcome = execution::evaluator::evaluate_rows(
         snapshot.binding_id(),
@@ -498,7 +531,7 @@ where
         snapshot.artifact_query().as_ref(),
         array,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(ExecutionFailure::from)?;
     let execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } = outcome.evaluation() else {
         return Ok(RuntimeFilterApplication::NotEvaluated(input));
     };
@@ -597,8 +630,11 @@ impl RuntimeFilterConsumerState {
     pub(crate) fn from_contracts(
         owner: &'static str,
         contracts: Vec<execution::RuntimeFilterConsumerContract>,
-        validate_key: impl FnMut(usize, &execution::RuntimeFilterConsumerContract) -> Result<(), String>,
-    ) -> Result<Self, String> {
+        validate_key: impl FnMut(
+            usize,
+            &execution::RuntimeFilterConsumerContract,
+        ) -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
         validate_membership_consumer_contracts(owner, &contracts, validate_key)?;
         Ok(Self {
             inner: Arc::new(NativeConsumerInner {
@@ -618,7 +654,7 @@ impl RuntimeFilterConsumerState {
         })
     }
 
-    pub(crate) fn bind(&self, state: &RuntimeState) -> Result<(), String> {
+    pub(crate) fn bind(&self, state: &RuntimeState) -> ExecutionResult<()> {
         *self
             .inner
             .wait_timeout
@@ -637,9 +673,11 @@ impl RuntimeFilterConsumerState {
             if bindings.is_empty() {
                 return Ok(());
             }
-            return Err(
-                "native runtime-filter consumers require an installed execution context".into(),
-            );
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::MissingSession,
+                "native runtime-filter consumers require an installed execution context",
+            )
+            .into());
         };
         for binding in bindings.iter_mut() {
             if !matches!(binding.state, NativeConsumerBindingState::Unbound) {
@@ -680,10 +718,10 @@ impl RuntimeFilterConsumerState {
                     binding.state = NativeConsumerBindingState::PassThrough;
                 }
                 Ok(_) => {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native Join runtime-filter binding_id={} session returned an activation-mismatched subscription",
                         binding.contract.binding_id().get()
-                    ));
+                    )));
                 }
                 Err(error)
                     if error.kind()
@@ -691,7 +729,7 @@ impl RuntimeFilterConsumerState {
                 {
                     binding.state = NativeConsumerBindingState::PassThrough;
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error.into()),
             }
             match binding.contract.activation() {
                 execution::ConsumerActivation::BlockingSnapshot
@@ -699,10 +737,10 @@ impl RuntimeFilterConsumerState {
                     late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
                 } => {}
                 execution::ConsumerActivation::NonBlockingLive { .. } => {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native Join runtime-filter binding_id={} has unsupported activation",
                         binding.contract.binding_id().get()
-                    ));
+                    )));
                 }
             }
         }
@@ -836,7 +874,7 @@ impl RuntimeFilterConsumerState {
         chunk: Chunk,
         keys: &mut K,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
-    ) -> Result<Option<Chunk>, K::Error> {
+    ) -> ExecutionResult<Option<Chunk>> {
         let (output, effects) = self.apply_chunk_inner(chunk, keys)?;
         if let Some(event_sink) = event_sink {
             for effect in effects {
@@ -850,7 +888,7 @@ impl RuntimeFilterConsumerState {
         &self,
         chunk: Chunk,
         keys: &mut K,
-    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), K::Error> {
+    ) -> ExecutionResult<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>)> {
         self.poll_live_bindings()?;
         let active = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
@@ -861,11 +899,9 @@ impl RuntimeFilterConsumerState {
                         | NativeConsumerBindingState::BoundBlocking(_)
                 )
             }) {
-                return Err(
-                    "native runtime-filter consumers must pass their gate before apply"
-                        .to_string()
-                        .into(),
-                );
+                return Err(contract_failure(
+                    "native runtime-filter consumers must pass their gate before apply",
+                ));
             }
             bindings
                 .iter()
@@ -909,7 +945,7 @@ impl RuntimeFilterConsumerState {
         Ok((current, effects))
     }
 
-    fn poll_live_bindings(&self) -> Result<(), String> {
+    fn poll_live_bindings(&self) -> ExecutionResult<()> {
         let pending = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
             bindings
@@ -941,10 +977,12 @@ impl RuntimeFilterConsumerState {
         index: usize,
         binding_id: u32,
         outcome: execution::LivePollOutcome,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         let mut bindings = self.inner.bindings.lock().expect("native RF consumer lock");
         let Some(binding) = bindings.get_mut(index) else {
-            return Err("native Join runtime-filter binding index drifted".into());
+            return Err(contract_failure(
+                "native Join runtime-filter binding index drifted",
+            ));
         };
         let NativeConsumerBindingState::BoundLive { observed, .. } = &mut binding.state else {
             return Ok(());
@@ -953,21 +991,21 @@ impl RuntimeFilterConsumerState {
         if let Some(version) = observed_version
             && version != execution::LogicalVersion::FIRST
         {
-            return Err(format!(
+            return Err(contract_failure(format!(
                 "native Join CompleteOnce runtime-filter binding_id={binding_id} private cursor must use LogicalVersion::FIRST, got {version:?}"
-            ));
+            )));
         }
         match outcome {
             execution::LivePollOutcome::Updated { snapshot, terminal } => {
                 if snapshot.logical_version() != execution::LogicalVersion::FIRST {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native Join CompleteOnce runtime-filter binding_id={binding_id} Updated artifact must use LogicalVersion::FIRST"
-                    ));
+                    )));
                 }
                 if terminal != Some(execution::LiveTerminal::Completed) {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native Join CompleteOnce runtime-filter binding_id={binding_id} Updated artifact requires terminal Completed, got {terminal:?}"
-                    ));
+                    )));
                 }
                 binding.state = NativeConsumerBindingState::Active(
                     NativeConsumerPredicate::Execution(snapshot),
@@ -980,25 +1018,25 @@ impl RuntimeFilterConsumerState {
                 if let Some(version) = latest_version
                     && version != execution::LogicalVersion::FIRST
                 {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native Join CompleteOnce runtime-filter binding_id={binding_id} Idle latest version must use LogicalVersion::FIRST, got {version:?}"
-                    ));
+                    )));
                 }
                 if terminal == Some(execution::LiveTerminal::Completed) {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native Join CompleteOnce runtime-filter binding_id={binding_id} reported Completed without the final artifact"
-                    ));
+                    )));
                 }
                 match (observed_version, latest_version) {
                     (None, Some(_)) => {
-                        return Err(format!(
+                        return Err(contract_failure(format!(
                             "native Join CompleteOnce runtime-filter binding_id={binding_id} Idle cursor advanced without returning an artifact"
-                        ));
+                        )));
                     }
                     (Some(_), None) => {
-                        return Err(format!(
+                        return Err(contract_failure(format!(
                             "native Join CompleteOnce runtime-filter binding_id={binding_id} Idle cursor regressed from LogicalVersion::FIRST"
-                        ));
+                        )));
                     }
                     _ => {}
                 }
@@ -1036,17 +1074,18 @@ struct ArenaRuntimeFilterKeys {
 }
 
 impl RuntimeFilterKeyProvider for &ArenaRuntimeFilterKeys {
-    type Error = String;
-
-    fn prepare_input(&mut self, chunk: Chunk) -> Result<Chunk, String> {
-        crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)
+    fn prepare_input(&mut self, chunk: Chunk) -> ExecutionResult<Chunk> {
+        Ok(crate::exec::chunk::hydrate_dictionary_columns_except(
+            &chunk,
+            |_, _| false,
+        )?)
     }
 
-    fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> Result<ArrayRef, String> {
+    fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> ExecutionResult<ArrayRef> {
         let expr_id = *self
             .expr_ids
             .get(binding)
-            .ok_or("native runtime-filter binding index drifted")?;
+            .ok_or_else(|| contract_failure("native runtime-filter binding index drifted"))?;
         self.arena.eval(expr_id, input)
     }
 }
@@ -1057,8 +1096,6 @@ struct CreatedArenaRuntimeFilterKeys<'a> {
     control: &'a dyn crate::exec::expr::ExprEvaluationControl,
 }
 impl RuntimeFilterKeyProvider for CreatedArenaRuntimeFilterKeys<'_> {
-    type Error = crate::runtime::fragment::ExecutionFailure;
-
     fn apply_snapshot(
         &mut self,
         input: Chunk,
@@ -1081,7 +1118,7 @@ impl RuntimeFilterKeyProvider for CreatedArenaRuntimeFilterKeys<'_> {
             .keys
             .expr_ids
             .get(binding)
-            .ok_or("native runtime-filter binding index drifted")?;
+            .ok_or_else(|| contract_failure("native runtime-filter binding index drifted"))?;
         let owner = self.factory.begin_input_construction(input)?;
         crate::exec::expr::ExprEvaluationContext::new(
             &self.keys.arena,
@@ -1101,16 +1138,16 @@ impl RuntimeFilterConsumerSet {
         owner: &'static str,
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let state = RuntimeFilterConsumerState::from_contracts(
             owner,
             specs.iter().map(|spec| spec.contract().clone()).collect(),
             |index, contract| {
                 if arena.data_type(specs[index].expr_id).is_none() {
-                    return Err(format!(
+                    return Err(contract_failure(format!(
                         "native Join runtime-filter binding_id={} expression is missing",
                         contract.binding_id().get()
-                    ));
+                    )));
                 }
                 Ok(())
             },
@@ -1129,7 +1166,7 @@ impl RuntimeFilterConsumerSet {
         &self.state
     }
 
-    pub(crate) fn bind(&self, state: &RuntimeState) -> Result<(), String> {
+    pub(crate) fn bind(&self, state: &RuntimeState) -> ExecutionResult<()> {
         self.state.bind(state)
     }
 
@@ -1169,7 +1206,7 @@ impl RuntimeFilterConsumerSet {
             .apply_chunk_observed(chunk, &mut keys, event_sink)
     }
 
-    pub(crate) fn apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    pub(crate) fn apply_chunk(&self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
         self.apply_chunk_observed(chunk, None)
     }
 
@@ -1177,7 +1214,7 @@ impl RuntimeFilterConsumerSet {
         &self,
         chunk: Chunk,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
-    ) -> Result<Option<Chunk>, String> {
+    ) -> ExecutionResult<Option<Chunk>> {
         self.state
             .apply_chunk_observed(chunk, &mut &*self.keys, event_sink)
     }
@@ -1185,30 +1222,30 @@ impl RuntimeFilterConsumerSet {
 
 fn execution_membership_consumer_contract(
     contract: &execution::RuntimeFilterConsumerContract,
-) -> Result<execution::RuntimeFilterConsumerContract, String> {
+) -> ExecutionResult<execution::RuntimeFilterConsumerContract> {
     if !matches!(
         contract.contract(),
         RuntimeFilterExecutionContract::Membership(_)
     ) {
-        return Err(format!(
+        return Err(contract_failure(format!(
             "native Join runtime-filter binding_id={} requires a Membership contract",
             contract.binding_id().get()
-        ));
+        )));
     }
     Ok(contract.clone())
 }
 
 fn execution_ordered_live_consumer_contract(
     spec: &RuntimeFilterConsumerBinding,
-) -> Result<execution::RuntimeFilterConsumerContract, String> {
+) -> ExecutionResult<execution::RuntimeFilterConsumerContract> {
     if !matches!(
         spec.execution_contract(),
         RuntimeFilterExecutionContract::Ordered(_)
     ) {
-        return Err(format!(
+        return Err(contract_failure(format!(
             "native ordered runtime-filter binding_id={} requires an Ordered contract",
             spec.binding_id()
-        ));
+        )));
     }
     if !matches!(
         spec.activation(),
@@ -1217,23 +1254,23 @@ fn execution_ordered_live_consumer_contract(
                 | execution::RuntimeFilterLateApplyGranularity::Split,
         }
     ) {
-        return Err(format!(
+        return Err(contract_failure(format!(
             "native ordered runtime-filter binding_id={} requires a non-blocking live activation",
             spec.binding_id()
-        ));
+        )));
     }
     Ok(spec.contract().clone())
 }
 
 fn validate_unique_consumer_bindings(
     binding_ids: impl IntoIterator<Item = u32>,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let mut bindings = BTreeSet::new();
     for binding_id in binding_ids {
         if !bindings.insert(binding_id) {
-            return Err(format!(
+            return Err(contract_failure(format!(
                 "duplicate native runtime-filter consumer binding_id={binding_id}"
-            ));
+            )));
         }
     }
     Ok(())
@@ -1246,8 +1283,11 @@ fn validate_unique_consumer_bindings(
 fn validate_membership_consumer_contracts(
     owner: &'static str,
     contracts: &[execution::RuntimeFilterConsumerContract],
-    mut validate_key: impl FnMut(usize, &execution::RuntimeFilterConsumerContract) -> Result<(), String>,
-) -> Result<(), String> {
+    mut validate_key: impl FnMut(
+        usize,
+        &execution::RuntimeFilterConsumerContract,
+    ) -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
     validate_unique_consumer_bindings(
         contracts.iter().map(|contract| contract.binding_id().get()),
     )?;
@@ -1259,20 +1299,20 @@ fn validate_membership_consumer_contracts(
                     late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
                 }
         ) {
-            return Err(format!(
+            return Err(contract_failure(format!(
                 "native {owner} runtime-filter binding_id={} requires BlockingSnapshot or Batch NonBlockingLive",
                 contract.binding_id().get()
-            ));
+            )));
         }
         if !matches!(
             contract.contract(),
             RuntimeFilterExecutionContract::Membership(_)
         ) || contract.reduction() != execution::RuntimeFilterReduction::SetUnion
         {
-            return Err(format!(
+            return Err(contract_failure(format!(
                 "native {owner} runtime-filter binding_id={} requires a membership SetUnion contract",
                 contract.binding_id().get()
-            ));
+            )));
         }
         validate_key(index, contract)?;
     }
@@ -1282,7 +1322,7 @@ fn validate_membership_consumer_contracts(
 fn validate_ordered_live_plan_specs(
     specs: &[RuntimeFilterConsumerBinding],
     arena: &ExprArena,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     validate_unique_consumer_bindings(specs.iter().map(RuntimeFilterConsumerBinding::binding_id))?;
     for spec in specs {
         match spec.activation() {
@@ -1292,16 +1332,16 @@ fn validate_ordered_live_plan_specs(
                     | execution::RuntimeFilterLateApplyGranularity::Split,
             } => {}
             execution::ConsumerActivation::NonBlockingLive { .. } => {
-                return Err(format!(
+                return Err(contract_failure(format!(
                     "native ordered runtime-filter binding_id={} has unsupported late-apply granularity",
                     spec.binding_id()
-                ));
+                )));
             }
             execution::ConsumerActivation::BlockingSnapshot => {
-                return Err(format!(
+                return Err(contract_failure(format!(
                     "native ordered runtime-filter binding_id={} requires NonBlockingLive",
                     spec.binding_id()
-                ));
+                )));
             }
         }
         if !matches!(
@@ -1310,10 +1350,10 @@ fn validate_ordered_live_plan_specs(
         ) || spec.contract().reduction()
             != execution::RuntimeFilterReduction::TightenOrderedBound
         {
-            return Err(format!(
+            return Err(contract_failure(format!(
                 "native ordered runtime-filter binding_id={} requires an ordered TightenOrderedBound contract",
                 spec.binding_id()
-            ));
+            )));
         }
         let RuntimeFilterExecutionContract::Ordered(order_contract) = spec.execution_contract()
         else {
@@ -1323,10 +1363,10 @@ fn validate_ordered_live_plan_specs(
             || arena.data_type(spec.expr_id)
                 != order_contract.keys().first().map(|key| key.data_type())
         {
-            return Err(format!(
+            return Err(contract_failure(format!(
                 "native ordered runtime-filter binding_id={} expression does not match its frozen single-key contract",
                 spec.binding_id()
-            ));
+            )));
         }
     }
     Ok(())
@@ -1401,7 +1441,7 @@ impl NativeRuntimeFilterProcessorFactory {
         owner_node_id: i32,
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Ok(Self {
             name: format!("NativeRuntimeFilter (id={owner_node_id})"),
             consumers: RuntimeFilterProcessorPlan::Arena(RuntimeFilterConsumerSet::from_plan(
@@ -1429,37 +1469,35 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(NativeRuntimeFilterProcessor {
-            name: self.name.clone(),
-            consumers: match &self.consumers {
-                RuntimeFilterProcessorPlan::Arena(value) => {
-                    RuntimeFilterProcessorConsumers::Arena(value.clone())
-                }
-                RuntimeFilterProcessorPlan::Compiled(value) => {
-                    RuntimeFilterProcessorConsumers::Compiled {
-                        state: value.state().clone(),
-                        keys: value.driver_keys(),
+        Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+            NativeRuntimeFilterProcessor {
+                name: self.name.clone(),
+                consumers: match &self.consumers {
+                    RuntimeFilterProcessorPlan::Arena(value) => {
+                        RuntimeFilterProcessorConsumers::Arena(value.clone())
                     }
-                }
+                    RuntimeFilterProcessorPlan::Compiled(value) => {
+                        RuntimeFilterProcessorConsumers::Compiled {
+                            state: value.state().clone(),
+                            keys: value.driver_keys(),
+                        }
+                    }
+                },
+                event_sink: Arc::new(NoopFragmentEventSink),
+                construction: None,
             },
-            output: None,
-            finishing: false,
-            event_sink: Arc::new(NoopFragmentEventSink),
-            construction: None,
-        })
+        ))
     }
 }
 
 struct NativeRuntimeFilterProcessor {
     name: String,
     consumers: RuntimeFilterProcessorConsumers,
-    output: Option<Chunk>,
-    finishing: bool,
     event_sink: Arc<dyn FragmentEventSink>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
-impl Operator for NativeRuntimeFilterProcessor {
+impl OperatorLifecycle for NativeRuntimeFilterProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -1468,10 +1506,11 @@ impl Operator for NativeRuntimeFilterProcessor {
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) {
         if let RuntimeFilterProcessorConsumers::Compiled { keys, .. } = &mut self.consumers {
-            keys.bind_construction_factory(factory.clone());
+            keys.bind_construction_factory(Arc::clone(&factory));
         }
         self.construction = Some(factory);
     }
+
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.consumers.bind_mem_tracker(tracker);
     }
@@ -1491,79 +1530,45 @@ impl Operator for NativeRuntimeFilterProcessor {
     fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         Ok(self.consumers.state().bind(state)?)
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finishing && self.output.is_none()
-    }
 }
-
-impl NativeRuntimeFilterProcessor {
-    fn has_room(&self) -> bool {
-        !self.finishing && self.output.is_none()
-    }
-}
-
-impl ProcessorOperator for NativeRuntimeFilterProcessor {
-    /// Held back only once a chunk reached a pending gate: until then the
-    /// gate's wait has not started and must not hold the pipeline.
-    fn need_input(&self) -> bool {
-        self.has_room() && !self.consumers.state().gate_holds_input()
-    }
-
-    /// The gate's wait starts here, with a chunk actually on the edge. While
-    /// the gate is pending the chunk stays on the edge.
-    fn can_accept_input(&self, _chunk: &Chunk) -> ExecutionResult<bool> {
-        Ok(
-            self.has_room()
-                && matches!(self.consumers.state().poll_gate(), RuntimeFilterGate::Open),
-        )
-    }
-
-    fn has_output(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if !self.has_room() {
-            return Err("native runtime-filter processor cannot accept input".into());
+impl crate::exec::pipeline::operator::InputEncodingPolicy for NativeRuntimeFilterProcessor {}
+impl crate::exec::pipeline::shape::TransformKernel for NativeRuntimeFilterProcessor {
+    fn admission(
+        &self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _input: &crate::exec::pipeline::input::RawInput,
+    ) -> ExecutionResult<Option<crate::exec::pipeline::step::AdmissionNext>> {
+        use crate::exec::pipeline::step::{AdmissionNext, WaitFact, WaitReason};
+        let observable = self.consumers.state().gate_observable();
+        let observed_generation = observable.generation();
+        match self.consumers.state().poll_gate() {
+            RuntimeFilterGate::Open => Ok(None),
+            RuntimeFilterGate::Pending => Ok(Some(AdmissionNext::Wait(WaitFact {
+                reason: WaitReason::Dependency,
+                observable,
+                observed_generation,
+                deadline: self.consumers.state().gate_deadline(),
+            }))),
         }
-        if !matches!(self.consumers.state().poll_gate(), RuntimeFilterGate::Open) {
-            return Err(
-                "native runtime-filter processor received input before its gate opened".into(),
-            );
-        }
-        self.output = self.consumers.apply_chunk_observed(
+    }
+    fn apply(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        input: crate::exec::pipeline::input::PreparedInput,
+    ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let output = self.consumers.apply_chunk_observed(
             chunk,
             Some(&self.event_sink),
             self.construction.as_deref(),
-            &super::compiled_expression::RuntimeKernelControl::new(_state.error_state()),
+            ctx,
         )?;
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(self.output.take())
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        Ok(())
-    }
-
-    fn sink_observable(&self) -> Option<Arc<Observable>> {
-        Some(self.consumers.state().gate_observable())
-    }
-
-    fn sink_block_deadline(&self) -> Option<DriverBlockDeadline> {
-        self.consumers.state().gate_deadline()
+        Ok(crate::exec::pipeline::step::StepResult::new(
+            output,
+            crate::exec::pipeline::step::NextStep::NeedInput,
+            rows,
+        ))
     }
 }
 
@@ -1808,7 +1813,7 @@ mod tests {
             Ok(_) => panic!("missing expression must fail before subscription"),
             Err(error) => error,
         };
-        assert!(error.contains("expression is missing"));
+        assert!(error.to_string().contains("expression is missing"));
     }
 
     #[test]
@@ -1838,7 +1843,7 @@ mod tests {
             Ok(_) => panic!("ordered consumers are live only"),
             Err(error) => error,
         };
-        assert!(error.contains("requires NonBlockingLive"));
+        assert!(error.to_string().contains("requires NonBlockingLive"));
     }
 
     #[test]
@@ -2054,9 +2059,10 @@ mod tests {
         let creation_runtime = RuntimeState::default();
         let factory = actual_evaluation_factory(&creation_runtime);
         let runtime = RuntimeState::default();
-        runtime
-            .error_state()
-            .set_error("runtime-filter fragment failed".to_string());
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Operational(
+            novarocks_functions::KernelDiagnostic::new("runtime-filter fragment failed"),
+        ));
+        runtime.error_state().set_error(original.clone());
         let control =
             super::super::compiled_expression::RuntimeKernelControl::new(runtime.error_state());
         let error = consumers
@@ -2067,11 +2073,10 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert_eq!(
-            error,
-            crate::runtime::fragment::ExecutionFailure::from(
-                "runtime-filter fragment failed".to_string()
-            )
+        assert_eq!(error, original);
+        assert!(
+            error.same_occurrence(&original),
+            "the original source occurrence survives the created-key path"
         );
     }
 
@@ -2212,103 +2217,61 @@ mod tests {
         observable: Arc<Observable>,
     }
 
-    impl Operator for QueueSource {
+    impl OperatorLifecycle for QueueSource {
         fn name(&self) -> &str {
             "QUEUE_SOURCE"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished.load(std::sync::atomic::Ordering::Acquire)
-                && self.chunks.lock().expect("chunks lock").is_empty()
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+    }
+    impl crate::exec::pipeline::shape::SourceKernel for QueueSource {
+        fn poll_output(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            let generation = self.observable.generation();
+            let mut queue = self.chunks.lock().expect("chunks lock");
+            let output = queue.pop_front();
+            let closed = queue.is_empty() && self.finished.load(Ordering::Acquire);
+            let next = if closed {
+                crate::exec::pipeline::step::NextStep::Finished
+            } else if output.is_some() {
+                crate::exec::pipeline::step::NextStep::Runnable
+            } else {
+                crate::exec::pipeline::step::NextStep::Wait(crate::exec::pipeline::step::WaitFact {
+                    reason: crate::exec::pipeline::step::WaitReason::Input,
+                    observable: self.observable.clone(),
+                    observed_generation: generation,
+                    deadline: None,
+                })
+            };
+            Ok(crate::exec::pipeline::step::StepResult::new(
+                output, next, 0,
+            ))
         }
     }
-
-    impl ProcessorOperator for QueueSource {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
-            !self.chunks.lock().expect("chunks lock").is_empty()
-        }
-
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
-            Err("a source accepts no input".to_string().into())
-        }
-
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(self.chunks.lock().expect("chunks lock").pop_front())
-        }
-
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn source_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
-        }
-    }
-
     struct CollectSink {
         values: Arc<Mutex<Vec<i32>>>,
-        finished: bool,
-        observable: Arc<Observable>,
     }
-
-    impl Operator for CollectSink {
+    impl OperatorLifecycle for CollectSink {
         fn name(&self) -> &str {
             "COLLECT_SINK"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
-
-    impl ProcessorOperator for CollectSink {
-        fn need_input(&self) -> bool {
-            !self.finished
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for CollectSink {}
+    impl crate::exec::pipeline::shape::SinkKernel for CollectSink {
+        fn consume(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            input: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            let chunk = input.into_uncovered_chunk()?;
             self.values
                 .lock()
                 .expect("values lock")
                 .extend(int_values(&chunk));
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-            self.finished = true;
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                crate::exec::pipeline::step::NextStep::NeedInput,
+                chunk.len() as u64,
+            ))
         }
     }
 
@@ -2333,7 +2296,7 @@ mod tests {
             .runtime_filter_session()
             .cloned();
         let state = Arc::new(
-            RuntimeState::new(
+            RuntimeState::for_local_execution(
                 Some(crate::runtime::query_options::QueryOptions {
                     runtime_filter_wait_timeout_ms: Some(
                         i32::try_from(timeout.as_millis()).unwrap(),
@@ -2361,17 +2324,17 @@ mod tests {
         let driver = crate::exec::pipeline::driver::PipelineDriver::new(
             1,
             vec![
-                Box::new(QueueSource {
+                Box::new(crate::exec::pipeline::shape::Source::new(QueueSource {
                     chunks: Arc::clone(&chunks),
                     finished: Arc::clone(&finished),
                     observable: Arc::clone(&source),
-                }),
+                })),
                 processor,
-                Box::new(CollectSink {
-                    values: Arc::clone(&values),
-                    finished: false,
-                    observable: Arc::new(Observable::new()),
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CollectSink {
+                        values: Arc::clone(&values),
+                    },
+                )),
             ],
             None,
             Vec::new(),
@@ -2414,16 +2377,20 @@ mod tests {
             pipeline.driver.process(Duration::from_millis(10)),
             DriverState::Blocked(BlockedReason::OutputFull)
         ));
-        let (observable, _, deadline) = pipeline
+        let (observable, observed, deadline) = pipeline
             .driver
             .blocked_observable_snapshot()
             .expect("parked on the gate");
-        assert!(Arc::ptr_eq(&observable, &pipeline.gate));
         let deadline = deadline.expect("a gate wait is bounded");
         assert!(deadline.at() >= arrived + Duration::from_secs(5));
         assert!(pipeline.values.lock().expect("values lock").is_empty());
 
         pipeline.subscription.publish(accepting(2));
+        assert_ne!(
+            observable.generation(),
+            observed,
+            "gate publication invalidates the driver snapshot"
+        );
         assert!(matches!(
             pipeline.driver.process(Duration::from_millis(10)),
             DriverState::Blocked(BlockedReason::InputEmpty)
@@ -2433,6 +2400,7 @@ mod tests {
         pipeline
             .finished
             .store(true, std::sync::atomic::Ordering::Release);
+        pipeline.source.notify_observers();
         assert!(matches!(
             pipeline.driver.process(Duration::from_millis(10)),
             DriverState::Finished
@@ -2448,6 +2416,7 @@ mod tests {
         pipeline
             .finished
             .store(true, std::sync::atomic::Ordering::Release);
+        pipeline.source.notify_observers();
         assert!(matches!(
             pipeline.driver.process(Duration::from_millis(10)),
             DriverState::Finished

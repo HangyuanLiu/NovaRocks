@@ -67,7 +67,7 @@ impl PureCompileControl for Compile {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, n));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -389,7 +389,7 @@ fn map_entries_owner_compile_success_and_original_admission_rejection_all_actual
             ] {
                 let control = Compile {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared_for_test_with_control(
                     "map_entries",
@@ -554,7 +554,7 @@ fn raw_arrow_map_entries_noncontiguous_copy_preserves_dictionary_constructor_gua
             let out = arrow_array::make_array(copy.freeze());
             assert_dictionary_extent(&out, 127);
         } else {
-            assert!(matches!(result, Err(CopyError::Extent)));
+            assert!(matches!(result, Err(CopyError::Extent(_))));
         }
         for stop in 0..calls {
             let cause =

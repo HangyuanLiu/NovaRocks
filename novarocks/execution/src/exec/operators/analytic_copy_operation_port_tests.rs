@@ -52,7 +52,7 @@ fn project(
 ) -> AnalyticCopyFailure<KernelFailure> {
     match error {
         AnalyticCopyFailure::OriginalArrow(error) => AnalyticCopyFailure::OriginalArrow(error),
-        AnalyticCopyFailure::OriginalText(text) => AnalyticCopyFailure::OriginalText(text),
+        AnalyticCopyFailure::Source(text) => AnalyticCopyFailure::Source(text),
         AnalyticCopyFailure::Control(never) => match never {},
     }
 }
@@ -88,7 +88,7 @@ impl AnalyticInputWork for Ports<'_> {
             column: ordinal,
             sources: sources.len(),
         });
-        stages::LegacyWork
+        stages::UnscopedWork
             .concat_column(&mut (), batches, sources, ordinal)
             .map_err(project)
     }
@@ -105,7 +105,7 @@ impl AnalyticInputWork for Ports<'_> {
             column: ordinal,
             raw: indices.values().to_vec(),
         });
-        stages::LegacyWork
+        stages::UnscopedWork
             .take_column(&mut (), source, ordinal, indices)
             .map_err(project)
     }
@@ -118,7 +118,7 @@ impl AnalyticInputWork for Ports<'_> {
     ) -> Result<ArrayRef, Self::Failure> {
         self.before_operation()?;
         self.occurrences.push(Occurrence::Slice { offset, len });
-        match stages::LegacyWork.slice_column(&mut (), source, offset, len) {
+        match stages::UnscopedWork.slice_column(&mut (), source, offset, len) {
             Ok(value) => Ok(value),
             Err(never) => match never {},
         }
@@ -263,7 +263,9 @@ fn analytic_copy_operation_port_same_default_control_trace_and_data_formatter() 
             }
         };
         match error {
-            AnalyticStageFailure::OriginalData { message, .. } => assert_eq!(message, expected),
+            AnalyticStageFailure::Operation { cause: message, .. } => {
+                assert_eq!(message.to_string(), expected)
+            }
             other => panic!("wrong channel {other:?}"),
         }
         let trace = control.trace();

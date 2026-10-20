@@ -246,7 +246,7 @@ fn comparison_control_failure_aborts_instead_of_becoming_an_optimization_decline
     struct Stop(CompileControlError);
     impl PureCompileControl for Stop {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
     for (cause, expected) in [

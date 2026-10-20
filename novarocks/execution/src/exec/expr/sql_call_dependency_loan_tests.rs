@@ -246,7 +246,7 @@ impl PureCompileControl for JournalMeter {
         let mut events = self.events.lock().unwrap();
         let ordinal = events.len();
         events.push(units);
-        if let Some((at, cause)) = self.fail
+        if let Some((at, cause)) = self.fail.clone()
             && ordinal == at
         {
             return Err(cause);
@@ -277,7 +277,7 @@ fn sql_call_dependency_loan_does_not_add_scope_step_or_success_footer_and_latche
     ] {
         for at in [1, 2] {
             let meter = JournalMeter {
-                fail: Some((at, cause)),
+                fail: Some((at, cause.clone())),
                 ..JournalMeter::default()
             };
             let mut work = CompileCheckpoints::try_new(&meter, CompilePhase::Validate).unwrap();

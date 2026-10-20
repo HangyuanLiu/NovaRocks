@@ -22,6 +22,148 @@ use chrono::{
     DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, Offset, Timelike, Utc,
 };
 
+#[derive(Debug, PartialEq)]
+pub struct VariantFailure(Box<VariantFailureCause>);
+#[derive(Debug, PartialEq)]
+enum VariantFailureCause {
+    Encoding(novarocks_failure_contract::BoundedDetail),
+    Conversion(novarocks_failure_contract::BoundedDetail),
+    Path(novarocks_failure_contract::BoundedDetail),
+    Utf8(std::str::Utf8Error),
+    PathIndex(std::num::ParseIntError),
+    Size { required: u128 },
+    NumericDate { days: i32 },
+    NumericTimestamp { micros: i64, offset_seconds: i32 },
+    PathStorage(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+}
+impl VariantFailure {
+    fn encoding(detail: impl std::fmt::Display) -> Self {
+        Self(Box::new(VariantFailureCause::Encoding(
+            novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+        )))
+    }
+    fn conversion(detail: impl std::fmt::Display) -> Self {
+        Self(Box::new(VariantFailureCause::Conversion(
+            novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+        )))
+    }
+    fn path(detail: impl std::fmt::Display) -> Self {
+        Self(Box::new(VariantFailureCause::Path(
+            novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+        )))
+    }
+    fn utf8(cause: std::str::Utf8Error) -> Self {
+        Self(Box::new(VariantFailureCause::Utf8(cause)))
+    }
+    fn path_index(cause: std::num::ParseIntError) -> Self {
+        Self(Box::new(VariantFailureCause::PathIndex(cause)))
+    }
+    fn size(required: u128) -> Self {
+        Self(Box::new(VariantFailureCause::Size { required }))
+    }
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for VariantFailure
+{
+    fn from(cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self(Box::new(VariantFailureCause::PathStorage(cause)))
+    }
+}
+impl std::fmt::Display for VariantFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.as_ref() {
+            VariantFailureCause::Encoding(detail)
+            | VariantFailureCause::Conversion(detail)
+            | VariantFailureCause::Path(detail) => f.write_str(detail.as_str()),
+            VariantFailureCause::Utf8(cause) => write!(f, "Variant UTF-8 decoding failed: {cause}"),
+            VariantFailureCause::PathIndex(cause) => {
+                write!(f, "Invalid Variant array index: {cause}")
+            }
+            VariantFailureCause::Size { required } => write!(
+                f,
+                "Variant value requires {required} bytes, maximum {VARIANT_MAX_SIZE}"
+            ),
+            VariantFailureCause::NumericDate { days } => write!(
+                f,
+                "Variant date {days} is outside the supported calendar range"
+            ),
+            VariantFailureCause::NumericTimestamp {
+                micros,
+                offset_seconds,
+            } => write!(
+                f,
+                "Variant timestamp {micros} microseconds with offset {offset_seconds} seconds is outside the supported calendar range"
+            ),
+            VariantFailureCause::PathStorage(cause) => write!(f, "Variant path storage: {cause}"),
+        }
+    }
+}
+impl std::error::Error for VariantFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.0.as_ref() {
+            VariantFailureCause::Utf8(cause) => Some(cause),
+            VariantFailureCause::PathIndex(cause) => Some(cause),
+            VariantFailureCause::PathStorage(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for VariantFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        if let VariantFailureCause::PathStorage(cause) = self.0.as_ref() {
+            return cause.failure_fact();
+        }
+        if matches!(
+            self.0.as_ref(),
+            VariantFailureCause::NumericDate { .. } | VariantFailureCause::NumericTimestamp { .. }
+        ) {
+            return novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact();
+        }
+        let code = match self.0.as_ref() {
+            VariantFailureCause::Encoding(_) => 60,
+            VariantFailureCause::Conversion(_) => 61,
+            VariantFailureCause::Path(_) | VariantFailureCause::PathIndex(_) => 62,
+            VariantFailureCause::Utf8(_) => 63,
+            VariantFailureCause::Size { .. } => 64,
+            VariantFailureCause::NumericDate { .. }
+            | VariantFailureCause::NumericTimestamp { .. } => {
+                unreachable!("numeric returned above")
+            }
+            VariantFailureCause::PathStorage(_) => unreachable!(),
+        };
+        let fact = FailureFact::new(
+            if matches!(self.0.as_ref(), VariantFailureCause::Size { .. }) {
+                FailureClass::Representation
+            } else {
+                FailureClass::Data
+            },
+            FailureReason::new(
+                domain::TYPE_CONTRACT,
+                std::num::NonZeroU16::new(code).unwrap(),
+            ),
+        );
+        if let VariantFailureCause::Size { required } = self.0.as_ref() {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::MinimumUnit,
+                layout: RepresentationLayout {
+                    domain: domain::TYPE_CONTRACT,
+                    code: std::num::NonZeroU16::new(2).unwrap(),
+                },
+                required: u64::try_from(*required).ok(),
+                extent_limit: Some(VARIANT_MAX_SIZE as u64),
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for VariantFailure {}
+
 const VARIANT_MAX_SIZE: usize = 16 * 1024 * 1024;
 const METADATA_MIN_SIZE: usize = 3;
 const HEADER_SIZE: usize = 1;
@@ -79,7 +221,7 @@ impl VariantMetadata {
         Self::from_bytes(vec![0x01, 0x00, 0x00]).expect("valid empty metadata")
     }
 
-    pub fn from_bytes(raw: Vec<u8>) -> Result<Self, String> {
+    pub fn from_bytes(raw: Vec<u8>) -> Result<Self, VariantFailure> {
         validate_metadata(&raw)?;
         let header = raw[0];
         let offset_size = 1 + ((header & OFFSET_SIZE_MASK) >> OFFSET_SIZE_SHIFT);
@@ -101,12 +243,12 @@ impl VariantMetadata {
         self.dict_size
     }
 
-    pub fn get_key(&self, index: u32) -> Result<String, String> {
+    pub fn get_key(&self, index: u32) -> Result<String, VariantFailure> {
         if index >= self.dict_size {
-            return Err(format!(
+            return Err(VariantFailure::encoding(format_args!(
                 "Variant index out of range: {} >= {}",
                 index, self.dict_size
-            ));
+            )));
         }
         let offset_size = self.offset_size as usize;
         let offset_start = HEADER_SIZE + offset_size + (index as usize) * offset_size;
@@ -116,11 +258,12 @@ impl VariantMetadata {
         let key_len = value_next_offset.saturating_sub(value_offset);
         let string_start = HEADER_SIZE + offset_size * (self.dict_size as usize + 2) + value_offset;
         if string_start + key_len > self.raw.len() {
-            return Err("Variant string out of range".to_string());
+            return Err(VariantFailure::encoding("Variant string out of range"));
         }
         let bytes = &self.raw[string_start..string_start + key_len];
-        let key = String::from_utf8(bytes.to_vec())
-            .map_err(|_| "Variant metadata key is not valid UTF-8".to_string())?;
+        let key = std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(VariantFailure::utf8)?;
         Ok(key)
     }
 
@@ -181,28 +324,29 @@ impl VariantMetadata {
 /// Split the engine-internal serialized variant form
 /// `[size:u32 LE | metadata | value]` into zero-copy `(metadata, value)`
 /// slices. Validation mirrors the original `VariantValue::from_serialized` logic.
-pub fn split_serialized(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
+pub fn split_serialized(data: &[u8]) -> Result<(&[u8], &[u8]), VariantFailure> {
     if data.len() < 4 {
-        return Err("Invalid variant slice: too small to contain size header".to_string());
+        return Err(VariantFailure::encoding(
+            "Invalid variant slice: too small to contain size header",
+        ));
     }
     let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if size > VARIANT_MAX_SIZE {
-        return Err(format!(
-            "Variant size exceeds maximum limit: {} > {}",
-            size, VARIANT_MAX_SIZE
-        ));
+        return Err(VariantFailure::size(size as u128));
     }
     if size > data.len().saturating_sub(4) {
-        return Err(format!(
+        return Err(VariantFailure::encoding(format_args!(
             "Invalid variant size: {} exceeds available data: {}",
             size,
             data.len().saturating_sub(4)
-        ));
+        )));
     }
     let payload = &data[4..4 + size];
     let metadata = load_metadata(payload)?;
     if metadata.len() > payload.len() {
-        return Err("Metadata size exceeds variant size".to_string());
+        return Err(VariantFailure::encoding(
+            "Metadata size exceeds variant size",
+        ));
     }
     let metadata_len = metadata.len();
     Ok((&payload[..metadata_len], &payload[metadata_len..]))
@@ -215,25 +359,23 @@ pub struct VariantValue {
 }
 
 impl VariantValue {
-    pub fn create(metadata: &[u8], value: &[u8]) -> Result<Self, String> {
+    pub fn create(metadata: &[u8], value: &[u8]) -> Result<Self, VariantFailure> {
         if metadata.is_empty() {
             return Ok(Self::null_value());
         }
         validate_metadata(metadata)?;
-        if metadata.len() + value.len() > VARIANT_MAX_SIZE {
-            return Err(format!(
-                "Variant value size exceeds maximum limit: {} > {}",
-                metadata.len() + value.len(),
-                VARIANT_MAX_SIZE
-            ));
+        let required = metadata.len() as u128 + value.len() as u128;
+        if required > VARIANT_MAX_SIZE as u128 {
+            return Err(VariantFailure::size(required));
         }
+
         Ok(Self {
             metadata: VariantMetadata::from_bytes(metadata.to_vec())?,
             value: value.to_vec(),
         })
     }
 
-    pub fn from_serialized(data: &[u8]) -> Result<Self, String> {
+    pub fn from_serialized(data: &[u8]) -> Result<Self, VariantFailure> {
         let (metadata, value) = split_serialized(data)?;
         Self::create(metadata, value)
     }
@@ -261,12 +403,12 @@ impl VariantValue {
         &self.value
     }
 
-    pub fn to_json_local(&self) -> Result<String, String> {
+    pub fn to_json_local(&self) -> Result<String, VariantFailure> {
         let tz = Local::now().offset().fix();
         self.to_json(Some(tz))
     }
 
-    pub fn to_json(&self, tz: Option<FixedOffset>) -> Result<String, String> {
+    pub fn to_json(&self, tz: Option<FixedOffset>) -> Result<String, VariantFailure> {
         let mut out = String::new();
         let variant = VariantRef {
             metadata: &self.metadata,
@@ -283,9 +425,9 @@ struct VariantRef<'a> {
 }
 
 impl<'a> VariantRef<'a> {
-    fn basic_type(&self) -> Result<BasicType, String> {
+    fn basic_type(&self) -> Result<BasicType, VariantFailure> {
         if self.value.is_empty() {
-            return Err("Variant value is empty".to_string());
+            return Err(VariantFailure::encoding("Variant value is empty"));
         }
         let bt = self.value[0] & 0b11;
         match bt {
@@ -293,7 +435,7 @@ impl<'a> VariantRef<'a> {
             1 => Ok(BasicType::ShortString),
             2 => Ok(BasicType::Object),
             3 => Ok(BasicType::Array),
-            _ => Err("Invalid variant basic type".to_string()),
+            _ => Err(VariantFailure::encoding("Invalid variant basic type")),
         }
     }
 
@@ -301,7 +443,7 @@ impl<'a> VariantRef<'a> {
         self.value[0] >> 2
     }
 
-    fn primitive_type(&self) -> Result<VariantPrimitiveType, String> {
+    fn primitive_type(&self) -> Result<VariantPrimitiveType, VariantFailure> {
         let header = self.value_header();
         Ok(match header {
             0 => VariantPrimitiveType::Null,
@@ -325,71 +467,78 @@ impl<'a> VariantRef<'a> {
             18 => VariantPrimitiveType::TimestampTzNanos,
             19 => VariantPrimitiveType::TimestampNtzNanos,
             20 => VariantPrimitiveType::Uuid,
-            _ => return Err(format!("Unsupported variant primitive type: {header}")),
+            _ => {
+                return Err(VariantFailure::encoding(format_args!(
+                    "Unsupported variant primitive type: {header}"
+                )));
+            }
         })
     }
 
-    fn primitive_bytes(&self, size: usize) -> Result<&'a [u8], String> {
+    fn primitive_bytes(&self, size: usize) -> Result<&'a [u8], VariantFailure> {
         if self.value.len() < HEADER_SIZE + size {
-            return Err(format!(
+            return Err(VariantFailure::encoding(format_args!(
                 "Variant value too short: expected {} bytes, got {}",
                 HEADER_SIZE + size,
                 self.value.len()
-            ));
+            )));
         }
         Ok(&self.value[HEADER_SIZE..HEADER_SIZE + size])
     }
 
-    fn get_bool(&self) -> Result<bool, String> {
+    fn get_bool(&self) -> Result<bool, VariantFailure> {
         match self.primitive_type()? {
             VariantPrimitiveType::BooleanTrue => Ok(true),
             VariantPrimitiveType::BooleanFalse => Ok(false),
-            other => Err(format!("Not a boolean variant type: {:?}", other)),
+            other => Err(VariantFailure::conversion(format_args!(
+                "Not a boolean variant type: {:?}",
+                other
+            ))),
         }
     }
 
-    fn get_int8(&self) -> Result<i8, String> {
+    fn get_int8(&self) -> Result<i8, VariantFailure> {
         let bytes = self.primitive_bytes(1)?;
         Ok(i8::from_le_bytes([bytes[0]]))
     }
 
-    fn get_int16(&self) -> Result<i16, String> {
+    fn get_int16(&self) -> Result<i16, VariantFailure> {
         let bytes = self.primitive_bytes(2)?;
         Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
-    fn get_int32(&self) -> Result<i32, String> {
+    fn get_int32(&self) -> Result<i32, VariantFailure> {
         let bytes = self.primitive_bytes(4)?;
         Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    fn get_int64(&self) -> Result<i64, String> {
+    fn get_int64(&self) -> Result<i64, VariantFailure> {
         let bytes = self.primitive_bytes(8)?;
         Ok(i64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
     }
 
-    fn get_float32(&self) -> Result<f32, String> {
+    fn get_float32(&self) -> Result<f32, VariantFailure> {
         let bytes = self.primitive_bytes(4)?;
         Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    fn get_float64(&self) -> Result<f64, String> {
+    fn get_float64(&self) -> Result<f64, VariantFailure> {
         let bytes = self.primitive_bytes(8)?;
         Ok(f64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
     }
 
-    fn get_decimal4(&self) -> Result<(i32, u8), String> {
+    fn get_decimal4(&self) -> Result<(i32, u8), VariantFailure> {
         let bytes = self.primitive_bytes(1 + 4)?;
         let scale = bytes[0];
         let val = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
         Ok((val, scale))
     }
 
-    fn get_decimal8(&self) -> Result<(i64, u8), String> {
+    fn get_decimal8(&self) -> Result<(i64, u8), VariantFailure> {
         let bytes = self.primitive_bytes(1 + 8)?;
         let scale = bytes[0];
         let mut buf = [0u8; 8];
@@ -397,7 +546,7 @@ impl<'a> VariantRef<'a> {
         Ok((i64::from_le_bytes(buf), scale))
     }
 
-    fn get_decimal16(&self) -> Result<(i128, u8), String> {
+    fn get_decimal16(&self) -> Result<(i128, u8), VariantFailure> {
         let bytes = self.primitive_bytes(1 + 16)?;
         let scale = bytes[0];
         let mut buf = [0u8; 16];
@@ -406,68 +555,75 @@ impl<'a> VariantRef<'a> {
         Ok((value, scale))
     }
 
-    fn get_date(&self) -> Result<i32, String> {
+    fn get_date(&self) -> Result<i32, VariantFailure> {
         self.get_int32()
     }
 
-    fn get_timestamp_micros(&self) -> Result<i64, String> {
+    fn get_timestamp_micros(&self) -> Result<i64, VariantFailure> {
         self.get_int64()
     }
 
-    fn get_timestamp_micros_ntz(&self) -> Result<i64, String> {
+    fn get_timestamp_micros_ntz(&self) -> Result<i64, VariantFailure> {
         self.get_int64()
     }
 
-    fn get_time_micros_ntz(&self) -> Result<i64, String> {
+    fn get_time_micros_ntz(&self) -> Result<i64, VariantFailure> {
         self.get_int64()
     }
 
-    fn get_uuid(&self) -> Result<[u8; 16], String> {
+    fn get_uuid(&self) -> Result<[u8; 16], VariantFailure> {
         let bytes = self.primitive_bytes(16)?;
         let mut out = [0u8; 16];
         out.copy_from_slice(bytes);
         Ok(out)
     }
 
-    fn get_string(&self) -> Result<&'a [u8], String> {
+    fn get_string(&self) -> Result<&'a [u8], VariantFailure> {
         match self.basic_type()? {
             BasicType::ShortString => {
                 let len = self.value_header() as usize;
                 if self.value.len() < HEADER_SIZE + len {
-                    return Err("Invalid short string length".to_string());
+                    return Err(VariantFailure::encoding("Invalid short string length"));
                 }
                 Ok(&self.value[HEADER_SIZE..HEADER_SIZE + len])
             }
             BasicType::Primitive => {
                 if self.value.len() < HEADER_SIZE + 4 {
-                    return Err("Invalid string value: too short".to_string());
+                    return Err(VariantFailure::encoding("Invalid string value: too short"));
                 }
                 let len = read_le_u32(&self.value[HEADER_SIZE..], 4)? as usize;
                 let start = HEADER_SIZE + 4;
                 if self.value.len() < start + len {
-                    return Err("Invalid string value: length out of bounds".to_string());
+                    return Err(VariantFailure::encoding(
+                        "Invalid string value: length out of bounds",
+                    ));
                 }
                 Ok(&self.value[start..start + len])
             }
-            other => Err(format!("Expected string, got {:?}", other)),
+            other => Err(VariantFailure::conversion(format_args!(
+                "Expected string, got {:?}",
+                other
+            ))),
         }
     }
 
-    fn get_binary(&self) -> Result<&'a [u8], String> {
+    fn get_binary(&self) -> Result<&'a [u8], VariantFailure> {
         if self.value.len() < HEADER_SIZE + 4 {
-            return Err("Invalid binary value: too short".to_string());
+            return Err(VariantFailure::encoding("Invalid binary value: too short"));
         }
         let len = read_le_u32(&self.value[HEADER_SIZE..], 4)? as usize;
         let start = HEADER_SIZE + 4;
         if self.value.len() < start + len {
-            return Err("Invalid binary value: length out of bounds".to_string());
+            return Err(VariantFailure::encoding(
+                "Invalid binary value: length out of bounds",
+            ));
         }
         Ok(&self.value[start..start + len])
     }
 
-    fn object_info(&self) -> Result<ObjectInfo, String> {
+    fn object_info(&self) -> Result<ObjectInfo, VariantFailure> {
         if self.basic_type()? != BasicType::Object {
-            return Err("Not an object variant".to_string());
+            return Err(VariantFailure::encoding("Not an object variant"));
         }
         let header = self.value_header();
         let field_offset_size = (header & 0b11) + 1;
@@ -475,7 +631,7 @@ impl<'a> VariantRef<'a> {
         let is_large = ((header >> 4) & 0b1) == 1;
         let num_elements_size = if is_large { 4 } else { 1 };
         if self.value.len() < HEADER_SIZE + num_elements_size as usize {
-            return Err("Object value too short".to_string());
+            return Err(VariantFailure::encoding("Object value too short"));
         }
         let num_elements = read_le_u32(
             &self.value[HEADER_SIZE..HEADER_SIZE + num_elements_size as usize],
@@ -486,7 +642,7 @@ impl<'a> VariantRef<'a> {
         let data_start_offset =
             offset_start_offset + (num_elements as usize + 1) * field_offset_size as usize;
         if data_start_offset > self.value.len() {
-            return Err("Invalid object value offsets".to_string());
+            return Err(VariantFailure::encoding("Invalid object value offsets"));
         }
         Ok(ObjectInfo {
             num_elements,
@@ -498,16 +654,16 @@ impl<'a> VariantRef<'a> {
         })
     }
 
-    fn array_info(&self) -> Result<ArrayInfo, String> {
+    fn array_info(&self) -> Result<ArrayInfo, VariantFailure> {
         if self.basic_type()? != BasicType::Array {
-            return Err("Not an array variant".to_string());
+            return Err(VariantFailure::encoding("Not an array variant"));
         }
         let header = self.value_header();
         let field_offset_size = (header & 0b11) + 1;
         let is_large = ((header >> 2) & 0b1) == 1;
         let num_elements_size = if is_large { 4 } else { 1 };
         if self.value.len() < HEADER_SIZE + num_elements_size as usize {
-            return Err("Array value too short".to_string());
+            return Err(VariantFailure::encoding("Array value too short"));
         }
         let num_elements = read_le_u32(
             &self.value[HEADER_SIZE..HEADER_SIZE + num_elements_size as usize],
@@ -517,7 +673,7 @@ impl<'a> VariantRef<'a> {
         let data_start_offset =
             offset_start_offset + (num_elements as usize + 1) * field_offset_size as usize;
         if data_start_offset > self.value.len() {
-            return Err("Invalid array value offsets".to_string());
+            return Err(VariantFailure::encoding("Invalid array value offsets"));
         }
         Ok(ArrayInfo {
             num_elements,
@@ -527,11 +683,11 @@ impl<'a> VariantRef<'a> {
         })
     }
 
-    fn get_object_by_key(&self, key: &str) -> Result<&'a [u8], String> {
+    fn get_object_by_key(&self, key: &str) -> Result<Option<&'a [u8]>, VariantFailure> {
         let info = self.object_info()?;
         let dict_indexes = self.metadata.get_index(key);
         if dict_indexes.is_empty() {
-            return Err(format!("Field key not found: {}", key));
+            return Ok(None);
         }
         for dict_index in dict_indexes {
             let mut found_index: Option<u32> = None;
@@ -549,33 +705,30 @@ impl<'a> VariantRef<'a> {
                 let offset = read_le_u32(&self.value[offset_pos..], info.offset_size)? as usize;
                 let start = info.data_start_offset + offset;
                 if start >= self.value.len() {
-                    return Err("Object offset out of bounds".to_string());
+                    return Err(VariantFailure::encoding("Object offset out of bounds"));
                 }
-                return Ok(&self.value[start..]);
+                return Ok(Some(&self.value[start..]));
             }
         }
-        Err(format!("Field key not found: {}", key))
+        Ok(None)
     }
 
-    fn get_element_at_index(&self, index: u32) -> Result<&'a [u8], String> {
+    fn get_element_at_index(&self, index: u32) -> Result<Option<&'a [u8]>, VariantFailure> {
         let info = self.array_info()?;
         if index >= info.num_elements {
-            return Err(format!(
-                "Array index out of range: {} >= {}",
-                index, info.num_elements
-            ));
+            return Ok(None);
         }
         let offset_pos = info.offset_start_offset + index as usize * info.offset_size as usize;
         let offset = read_le_u32(&self.value[offset_pos..], info.offset_size)? as usize;
         let start = info.data_start_offset + offset;
         if start >= self.value.len() {
-            return Err("Array offset out of bounds".to_string());
+            return Err(VariantFailure::encoding("Array offset out of bounds"));
         }
-        Ok(&self.value[start..])
+        Ok(Some(&self.value[start..]))
     }
 }
 
-pub fn is_variant_null(value: &VariantValue) -> Result<bool, String> {
+pub fn is_variant_null(value: &VariantValue) -> Result<bool, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
@@ -589,7 +742,32 @@ pub fn is_variant_null(value: &VariantValue) -> Result<bool, String> {
     ))
 }
 
-pub fn variant_typeof(value: &VariantValue) -> Result<String, String> {
+/// TYPEOF's established nullable row policy applies only to malformed Variant
+/// encoding. Extent, allocation and other domain refusals retain their source.
+pub fn variant_typeof_serialized_nullable(data: &[u8]) -> Result<Option<String>, VariantFailure> {
+    nullable_typeof_result(VariantValue::from_serialized(data))
+}
+
+/// The JSON converter exposes metadata and value separately. Apply the same
+/// Variant-owned nullable row policy without a second serialized allocation.
+pub fn variant_typeof_parts_nullable(
+    metadata: &[u8],
+    value: &[u8],
+) -> Result<Option<String>, VariantFailure> {
+    nullable_typeof_result(VariantValue::create(metadata, value))
+}
+
+fn nullable_typeof_result(
+    value: Result<VariantValue, VariantFailure>,
+) -> Result<Option<String>, VariantFailure> {
+    match value.and_then(|value| variant_typeof(&value)) {
+        Ok(label) => Ok(Some(label)),
+        Err(source) if matches!(source.0.as_ref(), VariantFailureCause::Encoding(_)) => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+pub fn variant_typeof(value: &VariantValue) -> Result<String, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
@@ -625,7 +803,7 @@ pub fn variant_typeof(value: &VariantValue) -> Result<String, String> {
     }
 }
 
-pub fn variant_to_bool(value: &VariantValue) -> Result<bool, String> {
+pub fn variant_to_bool(value: &VariantValue) -> Result<bool, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
@@ -636,20 +814,28 @@ pub fn variant_to_bool(value: &VariantValue) -> Result<bool, String> {
                 Ok(variant.get_bool()?)
             }
             VariantPrimitiveType::String => parse_bool_from_bytes(variant.get_string()?),
-            other => Err(format!("Cannot cast variant {:?} to BOOLEAN", other)),
+            other => Err(VariantFailure::conversion(format_args!(
+                "Cannot cast variant {:?} to BOOLEAN",
+                other
+            ))),
         },
         BasicType::ShortString => parse_bool_from_bytes(variant.get_string()?),
-        other => Err(format!("Cannot cast variant {:?} to BOOLEAN", other)),
+        other => Err(VariantFailure::conversion(format_args!(
+            "Cannot cast variant {:?} to BOOLEAN",
+            other
+        ))),
     }
 }
 
-pub fn variant_to_i64(value: &VariantValue) -> Result<i64, String> {
+pub fn variant_to_i64(value: &VariantValue) -> Result<i64, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
     };
     if variant.basic_type()? != BasicType::Primitive {
-        return Err("Cannot cast non-primitive variant to BIGINT".to_string());
+        return Err(VariantFailure::conversion(
+            "Cannot cast non-primitive variant to BIGINT",
+        ));
     }
     match variant.primitive_type()? {
         VariantPrimitiveType::BooleanTrue | VariantPrimitiveType::BooleanFalse => {
@@ -673,17 +859,22 @@ pub fn variant_to_i64(value: &VariantValue) -> Result<i64, String> {
             let (val, scale) = variant.get_decimal16()?;
             Ok(decimal_to_i64(val, scale))
         }
-        other => Err(format!("Cannot cast variant {:?} to BIGINT", other)),
+        other => Err(VariantFailure::conversion(format_args!(
+            "Cannot cast variant {:?} to BIGINT",
+            other
+        ))),
     }
 }
 
-pub fn variant_to_f64(value: &VariantValue) -> Result<f64, String> {
+pub fn variant_to_f64(value: &VariantValue) -> Result<f64, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
     };
     if variant.basic_type()? != BasicType::Primitive {
-        return Err("Cannot cast non-primitive variant to DOUBLE".to_string());
+        return Err(VariantFailure::conversion(
+            "Cannot cast non-primitive variant to DOUBLE",
+        ));
     }
     match variant.primitive_type()? {
         VariantPrimitiveType::BooleanTrue | VariantPrimitiveType::BooleanFalse => {
@@ -707,11 +898,14 @@ pub fn variant_to_f64(value: &VariantValue) -> Result<f64, String> {
             let (val, scale) = variant.get_decimal16()?;
             Ok(decimal_to_f64(val, scale))
         }
-        other => Err(format!("Cannot cast variant {:?} to DOUBLE", other)),
+        other => Err(VariantFailure::conversion(format_args!(
+            "Cannot cast variant {:?} to DOUBLE",
+            other
+        ))),
     }
 }
 
-pub fn variant_to_string(value: &VariantValue) -> Result<String, String> {
+pub fn variant_to_string(value: &VariantValue) -> Result<String, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
@@ -726,63 +920,84 @@ pub fn variant_to_string(value: &VariantValue) -> Result<String, String> {
     }
 }
 
-pub fn variant_to_date_days(value: &VariantValue, tz: FixedOffset) -> Result<i32, String> {
+pub fn variant_to_date_days(value: &VariantValue, tz: FixedOffset) -> Result<i32, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
     };
     if variant.basic_type()? != BasicType::Primitive {
-        return Err("Cannot cast non-primitive variant to DATE".to_string());
+        return Err(VariantFailure::conversion(
+            "Cannot cast non-primitive variant to DATE",
+        ));
     }
     match variant.primitive_type()? {
         VariantPrimitiveType::Date => variant.get_date(),
         VariantPrimitiveType::TimestampTz => {
             let micros = variant.get_timestamp_micros()?;
-            let date = timestamp_tz_to_local_naive(micros, tz).date();
+            let date = timestamp_tz_to_local_naive(micros, tz)?.date();
             Ok(date.num_days_from_ce() - 719163)
         }
-        other => Err(format!("Cannot cast variant {:?} to DATE", other)),
+        other => Err(VariantFailure::conversion(format_args!(
+            "Cannot cast variant {:?} to DATE",
+            other
+        ))),
     }
 }
 
-pub fn variant_to_datetime_micros(value: &VariantValue, tz: FixedOffset) -> Result<i64, String> {
+pub fn variant_to_datetime_micros(
+    value: &VariantValue,
+    tz: FixedOffset,
+) -> Result<i64, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
     };
     if variant.basic_type()? != BasicType::Primitive {
-        return Err("Cannot cast non-primitive variant to DATETIME".to_string());
+        return Err(VariantFailure::conversion(
+            "Cannot cast non-primitive variant to DATETIME",
+        ));
     }
     match variant.primitive_type()? {
         VariantPrimitiveType::TimestampNtz => variant.get_timestamp_micros_ntz(),
         VariantPrimitiveType::TimestampTz => {
             let micros = variant.get_timestamp_micros()?;
-            let naive = timestamp_tz_to_local_naive(micros, tz);
+            let naive = timestamp_tz_to_local_naive(micros, tz)?;
             let utc = naive.and_utc();
             Ok(utc.timestamp() * 1_000_000 + utc.timestamp_subsec_micros() as i64)
         }
-        other => Err(format!("Cannot cast variant {:?} to DATETIME", other)),
+        other => Err(VariantFailure::conversion(format_args!(
+            "Cannot cast variant {:?} to DATETIME",
+            other
+        ))),
     }
 }
 
-pub fn variant_to_time_micros(value: &VariantValue, tz: FixedOffset) -> Result<i64, String> {
+pub fn variant_to_time_micros(
+    value: &VariantValue,
+    tz: FixedOffset,
+) -> Result<i64, VariantFailure> {
     let variant = VariantRef {
         metadata: value.metadata(),
         value: value.value(),
     };
     if variant.basic_type()? != BasicType::Primitive {
-        return Err("Cannot cast non-primitive variant to TIME".to_string());
+        return Err(VariantFailure::conversion(
+            "Cannot cast non-primitive variant to TIME",
+        ));
     }
     match variant.primitive_type()? {
         VariantPrimitiveType::TimeNtz => variant.get_time_micros_ntz(),
         VariantPrimitiveType::TimestampTz => {
             let micros = variant.get_timestamp_micros()?;
-            let naive = timestamp_tz_to_local_naive(micros, tz);
+            let naive = timestamp_tz_to_local_naive(micros, tz)?;
             let time = naive.time();
             Ok(time.num_seconds_from_midnight() as i64 * 1_000_000
                 + (time.nanosecond() / 1000) as i64)
         }
-        other => Err(format!("Cannot cast variant {:?} to TIME", other)),
+        other => Err(VariantFailure::conversion(format_args!(
+            "Cannot cast variant {:?} to TIME",
+            other
+        ))),
     }
 }
 
@@ -875,9 +1090,12 @@ fn push_path<T, E: From<novarocks_type_contract::owned_resources::layout::Layout
                     LayoutResourceError::Arithmetic
                 }
                 // push_growth is a pure checked geometry author, not a control
-                // checkpoint; it cannot originate cancel/deadline.
+                // checkpoint; any caller-control source here violates its pure
+                // geometry contract and is rejected as a source model error.
                 ControlResourceError::Control(
-                    CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+                    CompileControlError::Cancelled
+                    | CompileControlError::DeadlineExceeded
+                    | CompileControlError::Source(_),
                 ) => LayoutResourceError::SourceModel,
             })
         })?;
@@ -888,31 +1106,8 @@ fn push_path<T, E: From<novarocks_type_contract::owned_resources::layout::Layout
     Ok(())
 }
 
-#[derive(Debug)]
-enum PurePathFailure {
-    Source(String),
-    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
-}
-impl From<String> for PurePathFailure {
-    fn from(error: String) -> Self {
-        Self::Source(error)
-    }
-}
-impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
-    for PurePathFailure
-{
-    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
-        Self::Resource(error)
-    }
-}
-
-pub fn parse_variant_path(path: &str) -> Result<VariantPath, String> {
-    parse_variant_path_core::<PurePathFailure>(path, &mut None).map_err(|error| match error {
-        PurePathFailure::Source(error) => error,
-        PurePathFailure::Resource(error) => {
-            format!("Variant path storage cannot be represented: {error:?}")
-        }
-    })
+pub fn parse_variant_path(path: &str) -> Result<VariantPath, VariantFailure> {
+    parse_variant_path_core::<VariantFailure>(path, &mut None)
 }
 
 pub fn parse_variant_path_with_storage_observed<E>(
@@ -921,7 +1116,8 @@ pub fn parse_variant_path_with_storage_observed<E>(
     mut observe: impl FnMut(VariantPathConstructionStep) -> Result<(), E>,
 ) -> Result<ObservedVariantPath, E>
 where
-    E: From<String> + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    E: From<VariantFailure>
+        + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
 {
     let path = parse_variant_path_core(path, &mut Some(&mut observe))?;
     Ok(ObservedVariantPath {
@@ -935,7 +1131,8 @@ fn parse_variant_path_core<E>(
     observe: &mut PathObserver<'_, E>,
 ) -> Result<VariantPath, E>
 where
-    E: From<String> + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    E: From<VariantFailure>
+        + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
 {
     let normalized = normalize_variant_path(path, observe)?;
     PathParser::new(&normalized, observe).parse()
@@ -979,36 +1176,81 @@ where
     Ok(normalized)
 }
 
-pub fn variant_query(value: &VariantValue, path: &VariantPath) -> Result<VariantValue, String> {
-    let mut current = VariantRef {
-        metadata: value.metadata(),
-        value: value.value(),
-    };
-    let mut current_value = current.value;
+/// Strict navigation requires a matching value. It shares the same physical
+/// decoder with nullable navigation and never repairs malformed storage.
+pub fn variant_query(
+    value: &VariantValue,
+    path: &VariantPath,
+) -> Result<VariantValue, VariantFailure> {
+    variant_query_nullable(value, path)?
+        .ok_or_else(|| VariantFailure::conversion("Variant path has no matching value"))
+}
+
+/// Missing keys/indices and a path through another value kind are ordinary
+/// absence. Encoded offsets, metadata, UTF-8 and representation failures remain
+/// failures; no semantic class is used as a blanket NULL policy.
+pub fn variant_query_nullable(
+    value: &VariantValue,
+    path: &VariantPath,
+) -> Result<Option<VariantValue>, VariantFailure> {
+    let mut current_value = value.value();
     for segment in &path.segments {
-        let next_value = match segment {
-            VariantPathSegment::ObjectKey(key) => {
-                let v = VariantRef {
-                    metadata: current.metadata,
-                    value: current_value,
-                };
-                v.get_object_by_key(key)?
-            }
-            VariantPathSegment::ArrayIndex(index) => {
-                let v = VariantRef {
-                    metadata: current.metadata,
-                    value: current_value,
-                };
-                v.get_element_at_index(*index)?
-            }
-        };
-        current_value = next_value;
-        current = VariantRef {
-            metadata: current.metadata,
+        let current = VariantRef {
+            metadata: value.metadata(),
             value: current_value,
         };
+        let next = match segment {
+            VariantPathSegment::ObjectKey(key) => {
+                if !matches!(current.basic_type()?, BasicType::Object) {
+                    return Ok(None);
+                }
+                current.get_object_by_key(key)?
+            }
+            VariantPathSegment::ArrayIndex(index) => {
+                if !matches!(current.basic_type()?, BasicType::Array) {
+                    return Ok(None);
+                }
+                current.get_element_at_index(*index)?
+            }
+        };
+        let Some(next) = next else { return Ok(None) };
+        current_value = next;
     }
-    VariantValue::create(value.metadata.raw(), current_value)
+    VariantValue::create(value.metadata.raw(), current_value).map(Some)
+}
+
+/// Only this domain's declared conversion rejection is nullable. This is an
+/// operation contract, not permission to suppress arbitrary Data failures.
+fn nullable_conversion<T>(result: Result<T, VariantFailure>) -> Result<Option<T>, VariantFailure> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if matches!(
+                error.0.as_ref(),
+                VariantFailureCause::Conversion(_)
+                    | VariantFailureCause::NumericDate { .. }
+                    | VariantFailureCause::NumericTimestamp { .. }
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+/// Tolerant path syntax keeps resource/layout failures on the error channel.
+pub fn parse_variant_path_nullable(path: &str) -> Result<Option<VariantPath>, VariantFailure> {
+    match parse_variant_path(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(error)
+            if matches!(
+                error.0.as_ref(),
+                VariantFailureCause::Path(_) | VariantFailureCause::PathIndex(_)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct PathParser<'a, 'observer, 'port, E> {
@@ -1019,7 +1261,8 @@ struct PathParser<'a, 'observer, 'port, E> {
 
 impl<'a, 'observer, 'port, E> PathParser<'a, 'observer, 'port, E>
 where
-    E: From<String> + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    E: From<VariantFailure>
+        + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
 {
     fn new(input: &'a str, observe: &'observer mut PathObserver<'port, E>) -> Self {
         Self {
@@ -1030,7 +1273,7 @@ where
     }
     fn parse(&mut self) -> Result<VariantPath, E> {
         if !self.consume_char(b'$')? {
-            return Err(E::from("Path must start with '$'".to_string()));
+            return Err(E::from(VariantFailure::path("Path must start with '$'")));
         }
         let mut segments = Vec::new();
         while !self.is_end() {
@@ -1039,7 +1282,7 @@ where
                 self.advance()?;
                 let key = self.parse_unquoted_key()?;
                 if key.is_empty() {
-                    return Err(E::from("Expected key after '.'".to_string()));
+                    return Err(E::from(VariantFailure::path("Expected key after '.'")));
                 }
                 push_path(
                     &mut segments,
@@ -1051,11 +1294,11 @@ where
                     push_path(&mut segments, seg, self.observe)?;
                 }
             } else {
-                return Err(E::from(format!(
+                return Err(E::from(VariantFailure::path(format_args!(
                     "Unexpected character '{}' at position {}",
                     self.peek_char() as char,
                     self.pos
-                )));
+                ))));
             }
         }
         Ok(VariantPath { segments })
@@ -1063,7 +1306,7 @@ where
     fn parse_bracket_segment(&mut self) -> Result<Option<VariantPathSegment>, E> {
         self.expect_char(b'[')?;
         if self.is_end() {
-            return Err(E::from("Unexpected end of path".to_string()));
+            return Err(E::from(VariantFailure::path("Unexpected end of path")));
         }
         let ch = self.peek_char();
         if ch == b'\'' || ch == b'"' {
@@ -1075,7 +1318,7 @@ where
         }
         let number = self.parse_number()?;
         if number.is_empty() {
-            return Err(E::from("Expected array index".to_string()));
+            return Err(E::from(VariantFailure::path("Expected array index")));
         }
         self.expect_char(b']')?;
         observe_path(
@@ -1084,7 +1327,7 @@ where
         )?;
         let index = number
             .parse::<u32>()
-            .map_err(|_| E::from(format!("Invalid array index: {}", number)))?;
+            .map_err(|cause| E::from(VariantFailure::path_index(cause)))?;
         Ok(Some(VariantPathSegment::ArrayIndex(index)))
     }
     fn parse_unquoted_key(&mut self) -> Result<String, E> {
@@ -1131,8 +1374,7 @@ where
             push_path(&mut out, byte, self.observe)?;
         }
         observe_path(self.observe, VariantPathConstructionStep::Work(out.len()))?;
-        String::from_utf8(out)
-            .map_err(|_| E::from("Variant path key is not valid UTF-8".to_string()))
+        String::from_utf8(out).map_err(|cause| E::from(VariantFailure::utf8(cause.utf8_error())))
     }
     fn peek_char(&self) -> u8 {
         self.input.get(self.pos).copied().unwrap_or(0)
@@ -1155,10 +1397,10 @@ where
         if self.consume_char(expected)? {
             Ok(())
         } else {
-            Err(E::from(format!(
+            Err(E::from(VariantFailure::path(format_args!(
                 "Expected '{}' at position {}",
                 expected as char, self.pos
-            )))
+            ))))
         }
     }
     fn is_end(&self) -> bool {
@@ -1166,43 +1408,48 @@ where
     }
 }
 
-fn validate_metadata(metadata: &[u8]) -> Result<(), String> {
+fn validate_metadata(metadata: &[u8]) -> Result<(), VariantFailure> {
     if metadata.len() < METADATA_MIN_SIZE {
-        return Err("Variant metadata is too short".to_string());
+        return Err(VariantFailure::encoding("Variant metadata is too short"));
     }
     let header = metadata[0];
     let version = header & VERSION_MASK;
     if version != 1 {
-        return Err(format!("Unsupported variant version: {}", version));
+        return Err(VariantFailure::encoding(format_args!(
+            "Unsupported variant version: {}",
+            version
+        )));
     }
     Ok(())
 }
 
-fn load_metadata(variant: &[u8]) -> Result<&[u8], String> {
+fn load_metadata(variant: &[u8]) -> Result<&[u8], VariantFailure> {
     if variant.is_empty() {
-        return Err("Variant is empty".to_string());
+        return Err(VariantFailure::encoding("Variant is empty"));
     }
     if variant.len() > VARIANT_MAX_SIZE {
-        return Err(format!(
-            "Variant size exceeds maximum limit: {} > {}",
-            variant.len(),
-            VARIANT_MAX_SIZE
-        ));
+        return Err(VariantFailure::size(variant.len() as u128));
     }
+
     let header = variant[0];
     let version = header & VERSION_MASK;
     if version != 1 {
-        return Err(format!("Unsupported variant version: {}", version));
+        return Err(VariantFailure::encoding(format_args!(
+            "Unsupported variant version: {}",
+            version
+        )));
     }
     let offset_size = 1 + ((header & OFFSET_SIZE_MASK) >> OFFSET_SIZE_SHIFT);
     if !(1..=4).contains(&offset_size) {
-        return Err(format!(
+        return Err(VariantFailure::encoding(format_args!(
             "Invalid offset size in variant metadata: {}",
             offset_size
-        ));
+        )));
     }
     if variant.len() < HEADER_SIZE + offset_size as usize {
-        return Err("Variant too short to contain dict_size".to_string());
+        return Err(VariantFailure::encoding(
+            "Variant too short to contain dict_size",
+        ));
     }
     let dict_size = read_le_u32(&variant[HEADER_SIZE..], offset_size)? as usize;
     let offset_list_offset = HEADER_SIZE + offset_size as usize;
@@ -1210,16 +1457,18 @@ fn load_metadata(variant: &[u8]) -> Result<&[u8], String> {
     let data_offset = offset_list_offset + required_offset_list_size;
     let last_offset_pos = offset_list_offset + dict_size * offset_size as usize;
     if last_offset_pos + offset_size as usize > variant.len() {
-        return Err("Variant too short to contain all offsets".to_string());
+        return Err(VariantFailure::encoding(
+            "Variant too short to contain all offsets",
+        ));
     }
     let last_data_size = read_le_u32(&variant[last_offset_pos..], offset_size)? as usize;
     let end_offset = data_offset + last_data_size;
     if end_offset > variant.len() {
-        return Err(format!(
+        return Err(VariantFailure::encoding(format_args!(
             "Variant metadata end offset exceeds variant size: {} > {}",
             end_offset,
             variant.len()
-        ));
+        )));
     }
     Ok(&variant[..end_offset])
 }
@@ -1228,12 +1477,12 @@ fn primitive_header(primitive: VariantPrimitiveType) -> u8 {
     (primitive as u8) << 2
 }
 
-fn read_le_u32(data: &[u8], size: u8) -> Result<u32, String> {
+fn read_le_u32(data: &[u8], size: u8) -> Result<u32, VariantFailure> {
     if size == 0 || size > 4 {
-        return Err("Invalid little-endian size".to_string());
+        return Err(VariantFailure::encoding("Invalid little-endian size"));
     }
     if data.len() < size as usize {
-        return Err("Not enough bytes to read value".to_string());
+        return Err(VariantFailure::encoding("Not enough bytes to read value"));
     }
     let mut out: u32 = 0;
     for (i, byte) in data.iter().copied().enumerate().take(size as usize) {
@@ -1246,7 +1495,7 @@ fn variant_to_json(
     variant: &VariantRef<'_>,
     out: &mut String,
     tz: Option<FixedOffset>,
-) -> Result<(), String> {
+) -> Result<(), VariantFailure> {
     match variant.basic_type()? {
         BasicType::Primitive => match variant.primitive_type()? {
             VariantPrimitiveType::Null => out.push_str("null"),
@@ -1304,8 +1553,12 @@ fn variant_to_json(
             }
             VariantPrimitiveType::Date => {
                 let days = variant.get_date()?;
-                let date = NaiveDate::from_num_days_from_ce_opt(719163 + days)
-                    .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                let date = 719163_i32
+                    .checked_add(days)
+                    .and_then(NaiveDate::from_num_days_from_ce_opt)
+                    .ok_or_else(|| {
+                        VariantFailure(Box::new(VariantFailureCause::NumericDate { days }))
+                    })?;
                 out.push('"');
                 out.push_str(&date.format("%Y-%m-%d").to_string());
                 out.push('"');
@@ -1313,14 +1566,14 @@ fn variant_to_json(
             VariantPrimitiveType::TimestampTz => {
                 let micros = variant.get_timestamp_micros()?;
                 let tz = tz.unwrap_or_else(|| Local::now().offset().fix());
-                let ts = format_timestamp_tz(micros, tz);
+                let ts = format_timestamp_tz(micros, tz)?;
                 out.push('"');
                 out.push_str(&ts);
                 out.push('"');
             }
             VariantPrimitiveType::TimestampNtz => {
                 let micros = variant.get_timestamp_micros_ntz()?;
-                let ts = format_timestamp_ntz(micros, 6);
+                let ts = format_timestamp_ntz(micros, 6)?;
                 out.push('"');
                 out.push_str(&ts);
                 out.push('"');
@@ -1328,7 +1581,7 @@ fn variant_to_json(
             VariantPrimitiveType::TimeNtz
             | VariantPrimitiveType::TimestampTzNanos
             | VariantPrimitiveType::TimestampNtzNanos => {
-                return Err("Unsupported variant type".to_string());
+                return Err(VariantFailure::encoding("Unsupported variant type"));
             }
         },
         BasicType::ShortString => {
@@ -1356,7 +1609,7 @@ fn variant_to_json(
                 let offset = read_le_u32(&variant.value[offset_pos..], info.offset_size)? as usize;
                 let start = info.data_start_offset + offset;
                 if start >= variant.value.len() {
-                    return Err("Invalid offset in object".to_string());
+                    return Err(VariantFailure::encoding("Invalid offset in object"));
                 }
                 let sub = VariantRef {
                     metadata: variant.metadata,
@@ -1377,7 +1630,7 @@ fn variant_to_json(
                 let offset = read_le_u32(&variant.value[offset_pos..], info.offset_size)? as usize;
                 let start = info.data_start_offset + offset;
                 if start >= variant.value.len() {
-                    return Err("Invalid offset in array".to_string());
+                    return Err(VariantFailure::encoding("Invalid offset in array"));
                 }
                 let sub = VariantRef {
                     metadata: variant.metadata,
@@ -1396,7 +1649,7 @@ fn decimal_to_string(value: i128, scale: u8) -> String {
         return value.to_string();
     }
     let negative = value < 0;
-    let abs = value.abs();
+    let abs = value.unsigned_abs();
     let digits = abs.to_string();
     let scale_usize = scale as usize;
     let mut out = String::new();
@@ -1419,18 +1672,19 @@ fn decimal_to_string(value: i128, scale: u8) -> String {
     out
 }
 
-fn bytes_to_string(value: &[u8]) -> Result<String, String> {
+fn bytes_to_string(value: &[u8]) -> Result<String, VariantFailure> {
     std::str::from_utf8(value)
         .map(|s| s.to_string())
-        .map_err(|_| "Variant string is not valid UTF-8".to_string())
+        .map_err(VariantFailure::utf8)
 }
 
-fn parse_bool_from_bytes(value: &[u8]) -> Result<bool, String> {
-    let s =
-        std::str::from_utf8(value).map_err(|_| "Variant string is not valid UTF-8".to_string())?;
+fn parse_bool_from_bytes(value: &[u8]) -> Result<bool, VariantFailure> {
+    let s = std::str::from_utf8(value).map_err(VariantFailure::utf8)?;
     let trimmed = s.trim();
     if trimmed.is_empty() {
-        return Err("Failed to cast empty string to BOOLEAN".to_string());
+        return Err(VariantFailure::conversion(
+            "Failed to cast empty string to BOOLEAN",
+        ));
     }
     if let Ok(parsed) = trimmed.parse::<i32>() {
         return Ok(parsed != 0);
@@ -1441,7 +1695,10 @@ fn parse_bool_from_bytes(value: &[u8]) -> Result<bool, String> {
     if trimmed.eq_ignore_ascii_case("false") {
         return Ok(false);
     }
-    Err(format!("Failed to cast string '{}' to BOOLEAN", s))
+    Err(VariantFailure::conversion(format_args!(
+        "Failed to cast string '{}' to BOOLEAN",
+        s
+    )))
 }
 
 fn decimal_to_i64(value: i128, scale: u8) -> i64 {
@@ -1463,12 +1720,23 @@ fn decimal_to_f64(value: i128, scale: u8) -> f64 {
     (value as f64) / divisor
 }
 
-fn timestamp_tz_to_local_naive(micros: i64, tz: FixedOffset) -> NaiveDateTime {
+fn timestamp_tz_to_local_naive(
+    micros: i64,
+    tz: FixedOffset,
+) -> Result<NaiveDateTime, VariantFailure> {
     let seconds = micros.div_euclid(1_000_000);
     let micros_rem = micros.rem_euclid(1_000_000) as u32;
-    let dt_utc = DateTime::<Utc>::from_timestamp(seconds, micros_rem * 1000)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
-    dt_utc.with_timezone(&tz).naive_local()
+    let failure = || {
+        VariantFailure(Box::new(VariantFailureCause::NumericTimestamp {
+            micros,
+            offset_seconds: tz.local_minus_utc(),
+        }))
+    };
+    let dt_utc = DateTime::<Utc>::from_timestamp(seconds, micros_rem * 1000).ok_or_else(failure)?;
+    dt_utc
+        .naive_utc()
+        .checked_add_signed(chrono::TimeDelta::seconds(i64::from(tz.local_minus_utc())))
+        .ok_or_else(failure)
 }
 
 fn remove_trailing_zeros(input: &str) -> String {
@@ -1536,34 +1804,44 @@ fn uuid_to_string(bytes: [u8; 16]) -> String {
     )
 }
 
-fn format_timestamp_tz(micros: i64, tz: FixedOffset) -> String {
+fn format_timestamp_tz(micros: i64, tz: FixedOffset) -> Result<String, VariantFailure> {
     let seconds = micros.div_euclid(1_000_000);
     let micros_rem = micros.rem_euclid(1_000_000) as u32;
-    let dt_utc = DateTime::<Utc>::from_timestamp(seconds, micros_rem * 1000)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+    let dt_utc = DateTime::<Utc>::from_timestamp(seconds, micros_rem * 1000).ok_or_else(|| {
+        VariantFailure(Box::new(VariantFailureCause::NumericTimestamp {
+            micros,
+            offset_seconds: tz.local_minus_utc(),
+        }))
+    })?;
+    timestamp_tz_to_local_naive(micros, tz)?;
     let dt = dt_utc.with_timezone(&tz);
     let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
     let frac = format_fraction_trim(micros_rem, 6);
     let offset = dt.format("%:z").to_string();
-    if frac.is_empty() {
+    Ok(if frac.is_empty() {
         format!("{}{}", base, offset)
     } else {
         format!("{}.{}{}", base, frac, offset)
-    }
+    })
 }
 
-fn format_timestamp_ntz(micros: i64, width: usize) -> String {
+fn format_timestamp_ntz(micros: i64, width: usize) -> Result<String, VariantFailure> {
     let seconds = micros.div_euclid(1_000_000);
     let micros_rem = micros.rem_euclid(1_000_000) as u32;
     let dt = DateTime::<Utc>::from_timestamp(seconds, micros_rem * 1000)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
+        .ok_or_else(|| {
+            VariantFailure(Box::new(VariantFailureCause::NumericTimestamp {
+                micros,
+                offset_seconds: 0,
+            }))
+        })?
         .naive_utc();
     let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
     if width == 0 {
-        return base;
+        return Ok(base);
     }
     let frac = format_fraction_fixed(micros_rem, width);
-    format!("{}.{}", base, frac)
+    Ok(format!("{}.{}", base, frac))
 }
 
 fn format_fraction_trim(value: u32, width: usize) -> String {
@@ -1617,15 +1895,101 @@ pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn variant_temporal_extremes_refuse_without_epoch_fallback_or_panic() {
+        use novarocks_failure_contract::FailureProjection;
+        for days in [i32::MIN, i32::MAX] {
+            let mut bytes = vec![primitive_header(VariantPrimitiveType::Date)];
+            bytes.extend_from_slice(&days.to_le_bytes());
+            let value = VariantValue::create(&[1, 0, 0], &bytes).unwrap();
+            assert_eq!(
+                value.to_json(None).unwrap_err().failure_fact(),
+                novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+            );
+        }
+        let tz = FixedOffset::east_opt(0).unwrap();
+        for primitive in [
+            VariantPrimitiveType::TimestampTz,
+            VariantPrimitiveType::TimestampNtz,
+        ] {
+            for micros in [i64::MIN, i64::MAX] {
+                let mut bytes = vec![primitive_header(primitive)];
+                bytes.extend_from_slice(&micros.to_le_bytes());
+                let value = VariantValue::create(&[1, 0, 0], &bytes).unwrap();
+                assert_eq!(
+                    value.to_json(Some(tz)).unwrap_err().failure_fact(),
+                    novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+                );
+                if matches!(primitive, VariantPrimitiveType::TimestampTz) {
+                    assert!(variant_to_date_days(&value, tz).is_err());
+                    assert!(variant_to_datetime_micros(&value, tz).is_err());
+                    assert!(variant_to_time_micros(&value, tz).is_err());
+                }
+            }
+        }
+    }
+    #[test]
+    fn variant_temporal_checked_offset_preserves_negative_fraction_bytes() {
+        let tz = FixedOffset::east_opt(0).unwrap();
+        assert_eq!(
+            format_timestamp_tz(-1, tz).unwrap(),
+            "1969-12-31 23:59:59.999999+00:00"
+        );
+        assert_eq!(
+            format_timestamp_ntz(-1, 6).unwrap(),
+            "1969-12-31 23:59:59.999999"
+        );
+        let max = NaiveDateTime::MAX.and_utc().timestamp_micros();
+        assert!(timestamp_tz_to_local_naive(max, FixedOffset::east_opt(86_399).unwrap()).is_err());
+        assert_eq!(
+            decimal_to_string(i128::MIN, 0),
+            "-170141183460469231731687303715884105728"
+        );
+        assert_eq!(
+            decimal_to_string(i128::MIN, 1),
+            "-17014118346046923173168730371588410572.8"
+        );
+    }
+
+    #[test]
+    fn variant_source_retains_utf8_and_parse_errors_without_input_storage() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use std::error::Error;
+        let bytes = std::sync::Arc::new(vec![0xff_u8]);
+        let weak = std::sync::Arc::downgrade(&bytes);
+        let error = bytes_to_string(bytes.as_slice()).unwrap_err();
+        assert!(error.source().unwrap().is::<std::str::Utf8Error>());
+        drop(bytes);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        let index = parse_variant_path("$[4294967296]").unwrap_err();
+        assert!(index.source().unwrap().is::<std::num::ParseIntError>());
+    }
+    #[test]
+    fn variant_unit_size_is_exact_representation_without_allocating_payload() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+        let error = VariantFailure::size(VARIANT_MAX_SIZE as u128 + 1);
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(
+            fact.representation().unwrap().boundary,
+            RepresentationBoundary::MinimumUnit
+        );
+        assert_eq!(
+            fact.representation().unwrap().required,
+            Some(VARIANT_MAX_SIZE as u64 + 1)
+        );
+    }
+
     use super::*;
     #[derive(Debug, PartialEq)]
     enum PathFailure {
-        Source(String),
+        Source(VariantFailure),
         Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
         Refused(std::sync::Arc<str>),
     }
-    impl From<String> for PathFailure {
-        fn from(error: String) -> Self {
+    impl From<VariantFailure> for PathFailure {
+        fn from(error: VariantFailure) -> Self {
             Self::Source(error)
         }
     }
@@ -1748,5 +2112,168 @@ mod tests {
         assert!(split_serialized(&[0u8, 0, 0]).is_err());
         // size header claims more bytes than present
         assert!(split_serialized(&[200u8, 0, 0, 0, 1]).is_err());
+    }
+}
+
+/// Nullable value conversion; malformed physical data remains an error.
+pub fn try_variant_to_bool(value: &VariantValue) -> Result<Option<bool>, VariantFailure> {
+    nullable_conversion(variant_to_bool(value))
+}
+
+/// Nullable value conversion; malformed physical data remains an error.
+pub fn try_variant_to_i64(value: &VariantValue) -> Result<Option<i64>, VariantFailure> {
+    nullable_conversion(variant_to_i64(value))
+}
+
+/// Nullable value conversion; malformed physical data remains an error.
+pub fn try_variant_to_f64(value: &VariantValue) -> Result<Option<f64>, VariantFailure> {
+    nullable_conversion(variant_to_f64(value))
+}
+
+/// Nullable value conversion; malformed physical data remains an error.
+pub fn try_variant_to_string(value: &VariantValue) -> Result<Option<String>, VariantFailure> {
+    nullable_conversion(variant_to_string(value))
+}
+
+/// Nullable temporal conversion; it preserves physical and resource failures.
+pub fn try_variant_to_date_days(
+    value: &VariantValue,
+    tz: FixedOffset,
+) -> Result<Option<i32>, VariantFailure> {
+    nullable_conversion(variant_to_date_days(value, tz))
+}
+
+/// Nullable temporal conversion; it preserves physical and resource failures.
+pub fn try_variant_to_datetime_micros(
+    value: &VariantValue,
+    tz: FixedOffset,
+) -> Result<Option<i64>, VariantFailure> {
+    nullable_conversion(variant_to_datetime_micros(value, tz))
+}
+
+/// Nullable temporal conversion; it preserves physical and resource failures.
+pub fn try_variant_to_time_micros(
+    value: &VariantValue,
+    tz: FixedOffset,
+) -> Result<Option<i64>, VariantFailure> {
+    nullable_conversion(variant_to_time_micros(value, tz))
+}
+
+/// Nullable JSON rendering for a value that has no supported conversion.
+/// Malformed storage and format/resource limits cannot become SQL NULL.
+pub fn try_variant_to_json(value: &VariantValue) -> Result<Option<String>, VariantFailure> {
+    nullable_conversion(value.to_json_local())
+}
+
+#[cfg(test)]
+mod nullable_operation_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    fn value(json: &str) -> VariantValue {
+        VariantValue::from_serialized(
+            &super::super::variant_encode::encode_json_text_to_variant_bytes(json).unwrap(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn nullable_navigation_distinguishes_absence_from_damaged_storage() {
+        let valid = value(r#"{"a": [1]}"#);
+        for path in ["$.missing", "$.a[1]", "$.a[0].missing"] {
+            let path = parse_variant_path(path).unwrap();
+            assert!(variant_query_nullable(&valid, &path).unwrap().is_none());
+            assert!(variant_query(&valid, &path).is_err());
+        }
+        let path = parse_variant_path("$.a[0]").unwrap();
+        let selected = variant_query_nullable(&valid, &path).unwrap().unwrap();
+        assert_eq!(variant_to_i64(&selected).unwrap(), 1);
+        let malformed = VariantValue::create(VariantMetadata::empty().raw(), &[]).unwrap();
+        let failure =
+            variant_query_nullable(&malformed, &parse_variant_path("$.a").unwrap()).unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 60);
+    }
+    #[test]
+    fn nullable_conversion_does_not_consume_physical_or_representation_failures() {
+        assert_eq!(
+            try_variant_to_i64(&value(r#""not an integer""#)).unwrap(),
+            None
+        );
+        assert_eq!(try_variant_to_bool(&value("[]")).unwrap(), None);
+        let malformed = VariantValue::create(VariantMetadata::empty().raw(), &[]).unwrap();
+        assert!(try_variant_to_bool(&malformed).is_err());
+        let failure = VariantValue::from_serialized(&((VARIANT_MAX_SIZE + 1) as u32).to_le_bytes())
+            .unwrap_err();
+        let original = failure.failure_fact();
+        let failure = nullable_conversion::<bool>(Err(failure)).unwrap_err();
+        assert_eq!(failure.failure_fact(), original);
+        assert_eq!(original.class(), FailureClass::Representation);
+    }
+    #[test]
+    fn nullable_path_syntax_has_an_explicit_absence_result() {
+        assert!(parse_variant_path_nullable("$.a[0]").unwrap().is_some());
+        assert!(parse_variant_path_nullable("not a path").unwrap().is_none());
+        assert!(
+            parse_variant_path_nullable("$[4294967296]")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod nullable_typeof_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+
+    #[test]
+    fn nullable_typeof_retains_original_labels_for_both_actual_encodings() {
+        let metadata = VariantMetadata::empty();
+        let mut integer = vec![6 << 2];
+        integer.extend_from_slice(&123_i64.to_le_bytes());
+        for (payload, expected) in [(integer.as_slice(), "Int64"), (&[0][..], "Null")] {
+            let serialized = VariantValue::create(metadata.raw(), payload)
+                .unwrap()
+                .serialize();
+            assert_eq!(
+                variant_typeof_serialized_nullable(&serialized)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                variant_typeof_parts_nullable(metadata.raw(), payload)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn nullable_typeof_nulls_only_the_original_malformed_encoding_rows() {
+        assert_eq!(variant_typeof_serialized_nullable(&[255]).unwrap(), None);
+        assert_eq!(variant_typeof_parts_nullable(&[255], &[0]).unwrap(), None);
+        assert_eq!(
+            variant_typeof_parts_nullable(VariantMetadata::empty().raw(), &[63 << 2]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn nullable_typeof_preserves_the_real_decoder_extent_refusal() {
+        // The real decoder checks the declared extent before touching payload.
+        // Four bytes exercise its production refusal without a huge fixture.
+        let header = ((VARIANT_MAX_SIZE + 1) as u32).to_le_bytes();
+        let original = VariantValue::from_serialized(&header).unwrap_err();
+        let refusal = variant_typeof_serialized_nullable(&header).unwrap_err();
+        assert_eq!(refusal, original);
+        let fact = refusal.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(fact.reason().code(), 64);
+        let extent = fact
+            .representation()
+            .expect("actual Variant representation extent");
+        assert_eq!(extent.required, Some(VARIANT_MAX_SIZE as u64 + 1));
+        assert_eq!(extent.extent_limit, Some(VARIANT_MAX_SIZE as u64));
     }
 }

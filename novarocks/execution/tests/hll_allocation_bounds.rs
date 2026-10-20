@@ -390,8 +390,11 @@ fn assert_merge_bound(label: &str, mut handle: HllHandle, input: &[u8]) {
 }
 
 fn reserved_update(handle: &mut HllHandle, hash: u64) -> HllAllocationUpperBounds {
-    let (preflight, measured_preflight) =
-        measure_allocations(|| handle.update_hash_allocation_preflight());
+    let (preflight, measured_preflight) = measure_allocations(|| {
+        handle
+            .update_hash_allocation_preflight()
+            .expect("valid HLL update preflight")
+    });
     assert_eq!(measured_preflight.allocated_bytes, 0, "update preflight");
     let bounds = preflight.bounds();
     let (result, measured) = measure_allocations(|| {
@@ -488,7 +491,10 @@ fn preflight_bounds_cover_modes_targets_aux_and_transitions() {
 fn update_preflight_is_live_configuration_sensitive() {
     let _lock = TEST_LOCK.lock().expect("lock allocation tracker");
     let mut small = HllHandle::new_unreserved(10, HllTargetType::Hll8).expect("small handle");
-    let small_initial = small.update_hash_allocation_preflight().bounds();
+    let small_initial = small
+        .update_hash_allocation_preflight()
+        .expect("valid HLL update preflight")
+        .bounds();
     assert_eq!(
         small_initial.current_bytes,
         small_initial.operation_peak_bytes
@@ -498,11 +504,17 @@ fn update_preflight_is_live_configuration_sensitive() {
             .update_hash_unreserved(mixed_value(index, 1))
             .expect("fill list");
     }
-    let list_transition = small.update_hash_allocation_preflight().bounds();
+    let list_transition = small
+        .update_hash_allocation_preflight()
+        .expect("valid HLL update preflight")
+        .bounds();
     assert!(list_transition.additional_headroom_bytes() < 1_024);
 
     let huge = HllHandle::new_unreserved(21, HllTargetType::Hll8).expect("huge handle");
-    let huge_initial = huge.update_hash_allocation_preflight().bounds();
+    let huge_initial = huge
+        .update_hash_allocation_preflight()
+        .expect("valid HLL update preflight")
+        .bounds();
     assert_eq!(
         huge_initial.current_bytes,
         huge_initial.operation_peak_bytes
@@ -510,7 +522,10 @@ fn update_preflight_is_live_configuration_sensitive() {
     assert_eq!(huge_initial.current_bytes, small_initial.current_bytes);
 
     let dense = populated_handle(HllType::Hll8, 10, 4_096, 2);
-    let dense_update = dense.update_hash_allocation_preflight().bounds();
+    let dense_update = dense
+        .update_hash_allocation_preflight()
+        .expect("valid HLL update preflight")
+        .bounds();
     assert_eq!(
         dense_update.current_bytes,
         dense_update.operation_peak_bytes
@@ -692,25 +707,26 @@ fn allocation_header_enforces_minimum_lengths_and_low_k_set_shape() {
 fn stale_and_mismatched_tokens_fail_before_datasketches_mutation() {
     let _lock = TEST_LOCK.lock().expect("lock allocation tracker");
     let mut handle = HllHandle::new_unreserved(10, HllTargetType::Hll8).expect("handle");
-    let stale = handle.update_hash_allocation_preflight();
+    let stale = handle
+        .update_hash_allocation_preflight()
+        .expect("valid HLL update preflight");
     handle
         .update_hash_unreserved(1_u64)
         .expect("advance handle");
     let estimate = handle.estimate().expect("estimate");
-    let (_, stale_error_baseline) = measure_allocations(|| {
-        with_reservation(|_| {
-            drop(String::from(
-                "ds_hll: update allocation preflight is stale or mismatched",
-            ))
-        })
-    });
     let (stale_result, stale_measurement) = measure_allocations(|| {
         with_reservation(|guard| handle.update_hash_under_reservation(2_u64, &stale, guard))
     });
-    assert!(stale_result.is_err());
+    let failure = stale_result.expect_err("a mismatched original preflight must be refused");
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&failure);
     assert_eq!(
-        stale_measurement.allocated_bytes, stale_error_baseline.allocated_bytes,
-        "stale rejection must allocate only its error string"
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 182);
+    assert_eq!(
+        stale_measurement.allocated_bytes, 0,
+        "typed preflight rejection must not enter allocating SDK work"
     );
     assert_eq!(handle.estimate().expect("estimate after stale"), estimate);
 
@@ -720,22 +736,21 @@ fn stale_and_mismatched_tokens_fail_before_datasketches_mutation() {
         .merge_payload_allocation_preflight(&list_payload)
         .expect("list preflight");
     let estimate = handle.estimate().expect("estimate before mismatch");
-    let (_, mismatch_error_baseline) = measure_allocations(|| {
-        with_reservation(|_| {
-            drop(String::from(
-                "ds_hll: merge allocation preflight is stale or mismatched",
-            ))
-        })
-    });
     let (mismatch_result, mismatch_measurement) = measure_allocations(|| {
         with_reservation(|guard| {
             handle.merge_payload_under_reservation(&dense_payload, &mismatched, guard)
         })
     });
-    assert!(mismatch_result.is_err());
+    let failure = mismatch_result.expect_err("a mismatched original preflight must be refused");
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&failure);
     assert_eq!(
-        mismatch_measurement.allocated_bytes, mismatch_error_baseline.allocated_bytes,
-        "mismatched payload rejection must allocate only its error string"
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 182);
+    assert_eq!(
+        mismatch_measurement.allocated_bytes, 0,
+        "typed preflight rejection must not enter allocating SDK work"
     );
     assert_eq!(
         handle.estimate().expect("estimate after mismatch"),
@@ -743,7 +758,9 @@ fn stale_and_mismatched_tokens_fail_before_datasketches_mutation() {
     );
 
     // Reservation denial is represented by the caller not invoking the operation at all.
-    let denied = handle.update_hash_allocation_preflight();
+    let denied = handle
+        .update_hash_allocation_preflight()
+        .expect("valid HLL update preflight");
     let denied_estimate = handle.estimate().expect("estimate before denial");
     assert!(denied.bounds().additional_headroom_bytes() <= 1 << 10);
     let (_, denied_measurement) = measure_allocations(|| {});

@@ -498,10 +498,10 @@ fn guarantee_shared_sparse_dag_preserves_exact_combined_projection_ceilings() {
         CompileControlError::ResourceExhausted,
     ] {
         for at in [0, quantum, expected.len() - 1] {
-            let control = Trace::new(Some(at), failure);
+            let control = Trace::new(Some(at), failure.clone());
             assert_eq!(
                 FragmentPackage::try_new(input.clone(), exact, &control).unwrap_err(),
-                FragmentPackageError::Control(failure)
+                FragmentPackageError::Control(failure.clone())
             );
             assert_eq!(*control.events.lock().unwrap(), expected[..=at]);
         }
@@ -619,7 +619,7 @@ impl PureCompileControl for Trace {
         events.push((phase, units));
         if self.fail_at == Some(at) {
             self.refused.store(true, Ordering::SeqCst);
-            Err(self.failure)
+            Err(self.failure.clone())
         } else {
             Ok(())
         }
@@ -683,10 +683,10 @@ fn guarantee_admission_original_control_prefix_includes_success_and_ordinary_fai
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..expected.len() {
-                let control = Trace::new(Some(at), failure);
+                let control = Trace::new(Some(at), failure.clone());
                 assert_eq!(
                     FragmentPackage::try_new(input.clone(), admission(), &control).unwrap_err(),
-                    FragmentPackageError::Control(failure)
+                    FragmentPackageError::Control(failure.clone())
                 );
                 assert_eq!(*control.events.lock().unwrap(), expected[..=at]);
                 assert!(control.refused.load(Ordering::SeqCst));

@@ -48,7 +48,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -146,7 +146,7 @@ fn prefixes(call: impl Fn(&Control) -> Result<(), BindingCodecError>, success: b
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(BindingCodecError::Control(actual)) if actual == cause),

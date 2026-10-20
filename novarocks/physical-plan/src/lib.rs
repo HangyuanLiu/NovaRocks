@@ -27,6 +27,7 @@ mod constants;
 mod definition_sources;
 mod expression;
 mod expression_site;
+mod failure_projection;
 mod frozen_calls;
 mod frozen_pruning;
 mod identity;

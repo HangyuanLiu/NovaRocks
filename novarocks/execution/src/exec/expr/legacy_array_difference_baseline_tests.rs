@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Independent actual ARRAY_DIFFERENCE dispatcher oracles, including original unchecked arithmetic.
+//! Actual ARRAY_DIFFERENCE values, prepared contracts and typed arithmetic refusals.
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
@@ -43,7 +43,11 @@ pub(super) fn target(item: DataType) -> DataType {
             .with_metadata([("output-field".into(), "exact".into())].into()),
     ))
 }
-pub(super) fn raw(a: ArrayRef, target: DataType, arity: usize) -> Result<ArrayRef, String> {
+pub(super) fn raw(
+    a: ArrayRef,
+    target: DataType,
+    arity: usize,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slot = SlotId::new(17);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -174,81 +178,93 @@ fn legacy_array_difference_original_float_decimal_and_arrow_cast_order() {
     );
 }
 #[test]
-fn legacy_array_difference_original_full_errors_and_arity_before_children() {
-    let a: ArrayRef = Arc::new(NullArray::new(1));
+fn array_difference_prepared_contracts_and_original_arrow_source_are_distinct() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let input: ArrayRef = Arc::new(NullArray::new(1));
     assert_eq!(
-        raw(a.clone(), target(DataType::Int64), 1).unwrap_err(),
-        "array_difference expects ListArray, got Null"
+        raw(input.clone(), target(DataType::Int64), 1)
+            .unwrap_err()
+            .failure_fact()
+            .class(),
+        FailureClass::Invariant
     );
     for arity in [0, 2] {
+        let failure = raw(input.clone(), target(DataType::Int64), arity).unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(
-            raw(a.clone(), target(DataType::Int64), arity).unwrap_err(),
-            format!("array_difference expects 1 to 1 arguments, got {arity}")
+            failure.failure_fact().reason(),
+            crate::runtime::fragment::ExecutionReason::ExpressionContract.reason()
         );
     }
-    let a = list(
+    let input = list(
         Arc::new(Int8Array::from(vec![None])),
         vec![0, 1],
         Some(vec![false]),
     );
     assert_eq!(
-        raw(a, target(DataType::Int8), 1).unwrap_err(),
-        "array_difference unsupported output element type: Int8"
+        raw(input, target(DataType::Int8), 1)
+            .unwrap_err()
+            .failure_fact()
+            .class(),
+        FailureClass::Invariant
     );
     let values: ArrayRef = Arc::new(Date32Array::from(vec![None]));
-    let expected = arrow::compute::cast(&values, &DataType::Boolean)
-        .unwrap_err()
-        .to_string();
-    let a = list(values, vec![0, 1], Some(vec![false]));
+    let expected = arrow::compute::cast(&values, &DataType::Boolean).unwrap_err();
+    let input = list(values, vec![0, 1], Some(vec![false]));
+    let failure = raw(input, target(DataType::Boolean), 1).unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
     assert_eq!(
-        raw(a, target(DataType::Boolean), 1).unwrap_err(),
-        format!("array_difference failed to cast element type Date32 -> Boolean: {expected}")
+        original_source::<arrow::error::ArrowError>(&failure).to_string(),
+        expected.to_string()
     );
 }
+
 #[test]
-fn legacy_array_difference_original_extreme_subtraction_panic_or_wrapping() {
-    let a = list(
-        Arc::new(Int64Array::from(vec![Some(i64::MIN), Some(i64::MAX)])),
-        vec![0, 2],
-        None,
-    );
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        raw(a, target(DataType::Int64), 1)
-    }));
-    if cfg!(debug_assertions) {
-        assert!(result.is_err());
-    } else {
-        assert_eq!(ints(&result.unwrap().unwrap()), vec![Some(0), Some(-1)]);
-    }
-    let a = list(
-        Arc::new(
-            Decimal128Array::from(vec![Some(i128::MIN), Some(i128::MAX)])
-                .with_precision_and_scale(38, 0)
-                .unwrap(),
+fn array_difference_extreme_subtraction_is_a_typed_numeric_value_failure() {
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_functions::builtin::array_difference_core::DifferenceRowError;
+    let inputs = [
+        (
+            list(
+                Arc::new(Int64Array::from(vec![Some(i64::MIN), Some(i64::MAX)])),
+                vec![0, 2],
+                None,
+            ),
+            target(DataType::Int64),
         ),
-        vec![0, 2],
-        None,
-    );
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        raw(a, target(DataType::Decimal128(38, 0)), 1)
-    }));
-    if cfg!(debug_assertions) {
-        assert!(result.is_err());
-    } else {
+        (
+            list(
+                Arc::new(
+                    Decimal128Array::from(vec![Some(i128::MIN), Some(i128::MAX)])
+                        .with_precision_and_scale(38, 0)
+                        .unwrap(),
+                ),
+                vec![0, 2],
+                None,
+            ),
+            target(DataType::Decimal128(38, 0)),
+        ),
+    ];
+    for (input, ty) in inputs {
+        let failure = raw(input, ty, 1).unwrap_err();
         assert_eq!(
-            result
-                .unwrap()
-                .unwrap()
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap()
-                .values()
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![Some(0), Some(-1)]
+            failure.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
         );
+        assert_eq!(original_source::<DifferenceRowError>(&failure).row, 0);
+    }
+}
+
+fn original_source<'a, T: std::error::Error + 'static>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> &'a T {
+    let mut source = error;
+    loop {
+        if let Some(original) = source.downcast_ref::<T>() {
+            return original;
+        }
+        source = source
+            .source()
+            .expect("original domain source must survive propagation");
     }
 }

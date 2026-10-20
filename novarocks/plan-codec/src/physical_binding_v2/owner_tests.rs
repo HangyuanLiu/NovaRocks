@@ -66,7 +66,7 @@ impl PureCompileControl for Control {
             assert!(at <= i, "callback after originating refusal");
         }
         s.trace.push((p, n));
-        match s.stop {
+        match s.stop.clone() {
             Some((i, c)) if i == at => Err(c),
             _ => Ok(()),
         }
@@ -298,7 +298,7 @@ fn every_actual_chain_callback_preserves_success_ordinary_tail_and_three_primary
             for cause in CAUSES {
                 let c = Control::default();
                 assert!(
-                    matches!(workflow(&c, Some((at, cause)), bad), Err(BindingCodecError::Control(actual)) if actual == cause)
+                    matches!(workflow(&c, Some((at, cause.clone())), bad), Err(BindingCodecError::Control(actual)) if actual == cause)
                 );
                 assert_eq!(c.trace(), trace[..=at]);
             }
@@ -331,7 +331,7 @@ fn known_header_index_and_clone_requests_win_before_pending_control() {
     for pending in [0, 254, 255] {
         for cause in CAUSES {
             for stage in 0..3 {
-                c.arm(Some((1, cause)));
+                c.arm(Some((1, cause.clone())));
                 let mut work =
                     CompileCheckpoints::try_new(original, CompilePhase::Validate).unwrap();
                 for _ in 0..pending {
@@ -664,7 +664,7 @@ fn wide_actual_sender_walk_retains_real_quantum_and_original_control_samples() {
     for at in [0, quantum, trace.len() / 2, trace.len() - 1] {
         for cause in CAUSES {
             assert!(
-                matches!(run(Some((at, cause))), Err(BindingCodecError::Control(actual)) if actual == cause)
+                matches!(run(Some((at, cause.clone()))), Err(BindingCodecError::Control(actual)) if actual == cause)
             );
             assert_eq!(c.trace(), trace[..=at]);
         }

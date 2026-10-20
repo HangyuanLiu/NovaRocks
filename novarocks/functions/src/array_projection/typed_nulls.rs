@@ -16,7 +16,7 @@
 // under the License.
 
 //! The original Chunk borrowed key-safety/root logical-NULL traversal.
-use super::ArrayNormalizationStep;
+use super::{ArrayNormalizationStep, ArrayProjectionFailure, ArrayProjectionViolation};
 use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Int32Array, LargeListArray, ListArray,
@@ -30,22 +30,24 @@ pub fn validate_encoded_keys_and_root_nulls_observed<E, F>(
     nodes: &mut usize,
 ) -> Result<bool, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     observe(ArrayNormalizationStep::InspectType(source.data_type()))?;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(
-            "typed array key validation exceeds its nesting profile".into(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
-    *nodes = nodes
-        .checked_add(1)
-        .ok_or_else(|| E::from("typed array key validation node count overflow".into()))?;
+    *nodes = nodes.checked_add(1).ok_or_else(|| {
+        E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        ))
+    })?;
     if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(E::from(
-            "typed array key validation exceeds its node profile".into(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        )));
     }
     let mut child = |array: &ArrayRef| {
         validate_encoded_keys_and_root_nulls_observed(array, observe, depth + 1, nodes).map(|_| ())
@@ -56,17 +58,17 @@ where
                 .as_any()
                 .downcast_ref::<DictionaryArray<Int32Type>>()
                 .ok_or_else(|| {
-                    E::from(
-                        "typed dictionary does not have its admitted Int32 physical keys".into(),
-                    )
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::NonInt32Dictionary,
+                    ))
                 })?;
             if !matches!(
                 dictionary.values().data_type(),
                 DataType::Utf8 | DataType::LargeUtf8
             ) {
-                return Err(E::from(
-                    "typed dictionary does not have direct string values".into(),
-                ));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::NonStringDictionary,
+                )));
             }
             return validate_dictionary_rows_observed(
                 source,
@@ -79,7 +81,11 @@ where
             let array = source
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| E::from("typed Struct has a different physical wrapper".into()))?;
+                .ok_or_else(|| {
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    ))
+                })?;
             for array in array.columns() {
                 child(array)?;
             }
@@ -88,14 +94,22 @@ where
             source
                 .as_any()
                 .downcast_ref::<ListArray>()
-                .ok_or_else(|| E::from("typed List has a different physical wrapper".into()))?
+                .ok_or_else(|| {
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    ))
+                })?
                 .values(),
         )?,
         DataType::LargeList(_) => child(
             source
                 .as_any()
                 .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| E::from("typed LargeList has a different physical wrapper".into()))?
+                .ok_or_else(|| {
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    ))
+                })?
                 .values(),
         )?,
         DataType::FixedSizeList(_, _) => child(
@@ -103,15 +117,18 @@ where
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or_else(|| {
-                    E::from("typed FixedSizeList has a different physical wrapper".into())
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    ))
                 })?
                 .values(),
         )?,
         DataType::Map(_, _) => {
-            let array = source
-                .as_any()
-                .downcast_ref::<MapArray>()
-                .ok_or_else(|| E::from("typed Map has a different physical wrapper".into()))?;
+            let array = source.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::PhysicalWrapper,
+                ))
+            })?;
             for array in array.entries().columns() {
                 child(array)?;
             }
@@ -120,7 +137,11 @@ where
             let array = source
                 .as_any()
                 .downcast_ref::<UnionArray>()
-                .ok_or_else(|| E::from("typed Union has a different physical wrapper".into()))?;
+                .ok_or_else(|| {
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    ))
+                })?;
             for (id, _) in fields.iter() {
                 child(array.child(id))?;
             }
@@ -140,7 +161,7 @@ pub fn validate_dictionary_rows_observed<E, F>(
     observe: &mut F,
 ) -> Result<bool, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     let mut root_has_nulls = false;
@@ -159,7 +180,11 @@ where
             let index = usize::try_from(keys.value(row))
                 .ok()
                 .filter(|index| *index < values.len())
-                .ok_or_else(|| E::from("typed dictionary key is outside its value array".into()))?;
+                .ok_or_else(|| {
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::DictionaryKeyBounds,
+                    ))
+                })?;
             root_has_nulls |= values.is_null(index);
         }
     }

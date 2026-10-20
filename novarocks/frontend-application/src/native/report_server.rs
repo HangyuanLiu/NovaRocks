@@ -34,6 +34,10 @@ struct LifecycleConvergenceDebugSnapshot {
     query_local_sequence: u64,
     query_attempt_id: u64,
     error_source: Option<&'static str>,
+    failure_fact: Option<Vec<u8>>,
+    failure_detail: Option<String>,
+    failure_site: Option<serde_json::Value>,
+    worker_contexts_converged: bool,
     runtime_filter: RuntimeFilterTerminalRollupDebug,
 }
 
@@ -230,7 +234,50 @@ fn lifecycle_convergence_debug_snapshot(
         query_local_sequence: attribution.sequence().get(),
         query_attempt_id: snapshot.execution_id.attempt_id().get(),
         error_source,
+        failure_fact: snapshot.failure.as_ref().map(|input| {
+            prost::Message::encode_to_vec(&novarocks_task_codec::status::encode_failure_fact(
+                input.fact(),
+            ))
+        }),
+        failure_detail: snapshot
+            .failure
+            .as_ref()
+            .map(|input| input.detail().as_str().to_owned()),
+        failure_site: snapshot
+            .failure
+            .as_ref()
+            .map(|input| failure_site_debug(input.site())),
+        worker_contexts_converged: snapshot.worker_contexts_converged,
         runtime_filter: runtime_filter_terminal_rollup_debug(snapshot.runtime_filter),
+    }
+}
+
+fn failure_site_debug(
+    site: novarocks_query_application::execution_error::ExecutionFailureSite,
+) -> serde_json::Value {
+    use novarocks_query_application::execution_error::ExecutionFailureSite as S;
+    use novarocks_task_codec::identity::{encode_query_context_ref, encode_task_identity};
+    use prost::Message;
+    use serde_json::json;
+    match site {
+        S::Task { identity, phase } => {
+            json!({"kind":"task", "identity":encode_task_identity(identity).encode_to_vec(), "phase":match phase { novarocks_execution_contract::TaskFailurePhase::Preparation=>"preparation", novarocks_execution_contract::TaskFailurePhase::Execution=>"execution" }})
+        }
+        S::TaskControl { identity } => {
+            json!({"kind":"task-control", "identity":encode_task_identity(identity).encode_to_vec()})
+        }
+        S::Operation {
+            context,
+            operation_id,
+            kind,
+        } => {
+            json!({"kind":"operation", "context":encode_query_context_ref(context).encode_to_vec(), "operation_id":operation_id.to_bytes(), "operation_kind":kind.as_str()})
+        }
+        S::RootRead { root } => {
+            json!({"kind":"root-read", "root":encode_task_identity(root).encode_to_vec()})
+        }
+        S::Backend { process } => json!({"kind":"backend", "process":process.to_string()}),
+        S::Coordinator => json!({"kind":"coordinator"}),
     }
 }
 
@@ -619,7 +666,11 @@ fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
         | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
         ProtocolErrorKind::Conflict => tonic::Status::already_exists(detail),
         ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
+        ProtocolErrorKind::Domain(source) => status_from_domain_source(source),
         ProtocolErrorKind::CompileControl(cause) => match cause {
+            novarocks_type_contract::CompileControlError::Source(source) => {
+                status_from_domain_source(source)
+            }
             novarocks_type_contract::CompileControlError::Cancelled => {
                 tonic::Status::cancelled(detail)
             }
@@ -633,8 +684,99 @@ fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
     }
 }
 
+fn status_from_domain_source(
+    source: &novarocks_failure_contract::SharedFailureCause,
+) -> tonic::Status {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let fact = source.failure_fact();
+    // The original cause is local. RPC diagnostics only publish
+    // neutral facts, never the caller's arbitrary source Display.
+    let detail = format!(
+        "native preparation {:?} refusal (reason {})",
+        fact.class(),
+        fact.reason()
+    );
+    match fact.class() {
+        FailureClass::Data => tonic::Status::invalid_argument(detail),
+        FailureClass::Unsupported => tonic::Status::unimplemented(detail),
+        FailureClass::Dependency => tonic::Status::unavailable(detail),
+        FailureClass::Resource => tonic::Status::resource_exhausted(detail),
+        FailureClass::Representation => tonic::Status::data_loss(detail),
+        FailureClass::Invariant | FailureClass::Unexpected => tonic::Status::internal(detail),
+        // A control observation is not necessarily this RPC caller's cancellation.
+        FailureClass::Control => tonic::Status::aborted(detail),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn domain_source_uses_neutral_transport_projection_without_publishing_private_text() {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        for (original, expected) in [
+            (LayoutResourceError::SourceModel, tonic::Code::Internal),
+            (
+                LayoutResourceError::Arithmetic,
+                tonic::Code::ResourceExhausted,
+            ),
+        ] {
+            let error = novarocks_proto_codec::ProtocolError::from_domain(
+                novarocks_proto_codec::FieldPath::root("original"),
+                original,
+            );
+            let status = super::status_from_contract_error(error);
+            assert_eq!(status.code(), expected);
+            assert!(status.message().contains("reason"));
+            assert!(!status.message().contains("allocation"));
+        }
+        let error = novarocks_proto_codec::ProtocolError::from_domain(
+            novarocks_proto_codec::FieldPath::root("original"),
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Cancelled,
+                "private authentication token",
+            ),
+        );
+        let status = super::status_from_contract_error(error);
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert!(!status.message().contains("private authentication token"));
+    }
+
+    #[test]
+    fn caller_control_source_projects_actual_category_without_cancellation_guess() {
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        for (raw, expected) in [
+            (
+                CompileControlError::from_domain(LayoutResourceError::SourceModel),
+                tonic::Code::Internal,
+            ),
+            (
+                CompileControlError::from_domain(LayoutResourceError::Arithmetic),
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                        "private capability detail".into(),
+                    ),
+                )),
+                tonic::Code::Unimplemented,
+            ),
+        ] {
+            let error = novarocks_proto_codec::ProtocolError::new(
+                novarocks_proto_codec::FieldPath::root("original"),
+                novarocks_proto_codec::ProtocolErrorKind::CompileControl(raw),
+                "Cancelled: misleading diagnostic",
+            );
+            let status = super::status_from_contract_error(error);
+            assert_eq!(status.code(), expected);
+            assert!(!status.message().contains("misleading diagnostic"));
+            assert!(!status.message().contains("private capability detail"));
+            assert!(status.message().contains("reason"));
+        }
+    }
 
     #[test]
     fn pure_compile_protocol_control_uses_exact_transport_status() {
@@ -652,7 +794,7 @@ mod tests {
         ] {
             let error = novarocks_proto_codec::ProtocolError::new(
                 novarocks_proto_codec::FieldPath::root("provider_payload"),
-                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause),
+                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause.clone()),
                 cause.to_string(),
             );
             assert_eq!(super::status_from_contract_error(error).code(), code);
@@ -715,6 +857,8 @@ mod tests {
             .expect("execution id"),
             error_source: None,
             primary_error: None,
+            failure: None,
+            worker_contexts_converged: false,
             runtime_filter,
         }
     }
@@ -838,6 +982,42 @@ mod tests {
             value["runtime_filter"]["totals"]["consumers"]["output_rows"],
             7
         );
+    }
+
+    #[test]
+    fn terminal_observation_projects_original_attempt_input_without_claiming_logical_acceptance() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        let mut snapshot =
+            debug_snapshot_with_runtime_filter(RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+            ));
+        let original = ExecutionFailureInput::new(
+            QueryFailureReason::BackendLost.failure_fact(),
+            novarocks_execution_contract::SafeDetail::truncating("original dependency refusal"),
+            ExecutionFailureSite::Coordinator,
+        );
+        snapshot.failure = Some(original.clone());
+        snapshot.worker_contexts_converged = true;
+        let json = super::lifecycle_convergence_debug_json(snapshot);
+        let bytes: Vec<u8> = serde_json::from_value(json["failure_fact"].clone()).unwrap();
+        use prost::Message;
+        let wire =
+            novarocks_proto_models::novarocks::FailureFact::decode(bytes.as_slice()).unwrap();
+        let actual = novarocks_task_codec::status::decode_failure_fact(
+            &wire,
+            novarocks_proto_codec::FieldPath::root("test_observed_fact"),
+        )
+        .unwrap();
+        assert_eq!(actual, original.fact());
+        assert_eq!(json["failure_detail"], original.detail().as_str());
+        assert_eq!(
+            json["failure_site"],
+            serde_json::json!({"kind":"coordinator"})
+        );
+        assert_eq!(json["worker_contexts_converged"], true);
     }
 
     #[test]

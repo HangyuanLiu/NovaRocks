@@ -207,7 +207,7 @@ mod tests {
                 assert_eq!(phase, CompilePhase::Validate);
                 assert!(work <= 256);
                 if (work > 0) == self.positive && !self.stopped.swap(true, Ordering::SeqCst) {
-                    return Err(self.error);
+                    return Err(self.error.clone());
                 }
                 Ok(())
             }
@@ -250,7 +250,7 @@ mod tests {
         ] {
             for positive in [false, true] {
                 let stop = Stop {
-                    error,
+                    error: error.clone(),
                     positive,
                     stopped: AtomicBool::new(false),
                 };

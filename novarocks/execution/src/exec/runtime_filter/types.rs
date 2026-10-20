@@ -51,7 +51,9 @@ pub enum RuntimeDecimalWidth {
 }
 
 impl RuntimeFilterType {
-    pub fn from_arrow_data_type(data_type: &DataType) -> Result<Self, String> {
+    pub fn from_arrow_data_type(
+        data_type: &DataType,
+    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
         let ty = match data_type {
             DataType::Boolean => Self::Boolean,
             DataType::Int8 => Self::Int8,
@@ -75,9 +77,8 @@ impl RuntimeFilterType {
                 scale: Some(*scale),
             },
             _ => {
-                return Err(format!(
-                    "unsupported runtime filter data type: {:?}",
-                    data_type
+                return Err(crate::exec::runtime_filter::failure::contract(
+                    format_args!("unsupported runtime filter data type: {:?}", data_type),
                 ));
             }
         };
@@ -101,14 +102,18 @@ impl RuntimeFilterType {
 }
 
 impl RuntimeDecimalWidth {
-    pub fn for_precision(precision: u8) -> Result<Self, String> {
+    pub fn for_precision(
+        precision: u8,
+    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
         match precision {
             1..=9 => Ok(Self::Decimal32),
             10..=18 => Ok(Self::Decimal64),
             19..=38 => Ok(Self::Decimal128),
-            _ => Err(format!(
-                "unsupported runtime filter decimal precision: {}",
-                precision
+            _ => Err(crate::exec::runtime_filter::failure::contract(
+                format_args!(
+                    "unsupported runtime filter decimal precision: {}",
+                    precision
+                ),
             )),
         }
     }
@@ -183,29 +188,44 @@ mod tests {
     #[test]
     fn rejects_decimal_precision_boundaries_outside_runtime_widths() {
         let err = RuntimeFilterType::from_arrow_data_type(&DataType::Decimal128(0, 0)).unwrap_err();
-        assert!(err.contains("unsupported runtime filter decimal precision: 0"));
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime filter decimal precision: 0")
+        );
 
         let err =
             RuntimeFilterType::from_arrow_data_type(&DataType::Decimal128(39, 0)).unwrap_err();
-        assert!(err.contains("unsupported runtime filter decimal precision: 39"));
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime filter decimal precision: 39")
+        );
     }
 
     #[test]
     fn rejects_fixed_size_binary_that_is_not_largeint() {
         let err =
             RuntimeFilterType::from_arrow_data_type(&DataType::FixedSizeBinary(15)).unwrap_err();
-        assert!(err.contains("unsupported runtime filter data type"));
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime filter data type")
+        );
     }
 
     #[test]
     fn rejects_time64_until_runtime_filters_support_time_arrays() {
         let err = RuntimeFilterType::from_arrow_data_type(&DataType::Time64(TimeUnit::Microsecond))
             .unwrap_err();
-        assert!(err.contains("unsupported runtime filter data type"));
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime filter data type")
+        );
 
         let err = RuntimeFilterType::from_arrow_data_type(&DataType::Time64(TimeUnit::Nanosecond))
             .unwrap_err();
-        assert!(err.contains("unsupported runtime filter data type"));
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime filter data type")
+        );
     }
 
     #[test]
@@ -214,6 +234,9 @@ mod tests {
             arrow::datatypes::Field::new("item", DataType::Int32, true),
         )))
         .unwrap_err();
-        assert!(err.contains("unsupported runtime filter data type"));
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime filter data type")
+        );
     }
 }

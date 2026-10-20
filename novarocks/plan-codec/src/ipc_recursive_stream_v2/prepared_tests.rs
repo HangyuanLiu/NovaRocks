@@ -35,7 +35,7 @@ fn every_boundary<T>(call: impl Fn(&Control) -> Result<T, RecursiveReaderError>,
         for cause in CAUSES {
             let refusing = Control {
                 trace: Mutex::new(Vec::new()),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&refusing), Err(RecursiveReaderError::Projection(FlatPoolResourceError::Control(actual))) if actual == cause)

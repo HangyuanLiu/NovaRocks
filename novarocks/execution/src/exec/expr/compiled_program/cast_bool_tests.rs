@@ -526,7 +526,7 @@ fn actual_compiled_bool_cast_compile_and_runtime_failures_keep_every_original_pr
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = CompileCallbacks::new(cause, at);
+            let control = CompileCallbacks::new(cause.clone(), at);
             assert!(
                 matches!(compile(&functions, package.clone(), &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
             );

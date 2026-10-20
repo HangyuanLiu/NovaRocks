@@ -118,7 +118,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -631,7 +631,7 @@ fn string_trim_compile_success_and_ordinary_tail_preserve_all_callback_causes() 
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "trim",

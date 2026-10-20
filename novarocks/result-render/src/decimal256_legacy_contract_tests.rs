@@ -135,6 +135,7 @@ fn append_public_record(text: &mut String, name: &str, value: i256, scale: i8, c
                 }
             }
             Err(error) => {
+                assert_decimal_data_source(error);
                 writeln!(
                     text,
                     "public\t{name}\t{scale}\t{capacity}\terror\t{:?}\t{:?}\t{}\t{}",
@@ -164,12 +165,15 @@ fn c16_p1_decimal256_frozen_legacy_integer_scale_precision_and_actual_encoder() 
                         hex(&atom.data[..atom.len])
                     )
                     .unwrap(),
-                    Err(error) => writeln!(
-                        &mut actual,
-                        "integer\t{name}\t{scale}\t{precision}\terror\t{:?}\t{:?}\t{}",
-                        error.kind, error.output_ordinal, error
-                    )
-                    .unwrap(),
+                    Err(error) => {
+                        assert_decimal_data_source(error);
+                        writeln!(
+                            &mut actual,
+                            "integer\t{name}\t{scale}\t{precision}\terror\t{:?}\t{:?}\t{}",
+                            error.kind, error.output_ordinal, error
+                        )
+                        .unwrap();
+                    }
                 }
             }
             for capacity in [64, 257, 4096] {
@@ -177,8 +181,41 @@ fn c16_p1_decimal256_frozen_legacy_integer_scale_precision_and_actual_encoder() 
             }
         }
     }
+    // The original value/byte corpus stays immutable. SEP-1 intentionally
+    // refines the old overloaded presentation error into invalid value data;
+    // every other field, failure position and output byte still matches it.
+    let actual_rows: Vec<_> = actual.lines().collect();
+    let expected_rows: Vec<_> = LEGACY_DECIMAL_ORACLE.lines().collect();
+    assert_eq!(actual_rows.len(), expected_rows.len());
+    for (index, (actual, expected)) in actual_rows.iter().zip(expected_rows).enumerate() {
+        let mut expected_fields: Vec<_> = expected.split('\t').collect();
+        if expected_fields[4] == "error" && expected_fields[5] == "UnsupportedPresentation" {
+            expected_fields[5] = "InvalidValue";
+            expected_fields[7] = match expected_fields[7] {
+                "bounded MySQL text encoding failed: UnsupportedPresentation" => {
+                    "bounded MySQL text encoding failed: InvalidValue"
+                }
+                "bounded MySQL text encoding failed: UnsupportedPresentation at output occurrence 0" => {
+                    "bounded MySQL text encoding failed: InvalidValue at output occurrence 0"
+                }
+                other => panic!("unexpected frozen decimal diagnostic: {other}"),
+            };
+        }
+        assert_eq!(
+            *actual,
+            expected_fields.join("\t"),
+            "decimal fixture row {index}"
+        );
+    }
+}
+
+fn assert_decimal_data_source(error: crate::RenderError) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.kind, crate::RenderErrorKind::InvalidValue);
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
     assert_eq!(
-        actual, LEGACY_DECIMAL_ORACLE,
-        "original decimal or actual result-render bytes/errors changed"
+        error.failure_fact().reason().domain(),
+        novarocks_failure_contract::domain::RESULT.get()
     );
+    assert_eq!(error.failure_fact().reason().code(), 108);
 }

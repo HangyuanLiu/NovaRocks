@@ -43,7 +43,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -635,7 +635,7 @@ fn actual_numeric_compile_success_and_ordinary_tails_keep_all_three_original_cau
             ] {
                 let c = CompileControl {
                     trace: Mutex::default(),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 assert_eq!(
                     DefaultValueRecipe::try_new(&source, &target, &c).unwrap_err(),
@@ -656,12 +656,34 @@ fn actual_numeric_runtime_success_and_ordinary_tails_keep_all_seven_original_cau
         None,
     ]));
     let wrong: ArrayRef = Arc::new(StringArray::from(vec![Some("7"), None, Some("8")]));
-    for array in [&valid, &wrong] {
+    for (array, success) in [(&valid, true), (&wrong, false)] {
         let baseline = Control::default();
-        let _ = r.evaluate_complete(EvaluatedArgument::Column(array), 3, &baseline);
+        let original = r.evaluate_complete(EvaluatedArgument::Column(array), 3, &baseline);
+        assert_eq!(original.is_ok(), success);
         let trace = baseline.trace.lock().unwrap().clone();
-        assert!(!trace.is_empty());
-        assert!(trace.last().copied().unwrap() > 0);
+        if success {
+            assert!(trace.last().copied().unwrap() > 0);
+        } else {
+            // The outer entry and shared validator entry run before the exact
+            // selected-type refusal; the validator does not append a footer.
+            assert_eq!(trace, [0, 0]);
+            assert_eq!(
+                original.unwrap_err(),
+                invalid("evaluated argument differs from its exact selected type")
+            );
+            for cause in failures() {
+                let c = Control {
+                    trace: Mutex::default(),
+                    refusal: Some((trace.len(), cause)),
+                };
+                assert_eq!(
+                    r.evaluate_complete(EvaluatedArgument::Column(array), 3, &c)
+                        .unwrap_err(),
+                    invalid("evaluated argument differs from its exact selected type")
+                );
+                assert_eq!(*c.trace.lock().unwrap(), trace);
+            }
+        }
         for stop in 0..trace.len() {
             for cause in failures() {
                 let c = Control {

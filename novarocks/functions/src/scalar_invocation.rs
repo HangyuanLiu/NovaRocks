@@ -21,7 +21,7 @@
 pub use crate::builtin::scalar_invocation_data::{ScalarInvocationData, ScalarInvocationFailure};
 use crate::kernel_control::{internal, invalid};
 use crate::opaque_memory::OpaqueRetainedCharge;
-use crate::scalar_kernel::{ScalarInvocationError, ScalarInvocationRuntime, evaluate_scalar_once};
+use crate::scalar_kernel::{ScalarInvocationRuntime, evaluate_scalar_once};
 use crate::*;
 use std::{fmt, sync::Arc};
 
@@ -70,11 +70,6 @@ pub trait InvocationScalarKernelInstance: Send {
         Err(invalid("scalar owner does not implement explicit invocation scope").into())
     }
     fn retained_bytes(&self) -> usize;
-}
-impl ScalarInvocationError for ScalarInvocationFailure {
-    fn omit_failure_footer(&self) -> bool {
-        true
-    }
 }
 impl ScalarInvocationRuntime<ScalarInvocationFailure> for dyn InvocationScalarKernelInstance {
     fn invoke<'a>(
@@ -169,7 +164,7 @@ fn specialize_invocation_scalar_once<O: PureInvocationScalarImplementation + ?Si
         |contract| {
             owner
                 .prepare_invocation_scalar(input, contract, control)
-                .map_err(FunctionSpecializationFailure::Kernel)
+                .map_err(FunctionSpecializationFailure::from)
         },
     )
 }
@@ -203,7 +198,7 @@ pub(crate) fn specialize_invocation_scalar_once_checked<
                 .prepare_invocation_scalar_checked(input, checked, contract, control)
                 .map_err(|error| match error {
                     crate::CheckedOwnerFailure::Original(error) => {
-                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::from(
                             error,
                         ))
                     }
@@ -234,7 +229,7 @@ fn specialize_invocation_scalar_once_core<
     let (receipt, effects) = refine(arguments)?;
     let contract = Arc::new(
         ScalarCallContract::from_refined_invocation(input, &receipt, selected, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {

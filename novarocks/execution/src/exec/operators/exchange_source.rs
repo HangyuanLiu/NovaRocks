@@ -27,29 +27,24 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::binding::ExchangeBinding;
-use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::shape::{Source, SourceKernel};
+use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 use crate::runtime::exchange;
 use crate::runtime::fragment::io::ExchangeReceiverKey;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::UniqueId;
 use tracing::debug;
-
-static EXCHANGE_SOURCE_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
-
-fn should_log_exchange_source_ready() -> bool {
-    let count = EXCHANGE_SOURCE_READY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    count.is_multiple_of(1024)
-}
 
 struct ExchangeIdleDeadlineState {
     current: Option<DriverBlockDeadline>,
@@ -235,32 +230,43 @@ impl ExchangeSourceFactory {
     }
 }
 
+impl ExchangeSourceFactory {
+    // The signal is construction metadata, not a readiness predicate. Tests
+    // observe this same signal without polling work or starting an idle timer.
+    pub(super) fn create_source(&self, driver_id: i32) -> (Box<dyn Operator>, Arc<Observable>) {
+        let source_observable = Arc::new(Observable::new());
+        let idle_deadline = Arc::new(ExchangeIdleDeadline::new());
+        self.idle_progress
+            .register(&idle_deadline, &source_observable);
+        let operator: Box<dyn Operator> = Box::new(Source::new(ExchangeSourceOperator {
+            name: self.name.clone(),
+            node: self.node,
+            binding: self.binding.clone(),
+            driver_id,
+            receiver: None,
+            idle_deadline,
+            idle_progress: Arc::clone(&self.idle_progress),
+            source_observable: Arc::clone(&source_observable),
+            logged_first_pull: false,
+            logged_first_none: false,
+            #[cfg(novarocks_dev_controls)]
+            last_partial_eos_marker_count: 0,
+            receiver_mem_tracker_ready: false,
+            receiver_mem_tracker_root: None,
+            #[cfg(novarocks_dev_controls)]
+            test_observer: None,
+        }));
+        (operator, source_observable)
+    }
+}
+
 impl OperatorFactory for ExchangeSourceFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        let source_observable = Arc::new(Observable::new());
-        let idle_deadline = Arc::new(ExchangeIdleDeadline::new());
-        self.idle_progress
-            .register(&idle_deadline, &source_observable);
-        Box::new(ExchangeSourceOperator {
-            name: self.name.clone(),
-            node: self.node.clone(),
-            binding: self.binding.clone(),
-            driver_id,
-            receiver: None,
-            idle_deadline,
-            idle_progress: Arc::clone(&self.idle_progress),
-            source_observable,
-            finished: false,
-            logged_first_pull: false,
-            logged_first_none: false,
-            #[cfg(novarocks_dev_controls)]
-            last_partial_eos_marker_count: 0,
-            receiver_mem_tracker_ready: false,
-        })
+        self.create_source(driver_id).0
     }
 
     fn is_source(&self) -> bool {
@@ -277,15 +283,75 @@ struct ExchangeSourceOperator {
     source_observable: Arc<Observable>,
     idle_deadline: Arc<ExchangeIdleDeadline>,
     idle_progress: Arc<ExchangeIdleProgress>,
-    finished: bool,
     logged_first_pull: bool,
     logged_first_none: bool,
     #[cfg(novarocks_dev_controls)]
     last_partial_eos_marker_count: usize,
     receiver_mem_tracker_ready: bool,
+    receiver_mem_tracker_root: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
+    #[cfg(novarocks_dev_controls)]
+    test_observer: Option<Arc<dyn exchange::TestEventObserver>>,
 }
 
-impl Operator for ExchangeSourceOperator {
+impl ExchangeSourceOperator {
+    fn waiting(&self, observed_generation: u64) -> StepResult {
+        StepResult::new(
+            None,
+            NextStep::Wait(WaitFact {
+                reason: WaitReason::Input,
+                observable: Arc::clone(&self.source_observable),
+                observed_generation,
+                deadline: self.idle_deadline.arm(self.node.timeout),
+            }),
+            0,
+        )
+    }
+}
+
+#[derive(Debug)]
+enum ExchangeSourceFailure {
+    NotPrepared,
+    IdleTimeout {
+        key: exchange::ExchangeKey,
+        expected_senders: usize,
+        timeout: std::time::Duration,
+    },
+}
+impl std::fmt::Display for ExchangeSourceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPrepared => f.write_str("exchange source operator not prepared"),
+            Self::IdleTimeout {
+                key,
+                expected_senders,
+                timeout,
+            } => write!(
+                f,
+                "exchange timeout waiting for senders: finst_id={} node_id={} expected_senders={} timeout_ms={}",
+                key.finst_uuid(),
+                key.node_id,
+                expected_senders,
+                timeout.as_millis()
+            ),
+        }
+    }
+}
+impl std::error::Error for ExchangeSourceFailure {}
+impl novarocks_failure_contract::FailureProjection for ExchangeSourceFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let (class, reason) = match self {
+            Self::IdleTimeout { .. } => (FailureClass::Dependency, 1),
+            Self::NotPrepared => (FailureClass::Invariant, 2),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::EXCHANGE, std::num::NonZeroU16::new(reason).unwrap()),
+        )
+    }
+}
+
+impl OperatorLifecycle for ExchangeSourceOperator {
     fn name(&self) -> &str {
         &self.name
     }
@@ -310,90 +376,50 @@ impl Operator for ExchangeSourceOperator {
         Ok(())
     }
 
-    fn close(&mut self) -> ExecutionResult<()> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.receiver_mem_tracker_root = state.mem_tracker();
+        #[cfg(novarocks_dev_controls)]
+        {
+            self.test_observer = state.exchange_test_observer();
+        }
+        Ok(())
+    }
+
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
         self.idle_deadline.cancel();
         Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
 
     fn cancel(&mut self) {
         self.idle_deadline.cancel();
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
 }
 
-impl ProcessorOperator for ExchangeSourceOperator {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
-        if self.finished {
-            return false;
-        }
-        let Some(receiver) = self.receiver.as_ref() else {
-            return false;
-        };
-        let ready = receiver.has_output_or_finished(self.binding.expected_senders);
-        if ready {
-            self.idle_deadline.clear();
-        } else if self.idle_deadline.is_expired() {
-            if should_log_exchange_source_ready() {
-                debug!(
-                    "ExchangeSource has_output due to idle timeout: finst={} node_id={} timeout={:?}",
-                    self.binding.key.finst_uuid(),
-                    self.node.node_id,
-                    self.node.timeout
-                );
-            }
-            return true;
-        }
-        if ready && should_log_exchange_source_ready() {
-            debug!(
-                "ExchangeSource has_output due to receiver: finst={} node_id={} expected_senders={}",
-                self.binding.key.finst_uuid(),
-                self.node.node_id,
-                self.binding.expected_senders
-            );
-        }
-        ready
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("exchange source operator does not accept input"
-            .to_string()
-            .into())
-    }
-
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.finished {
-            return Ok(None);
-        }
-
+impl SourceKernel for ExchangeSourceOperator {
+    fn poll_output(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
         if self.receiver.is_none() {
-            return Err("exchange source operator not prepared".to_string().into());
+            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                ExchangeSourceFailure::NotPrepared,
+            ));
         }
-
         if !self.receiver_mem_tracker_ready {
             self.receiver_mem_tracker_ready = true;
-            if let Some(root) = state.mem_tracker() {
-                let _ = self
-                    .binding
+            if let Some(root) = self.receiver_mem_tracker_root.as_ref() {
+                self.binding
                     .receiver_port
-                    .ensure_mem_tracker(receiver_key(self.binding.key), &root)?;
+                    .ensure_mem_tracker(receiver_key(self.binding.key), root)?;
             }
         }
-
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        let observed_generation = self.source_observable.generation();
         if !self.logged_first_pull {
             self.logged_first_pull = true;
             debug!(
@@ -402,46 +428,130 @@ impl ProcessorOperator for ExchangeSourceOperator {
             );
         }
 
-        loop {
-            let receiver = self.receiver.as_ref().expect("receiver");
-            let out = receiver
-                .try_pop_next_with_stats(self.binding.expected_senders)
-                .map_err(|e| e.to_string())?;
+        let receiver = self.receiver.as_ref().expect("receiver");
+        let out = receiver.try_pop_next_with_stats(self.binding.expected_senders)?;
 
-            match out {
-                Some(exchange::ExchangePopResult::Chunk(chunk)) => {
-                    self.idle_deadline.clear();
-                    let input_rows = chunk.len();
-                    if chunk.is_empty() {
-                        debug!(
-                            "ExchangeSource filtered empty chunk: node_id={} driver_id={} input_rows={}",
-                            self.node.node_id, self.driver_id, input_rows
-                        );
-                        continue;
-                    }
+        match out {
+            Some(exchange::ExchangePopResult::Chunk(chunk)) => {
+                self.idle_deadline.clear();
+                let input_rows = chunk.len();
+                if chunk.is_empty() {
                     debug!(
-                        "ExchangeSource output chunk: node_id={} driver_id={} input_rows={} output_rows={}",
-                        self.node.node_id,
-                        self.driver_id,
-                        input_rows,
-                        chunk.len()
+                        "ExchangeSource filtered empty chunk: node_id={} driver_id={} input_rows={}",
+                        self.node.node_id, self.driver_id, input_rows
                     );
-                    return Ok(Some(chunk));
+                    return Ok(StepResult::new(None, NextStep::Runnable, input_rows as u64));
                 }
-                Some(exchange::ExchangePopResult::Finished(stats)) => {
-                    self.idle_deadline.cancel();
-                    #[cfg(novarocks_dev_controls)]
-                    if let Some(observer) = state
-                        .exchange_test_observer()
-                        .filter(|observer| observer.is_active())
-                    {
-                        let snapshot = self
-                            .binding
-                            .receiver_port
-                            .snapshot(receiver_key(self.binding.key));
+                debug!(
+                    "ExchangeSource output chunk: node_id={} driver_id={} input_rows={} output_rows={}",
+                    self.node.node_id,
+                    self.driver_id,
+                    input_rows,
+                    chunk.len()
+                );
+                return Ok(StepResult::new(
+                    Some(chunk),
+                    NextStep::Runnable,
+                    input_rows as u64,
+                ));
+            }
+            Some(exchange::ExchangePopResult::Finished(stats)) => {
+                self.idle_deadline.cancel();
+                #[cfg(novarocks_dev_controls)]
+                if let Some(observer) = self
+                    .test_observer
+                    .as_ref()
+                    .filter(|observer| observer.is_active())
+                {
+                    let snapshot = self
+                        .binding
+                        .receiver_port
+                        .snapshot(receiver_key(self.binding.key));
+                    exchange::emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
+                        format!(
+                            "event=source_finished finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                            self.binding.key.finst_uuid(),
+                            self.node.node_id,
+                            self.driver_id,
+                            self.binding.expected_senders,
+                            snapshot,
+                            self.source_observable.generation(),
+                        )
+                    });
+                }
+                debug!(
+                    "ExchangeSource finished: finst={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
+                    self.binding.key.finst_uuid(),
+                    self.node.node_id,
+                    self.driver_id,
+                    stats.request_received,
+                    stats.bytes_received,
+                    stats.deserialize_ns,
+                    stats.chunks_received,
+                    stats.rows_received
+                );
+                return Ok(StepResult::new(None, NextStep::Finished, 0));
+            }
+            None => {
+                if self.idle_deadline.is_expired() {
+                    let error = crate::runtime::fragment::ExecutionFailure::from_domain(
+                        ExchangeSourceFailure::IdleTimeout {
+                            key: self.binding.key,
+                            expected_senders: self.binding.expected_senders,
+                            timeout: self.node.timeout,
+                        },
+                    );
+                    ctx.report_failure(error.clone());
+                    let snapshot = self
+                        .binding
+                        .receiver_port
+                        .snapshot(receiver_key(self.binding.key));
+                    debug!(
+                        "ExchangeSource timeout waiting for senders: finst_id={} node_id={} timeout={:?} expected_senders={} snapshot={:?}",
+                        self.binding.key.finst_uuid(),
+                        self.node.node_id,
+                        self.node.timeout,
+                        self.binding.expected_senders,
+                        snapshot,
+                    );
+                    return Err(error);
+                }
+                let first_none = !self.logged_first_none;
+                if first_none {
+                    self.logged_first_none = true;
+                }
+                #[cfg(novarocks_dev_controls)]
+                if let Some(observer) = self
+                    .test_observer
+                    .as_ref()
+                    .filter(|observer| observer.is_active())
+                {
+                    let snapshot = self
+                        .binding
+                        .receiver_port
+                        .snapshot(receiver_key(self.binding.key));
+                    if first_none {
+                        let first_snapshot = snapshot.clone();
                         exchange::emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
                             format!(
-                                "event=source_finished finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                "event=source_first_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                self.binding.key.finst_uuid(),
+                                self.node.node_id,
+                                self.driver_id,
+                                self.binding.expected_senders,
+                                first_snapshot,
+                                self.source_observable.generation(),
+                            )
+                        });
+                    }
+                    if let Some(snapshot) = snapshot
+                        && snapshot.finished_senders > self.last_partial_eos_marker_count
+                        && snapshot.finished_senders < self.binding.expected_senders
+                    {
+                        self.last_partial_eos_marker_count = snapshot.finished_senders;
+                        exchange::emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
+                            format!(
+                                "event=source_partial_eos_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
                                 self.binding.key.finst_uuid(),
                                 self.node.node_id,
                                 self.driver_id,
@@ -451,120 +561,16 @@ impl ProcessorOperator for ExchangeSourceOperator {
                             )
                         });
                     }
+                }
+                if first_none {
                     debug!(
-                        "ExchangeSource finished: finst={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
-                        self.binding.key.finst_uuid(),
-                        self.node.node_id,
-                        self.driver_id,
-                        stats.request_received,
-                        stats.bytes_received,
-                        stats.deserialize_ns,
-                        stats.chunks_received,
-                        stats.rows_received
+                        "ExchangeSource no output yet: node_id={} driver_id={}",
+                        self.node.node_id, self.driver_id
                     );
-                    self.finished = true;
-                    return Ok(None);
                 }
-                None => {
-                    if self.idle_deadline.is_expired() {
-                        let snapshot = self
-                            .binding
-                            .receiver_port
-                            .snapshot(receiver_key(self.binding.key));
-                        debug!(
-                            "ExchangeSource timeout waiting for senders: finst_id={} node_id={} timeout={:?} expected_senders={} snapshot={:?}",
-                            self.binding.key.finst_uuid(),
-                            self.node.node_id,
-                            self.node.timeout,
-                            self.binding.expected_senders,
-                            snapshot,
-                        );
-                        return Err(format!(
-                            "exchange timeout waiting for senders: finst_id={} node_id={} expected_senders={} snapshot={snapshot:?}",
-                            self.binding.key.finst_uuid(),
-                            self.node.node_id,
-                            self.binding.expected_senders,
-                        ).into());
-                    }
-                    let first_none = !self.logged_first_none;
-                    if first_none {
-                        self.logged_first_none = true;
-                    }
-                    #[cfg(novarocks_dev_controls)]
-                    if let Some(observer) = state
-                        .exchange_test_observer()
-                        .filter(|observer| observer.is_active())
-                    {
-                        let snapshot = self
-                            .binding
-                            .receiver_port
-                            .snapshot(receiver_key(self.binding.key));
-                        if first_none {
-                            let first_snapshot = snapshot.clone();
-                            exchange::emit_exchange_snapshot_marker(
-                                Some(observer.as_ref()),
-                                || {
-                                    format!(
-                                        "event=source_first_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
-                                        self.binding.key.finst_uuid(),
-                                        self.node.node_id,
-                                        self.driver_id,
-                                        self.binding.expected_senders,
-                                        first_snapshot,
-                                        self.source_observable.generation(),
-                                    )
-                                },
-                            );
-                        }
-                        if let Some(snapshot) = snapshot
-                            && snapshot.finished_senders > self.last_partial_eos_marker_count
-                            && snapshot.finished_senders < self.binding.expected_senders
-                        {
-                            self.last_partial_eos_marker_count = snapshot.finished_senders;
-                            exchange::emit_exchange_snapshot_marker(
-                                Some(observer.as_ref()),
-                                || {
-                                    format!(
-                                        "event=source_partial_eos_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
-                                        self.binding.key.finst_uuid(),
-                                        self.node.node_id,
-                                        self.driver_id,
-                                        self.binding.expected_senders,
-                                        snapshot,
-                                        self.source_observable.generation(),
-                                    )
-                                },
-                            );
-                        }
-                    }
-                    if first_none {
-                        debug!(
-                            "ExchangeSource no output yet: node_id={} driver_id={}",
-                            self.node.node_id, self.driver_id
-                        );
-                    }
-                    return Ok(None);
-                }
+                return Ok(self.waiting(observed_generation));
             }
         }
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn precondition_dependency(
-        &self,
-    ) -> Option<crate::exec::pipeline::dependency::DependencyHandle> {
-        None
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        Some(Arc::clone(&self.source_observable))
-    }
-
-    fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
-        self.idle_deadline.arm(self.node.timeout)
     }
 }
 
@@ -665,49 +671,44 @@ mod tests {
 
     struct CountingSink {
         rows: Arc<AtomicUsize>,
-        finishing: bool,
     }
-
-    impl Operator for CountingSink {
+    impl OperatorLifecycle for CountingSink {
         fn name(&self) -> &str {
             "COUNTING_SINK"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finishing
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+    }
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for CountingSink {}
+    impl crate::exec::pipeline::shape::SinkKernel for CountingSink {
+        fn consume(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            input: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            let rows = input.into_uncovered_chunk()?.len();
+            self.rows.fetch_add(rows, Ordering::AcqRel);
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                crate::exec::pipeline::step::NextStep::NeedInput,
+                rows as u64,
+            ))
         }
     }
 
-    impl ProcessorOperator for CountingSink {
-        fn need_input(&self) -> bool {
-            !self.finishing
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-            self.rows.fetch_add(chunk.len(), Ordering::AcqRel);
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            self.finishing = true;
-            Ok(())
-        }
+    fn source_step(source: &mut Box<dyn Operator>, state: &RuntimeState) -> StepResult {
+        use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork};
+        let control = state.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
+        source
+            .as_mut()
+            .drive(&mut StepContext::new(&control, &mut work))
+            .expect("source step")
+    }
+    fn idle_deadline(source: &mut Box<dyn Operator>, state: &RuntimeState) -> DriverBlockDeadline {
+        let step = source_step(source, state);
+        assert!(step.output.is_none());
+        let NextStep::Wait(wait) = step.next else {
+            panic!("an actual idle poll must report its wait");
+        };
+        wait.deadline.expect("idle deadline")
     }
 
     struct TimeoutPipeline {
@@ -729,17 +730,13 @@ mod tests {
         register_int32_receiver(&binding);
         let factory = ExchangeSourceFactory::new_compiled(key.node_id, timeout, binding.clone());
         let state = Arc::new(runtime_state());
-        let mut source = factory.create(1, 0);
+        let (mut source, observable) = factory.create_source(0);
         source.prepare().expect("prepare exchange source");
         source
             .bind_runtime_state(&state)
             .expect("bind exchange source runtime");
-        let observable = source
-            .as_processor_ref()
-            .and_then(ProcessorOperator::source_observable)
-            .expect("exchange source observable");
         let rows = Arc::new(AtomicUsize::new(0));
-        let completion = FragmentCompletion::new(1);
+        let completion = FragmentCompletion::new(1, state.error_state());
         let fragment = Arc::new(FragmentContext::new(
             None,
             Arc::clone(&state),
@@ -766,23 +763,24 @@ mod tests {
         rows: Arc<AtomicUsize>,
         completion: Arc<FragmentCompletion>,
         fragment: Arc<FragmentContext>,
-    ) {
+    ) -> Arc<crate::exec::pipeline::driver::DriverScheduleState> {
         let driver = PipelineDriver::new(
             0,
             vec![
                 source,
-                Box::new(CountingSink {
-                    rows,
-                    finishing: false,
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CountingSink { rows },
+                )),
             ],
             None,
             Vec::new(),
             state,
             fragment.fragment_instance_id(),
         );
+        let parked = driver.schedule_state();
         let task = DriverTask::new(driver, completion, fragment, Duration::from_millis(5));
         executor.submit(vec![task]);
+        parked
     }
 
     fn wait_for_exchange_timeout(
@@ -794,7 +792,13 @@ mod tests {
             std::thread::yield_now();
         }
         if !completion.should_abort() {
-            let error = "exchange timeout test did not complete".to_string();
+            let error = crate::runtime::fragment::ExecutionFailure::from(
+                novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(
+                        &("exchange timeout test did not complete"),
+                    ),
+                ),
+            );
             completion.fail(error.clone());
             fragment.set_final_status(error);
         }
@@ -861,7 +865,7 @@ mod tests {
             binding,
         } = timeout_pipeline(key, Duration::from_millis(100));
         let executor = GlobalDriverExecutor::new(1);
-        submit_timeout_pipeline(
+        let parked = submit_timeout_pipeline(
             &executor,
             state,
             source,
@@ -871,10 +875,10 @@ mod tests {
         );
 
         let registration_deadline = Instant::now() + Duration::from_secs(1);
-        while observable.num_observers() == 0 && Instant::now() < registration_deadline {
+        while !parked.is_in_blocked() && Instant::now() < registration_deadline {
             std::thread::yield_now();
         }
-        assert!(observable.num_observers() > 0, "source did not park");
+        assert!(parked.is_in_blocked(), "source did not park");
         let after_park = observable.generation();
         binding.receiver_port.push_local(
             receiver_key(key),
@@ -928,14 +932,11 @@ mod tests {
         first.prepare().expect("prepare first exchange source");
         second.prepare().expect("prepare second exchange source");
 
-        let first_before = first
-            .as_processor_ref()
-            .and_then(ProcessorOperator::source_block_deadline)
-            .expect("first source deadline");
-        let second_before = second
-            .as_processor_ref()
-            .and_then(ProcessorOperator::source_block_deadline)
-            .expect("second source deadline");
+        let state = runtime_state();
+        first.bind_runtime_state(&state).unwrap();
+        second.bind_runtime_state(&state).unwrap();
+        let first_before = idle_deadline(&mut first, &state);
+        let second_before = idle_deadline(&mut second, &state);
         assert_eq!(first_before.token(), 1);
         assert_eq!(second_before.token(), 1);
 
@@ -946,25 +947,11 @@ mod tests {
             vec![int32_chunk(vec![11])],
             false,
         );
-        let output = first
-            .as_processor_mut()
-            .expect("first processor")
-            .pull_chunk(&runtime_state())
-            .expect("first source pull")
+        let output = source_step(&mut first, &state)
+            .output
             .expect("first source chunk");
         assert_eq!(int32_values(&output), vec![11]);
-        assert!(
-            !second
-                .as_processor_ref()
-                .expect("second processor")
-                .has_output(),
-            "the sibling consumed the only queued chunk"
-        );
-
-        let second_after = second
-            .as_processor_ref()
-            .and_then(ProcessorOperator::source_block_deadline)
-            .expect("reset second source deadline");
+        let second_after = idle_deadline(&mut second, &state);
         assert_ne!(
             second_after.token(),
             second_before.token(),
@@ -1000,36 +987,32 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(5);
+        let completion = FragmentCompletion::new(5, state.error_state());
         let rows = Arc::new(AtomicUsize::new(0));
-        let mut observables = Vec::new();
+        let mut parked = Vec::new();
         let mut tasks = Vec::new();
         for driver_id in 0..5 {
-            let mut source = factory.create(5, driver_id);
+            let (mut source, _) = factory.create_source(driver_id);
             source.prepare().expect("prepare exchange source");
             source
                 .bind_runtime_state(&state)
                 .expect("bind exchange source runtime");
-            observables.push(
-                source
-                    .as_processor_ref()
-                    .and_then(ProcessorOperator::source_observable)
-                    .expect("source observable"),
-            );
             let driver = PipelineDriver::new(
                 driver_id,
                 vec![
                     source,
-                    Box::new(CountingSink {
-                        rows: Arc::clone(&rows),
-                        finishing: false,
-                    }),
+                    Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                        CountingSink {
+                            rows: Arc::clone(&rows),
+                        },
+                    )),
                 ],
                 None,
                 Vec::new(),
                 Arc::clone(&state),
                 fragment.fragment_instance_id(),
             );
+            parked.push(driver.schedule_state());
             tasks.push(DriverTask::new(
                 driver,
                 Arc::clone(&completion),
@@ -1041,17 +1024,11 @@ mod tests {
         let executor = GlobalDriverExecutor::new(2);
         executor.submit(tasks);
         let park_deadline = Instant::now() + Duration::from_secs(1);
-        while observables
-            .iter()
-            .any(|observable| observable.num_observers() == 0)
-            && Instant::now() < park_deadline
-        {
+        while parked.iter().any(|state| !state.is_in_blocked()) && Instant::now() < park_deadline {
             std::thread::yield_now();
         }
         assert!(
-            observables
-                .iter()
-                .all(|observable| observable.num_observers() > 0),
+            parked.iter().all(|state| state.is_in_blocked()),
             "every high-DOP exchange driver must be parked before EOS"
         );
 
@@ -1068,7 +1045,12 @@ mod tests {
         completion
             .wait_timeout(
                 Duration::from_secs(1),
-                "shared exchange EOS did not finish every parked driver".to_string(),
+                novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(
+                        &("shared exchange EOS did not finish every parked driver".to_string()),
+                    ),
+                )
+                .into(),
             )
             .expect("all exchange drivers finish after the third sender EOS");
         assert_eq!(rows.load(Ordering::Acquire), 0);

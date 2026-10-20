@@ -47,7 +47,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -604,7 +604,7 @@ fn encoded_plain_ingress_and_bare_null_follow_logical_counts_and_generic_profile
 }
 
 #[test]
-fn compile_callbacks_keep_original_three_causes_on_success_and_ordinary_refusal_tails() {
+fn compile_callbacks_keep_original_three_causes_before_success_or_semantic_refusal() {
     for source in [
         Some(FunctionValueType::new(DataType::Int32, true)),
         Some(FunctionValueType::new(DataType::Null, true)),
@@ -623,7 +623,7 @@ fn compile_callbacks_keep_original_three_causes_on_success_and_ordinary_refusal_
             ] {
                 let control = CompileControl {
                     trace: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     compile_cause(fixture.prepare(false, &control).unwrap_err()),
@@ -868,7 +868,7 @@ fn zero_partition_and_retained_representation_bound_keep_typed_nonnull_empty_out
 }
 
 #[test]
-fn static_source_options_and_direct_ordinary_tail_do_not_publish_or_erase_original_control() {
+fn static_source_options_and_direct_first_cause_keep_original_control() {
     let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
     let fixture = Fixture::new(Some(ty(&values, false)), DecimalOverflowPolicy::ReportError);
     let changed = [FunctionArgument::Value {
@@ -952,7 +952,9 @@ fn static_source_options_and_direct_ordinary_tail_do_not_publish_or_erase_origin
         Err(KernelFailure::InvalidProgram(_))
     ));
     let trace = baseline.trace.lock().unwrap().clone();
-    assert_eq!(trace.last(), Some(&1));
+    // The actual shape author already refused. Successful callbacks before
+    // that point remain observable; a new completion tail cannot replace it.
+    assert_eq!(trace, [0]);
     for at in 0..trace.len() {
         for cause in causes() {
             let mut part = prepared
@@ -975,5 +977,139 @@ fn static_source_options_and_direct_ordinary_tail_do_not_publish_or_erase_origin
             );
             assert!(stopped.trace.lock().unwrap().is_empty());
         }
+    }
+}
+
+#[test]
+fn count_real_partition_shape_error_precedes_every_armed_completion_refusal() {
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+    let fixture = Fixture::new(Some(ty(&values, false)), DecimalOverflowPolicy::ReportError);
+    let prepared = fixture.prepare(false, &CompileControl::default()).unwrap();
+    let arguments = [EvaluatedArgument::Column(&values)];
+    let peers = [WindowRowRange { start: 0, end: 2 }];
+    let frames = [WindowRowRange { start: 0, end: 2 }; 2];
+    let input = geometry(&prepared, &arguments, &peers, &frames);
+    for late in causes() {
+        let mut partition = prepared
+            .clone()
+            .begin_partition(input, &Control::default())
+            .unwrap();
+        let control = Control {
+            trace: Mutex::default(),
+            refusal: Some((1, late)),
+        };
+        assert!(matches!(
+            partition.evaluate(Selection::all(3), 3, &control),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        assert_eq!(*control.trace.lock().unwrap(), [0]);
+        let stopped = Control::default();
+        assert_eq!(
+            partition.finish(&stopped),
+            Err(KernelFailure::InstanceFailed)
+        );
+        assert!(stopped.trace.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn count_real_finish_clears_original_counts_before_success_tail_refusal_and_owner_drop() {
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+    let fixture = Fixture::new(Some(ty(&values, false)), DecimalOverflowPolicy::ReportError);
+    let prepared = fixture.prepare(false, &CompileControl::default()).unwrap();
+    let arguments = [EvaluatedArgument::Column(&values)];
+    let peers = [WindowRowRange { start: 0, end: 2 }];
+    let frames = [WindowRowRange { start: 0, end: 2 }; 2];
+    let input = geometry(&prepared, &arguments, &peers, &frames);
+    let before = Arc::strong_count(&prepared);
+    let mut partition = prepared
+        .clone()
+        .begin_partition(input, &Control::default())
+        .unwrap();
+    assert_eq!(Arc::strong_count(&prepared), before + 1);
+    assert!(partition.retained_bytes() > size_of::<CountPartition>());
+    // Entry succeeds, real counts=Box::default runs, then successful work's
+    // genuine final checkpoint refuses. Error must not suppress that cleanup.
+    let stop = Control {
+        trace: Mutex::default(),
+        refusal: Some((1, KernelFailure::Cancelled)),
+    };
+    assert_eq!(partition.finish(&stop), Err(KernelFailure::Cancelled));
+    assert_eq!(*stop.trace.lock().unwrap(), [0, 1]);
+    assert_eq!(partition.retained_bytes(), size_of::<CountPartition>());
+    assert_eq!(Arc::strong_count(&prepared), before + 1);
+    let repeated = Control::default();
+    assert_eq!(
+        partition.finish(&repeated),
+        Err(KernelFailure::InstanceFailed)
+    );
+    assert!(repeated.trace.lock().unwrap().is_empty());
+    drop(partition);
+    assert_eq!(Arc::strong_count(&prepared), before);
+}
+
+#[test]
+fn count_installed_compile_semantic_error_keeps_first_cause_and_drops_temporary_owners() {
+    let fixture = Fixture::new(
+        Some(FunctionValueType::new(DataType::Int64, true)),
+        DecimalOverflowPolicy::OutputNull,
+    );
+    let run = |control: &dyn PureCompileControl| {
+        let mut options = fixture.preparation(false);
+        if let PureCallPreparation::AggregateWindow { options, .. } = &mut options {
+            options.window = WindowCallOptions::try_new(
+                Some(WindowFrame {
+                    units: WindowFrameUnits::Rows,
+                    start: WindowBound::UnboundedPreceding,
+                    end: WindowBound::CurrentRow,
+                    exclusion: WindowFrameExclusion::CurrentRow,
+                }),
+                false,
+                &CompileControl::default(),
+            )
+            .unwrap();
+        }
+        fixture.catalog.prepare_fresh_selected(
+            fixture.input(),
+            fixture.selected.clone(),
+            options,
+            control,
+        )
+    };
+    let baseline = CompileControl::default();
+    assert!(matches!(
+        run(&baseline),
+        Err(FunctionSpecializationFailure::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
+    ));
+    let trace = baseline.trace.lock().unwrap().clone();
+    assert!(!trace.is_empty());
+    let source = CompileControlError::from_domain(
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+    );
+    let original_owners = Arc::strong_count(&fixture.selected);
+    let control = CompileControl {
+        trace: Mutex::default(),
+        refusal: Some((trace.len(), source.clone())),
+    };
+    assert!(matches!(
+        run(&control),
+        Err(FunctionSpecializationFailure::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
+    ));
+    assert_eq!(*control.trace.lock().unwrap(), trace);
+    assert_eq!(Arc::strong_count(&fixture.selected), original_owners);
+    for at in 0..trace.len() {
+        let control = CompileControl {
+            trace: Mutex::default(),
+            refusal: Some((at, source.clone())),
+        };
+        assert!(
+            matches!(run(&control),Err(FunctionSpecializationFailure::Control(actual)) if actual==source)
+        );
+        assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        assert_eq!(Arc::strong_count(&fixture.selected), original_owners);
     }
 }

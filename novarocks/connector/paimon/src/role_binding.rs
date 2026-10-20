@@ -1477,7 +1477,7 @@ impl PaimonConnectorReadWireAdapter {
     fn private_rejection(&self, error: ConnectorCodecError) -> ConnectorCodecError {
         ConnectorCodecError::new(
             ConnectorFieldPath::root("provider_payload"),
-            error.kind(),
+            error.kind().clone(),
             format!("{}: {}", error.path(), error.detail()),
         )
     }

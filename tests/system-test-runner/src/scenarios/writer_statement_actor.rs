@@ -34,6 +34,7 @@ pub(super) struct WriterActor {
     deadline: Instant,
     observation: QueryLifecycleStatementObservation,
     sql_outcome: Arc<Mutex<Option<SqlOutcome>>>,
+    reentry_release: Option<mpsc::SyncSender<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +64,7 @@ impl WriterActor {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (submit_tx, submit_rx) = mpsc::sync_channel(1);
         let (done_tx, done) = mpsc::sync_channel(1);
+        let (reentry_release, reentry_wait) = mpsc::sync_channel(1);
         let user = context.mysql_user().to_owned();
         let port = context.mysql_port();
         context.remaining("connect original writer actor")?;
@@ -102,17 +104,26 @@ impl WriterActor {
                         .lock()
                         .map(|mut saved| *saved = Some(classification))
                         .map_err(|_| anyhow::anyhow!("original writer SQL outcome owner poisoned"));
-                    let reentry = if matches!(classification, SqlOutcome::PublicError) {
-                        require_public_error_reentry(connection)
-                    } else {
-                        Ok(())
-                    };
                     let delivery = match done_tx.send(outcome) {
                         Ok(()) => Ok(()),
                         Err(mpsc::SendError(Err(actual))) => Err(anyhow::Error::from(actual)
                             .context("original writer query failed after its result owner closed")),
                         Err(mpsc::SendError(Ok(_))) => Err(anyhow::anyhow!(
                             "original writer result owner closed before delivery"
+                        )),
+                    };
+                    // Preserve this exact idle connection while the scenario
+                    // observes only the original writer's counter window.
+                    // A disconnected gate is failure cleanup, never reentry.
+                    let reentry = match reentry_wait
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(()) if matches!(classification, SqlOutcome::PublicError) => {
+                            require_public_error_reentry(connection)
+                        }
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+                        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                            "original writer reentry gate deadline expired"
                         )),
                     };
                     combine(combine(delivery, reentry), recorded)
@@ -129,10 +140,12 @@ impl WriterActor {
             Ok(ready) => ready,
             Err(primary) => {
                 drop(submit_tx);
+                drop(reentry_release);
                 return combine::<Self>(Err(primary), join(actor));
             }
         };
         if let Err(primary) = submit_tx.send(()) {
+            drop(reentry_release);
             let cleanup = combine(
                 join(actor),
                 context
@@ -150,6 +163,7 @@ impl WriterActor {
             deadline,
             observation,
             sql_outcome,
+            reentry_release: Some(reentry_release),
         })
     }
 
@@ -163,6 +177,11 @@ impl WriterActor {
         let mut cleanup = Ok(());
         if primary.is_err()
             && self
+                .sql_outcome
+                .lock()
+                .map(|saved| saved.is_none())
+                .unwrap_or(true)
+            && self
                 .actor
                 .as_ref()
                 .is_some_and(|actor| !actor.is_finished())
@@ -171,6 +190,14 @@ impl WriterActor {
             if cleanup.is_err() {
                 cleanup = combine(cleanup, context.shutdown());
             }
+        }
+        // KILL above cannot strike SELECT 1: reentry is still gated until the
+        // original SQL is known complete or its cancellation has returned.
+        if let Some(release) = self.reentry_release.take() {
+            let released = release.send(()).map_err(|_| {
+                anyhow::anyhow!("original writer reentry owner exited before release")
+            });
+            cleanup = combine(cleanup, released);
         }
         if let Some(actor) = self.actor.take() {
             cleanup = combine(cleanup, join(actor));
@@ -228,8 +255,16 @@ impl Drop for WriterActor {
     fn drop(&mut self) {
         // The normal driver calls settle so failures remain reportable. This
         // unwind fallback still joins, instead of detaching live SQL work.
+        // Disconnect before cancellation/join: an idle actor must not retain
+        // this thread, and an in-flight SQL must never start reentry on Drop.
+        drop(self.reentry_release.take());
         if let Some(actor) = self.actor.take() {
-            if !actor.is_finished() {
+            let sql_running = self
+                .sql_outcome
+                .lock()
+                .map(|saved| saved.is_none())
+                .unwrap_or(true);
+            if sql_running && !actor.is_finished() {
                 let _ = cancel(&self.user, self.port, self.connection_id, self.deadline);
             }
             let _ = join(actor);

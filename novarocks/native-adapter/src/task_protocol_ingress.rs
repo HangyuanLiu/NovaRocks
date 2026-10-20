@@ -161,9 +161,13 @@ impl RegistryTaskExecutionIngress {
         {
             return Ok(encode_receipt(
                 operation_id,
-                OperationOutcome::CompatibilityMismatch,
-                "native compatibility identity does not match this backend process",
-                None,
+                novarocks_execution_contract::operation::OperationResult::Verdict {
+                    outcome: OperationOutcome::CompatibilityMismatch,
+                    detail: Some(novarocks_execution_contract::SafeDetail::truncating(
+                        "native compatibility identity does not match this backend process",
+                    )),
+                    acknowledgement: None,
+                },
             ));
         }
         match operation {
@@ -949,7 +953,7 @@ mod tests {
             &self,
             _descriptor: &TaskDescriptor,
             input: TaskCreationInput,
-            _preparation_stop: novarocks_worker::TaskPreparationStopView,
+            _preparation_stop: novarocks_worker::TaskPreparationContext<'_>,
         ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
             let (fragment, _assignment) = input.into_parts();
             self.prepared
@@ -961,18 +965,15 @@ mod tests {
                 FieldPath::root("frozen_fragment"),
             )
             .map_err(|error| {
-                HostRejection::new(
-                    novarocks_execution_contract::TaskFailureCategory::Protocol,
-                    format!("static package carrier is not decodable: {error}"),
-                )
+                HostRejection::from_domain(novarocks_execution_contract::task_execution::status::TaskFailureCategory::Protocol, error)
             })?;
             let package = novarocks_proto_models::physical_package_v2::FragmentPackage::decode(
                 decoded.package().clone(),
             )
             .map_err(|error| {
-                HostRejection::new(
+                HostRejection::from_domain(
                     novarocks_execution_contract::TaskFailureCategory::Protocol,
-                    format!("static package is not decodable: {error}"),
+                    novarocks_plan_codec::physical_package_v2::PackageWireError::Protobuf(error),
                 )
             })?;
             use novarocks_proto_models::physical_package_v2::fragment_sink::Kind;
@@ -982,9 +983,16 @@ mod tests {
                 .and_then(|fragment| fragment.sink.as_ref())
                 .and_then(|sink| sink.kind.as_ref())
                 .ok_or_else(|| {
-                    HostRejection::new(
+                    HostRejection::from_domain(
                         novarocks_execution_contract::TaskFailureCategory::Protocol,
-                        "static package has no sink",
+                        novarocks_proto_codec::ProtocolError::new(
+                            FieldPath::root("frozen_fragment")
+                                .field("package")
+                                .field("fragment")
+                                .field("sink"),
+                            novarocks_proto_codec::ProtocolErrorKind::MissingField,
+                            "static package has no sink",
+                        ),
                     )
                 })?;
             let sink_kind = match kind {
@@ -1064,6 +1072,9 @@ mod tests {
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
                 crate::task_execution_observation::backend_task_execution_ports(
+                    Arc::new(
+                        novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+                    ),
                     #[cfg(novarocks_dev_controls)]
                     None,
                 ),
@@ -1199,7 +1210,8 @@ mod tests {
                 self.native_compatibility_id,
                 self.registry.admission_epoch_capability(),
             )]);
-            let Some(ReceiptAck::QueryContextAdmissionTicket(ack)) = &response.receipts[0].ack
+            let Some(ReceiptAck::QueryContextAdmissionTicket(ack)) =
+                receipt_ack(&response.receipts[0])
             else {
                 panic!("ticket acquisition returns its grant");
             };
@@ -1531,7 +1543,29 @@ mod tests {
     }
 
     fn outcome_of(receipt: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
-        proto::TaskOperationOutcome::try_from(receipt.outcome).expect("a known outcome")
+        let value = match receipt.result.as_ref().expect("a required result branch") {
+            proto::task_operation_receipt::Result::Verdict(v) => v.outcome,
+            proto::task_operation_receipt::Result::DomainFailure(v) => v.outcome,
+        };
+        proto::TaskOperationOutcome::try_from(value).expect("a known outcome")
+    }
+
+    fn receipt_ack(receipt: &proto::TaskOperationReceipt) -> Option<&ReceiptAck> {
+        match receipt.result.as_ref().expect("required result branch") {
+            proto::task_operation_receipt::Result::Verdict(v) => v.ack.as_ref(),
+            proto::task_operation_receipt::Result::DomainFailure(_) => None,
+        }
+    }
+    fn receipt_detail(receipt: &proto::TaskOperationReceipt) -> &str {
+        match receipt.result.as_ref().expect("required result branch") {
+            proto::task_operation_receipt::Result::Verdict(v) => &v.safe_detail,
+            proto::task_operation_receipt::Result::DomainFailure(v) => {
+                &v.failure
+                    .as_ref()
+                    .expect("required producer failure")
+                    .safe_detail
+            }
+        }
     }
 
     fn assert_create_replay(
@@ -1539,7 +1573,7 @@ mod tests {
         replay: &proto::TaskOperationReceipt,
     ) {
         let (Some(ReceiptAck::CreateTask(original)), Some(ReceiptAck::CreateTask(replay))) =
-            (original.ack.as_ref(), replay.ack.as_ref())
+            (receipt_ack(original), receipt_ack(replay))
         else {
             panic!("both create receipts carry the original Task identity");
         };
@@ -1549,6 +1583,88 @@ mod tests {
         let replay_status = replay.current_status.as_ref().expect("current status");
         assert_eq!(replay_status.identity, original_status.identity);
         assert!(replay_status.status_version >= original_status.status_version);
+    }
+
+    #[test]
+    fn a_domain_refusal_retains_the_actual_worker_reason_without_a_task_conclusion() {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        use novarocks_execution_contract::operation::{DomainFailureOutcome, OperationResult};
+
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(1, 1);
+        let response = fixture.apply(vec![
+            fixture.establish(context, TaskOperationId::new_v7()),
+            create_task(context, identity, TaskOperationId::new_v7()),
+        ]);
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::Accepted
+        );
+        fixture.wait_installed(identity);
+        let source = fixture
+            .registry
+            .status_source(context)
+            .expect("actual Task source");
+        let installed = source.latest(identity).expect("installed Task status");
+        let applied = fixture.task_host.domains_applied.load(Ordering::SeqCst);
+
+        // Edge 9 is valid wire syntax but absent from this exact frozen descriptor.
+        // The real Worker membership author must refuse before host execution.
+        let operation = TaskOperationId::new_v7();
+        let response = fixture.apply(vec![proto::TaskOperation {
+            envelope: Some(envelope(operation)),
+            operation: Some(proto::task_operation::Operation::UpdateTask(
+                proto::UpdateTaskRequest {
+                    identity: Some(encode_task_identity(identity)),
+                    domains: vec![proto::TaskDomainUpdate {
+                        domain: Some(proto::task_domain_update::Domain::OpenExchangeEdges(
+                            proto::OpenExchangeEdgesDomain {
+                                version: 1,
+                                edge_ids: vec![9],
+                            },
+                        )),
+                    }],
+                },
+            )),
+        }]);
+        let wire = &response.receipts[0];
+        assert!(
+            receipt_ack(wire).is_none(),
+            "a refusal carries no positive ACK"
+        );
+        let header = novarocks_task_codec::operation::decode_receipt_header(
+            wire,
+            FieldPath::root("actual_worker_refusal"),
+        )
+        .expect("the actual Native response preserves a typed refusal");
+        assert_eq!(header.operation_id(), operation);
+        let OperationResult::DomainFailure { outcome, failure } = header.result() else {
+            panic!("Worker domain facts must not collapse into a protocol verdict");
+        };
+        assert_eq!(*outcome, DomainFailureOutcome::DomainConflict);
+        assert_eq!(
+            failure.fact(),
+            FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(63).unwrap()),
+            )
+        );
+        assert_eq!(
+            failure.detail().as_str(),
+            "edge open names exchange edge 9 which the descriptor did not freeze"
+        );
+        assert_eq!(
+            fixture.task_host.domains_applied.load(Ordering::SeqCst),
+            applied
+        );
+        assert_eq!(
+            source.latest(identity).unwrap(),
+            installed,
+            "a port refusal is no Task termination acceptance"
+        );
     }
 
     #[test]
@@ -1568,7 +1684,7 @@ mod tests {
             proto::TaskOperationOutcome::CompatibilityMismatch
         );
         assert!(
-            response.receipts[0].ack.is_none(),
+            receipt_ack(&response.receipts[0]).is_none(),
             "a compatibility rejection cannot acknowledge an establishment"
         );
         assert_eq!(
@@ -1611,7 +1727,7 @@ mod tests {
             proto::TaskOperationOutcome::Accepted
         );
         assert!(matches!(
-            response.receipts[0].ack,
+            receipt_ack(&response.receipts[0]),
             Some(ReceiptAck::QueryContext(_))
         ));
         assert_eq!(
@@ -1652,7 +1768,7 @@ mod tests {
             "a rejected item must not carry the valid establish down with it"
         );
         assert!(matches!(
-            response.receipts[1].ack,
+            receipt_ack(&response.receipts[1]),
             Some(ReceiptAck::QueryContext(_))
         ));
         assert_eq!(
@@ -1696,19 +1812,19 @@ mod tests {
             assert_eq!(outcome_of(receipt), proto::TaskOperationOutcome::Accepted);
         }
         assert!(matches!(
-            response.receipts[0].ack,
+            receipt_ack(&response.receipts[0]),
             Some(ReceiptAck::QueryContext(_))
         ));
         assert!(matches!(
-            response.receipts[1].ack,
+            receipt_ack(&response.receipts[1]),
             Some(ReceiptAck::QueryContext(_))
         ));
         assert!(matches!(
-            response.receipts[2].ack,
+            receipt_ack(&response.receipts[2]),
             Some(ReceiptAck::QuiesceQueryContext(_))
         ));
         assert!(matches!(
-            response.receipts[3].ack,
+            receipt_ack(&response.receipts[3]),
             Some(ReceiptAck::ReleaseQueryContext(_))
         ));
     }
@@ -1738,11 +1854,11 @@ mod tests {
             proto::TaskOperationOutcome::InvalidStateOrRequest
         );
         assert!(
-            response.receipts[1].ack.is_none(),
+            receipt_ack(&response.receipts[1]).is_none(),
             "a refusal carries no acknowledgement"
         );
         assert!(
-            !response.receipts[1].safe_detail.is_empty(),
+            !receipt_detail(&response.receipts[1]).is_empty(),
             "a refusal carries its own redacted diagnostic"
         );
         assert_eq!(
@@ -2429,7 +2545,7 @@ mod tests {
             outcome_of(&response.receipts[1]),
             proto::TaskOperationOutcome::Accepted,
             "unexpected create refusal: {}",
-            response.receipts[1].safe_detail
+            receipt_detail(&response.receipts[1])
         );
         fixture.wait_installed(identity);
 
@@ -2685,13 +2801,32 @@ mod tests {
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         fixture.wait_installed(identity);
+        let retained = Arc::new(OpaqueContent) as Arc<dyn CodecOwnedContent>;
+        let projection = novarocks_task_codec::domain::encode_task_dynamic_filter_domain(
+            DomainVersion::new(3).unwrap(),
+            retained.as_ref(),
+        )
+        .expect_err("the actual retained payload is not a filter envelope");
+        assert!(matches!(
+            projection,
+            novarocks_task_codec::domain::DynamicFilterProjectionError::NotAFilterEnvelope
+        ));
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, FailureReason, domain,
+        };
+        let fact = projection.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Invariant);
+        assert_eq!(
+            fact.reason(),
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(820).unwrap())
+        );
         fixture
             .task_host
             .reporter(identity)
             .advertise_dynamic_filters(
                 DomainVersion::new(3).expect("nonzero version"),
                 2,
-                Arc::new(OpaqueContent) as Arc<dyn CodecOwnedContent>,
+                Arc::clone(&retained),
             );
 
         let error = fixture
@@ -2702,11 +2837,7 @@ mod tests {
             })
             .expect_err("this boundary cannot encode a codec-owned payload");
         assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(
-            error.message().contains("version 3"),
-            "the refusal must name what it could not encode: {}",
-            error.message()
-        );
+        assert_eq!(error.message(), "Invariant failure (reason 13:820)");
     }
 
     #[test]
@@ -2749,7 +2880,7 @@ mod tests {
             "{:?}",
             response.receipts[1]
         );
-        assert!(response.receipts[1].ack.is_some());
+        assert!(receipt_ack(&response.receipts[1]).is_some());
         fixture.wait_installed(identity);
 
         let mut changed = CreateCarriers::producer(context, identity);
@@ -2968,7 +3099,7 @@ mod tests {
             "{:?}",
             fenced.receipts[0]
         );
-        assert!(fenced.receipts[0].ack.is_none());
+        assert!(receipt_ack(&fenced.receipts[0]).is_none());
         assert_eq!(fixture.task_host.prepared().len(), 1);
     }
 

@@ -15,18 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef};
+use novarocks_functions::KernelFailure;
 use novarocks_functions::builtin::map_lookup_core::{
     MapLookupFailure, MapLookupInputs, lookup_observed,
 };
-use std::convert::Infallible;
 pub fn eval_element_at<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if !matches!(args.len(), 2 | 3) {
+        return Err(expression_contract(
+            "element_at map requires 2 or 3 prepared arguments",
+        ));
+    }
     let map_arr = arena.eval(args[0], chunk)?;
     let key_arr = arena.eval(args[1], chunk)?;
     let check_arr = if args.len() == 3 {
@@ -35,20 +41,30 @@ pub fn eval_element_at<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         None
     };
     let inputs = MapLookupInputs::new(&map_arr, &key_arr, check_arr.as_ref())?;
-    inputs.validate_legacy_lengths()?;
-    Ok((lookup_observed(
+    inputs.validate_direct_lengths()?;
+    lookup_observed(
         &inputs,
         novarocks_functions::Selection::all(inputs.map.len()),
-        |_, row| Ok::<_, Infallible>(inputs.legacy_rows(row)),
+        |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
         arena.data_type(expr),
-        |_, _| Ok::<(), Infallible>(()),
-        |_, message| Err(message),
-        &mut |_| Ok::<(), Infallible>(()),
+        |values, indices| {
+            novarocks_functions::selected_copy::preflight_original_take(
+                values,
+                novarocks_functions::selected_copy::CopyIndexView::UInt32(indices),
+                |_| Ok(()),
+            )
+            .map_err(novarocks_functions::selected_copy::CopyError::into_kernel)
+        },
+        |ordinal, cause| {
+            Err(novarocks_functions::builtin::map_lookup_core::required_row_error(ordinal, cause))
+        },
+        &mut |_| Ok::<(), KernelFailure>(()),
     )
     .map_err(|failure| match failure {
-        MapLookupFailure::Data(message) => message,
-        MapLookupFailure::Control(never) => match never {},
-    }))?)
+        MapLookupFailure::Operation(cause) | MapLookupFailure::Control(cause) => {
+            ExecutionFailure::from(cause)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -75,11 +91,10 @@ mod tests {
         calls: RefCell<Vec<ExprId>>,
     }
     impl ExprEvaluation for FailingProbe {
-        type Error = ExecutionFailure;
         fn arena(&self) -> &ExprArena {
             &self.arena
         }
-        fn eval(&self, id: ExprId, _: &Chunk) -> Result<ArrayRef, Self::Error> {
+        fn eval(&self, id: ExprId, _: &Chunk) -> Result<ArrayRef, ExecutionFailure> {
             self.calls.borrow_mut().push(id);
             if id == self.map_id {
                 Ok(self.map.clone())
@@ -87,18 +102,8 @@ mod tests {
                 Err(self.cause.clone())
             }
         }
-        fn slice_input(&self, _: &Chunk, _: usize, _: usize) -> Result<Chunk, Self::Error> {
+        fn slice_input(&self, _: &Chunk, _: usize, _: usize) -> Result<Chunk, ExecutionFailure> {
             panic!("empty Map must not retry a failed probe")
-        }
-        fn recoverable_error(&self, _: &Self::Error) -> bool {
-            false
-        }
-        fn annotate_error(
-            &self,
-            error: Self::Error,
-            _: impl FnOnce(&str) -> String,
-        ) -> Self::Error {
-            error
         }
     }
 
@@ -138,9 +143,7 @@ mod tests {
         )
         .unwrap();
         let chunk = Chunk::new_with_chunk_schema(batch, schema);
-        let mut causes = vec![ExecutionFailure::from(
-            "original probe row error".to_owned(),
-        )];
+        let mut causes = vec![super::super::common::null_key()];
         causes.extend(
             [
                 KernelFailure::Cancelled,

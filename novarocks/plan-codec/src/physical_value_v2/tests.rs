@@ -48,7 +48,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after original refusal");
         }
@@ -686,7 +686,7 @@ fn every_callback(
     assert!(baseline.iter().all(|(phase, _)| *phase == expected_phase));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(
                 matches!(action(), Err(Error::Control(c)) if c == cause),
                 "at={at}, cause={cause:?}"
@@ -831,7 +831,7 @@ fn value_namespace_real_320_occurrences_observe_quantum_and_retain_order() {
             .unwrap();
         for at in [0, quantum, baseline.len() - 1] {
             for cause in CAUSES {
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 let result = match phase {
                     CompilePhase::Encode => {
                         encode_values(&inputs, &payloads, &types, WIDE_SOURCE, limits()).map(|_| ())

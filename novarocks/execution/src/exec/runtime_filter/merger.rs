@@ -196,9 +196,11 @@ impl PartialRuntimeInFilterMerger {
         partition: usize,
         ht_row_count: usize,
         filters: Vec<RuntimeInFilter>,
-    ) -> Result<Option<Vec<RuntimeInFilter>>, String> {
+    ) -> Result<Option<Vec<RuntimeInFilter>>, crate::runtime::fragment::ExecutionFailure> {
         if partition >= self.expected_partitions {
-            return Err("runtime in-filter partition out of bounds".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime in-filter partition out of bounds",
+            ));
         }
         let mut guard = self.state.lock().expect("runtime in-filter merge lock");
         guard.ht_row_counts[partition] = ht_row_count;
@@ -218,7 +220,9 @@ impl PartialRuntimeInFilterMerger {
             max_rows = max_rows.max(rows);
             let Some(filters) = guard.partial_filters[idx].as_ref() else {
                 self.record_in_filter_drop("in_filter_partial_missing_or_empty");
-                return Err("runtime in-filter missing partial filters".to_string());
+                return Err(crate::exec::runtime_filter::failure::contract(
+                    "runtime in-filter missing partial filters",
+                ));
             };
             if filters.is_empty() {
                 can_merge = false;
@@ -242,15 +246,23 @@ impl PartialRuntimeInFilterMerger {
 
         let mut total = guard.partial_filters[active_indices[0]]
             .as_ref()
-            .ok_or_else(|| "runtime in-filter missing partial filters".to_string())?
+            .ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime in-filter missing partial filters",
+                )
+            })?
             .clone();
 
         for idx in active_indices.iter().skip(1) {
-            let filters = guard.partial_filters[*idx]
-                .as_ref()
-                .ok_or_else(|| "runtime in-filter missing partial filters".to_string())?;
+            let filters = guard.partial_filters[*idx].as_ref().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime in-filter missing partial filters",
+                )
+            })?;
             if filters.len() != total.len() {
-                return Err("runtime in-filter size mismatch".to_string());
+                return Err(crate::exec::runtime_filter::failure::contract(
+                    "runtime in-filter size mismatch",
+                ));
             }
             for (target, source) in total.iter_mut().zip(filters.iter()) {
                 target.merge_from(source)?;
@@ -264,9 +276,12 @@ impl PartialRuntimeInFilterMerger {
         partition: usize,
         params: Vec<RuntimeMembershipFilterBuildParam>,
         options: RuntimeMembershipBuildOptions,
-    ) -> Result<Option<Vec<RuntimeMembershipFilter>>, String> {
+    ) -> Result<Option<Vec<RuntimeMembershipFilter>>, crate::runtime::fragment::ExecutionFailure>
+    {
         if partition >= self.expected_partitions {
-            return Err("runtime membership filter partition out of bounds".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime membership filter partition out of bounds",
+            ));
         }
         let mut guard = self
             .state
@@ -299,7 +314,9 @@ impl PartialRuntimeInFilterMerger {
         }
         for params in parts.iter().skip(1) {
             if params.len() != expected_len {
-                return Err("runtime membership filter size mismatch".to_string());
+                return Err(crate::exec::runtime_filter::failure::contract(
+                    "runtime membership filter size mismatch",
+                ));
             }
         }
 
@@ -318,7 +335,9 @@ impl PartialRuntimeInFilterMerger {
                     || meta.ltype() != other.ltype()
                     || meta.join_mode() != other.join_mode()
                 {
-                    return Err("runtime membership filter metadata mismatch".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime membership filter metadata mismatch",
+                    ));
                 }
             }
             let mut min_max = RuntimeMinMaxFilter::empty_range(meta.ltype())?;
@@ -421,7 +440,7 @@ mod tests {
             .add_partial(0, 1, vec![filter])
             .expect_err("missing active partition payload should remain an error");
 
-        assert_eq!(err, "runtime in-filter missing partial filters");
+        assert_eq!(err.to_string(), "runtime in-filter missing partial filters");
         let counters = merger.drain_drop_counters();
         assert_eq!(counters.in_filters, 1);
         assert_eq!(counters.membership_filters, 0);

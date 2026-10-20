@@ -47,6 +47,17 @@ pub(crate) fn finish_attempt<T, H>(
     result: Result<T, FragmentCreationError<H>>,
     work: CompileCheckpoints<'_>,
 ) -> Result<T, FragmentCreationError<H>> {
+    // A nested compiler owner authors its own facts. Keeping a richer
+    // cause must not make a later footer replace its already observed refusal.
+    if let Err(FragmentCreationError::Compile(source)) = &result {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        if matches!(
+            source.failure_fact().class(),
+            FailureClass::Resource | FailureClass::Control
+        ) {
+            return result;
+        }
+    }
     if matches!(
         &result,
         Err(FragmentCreationError::Control(_)
@@ -101,12 +112,12 @@ impl<H> From<novarocks_local_program::ValuesCreationFailure<H>> for FragmentCrea
 }
 impl<H> From<novarocks_physical_plan::ConstantReferenceError> for FragmentCreationError<H> {
     fn from(error: novarocks_physical_plan::ConstantReferenceError) -> Self {
-        crate::unpivot::UnpivotLoweringError::from(error).into()
+        FragmentCompileError::from(error).into()
     }
 }
 impl<H> From<novarocks_functions::ConstantError> for FragmentCreationError<H> {
     fn from(error: novarocks_functions::ConstantError) -> Self {
-        crate::unpivot::UnpivotLoweringError::from(error).into()
+        FragmentCompileError::from(error).into()
     }
 }
 impl<H: fmt::Display> fmt::Display for FragmentCreationError<H> {
@@ -124,7 +135,7 @@ impl<H: Error + 'static> Error for FragmentCreationError<H> {
         match self {
             Self::Control(e) => Some(e),
             Self::Creator(e) => Some(e),
-            Self::Resource(_) => None,
+            Self::Resource(source) => Some(source),
             Self::Compile(e) => Some(e),
         }
     }
@@ -152,7 +163,7 @@ macro_rules! compiler_cause {
         }
     };
 }
-compiler_cause!(String);
+compiler_cause!(novarocks_functions::array_projection::ArrayProjectionFailure);
 compiler_cause!(novarocks_type_contract::ValueTypeError);
 compiler_cause!(crate::repeat::RepeatLoweringError);
 compiler_cause!(crate::unpivot::UnpivotLoweringError);
@@ -169,15 +180,6 @@ compiler_cause!(novarocks_local_program::ProgramChannelTypeError);
 compiler_cause!(novarocks_local_program::ProgramLexicalBindingError);
 compiler_cause!(novarocks_local_program::LocalProgramCompileError);
 
-#[derive(Debug)]
-struct GeometryError(LayoutResourceError);
-impl fmt::Display for GeometryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "compiler construction geometry: {:?}", self.0)
-    }
-}
-impl Error for GeometryError {}
-
 impl FragmentCreationError<std::convert::Infallible> {
     pub(crate) fn into_compile(self) -> FragmentCompileError {
         match self {
@@ -185,7 +187,7 @@ impl FragmentCreationError<std::convert::Infallible> {
             Self::Creator(never) => match never {},
             Self::Resource(cause) => FragmentCompileError::Owner {
                 phase: "creation geometry",
-                error: Box::new(GeometryError(cause)),
+                error: novarocks_failure_contract::SharedFailureCause::new(cause),
             },
             Self::Compile(cause) => cause,
         }
@@ -246,6 +248,39 @@ mod tests {
             crate::typed_layout::TypedLayoutBuilder::new_with_creation(1, &mut work, &mut creation),
             Err(LayoutCreationFailure::Creator(Refusal(73)))
         ));
+    }
+    #[test]
+    fn typed_array_resource_refusal_precedes_later_compilation_control() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_functions::array_projection::{
+            ArrayProjectionFailure, ArrayProjectionOperation,
+        };
+        for original in [
+            ArrayProjectionFailure::ValueType(novarocks_type_contract::ValueTypeError::TooDeep),
+            ArrayProjectionFailure::RequestArithmetic,
+            ArrayProjectionFailure::Arrow {
+                operation: ArrayProjectionOperation::RebuildArray,
+                source: arrow_schema::ArrowError::MemoryError("original array request".into()),
+            },
+        ] {
+            let expected = original.failure_fact();
+            assert_eq!(expected.class(), FailureClass::Resource);
+            let control = Control(AtomicBool::new(false));
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+            work.step().unwrap();
+            control.0.store(true, Ordering::SeqCst);
+            let result: Result<(), FragmentCreationError<Refusal>> = finish_attempt(
+                Err(FragmentCompileError::ArrayProjection(original).into()),
+                work,
+            );
+            let Err(FragmentCreationError::Compile(FragmentCompileError::ArrayProjection(cause))) =
+                result
+            else {
+                panic!("a later footer must not replace the originating array refusal: {result:?}");
+            };
+            assert_eq!(cause.failure_fact(), expected);
+        }
     }
     struct Hold(Arc<AtomicUsize>);
     impl ValueTypeStorageHold for Hold {}
@@ -357,11 +392,25 @@ where
             Failure::Control(c) => Self::Control(c),
             Failure::Creator(c) => Self::Creator(c),
             Failure::Resource(c) => Self::Resource(c),
-            Failure::Capacity(_) => Self::Control(CompileControlError::ResourceExhausted),
+            Failure::Capacity(source) => program_publication_failure(source).into(),
             Failure::Owner(c) => FragmentCompileError::from(c).into(),
         }
     }
 }
+pub(crate) fn program_publication_failure(
+    source: std::collections::TryReserveError,
+) -> FragmentCompileError {
+    FragmentCompileError::Owner {
+        phase: "program publication",
+        error: novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_local_program::ProgramCreationFailure::<
+                std::convert::Infallible,
+                std::convert::Infallible,
+            >::Capacity(source),
+        ),
+    }
+}
+
 /// Same locked Vec operation quote, before the caller's unchanged push.
 pub(crate) fn before_vec_push<T, H>(
     values: &Vec<T>,
@@ -508,9 +557,7 @@ pub(crate) fn argument_types_failure<H>(
         Failure::Control(c) => FragmentCreationError::Control(c),
         Failure::Creator(c) => FragmentCreationError::Creator(c),
         Failure::Resource(c) => FragmentCreationError::Resource(c),
-        Failure::Capacity(_) => {
-            FragmentCreationError::Control(CompileControlError::ResourceExhausted)
-        }
+        Failure::Capacity(source) => program_publication_failure(source).into(),
         Failure::Owner(never) => match never {},
     }
 }

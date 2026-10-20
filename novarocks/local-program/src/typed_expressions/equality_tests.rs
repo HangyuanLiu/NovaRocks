@@ -539,7 +539,7 @@ impl PureCompileControl for Trace {
         seen.push((phase, units));
         if self.at == Some(seen.len() - 1) {
             *refused = true;
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -582,7 +582,7 @@ fn eq_ne_actual_wide_type_walk_preserves_three_control_causes_at_every_callback_
             for at in 0..expected.len() {
                 let control = Trace {
                     at: Some(at),
-                    cause,
+                    cause: cause.clone(),
                     seen: Mutex::new(vec![]),
                     refused: Mutex::new(false),
                 };
@@ -628,7 +628,7 @@ fn invalid_eq_ordinary_error_observes_completed_tail_and_preserves_primary_contr
     ] {
         let control = Trace {
             at: Some(expected.len() - 1),
-            cause,
+            cause: cause.clone(),
             seen: Mutex::new(vec![]),
             refused: Mutex::new(false),
         };

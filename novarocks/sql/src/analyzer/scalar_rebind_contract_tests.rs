@@ -63,7 +63,7 @@ impl PureCompileControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         let at = calls.len();
         calls.push((phase, units));
-        if let Some((index, cause)) = self.stop
+        if let Some((index, cause)) = self.stop.clone()
             && at == index
         {
             return Err(cause);
@@ -393,7 +393,7 @@ fn scalar_rebind_lawful_canonical_source_keeps_policy_and_catalog_owned_changed_
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Fault {
     Short,
     Long,
@@ -446,7 +446,7 @@ impl SqlFunctionCatalog for FaultCatalog {
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         let at = self.calls.fetch_add(1, Ordering::SeqCst);
         if at == self.at
-            && let Fault::Control(cause) = self.fault
+            && let Fault::Control(cause) = self.fault.clone()
         {
             return Err(cause.into());
         }
@@ -580,7 +580,7 @@ fn scalar_rebind_catalog_shapes_never_truncate_arguments_or_publish_non_scalar_r
                 Fault::Relation,
                 Fault::Shape,
             ] {
-                let catalog = FaultCatalog::new(catalog(Behavior::Echo), at, fault);
+                let catalog = FaultCatalog::new(catalog(Behavior::Echo), at, fault.clone());
                 let error = bind(
                     path,
                     &catalog,
@@ -624,7 +624,7 @@ fn scalar_rebind_full_value_and_callable_targets_match_actual_coerced_ast() {
     ];
     for path in [Path::Ordinary, Path::Resolved] {
         for (fault, ty) in &cases {
-            let catalog = FaultCatalog::new(catalog(Behavior::Echo), 1, *fault);
+            let catalog = FaultCatalog::new(catalog(Behavior::Echo), 1, fault.clone());
             let error = bind(
                 path,
                 &catalog,
@@ -675,7 +675,8 @@ fn scalar_rebind_catalog_first_and_second_control_causes_never_retry() {
     for path in [Path::Ordinary, Path::Resolved] {
         for at in [0, 1] {
             for cause in CAUSES {
-                let catalog = FaultCatalog::new(catalog(Behavior::Echo), at, Fault::Control(cause));
+                let catalog =
+                    FaultCatalog::new(catalog(Behavior::Echo), at, Fault::Control(cause.clone()));
                 let error = bind(
                     path,
                     &catalog,
@@ -718,7 +719,7 @@ fn scalar_rebind_actual_success_and_ordinary_tail_keep_every_control_prefix() {
             for at in 0..recorded.len() {
                 for cause in CAUSES {
                     let control = Trace {
-                        stop: Some((at, cause)),
+                        stop: Some((at, cause.clone())),
                         ..Trace::default()
                     };
                     let error = bind(
@@ -778,7 +779,7 @@ fn scalar_rebind_wide_actual_nested_fvt_gate_observes_quantum_and_original_contr
         for at in positions {
             for cause in CAUSES {
                 let control = Trace {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Trace::default()
                 };
                 let error = bind(

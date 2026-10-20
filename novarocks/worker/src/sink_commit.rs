@@ -64,7 +64,7 @@ impl FragmentCommitPort for WorkerSinkCommitPort {
     fn acquire(
         &self,
         fragment_instance_id: UniqueId,
-    ) -> Result<Box<dyn FragmentCommitLease>, String> {
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>> {
         acquire_worker_sink_commit_lease(fragment_instance_id, WriteCommitEvidenceLimits::default())
     }
 }
@@ -85,7 +85,7 @@ impl FragmentCommitPort for ConfiguredWorkerSinkCommitPort {
     fn acquire(
         &self,
         fragment_instance_id: UniqueId,
-    ) -> Result<Box<dyn FragmentCommitLease>, String> {
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>> {
         acquire_worker_sink_commit_lease(fragment_instance_id, self.evidence_limits)
     }
 }
@@ -93,14 +93,16 @@ impl FragmentCommitPort for ConfiguredWorkerSinkCommitPort {
 fn acquire_worker_sink_commit_lease(
     fragment_instance_id: UniqueId,
     evidence_limits: WriteCommitEvidenceLimits,
-) -> Result<Box<dyn FragmentCommitLease>, String> {
+) -> novarocks_execution::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>> {
     if !try_register_with_ledger(
         fragment_instance_id,
         WriteCommitEvidenceLedger::new(evidence_limits),
     ) {
-        return Err(format!(
-            "sink commit already registered for fragment instance {fragment_instance_id}"
-        ));
+        return Err(
+            novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                DuplicateCommitRegistration(fragment_instance_id),
+            ),
+        );
     }
     Ok(Box::new(WorkerSinkCommitLease {
         fragment_instance_id,
@@ -114,6 +116,23 @@ struct WorkerSinkCommitLease {
 }
 
 impl WorkerSinkCommitLease {
+    fn require_registration_permission(
+        &self,
+        operation: CommitLeaseOperation,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        if !self.active {
+            return Err(
+                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                    CommitLeaseAfterSettled {
+                        fragment_instance_id: self.fragment_instance_id,
+                        operation,
+                    },
+                ),
+            );
+        }
+        Ok(())
+    }
+
     fn snapshot(&self) -> FragmentCommitReport {
         let snapshot = report_snapshot(self.fragment_instance_id);
         FragmentCommitReport {
@@ -143,16 +162,25 @@ impl WorkerSinkCommitLease {
 }
 
 impl FragmentCommitLease for WorkerSinkCommitLease {
-    fn add_load_stats(&mut self, stats: FragmentSinkLoadStats) {
+    fn add_load_stats(
+        &mut self,
+        stats: FragmentSinkLoadStats,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.require_registration_permission(CommitLeaseOperation::AddLoadStats)?;
         add_load_stats(
             self.fragment_instance_id,
             stats.loaded_rows,
             stats.loaded_bytes,
             stats.filtered_rows,
         );
+        Ok(())
     }
 
-    fn add_tablet_commit_info(&mut self, info: ExecutionTabletCommitInfo) -> Result<(), String> {
+    fn add_tablet_commit_info(
+        &mut self,
+        info: ExecutionTabletCommitInfo,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.require_registration_permission(CommitLeaseOperation::AddTabletCommitInfo)?;
         try_add_tablet_commit_info(
             self.fragment_instance_id,
             TabletCommitInfo {
@@ -162,7 +190,11 @@ impl FragmentCommitLease for WorkerSinkCommitLease {
         )
     }
 
-    fn add_tablet_fail_info(&mut self, info: ExecutionTabletFailInfo) -> Result<(), String> {
+    fn add_tablet_fail_info(
+        &mut self,
+        info: ExecutionTabletFailInfo,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.require_registration_permission(CommitLeaseOperation::AddTabletFailInfo)?;
         try_add_tablet_fail_info(
             self.fragment_instance_id,
             TabletFailInfo {
@@ -172,25 +204,26 @@ impl FragmentCommitLease for WorkerSinkCommitLease {
         )
     }
 
-    fn finish(mut self: Box<Self>) -> Result<FragmentCommitReport, String> {
+    fn finish(
+        &mut self,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<FragmentCommitReport> {
+        self.require_registration_permission(CommitLeaseOperation::Finish)?;
+        self.active = false;
         let snapshot = self.snapshot();
-        if self.active {
-            unregister(self.fragment_instance_id);
-            self.active = false;
-        }
+        unregister(self.fragment_instance_id);
         Ok(snapshot)
     }
 
-    fn handoff(mut self: Box<Self>) -> Result<(), String> {
+    fn handoff(&mut self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.require_registration_permission(CommitLeaseOperation::Handoff)?;
         self.active = false;
         Ok(())
     }
 
-    fn rollback(mut self: Box<Self>) -> Result<(), String> {
-        if self.active {
-            unregister(self.fragment_instance_id);
-            self.active = false;
-        }
+    fn rollback(&mut self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.require_registration_permission(CommitLeaseOperation::Rollback)?;
+        self.active = false;
+        unregister(self.fragment_instance_id);
         Ok(())
     }
 }
@@ -200,6 +233,40 @@ impl Drop for WorkerSinkCommitLease {
         if self.active {
             unregister(self.fragment_instance_id);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitLeaseOperation {
+    AddLoadStats,
+    AddTabletCommitInfo,
+    AddTabletFailInfo,
+    Finish,
+    Handoff,
+    Rollback,
+}
+#[derive(Debug)]
+struct CommitLeaseAfterSettled {
+    fragment_instance_id: UniqueId,
+    operation: CommitLeaseOperation,
+}
+impl std::fmt::Display for CommitLeaseAfterSettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sink commit lease for fragment instance {} is settled before {:?}",
+            self.fragment_instance_id, self.operation
+        )
+    }
+}
+impl std::error::Error for CommitLeaseAfterSettled {}
+impl novarocks_execution_contract::failure::FailureProjection for CommitLeaseAfterSettled {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::SinkCommitAfterSettled.reason(),
+        )
     }
 }
 
@@ -253,7 +320,10 @@ fn unregister(finst_id: UniqueId) {
     guard.remove(&finst_id);
 }
 
-fn try_add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) -> Result<(), String> {
+fn try_add_tablet_commit_info(
+    finst_id: UniqueId,
+    info: TabletCommitInfo,
+) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard
@@ -263,13 +333,23 @@ fn try_add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) -> Res
         entry
             .evidence_ledger
             .reserve(TABLET_TERMINAL_CANONICAL_BYTES, 1)
-            .map_err(|error| format!("reserve tablet commit evidence: {error}"))?;
+            .map_err(|source| {
+                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                    CommitEvidenceFailure {
+                        operation: CommitEvidenceOperation::Commit,
+                        source,
+                    },
+                )
+            })?;
         entry.tablet_commit_infos.push(info);
     }
     Ok(())
 }
 
-fn try_add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) -> Result<(), String> {
+fn try_add_tablet_fail_info(
+    finst_id: UniqueId,
+    info: TabletFailInfo,
+) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard
@@ -279,7 +359,14 @@ fn try_add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) -> Result<
         entry
             .evidence_ledger
             .reserve(TABLET_TERMINAL_CANONICAL_BYTES, 1)
-            .map_err(|error| format!("reserve tablet failure evidence: {error}"))?;
+            .map_err(|source| {
+                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                    CommitEvidenceFailure {
+                        operation: CommitEvidenceOperation::Failure,
+                        source,
+                    },
+                )
+            })?;
         entry.tablet_fail_infos.push(info);
     }
     Ok(())
@@ -360,5 +447,288 @@ mod tests {
         assert_eq!(snapshot.tablet_fail_infos, vec![fail]);
 
         unregister(finst_id);
+    }
+    #[test]
+    fn borrowed_commit_settlement_and_box_drop_preserve_the_replacement_epoch() {
+        use novarocks_execution::runtime::fragment::io::FragmentCommitPort;
+        let port = super::WorkerSinkCommitPort;
+        for (ordinal, finish) in [false, true].into_iter().enumerate() {
+            let identity = UniqueId::new(44_598, ordinal as i64);
+            let mut original = port.acquire(identity).unwrap();
+            assert!(
+                port.acquire(identity).is_err(),
+                "the actual original registration is occupied"
+            );
+            if finish {
+                original.finish().unwrap();
+            } else {
+                original.rollback().unwrap();
+            }
+            let mut replacement = port.acquire(identity).unwrap();
+            drop(original);
+            assert!(
+                port.acquire(identity).is_err(),
+                "an old Box Drop must not unregister the new epoch"
+            );
+            replacement.rollback().unwrap();
+            let mut final_lease = port.acquire(identity).unwrap();
+            final_lease.rollback().unwrap();
+        }
+        let identity = UniqueId::new(44_598, 2);
+        let mut handed_off = port.acquire(identity).unwrap();
+        handed_off.handoff().unwrap();
+        drop(handed_off);
+        assert!(
+            port.acquire(identity).is_err(),
+            "handoff retains the host registration after lease Box Drop"
+        );
+        super::unregister(identity);
+        let mut replacement = port.acquire(identity).unwrap();
+        replacement.rollback().unwrap();
+    }
+
+    #[test]
+    fn settled_borrowed_lease_rejects_every_operation_without_touching_same_id_replacement() {
+        use super::{CommitLeaseAfterSettled, CommitLeaseOperation};
+        use novarocks_execution::runtime::fragment::{
+            ExecutionFailureCause,
+            io::{
+                FragmentCommitPort, FragmentSinkLoadStats, TabletCommitInfo as Commit,
+                TabletFailInfo as Failed,
+            },
+        };
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        let port = super::WorkerSinkCommitPort;
+        for (ordinal, settlement) in [
+            CommitLeaseOperation::Finish,
+            CommitLeaseOperation::Handoff,
+            CommitLeaseOperation::Rollback,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let identity = UniqueId::new(44_608, ordinal as i64);
+            let mut original = port.acquire(identity).unwrap();
+            original
+                .add_load_stats(FragmentSinkLoadStats {
+                    loaded_rows: 1,
+                    loaded_bytes: 2,
+                    filtered_rows: 3,
+                })
+                .unwrap();
+            match settlement {
+                CommitLeaseOperation::Finish => {
+                    let report = original.finish().unwrap();
+                    assert_eq!(report.load_stats.loaded_rows, 1);
+                }
+                CommitLeaseOperation::Handoff => {
+                    original.handoff().unwrap();
+                    assert_eq!(super::report_snapshot(identity).load_stats.loaded_rows, 1);
+                    assert!(
+                        port.acquire(identity).is_err(),
+                        "handoff retains the actual host registration"
+                    );
+                    super::unregister(identity); // The original host's explicit final retirement.
+                }
+                CommitLeaseOperation::Rollback => original.rollback().unwrap(),
+                _ => unreachable!("only settlement authors in this test"),
+            }
+            let mut replacement = port.acquire(identity).unwrap();
+            replacement
+                .add_load_stats(FragmentSinkLoadStats {
+                    loaded_rows: 17,
+                    loaded_bytes: 23,
+                    filtered_rows: 29,
+                })
+                .unwrap();
+            let commit = Commit {
+                tablet_id: 31,
+                backend_id: 37,
+            };
+            replacement.add_tablet_commit_info(commit).unwrap();
+            let expected = super::report_snapshot(identity);
+            for operation in [
+                CommitLeaseOperation::AddLoadStats,
+                CommitLeaseOperation::AddTabletCommitInfo,
+                CommitLeaseOperation::AddTabletFailInfo,
+                CommitLeaseOperation::Finish,
+                CommitLeaseOperation::Handoff,
+                CommitLeaseOperation::Rollback,
+            ] {
+                let error = match operation {
+                    CommitLeaseOperation::AddLoadStats => {
+                        original.add_load_stats(FragmentSinkLoadStats {
+                            loaded_rows: 1000,
+                            loaded_bytes: 2000,
+                            filtered_rows: 3000,
+                        })
+                    }
+                    CommitLeaseOperation::AddTabletCommitInfo => {
+                        original.add_tablet_commit_info(Commit {
+                            tablet_id: 41,
+                            backend_id: 43,
+                        })
+                    }
+                    CommitLeaseOperation::AddTabletFailInfo => {
+                        original.add_tablet_fail_info(Failed {
+                            tablet_id: 47,
+                            backend_id: 53,
+                        })
+                    }
+                    CommitLeaseOperation::Finish => original.finish().map(|_| ()),
+                    CommitLeaseOperation::Handoff => original.handoff(),
+                    CommitLeaseOperation::Rollback => original.rollback(),
+                }
+                .unwrap_err();
+                assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+                assert_eq!(
+                    error.failure_fact().reason(),
+                    crate::failure_reason::WorkerFailureReason::SinkCommitAfterSettled.reason()
+                );
+                let ExecutionFailureCause::Domain(source) = error.cause() else {
+                    panic!("the real Worker author is retained");
+                };
+                let source = source.downcast_ref::<CommitLeaseAfterSettled>().unwrap();
+                assert_eq!(source.fragment_instance_id, identity);
+                assert_eq!(source.operation, operation);
+                assert_eq!(
+                    super::report_snapshot(identity),
+                    expected,
+                    "a settled owner cannot mutate or retire a new registration"
+                );
+            }
+            drop(original);
+            assert_eq!(
+                super::report_snapshot(identity),
+                expected,
+                "old owner Drop cannot roll back a new registration"
+            );
+            let report = replacement.finish().unwrap();
+            assert_eq!(report.load_stats.loaded_rows, 17);
+            assert_eq!(report.load_stats.loaded_bytes, 23);
+            assert_eq!(report.load_stats.filtered_rows, 29);
+            assert_eq!(report.tablet_commit_infos, vec![commit]);
+            assert!(report.tablet_fail_infos.is_empty());
+            drop(replacement);
+            let mut final_owner = port.acquire(identity).unwrap();
+            final_owner.rollback().unwrap();
+        }
+    }
+
+    #[test]
+    fn actual_commit_lease_preserves_evidence_refusal_and_does_not_publish_a_partial_fact() {
+        use novarocks_execution::runtime::fragment::io::{
+            FragmentCommitPort, TabletCommitInfo as Commit, TabletFailInfo as Failed,
+        };
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, ResourceDimension, ResourceScope, domain,
+        };
+        use std::error::Error;
+        let identity = UniqueId::new(41, 43);
+        let port = super::ConfiguredWorkerSinkCommitPort::new(
+            novarocks_spi::connector::WriteCommitEvidenceLimits::try_new(16, 1).unwrap(),
+        );
+        let mut lease = port.acquire(identity).unwrap();
+        let committed = Commit {
+            tablet_id: 8,
+            backend_id: 9,
+        };
+        lease.add_tablet_commit_info(committed).unwrap();
+        lease.add_tablet_commit_info(committed).unwrap();
+        let failure = lease
+            .add_tablet_fail_info(Failed {
+                tablet_id: 10,
+                backend_id: 11,
+            })
+            .unwrap_err();
+        let fact = failure.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().domain(), domain::CONNECTOR.get());
+        assert_eq!(fact.reason().code(), 47);
+        let resource = fact.resource().unwrap();
+        assert_eq!(resource.dimension, ResourceDimension::Bytes);
+        assert_eq!(resource.requested, Some(16));
+        assert_eq!(resource.committed, Some(16));
+        assert_eq!(resource.limit, Some(16));
+        assert_eq!(resource.constraint_scope, Some(ResourceScope::Task));
+        let mut source = failure.source();
+        let mut connector = false;
+        while let Some(error) = source {
+            if let Some(original) = error.downcast_ref::<novarocks_spi::connector::ConnectorError>()
+            {
+                assert_eq!(original.failure_fact(), fact);
+                assert_eq!(
+                    original.message(),
+                    "write commit evidence exceeds fragment budget: bytes 32/16 entries 2/1"
+                );
+                connector = true;
+            }
+            source = error.source();
+        }
+        assert!(
+            connector,
+            "the real SPI source survives the Worker context and Execution envelope"
+        );
+        let report = lease.finish().unwrap();
+        assert_eq!(report.tablet_commit_infos, vec![committed]);
+        assert!(report.tablet_fail_infos.is_empty());
+        assert_eq!(
+            super::report_snapshot(identity),
+            super::SinkCommitReportSnapshot::default()
+        );
+        let mut replacement = port.acquire(identity).unwrap();
+        replacement.rollback().unwrap();
+    }
+}
+
+#[derive(Debug)]
+struct DuplicateCommitRegistration(UniqueId);
+impl std::fmt::Display for DuplicateCommitRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sink commit already registered for fragment instance {}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for DuplicateCommitRegistration {}
+impl novarocks_execution_contract::failure::FailureProjection for DuplicateCommitRegistration {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::SinkCommitAlreadyRegistered.reason(),
+        )
+    }
+}
+
+#[derive(Debug)]
+enum CommitEvidenceOperation {
+    Commit,
+    Failure,
+}
+#[derive(Debug)]
+struct CommitEvidenceFailure {
+    operation: CommitEvidenceOperation,
+    source: novarocks_spi::connector::ConnectorError,
+}
+impl std::fmt::Display for CommitEvidenceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let operation = match self.operation {
+            CommitEvidenceOperation::Commit => "commit",
+            CommitEvidenceOperation::Failure => "failure",
+        };
+        write!(f, "reserve tablet {operation} evidence: {}", self.source)
+    }
+}
+impl std::error::Error for CommitEvidenceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for CommitEvidenceFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        novarocks_execution_contract::failure::FailureProjection::failure_fact(&self.source)
     }
 }

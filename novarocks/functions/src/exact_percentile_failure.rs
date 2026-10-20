@@ -16,7 +16,7 @@
 // under the License.
 
 //! Original percentile error formatting, with no new mathematical dispatch.
-use crate::aggregate_scalar::{AggScalarValue, ScalarStateError, TrackedAggScalarValue};
+use crate::aggregate_scalar::{AggScalarValue, TrackedAggScalarValue};
 use crate::exact_percentile_core::{
     EXACT_PERCENTILE_MAGIC, EXACT_PERCENTILE_VERSION, ExactPercentileAllocator,
 };
@@ -34,8 +34,6 @@ pub enum PercentileDataRecipe<'a, A: ExactPercentileAllocator> {
     ShortPayload,
     Magic(u8),
     Version(u8),
-    ScratchOverflow,
-    Json(&'a serde_json::Error),
 }
 impl<A: ExactPercentileAllocator> fmt::Display for PercentileDataRecipe<'_, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,33 +66,157 @@ impl<A: ExactPercentileAllocator> fmt::Display for PercentileDataRecipe<'_, A> {
                 "unsupported exact percentile payload version: expected={} actual={}",
                 EXACT_PERCENTILE_VERSION, actual
             ),
-            Self::ScratchOverflow => f.write_str("exact percentile parser scratch bound overflow"),
-            Self::Json(error) => fmt::Display::fmt(error, f),
         }
     }
 }
 /// Typed receiver at the original error-construction frontier. It neither
 /// evaluates an argument nor walks a state/type/AST to decide a failure.
+
 pub trait PercentileFailureSink<A: ExactPercentileAllocator> {
     type Error;
     fn data(&mut self, recipe: PercentileDataRecipe<'_, A>) -> Self::Error;
-    fn scalar(&mut self, error: ScalarStateError) -> Self::Error;
-    fn reader(&mut self, error: String) -> Self::Error;
-    fn json(&mut self, error: &serde_json::Error, allocator: &A) -> Self::Error {
-        let _ = allocator;
-        self.data(PercentileDataRecipe::Json(error))
-    }
+    fn scalar(&mut self, error: crate::KernelFailure) -> Self::Error;
+    fn reader(&mut self, error: crate::KernelFailure) -> Self::Error;
+    fn json(&mut self, error: serde_json::Error, allocator: &A) -> Self::Error;
 }
-pub struct LegacyPercentileFailure;
-impl<A: ExactPercentileAllocator> PercentileFailureSink<A> for LegacyPercentileFailure {
-    type Error = String;
-    fn data(&mut self, recipe: PercentileDataRecipe<'_, A>) -> String {
-        recipe.to_string()
+/// Required calls return an outer failure. Only the selected host may publish
+/// the explicit value recipes into its own whole-value failure domain.
+pub struct RequiredPercentileFailure;
+impl<A: ExactPercentileAllocator> PercentileFailureSink<A> for RequiredPercentileFailure {
+    type Error = crate::KernelFailure;
+    fn data(&mut self, recipe: PercentileDataRecipe<'_, A>) -> Self::Error {
+        recipe.into_failure()
     }
-    fn scalar(&mut self, error: ScalarStateError) -> String {
-        error.to_string()
-    }
-    fn reader(&mut self, error: String) -> String {
+    fn scalar(&mut self, error: crate::KernelFailure) -> Self::Error {
         error
     }
+    fn reader(&mut self, error: crate::KernelFailure) -> Self::Error {
+        error
+    }
+    fn json(&mut self, error: serde_json::Error, _: &A) -> Self::Error {
+        json_failure(error)
+    }
+}
+impl<A: ExactPercentileAllocator> PercentileDataRecipe<'_, A> {
+    pub(crate) fn value_reason(&self) -> Option<crate::DataFailureReason> {
+        match self {
+            Self::RateOutOfRange | Self::RateMismatch { .. } => {
+                Some(crate::DataFailureReason::InvalidValue)
+            }
+            Self::ShortPayload | Self::Magic(_) | Self::Version(_) => {
+                Some(crate::DataFailureReason::InvalidEncoding)
+            }
+            Self::InvalidScalar(_) | Self::InterpolationInput(_) | Self::OutputType(_) => None,
+        }
+    }
+    pub fn into_failure(self) -> crate::KernelFailure {
+        crate::KernelFailure::from_domain(ExactPercentileFailure {
+            reason: self.value_reason(),
+            detail: novarocks_failure_contract::BoundedDetail::truncating_display(self),
+            source: None,
+        })
+    }
+}
+#[derive(Debug)]
+struct ExactPercentileFailure {
+    reason: Option<crate::DataFailureReason>,
+    detail: novarocks_failure_contract::BoundedDetail,
+    source: Option<serde_json::Error>,
+}
+impl fmt::Display for ExactPercentileFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.detail.fmt(f)
+    }
+}
+impl std::error::Error for ExactPercentileFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ExactPercentileFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        match self.reason {
+            Some(reason) => reason.failure_fact(),
+            None => FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(396).unwrap()),
+            ),
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ExactPercentileFailure {}
+pub(crate) fn json_failure(source: serde_json::Error) -> crate::KernelFailure {
+    crate::KernelFailure::from_domain(ExactPercentileFailure {
+        reason: Some(crate::DataFailureReason::InvalidEncoding),
+        detail: novarocks_failure_contract::BoundedDetail::truncating_display(&source),
+        source: Some(source),
+    })
+}
+
+pub(crate) fn json_encode_failure(source: serde_json::Error) -> crate::KernelFailure {
+    crate::KernelFailure::from_domain(ExactPercentileFailure {
+        reason: None,
+        detail: novarocks_failure_contract::BoundedDetail::truncating_display(&source),
+        source: Some(source),
+    })
+}
+#[derive(Debug)]
+struct ExactByteExtent {
+    required: u128,
+    source: Option<std::alloc::LayoutError>,
+}
+impl fmt::Display for ExactByteExtent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "exact percentile byte request {} exceeds its addressable layout",
+            self.required
+        )
+    }
+}
+impl std::error::Error for ExactByteExtent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ExactByteExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let code = std::num::NonZeroU16::new(397).unwrap();
+        FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(domain::KERNEL, code),
+        )
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::MinimumUnit,
+            layout: RepresentationLayout {
+                domain: domain::KERNEL,
+                code,
+            },
+            required: u64::try_from(self.required).ok(),
+            extent_limit: Some(isize::MAX as u64),
+            representable_prefix: None,
+        })
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ExactByteExtent {}
+pub(crate) fn byte_extent(required: u128) -> Result<usize, crate::KernelFailure> {
+    let bytes = usize::try_from(required).map_err(|_| {
+        crate::KernelFailure::from_domain(ExactByteExtent {
+            required,
+            source: None,
+        })
+    })?;
+    std::alloc::Layout::array::<u8>(bytes).map_err(|source| {
+        crate::KernelFailure::from_domain(ExactByteExtent {
+            required,
+            source: Some(source),
+        })
+    })?;
+    Ok(bytes)
 }

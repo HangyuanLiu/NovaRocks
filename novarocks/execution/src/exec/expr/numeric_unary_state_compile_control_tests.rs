@@ -32,7 +32,7 @@ impl PureCompileControl for Control {
             assert!(ordinal <= at, "callback after first real refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((at, cause)) if ordinal == at => Err(cause),
             _ => Ok(()),
         }
@@ -54,7 +54,7 @@ fn check(sum: Option<(i64, i64, i64)>, intermediate: bool) {
         ] {
             let refused = Control {
                 trace: Mutex::new(Vec::new()),
-                stop: Some((ordinal, cause)),
+                stop: Some((ordinal, cause.clone())),
             };
             let result = ordinary_union_source_for_test(sum, intermediate, &refused);
             let actual = match result {
@@ -62,6 +62,7 @@ fn check(sum: Option<(i64, i64, i64)>, intermediate: bool) {
                 Err(error) => error,
             };
             let expected = match cause {
+                CompileControlError::Source(source) => SqlCompileError::CompilationSource(source),
                 CompileControlError::Cancelled => SqlCompileError::Cancelled,
                 CompileControlError::DeadlineExceeded => SqlCompileError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted => SqlCompileError::ResourceExhausted,

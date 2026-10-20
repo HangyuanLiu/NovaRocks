@@ -303,11 +303,11 @@ fn pure_differential_array_unique_nonlist_catalogue_drift_is_named_refusal() {
         };
         assert_eq!(name, "array_unique_agg");
         let scalar = &source.data_type();
-        let list = DataType::List(Arc::new(Field::new("item", scalar.clone().clone(), true)));
+        let list = DataType::List(Arc::new(Field::new("item", (*scalar).clone(), true)));
         assert_eq!(
             reason,
             format!(
-                "bind aggregate `array_unique_agg`: prepare aggregate `array_unique_agg` overload `builtin.aggregate/array_unique_agg/derived-v1`: legacy aggregate type drift: implementation intermediate={scalar:?}, output={list:?}; catalog intermediate={scalar:?}, output={scalar:?}"
+                "prepare aggregate `array_unique_agg` overload `builtin.aggregate/array_unique_agg/derived-v1`: fragment plan build error (expression invariant): legacy aggregate type drift: implementation intermediate={scalar:?}, output={list:?}; catalog intermediate={scalar:?}, output={scalar:?}"
             )
         );
     }

@@ -63,7 +63,7 @@ fn compare_profile(dtype: DataType, p: u8, s: i8) {
                         Ok(a) => expected.push(values(&a)[0]),
                         Err(message) => {
                             expected.push(None);
-                            errors.push((ordinal, message));
+                            errors.push((ordinal, message.detail().to_owned()));
                         }
                     }
                 }

@@ -42,7 +42,10 @@ INSERT INTO ${case_db}.sqlx2_profile_timeout_cleanup VALUES (3, 3);
 -- the admission-frozen deadline without exposing execution profile objects to
 -- the compiler. The timeout must abort every participant and leave no state
 -- that contaminates the next EXPLAIN ANALYZE request.
--- @expect_error=query timed out after 1000 ms
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.deadline_exceeded
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1317 (70100): [query.execution.deadline_exceeded]
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
 SET query_timeout = 1;
 EXPLAIN ANALYZE

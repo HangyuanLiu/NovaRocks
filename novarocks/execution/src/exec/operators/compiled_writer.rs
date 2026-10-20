@@ -36,6 +36,9 @@
 //! the finish's compiled statistics owner replaces the plan-tree final
 //! aggregate and grouped Unpivot behind the finish's own coverage checks.
 
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
@@ -45,6 +48,7 @@ use novarocks_local_program::{
     ProgramNodeKind, ProgramRootInput, root_input_layout,
 };
 
+use super::compiled_writer_failure as failure;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
@@ -72,19 +76,23 @@ pub(crate) fn compiled_table_writer_factory(
     display_id: i32,
     binding: &TableWriterRuntimeBinding,
     error: &Arc<RuntimeErrorState>,
-) -> Result<TableWriterOperatorFactory, String> {
-    let node = program
-        .graph()
-        .nodes()
-        .get(id.index())
-        .ok_or_else(|| format!("missing compiled table writer node {}", id.index()))?;
+) -> ExecutionResult<TableWriterOperatorFactory> {
+    let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
+        failure::contract(format_args!(
+            "missing compiled table writer node {}",
+            id.index()
+        ))
+    })?;
     let ProgramNodeKind::TableWriter {
         target,
         writer_multiplex_layout,
         ..
     } = node.kind()
     else {
-        return Err(format!("compiled node {} is not a TableWriter", id.index()));
+        return Err(failure::contract(format_args!(
+            "compiled node {} is not a TableWriter",
+            id.index()
+        )));
     };
     let partial_aggregate_factory =
         CompiledWriterPartialFactory::try_new(program, id, Arc::clone(error))?
@@ -92,10 +100,10 @@ pub(crate) fn compiled_table_writer_factory(
     let projection = CompiledWriterProjection::try_new(Arc::clone(program), id, Arc::clone(error))?;
     let relation = WriterMultiplexRelationTemplate::try_new(writer_multiplex_layout)?;
     if relation.slots() != node.output_layout().slots() {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "compiled table writer at local node {} does not publish its multiplex relation",
             id.index()
-        ));
+        )));
     }
     TableWriterOperatorFactory::try_new_compiled(
         display_id,
@@ -116,12 +124,13 @@ pub(crate) fn compiled_table_finish_factory(
     display_id: i32,
     binding: &TableFinishRuntimeBinding,
     error: &Arc<RuntimeErrorState>,
-) -> Result<TableFinishOperatorFactory, String> {
-    let node = program
-        .graph()
-        .nodes()
-        .get(id.index())
-        .ok_or_else(|| format!("missing compiled table finish node {}", id.index()))?;
+) -> ExecutionResult<TableFinishOperatorFactory> {
+    let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
+        failure::contract(format_args!(
+            "missing compiled table finish node {}",
+            id.index()
+        ))
+    })?;
     let ProgramNodeKind::TableFinish {
         inputs,
         expected_targets,
@@ -130,27 +139,35 @@ pub(crate) fn compiled_table_finish_factory(
         ..
     } = node.kind()
     else {
-        return Err(format!("compiled node {} is not a TableFinish", id.index()));
+        return Err(failure::contract(format_args!(
+            "compiled node {} is not a TableFinish",
+            id.index()
+        )));
     };
     let [input] = inputs.as_slice() else {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "compiled table finish at local node {} reads more than one writer input",
             id.index()
-        ));
+        )));
     };
     let input_layout = program
         .graph()
         .nodes()
         .get(input.index())
-        .ok_or_else(|| format!("missing compiled table finish input {}", input.index()))?
+        .ok_or_else(|| {
+            failure::missing(format_args!(
+                "missing compiled table finish input {}",
+                input.index()
+            ))
+        })?
         .output_layout();
     if input_layout.slots() != writer_multiplex_layout.slots()
         || input_layout.schema() != writer_multiplex_layout.schema()
     {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "compiled table finish at local node {} does not read its input relation unchanged",
             id.index()
-        ));
+        )));
     }
     let statistics = CompiledFinishStatistics::try_new(program, id, Arc::clone(error))?.map(
         |(coverage, statistics)| {
@@ -189,22 +206,29 @@ impl CompiledWriterProjection {
         program: Arc<LocalProgram>,
         id: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
-        let node = program
-            .graph()
-            .nodes()
-            .get(id.index())
-            .ok_or_else(|| format!("missing compiled table writer node {}", id.index()))?;
+    ) -> ExecutionResult<Self> {
+        let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("missing compiled table writer node {}", id.index()),
+            )
+        })?;
         let ProgramNodeKind::TableWriter {
             input, projection, ..
         } = node.kind()
         else {
-            return Err(format!("compiled node {} is not a TableWriter", id.index()));
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled node {} is not a TableWriter", id.index()),
+            ));
         };
         let recipe = program.write_recipes().get(&id).ok_or_else(|| {
-            format!(
-                "compiled table writer at local node {} has no provider write recipe",
-                id.index()
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!(
+                    "compiled table writer at local node {} has no provider write recipe",
+                    id.index()
+                ),
             )
         })?;
         let fields = recipe
@@ -216,19 +240,22 @@ impl CompiledWriterProjection {
         if fields.len() != projection.expressions.len()
             || fields.len() != projection.layout.slots().len()
         {
-            return Err(format!(
-                "compiled table writer at local node {} projects {} values for {} provider fields",
-                id.index(),
-                projection.expressions.len(),
-                fields.len()
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled table writer at local node {} projects {} values for {} provider fields",
+                    id.index(),
+                    projection.expressions.len(),
+                    fields.len()
+                ),
             ));
         }
         let mut sites = Vec::with_capacity(fields.len());
         for ordinal in 0..fields.len() {
             let site = ProgramExpressionRootSite::WriterProjection {
                 node: id,
-                expression: u32::try_from(ordinal)
-                    .map_err(|_| "writer projection width exceeds u32".to_string())?,
+                expression: novarocks_local_program::checked_program_ordinal(ordinal)
+                    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
             };
             // Every projected value reads the writer's input port, the batch
             // the writer is pushed.
@@ -238,9 +265,12 @@ impl CompiledWriterProjection {
                     role: ProgramChannelLayoutRole::NodeOutput,
                 }) if node == *input => {}
                 other => {
-                    return Err(format!(
-                        "compiled writer projection {ordinal} at local node {} does not read its input port: {other:?}",
-                        id.index()
+                    return Err(program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        format!(
+                            "compiled writer projection {ordinal} at local node {} does not read its input port: {other:?}",
+                            id.index()
+                        ),
                     ));
                 }
             }

@@ -36,8 +36,8 @@ impl Port {
 }
 impl ScalarReadFailureSink for Port {
     type Error = JsonObjectFailure<&'static str>;
-    fn read_data(&mut self, failure: ScalarReadFailure<'_>) -> Self::Error {
-        OriginalData(failure.to_string())
+    fn read_contract(&mut self, failure: ScalarReadFailure<'_>) -> Self::Error {
+        Outer(failure.into_kernel())
     }
     fn observe(&mut self, event: ScalarReadObservation) -> Result<(), Self::Error> {
         match event {
@@ -106,6 +106,7 @@ fn output(result: Result<ArrayRef, JsonObjectFailure<&'static str>>) -> ArrayRef
     match result {
         Ok(out) => out,
         Err(OriginalData(message)) => panic!("{message}"),
+        Err(Outer(cause)) => panic!("{cause}"),
         Err(Control(cause)) => panic!("{cause}"),
     }
 }
@@ -164,7 +165,7 @@ fn json_object_core_null_key_suppresses_unsupported_reader_without_early_data() 
         Arc::new(UInt32Array::from(vec![1])),
     ];
     assert!(
-        matches!(evaluate_selected(arguments.as_slice(), Selection::all(1), &mut port()), Err(OriginalData(message)) if message == "unsupported scalar type: UInt32")
+        matches!(evaluate_selected(arguments.as_slice(), Selection::all(1), &mut port()), Err(Outer(cause)) if cause.to_string() == "unsupported scalar type: UInt32")
     );
 }
 

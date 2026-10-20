@@ -51,11 +51,17 @@ impl LegacyState {
     fn pointer(&mut self) -> AggStatePtr {
         self.raw.as_mut_ptr() as AggStatePtr
     }
-    fn update(&mut self, input: &ArrayRef) -> Result<(), String> {
+    fn update(
+        &mut self,
+        input: &ArrayRef,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         let pointers = vec![self.pointer(); input.len()];
         CountDistinctAgg.update_batch(&self.spec, 0, &pointers, &AggInputView::Any(input))
     }
-    fn merge(&mut self, input: &BinaryArray) -> Result<(), String> {
+    fn merge(
+        &mut self,
+        input: &BinaryArray,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         let pointers = vec![self.pointer(); input.len()];
         CountDistinctAgg.merge_batch(&self.spec, 0, &pointers, &AggInputView::Binary(input))
     }
@@ -294,7 +300,7 @@ fn legacy_count_distinct_decoder_rejects_truncation_before_mutating_that_row_but
         payload(&[b"abc"], &[])[..10].to_vec(),
     ] {
         assert_eq!(
-            deserialize_set(&bytes).unwrap_err(),
+            (deserialize_set(&bytes).unwrap_err()).to_string(),
             "invalid distinct set encoding"
         );
     }
@@ -306,12 +312,13 @@ fn legacy_count_distinct_decoder_rejects_truncation_before_mutating_that_row_but
         MemTracker::new_root("legacy-distinct-merge-error"),
     );
     assert_eq!(
-        state
+        (state
             .merge(&BinaryArray::from(vec![
                 valid.as_slice(),
                 malformed.as_slice()
             ]))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "invalid distinct set encoding"
     );
     assert_eq!(state.keys(), vec![b"old".to_vec()]);
@@ -347,15 +354,17 @@ fn legacy_count_distinct_unsupported_top_level_carrier_and_full_nested_error_rem
         MemTracker::new_root("legacy-distinct-errors"),
     );
     assert_eq!(
-        state
+        (state
             .update(&(Arc::new(UInt64Array::from(vec![None])) as ArrayRef))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "unsupported count_distinct input type: UInt64"
     );
     assert_eq!(
-        state
+        (state
             .update(&(Arc::new(LargeStringArray::from(vec!["a"])) as ArrayRef))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "unsupported count_distinct input type: LargeUtf8"
     );
     let name = "x".repeat(800);
@@ -372,19 +381,17 @@ fn legacy_count_distinct_unsupported_top_level_carrier_and_full_nested_error_rem
     );
     let input = arrow::array::new_empty_array(&map_type);
     let error = state.update(&input).unwrap_err();
-    assert!(error.len() > 512);
-    assert_eq!(
-        error,
-        format!("unsupported count_distinct input type: {:?}", map_type)
-    );
+    let expected = format!("unsupported count_distinct input type: {:?}", map_type);
+    assert!(expected.len() > 512);
+    crate::exec::expr::agg::functions::common::assert_bounded_outer_contract(&error, &expected);
     let child = Arc::new(StructArray::new(
         Fields::from(vec![Field::new(name, DataType::UInt64, true)]),
         vec![Arc::new(UInt64Array::from(vec![1]))],
         None,
     )) as ArrayRef;
-    // Direct struct reader diagnoses the unsupported leaf, without a bounded diagnostic carrier.
+    // The direct reader preserves the actual unsupported leaf contract.
     assert_eq!(
-        state.update(&child).unwrap_err(),
+        (state.update(&child).unwrap_err()).to_string(),
         "unsupported scalar type: UInt64"
     );
     state
@@ -415,9 +422,11 @@ fn legacy_count_distinct_allocator_table_rejection_and_key_rejection_keep_exact_
     let tracker = MemTracker::new_root("legacy-distinct-table-refusal");
     tracker.install_limit_once(1).unwrap();
     let mut set = DistinctSet::new(Arc::clone(&tracker));
-    assert_eq!(
-        set.insert(vec![1]).unwrap_err(),
-        "ResourceExhausted: reserve distinct hash set: aggregate allocation was rejected by memory tracker legacy-distinct-table-refusal or the system allocator"
+    crate::exec::expr::agg::functions::common::assert_collection_refusal::<
+        hashbrown::TryReserveError,
+    >(
+        &(set.insert(vec![1]).unwrap_err()),
+        "reserve distinct hash set",
     );
     assert_eq!(set.len(), 0);
     assert_eq!(tracker.current(), 0);
@@ -431,9 +440,11 @@ fn legacy_count_distinct_allocator_table_rejection_and_key_rejection_keep_exact_
     let tracker = MemTracker::new_root("legacy-distinct-key-refusal");
     tracker.install_limit_once(table).unwrap();
     let mut set = DistinctSet::new(Arc::clone(&tracker));
-    assert_eq!(
-        set.insert(vec![1]).unwrap_err(),
-        "ResourceExhausted: reserve aggregate byte value: aggregate allocation was rejected by memory tracker legacy-distinct-key-refusal or the system allocator"
+    crate::exec::expr::agg::functions::common::assert_collection_refusal::<
+        allocator_api2::collections::TryReserveError,
+    >(
+        &(set.insert(vec![1]).unwrap_err()),
+        "reserve aggregate byte value",
     );
     assert_eq!(set.len(), 0);
     assert_eq!(tracker.current(), table);

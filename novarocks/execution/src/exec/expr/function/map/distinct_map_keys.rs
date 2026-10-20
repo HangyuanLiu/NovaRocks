@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 use arrow::array::{Array, ArrayRef, MapArray, StructArray, make_array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -28,15 +28,25 @@ pub fn eval_distinct_map_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "distinct_map_keys requires exactly 1 arguments",
+        ));
+    }
     let map_arr = arena.eval(args[0], chunk)?;
     let map = map_arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
-        format!(
+        expression_contract(format_args!(
             "distinct_map_keys expects MapArray, got {:?}",
             map_arr.data_type()
-        )
+        ))
     })?;
 
+    crate::exec::expr::function::array::common::validate_rows(
+        map_arr.len(),
+        chunk.len(),
+        "distinct_map_keys input",
+    )?;
     let mut keys = map.keys().clone();
     let mut values = map.values().clone();
     let (map_field, ordered) = super::common::output_map_field(
@@ -46,28 +56,22 @@ pub fn eval_distinct_map_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
         "distinct_map_keys",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err(("distinct_map_keys map entries type must be Struct".to_string()).into());
+        return Err(expression_contract(
+            "distinct_map_keys map entries type must be Struct",
+        ));
     };
     if fields.len() != 2 {
-        return Err(("distinct_map_keys map entries type must have 2 fields".to_string()).into());
+        return Err(expression_contract(
+            "distinct_map_keys map entries type must have 2 fields",
+        ));
     }
     if keys.data_type() != fields[0].data_type() {
-        keys = cast(&keys, fields[0].data_type()).map_err(|e| {
-            format!(
-                "distinct_map_keys failed to cast keys to output type {:?}: {}",
-                fields[0].data_type(),
-                e
-            )
-        })?;
+        keys = cast(&keys, fields[0].data_type())
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
     if values.data_type() != fields[1].data_type() {
-        values = cast(&values, fields[1].data_type()).map_err(|e| {
-            format!(
-                "distinct_map_keys failed to cast values to output type {:?}: {}",
-                fields[1].data_type(),
-                e
-            )
-        })?;
+        values = cast(&values, fields[1].data_type())
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
     let keys_data = keys.to_data();
@@ -107,12 +111,12 @@ pub fn eval_distinct_map_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
 
         selected_rev.reverse();
         for idx in selected_rev {
+            current = novarocks_functions::aggregate_scalar::checked_map_output_offset(
+                current as i32,
+                1,
+            )? as i64;
             keys_mutable.extend(0, idx, idx + 1);
             values_mutable.extend(0, idx, idx + 1);
-            current += 1;
-        }
-        if current > i32::MAX as i64 {
-            return Err(("distinct_map_keys offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
@@ -120,7 +124,13 @@ pub fn eval_distinct_map_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
 
     let out_keys = make_array(keys_mutable.freeze());
     let out_values = make_array(values_mutable.freeze());
-    let out_entries = StructArray::new(fields.clone(), vec![out_keys, out_values], None);
+    let out_entries = StructArray::try_new(fields.clone(), vec![out_keys, out_values], None)
+        .map_err(|source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "distinct_map_keys StructArray",
+                source,
+            )
+        })?;
     let out = MapArray::try_new(
         map_field,
         OffsetBuffer::new(out_offsets.into()),
@@ -128,6 +138,11 @@ pub fn eval_distinct_map_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
         null_builder.finish(),
         ordered,
     )
-    .map_err(|e| format!("distinct_map_keys: {}", e))?;
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "distinct_map_keys constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }

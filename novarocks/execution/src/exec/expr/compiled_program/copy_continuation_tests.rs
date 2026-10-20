@@ -120,7 +120,7 @@ fn copy_chain(all_true: bool, finite: bool) {
     }
     let tracker = crate::runtime::mem_tracker::MemTracker::new_root("computed-copy-actual-creator");
     let host: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>> = finite.then(|| {
-        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone())
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone())
             as Arc<dyn novarocks_functions::AggregateStateAllocator>
     });
     let observed = ObservedControl {
@@ -401,7 +401,7 @@ fn scalar_v1_alias_into_pure_b_then_take_keeps_actual_finite_a() {
     assert!(b.typed_binding().layout().storage_lifetime().is_pure());
     let tracker = crate::runtime::mem_tracker::MemTracker::new_root("scalar-alias-actual-creator");
     let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
-        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone());
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     let observed = ObservedControl {
         original: &Control,
         refused: AtomicBool::new(false),
@@ -534,9 +534,8 @@ fn constant_nonzero_pool_ordinal_take_keeps_actual_a_even_when_current_b_is_pure
             crate::runtime::mem_tracker::MemTracker::new_root("constant-copy-actual-pool");
         let host: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>> =
             finite.then(|| {
-                crate::exec::operators::compiled_aggregate::expression_allocation_host(
-                    tracker.clone(),
-                ) as Arc<dyn novarocks_functions::AggregateStateAllocator>
+                crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone())
+                    as Arc<dyn novarocks_functions::AggregateStateAllocator>
             });
         let observed = ObservedControl {
             original: &Control,

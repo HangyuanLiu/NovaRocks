@@ -20,9 +20,9 @@ use super::ds_hll_state_core::{self as core, ScalarSketchPort, ScalarStateSink, 
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_scalar::{ScalarReadFailure, ScalarReadFailureSink, ScalarReadObservation};
 use crate::datasketches_hll_failure::{
-    HllDataRecipe, HllFailureSink, HllInvariantRecipe, HllObservation,
+    HllFailureRecipe, HllFailureSink, HllInvariantRecipe, HllObservation,
 };
-use crate::kernel_control::{internal, invalid};
+use crate::kernel_control::invalid;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 use crate::sketch_hash::{SketchHashFailure, SketchHashFailureSink};
@@ -32,7 +32,7 @@ use crate::{
 };
 use arrow_array::{ArrayRef, builder::BinaryBuilder};
 use arrow_schema::DataType;
-use std::{alloc::Layout, fmt, sync::Arc};
+use std::{alloc::Layout, sync::Arc};
 #[derive(Debug)]
 enum RowFailure {
     Data(RowDataError),
@@ -47,10 +47,14 @@ struct Sink<'work, 'control, 'host> {
     copies: OpaqueRetainedCharge,
 }
 impl Sink<'_, '_, '_> {
-    fn data(&mut self, message: &dyn fmt::Display) -> RowFailure {
-        match RowDataError::prepare_host(self.ordinal, self.allocator, self.work, |f| {
-            write!(f, "{message}")
-        }) {
+    fn value_data(&mut self, value: &core::DsHllStateValueFailure) -> RowFailure {
+        match RowDataError::prepare_host_with_reason(
+            self.ordinal,
+            value.reason(),
+            self.allocator,
+            self.work,
+            |f| write!(f, "{value}"),
+        ) {
             Ok(data) => RowFailure::Data(data),
             Err(cause) => RowFailure::Kernel(cause),
         }
@@ -65,11 +69,18 @@ impl Sink<'_, '_, '_> {
 }
 impl HllFailureSink for Sink<'_, '_, '_> {
     type Error = RowFailure;
-    fn data(&mut self, r: HllDataRecipe<'_>) -> RowFailure {
-        Sink::data(self, &r)
+    fn failure(&mut self, r: HllFailureRecipe) -> RowFailure {
+        match r.classify() {
+            crate::datasketches_hll_failure::ClassifiedHllFailure::Value(value) => {
+                self.value_data(&core::DsHllStateValueFailure::Hll(value))
+            }
+            crate::datasketches_hll_failure::ClassifiedHllFailure::Outer(cause) => {
+                RowFailure::Kernel(crate::KernelFailure::from_domain(cause))
+            }
+        }
     }
     fn invariant(&mut self, r: HllInvariantRecipe) -> RowFailure {
-        RowFailure::Kernel(internal(r.message()))
+        RowFailure::Kernel(crate::KernelFailure::from_domain(r))
     }
     fn observe(&mut self, event: HllObservation) -> Result<(), RowFailure> {
         self.observed(event)
@@ -77,8 +88,8 @@ impl HllFailureSink for Sink<'_, '_, '_> {
 }
 impl SketchHashFailureSink for Sink<'_, '_, '_> {
     type Error = RowFailure;
-    fn hash_data(&mut self, r: SketchHashFailure<'_>) -> RowFailure {
-        self.data(&r.message("ds_hll_count_distinct_state"))
+    fn hash_contract(&mut self, r: SketchHashFailure<'_>) -> RowFailure {
+        RowFailure::Kernel(r.into_kernel("ds_hll_count_distinct_state"))
     }
     fn observe_hash(&mut self, event: HllObservation) -> Result<(), RowFailure> {
         self.observed(event)
@@ -86,8 +97,8 @@ impl SketchHashFailureSink for Sink<'_, '_, '_> {
 }
 impl ScalarReadFailureSink for Sink<'_, '_, '_> {
     type Error = RowFailure;
-    fn read_data(&mut self, r: ScalarReadFailure<'_>) -> RowFailure {
-        self.data(&r)
+    fn read_contract(&mut self, r: ScalarReadFailure<'_>) -> RowFailure {
+        RowFailure::Kernel(r.into_kernel())
     }
     fn observe(&mut self, event: ScalarReadObservation) -> Result<(), RowFailure> {
         self.observed(match event {
@@ -125,7 +136,12 @@ impl ScalarReadFailureSink for Sink<'_, '_, '_> {
 }
 impl ScalarStateSink for Sink<'_, '_, '_> {
     fn tuning(&mut self, r: TuningFailure<'_>) -> RowFailure {
-        self.data(&r)
+        match r.classify() {
+            core::ClassifiedTuningFailure::Value(value) => {
+                self.value_data(&core::DsHllStateValueFailure::Tuning(value))
+            }
+            core::ClassifiedTuningFailure::Contract(cause) => RowFailure::Kernel(cause),
+        }
     }
 }
 struct Port(OpaqueRetainedCharge);
@@ -163,8 +179,8 @@ pub(super) fn validate_profile(
             "ds_hll_count_distinct_state requires one, two or three exact value arguments",
         ));
     }
-    // Generic ANY is not a hash or tuning whitelist. Unsupported actual values
-    // remain lazy original row errors; NULL keys skip tuning altogether.
+    // Generic ANY is not a hash or tuning whitelist. Unsupported actual carriers
+    // fail at their required read; NULL keys skip tuning altogether.
     for _ in args.iter() {
         step()?;
     }
@@ -198,6 +214,7 @@ pub(super) fn evaluate<'a>(
         }
         let selection = input.selection();
         let mut builder = BinaryBuilder::new();
+        let mut extent = super::aggregate_ds_hll_failure::DsHllOutputTally::default();
         let mut errors = Vec::new();
         for (ordinal, row) in selection.iter().enumerate() {
             work.step()?;
@@ -220,6 +237,7 @@ pub(super) fn evaluate<'a>(
                         sink.work.step()?;
                     }
                     sink.work.flush()?;
+                    extent.append(produced.payload().len())?;
                     builder.append_value(produced.payload());
                     sink.work.flush()?;
                 }

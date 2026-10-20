@@ -17,6 +17,7 @@
 
 //! Native ingress checks against the real 1FE+3BE process boundary.
 
+use super::native_creation::receipt_verdict;
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use h2::client;
@@ -664,9 +665,10 @@ impl Scenario for BlockingSaturationControl {
                 "Cancel",
             )?;
             ensure!(
-                receipt.ack.is_none()
-                    && receipt.safe_field_path.is_none()
-                    && receipt.safe_detail == "cancel names a task this backend does not own",
+                receipt_verdict(&receipt)?.ack.is_none()
+                    && receipt_verdict(&receipt)?.safe_field_path.is_none()
+                    && receipt_verdict(&receipt)?.safe_detail
+                        == "cancel names a task this backend does not own",
                 "task-free Cancel did not return its Worker-owned refusal: {receipt:?}"
             );
             context.action(
@@ -692,7 +694,8 @@ impl Scenario for BlockingSaturationControl {
                 proto::TaskOperationOutcome::Accepted,
                 "Quiesce",
             )?;
-            let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(ack)) = &receipt.ack
+            let Some(proto::task_operation_verdict::Ack::QuiesceQueryContext(ack)) =
+                &receipt_verdict(&receipt)?.ack
             else {
                 anyhow::bail!("Quiesce control omitted its typed acknowledgement: {receipt:?}");
             };
@@ -725,7 +728,8 @@ impl Scenario for BlockingSaturationControl {
                 proto::TaskOperationOutcome::Accepted,
                 "Release",
             )?;
-            let Some(proto::task_operation_receipt::Ack::ReleaseQueryContext(ack)) = &receipt.ack
+            let Some(proto::task_operation_verdict::Ack::ReleaseQueryContext(ack)) =
+                &receipt_verdict(&receipt)?.ack
             else {
                 anyhow::bail!("Release control omitted its typed acknowledgement: {receipt:?}");
             };
@@ -1505,7 +1509,8 @@ fn establish_releasable_context(
         proto::TaskOperationOutcome::Accepted,
         "Admission ticket",
     )?;
-    let Some(proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ticket)) = receipt.ack
+    let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(ticket)) =
+        receipt_verdict(&receipt)?.ack.clone()
     else {
         anyhow::bail!("ticket acquisition omitted ticket acknowledgement");
     };
@@ -1537,7 +1542,9 @@ fn establish_releasable_context(
         proto::TaskOperationOutcome::Accepted,
         "Establish",
     )?;
-    let Some(proto::task_operation_receipt::Ack::QueryContext(ack)) = receipt.ack else {
+    let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+        receipt_verdict(&receipt)?.ack.clone()
+    else {
         anyhow::bail!("Establish omitted its typed context acknowledgement");
     };
     let lease = ack
@@ -1603,7 +1610,8 @@ fn exact_probe_receipt(
     let receipt = body.receipts.remove(0);
     ensure!(
         receipt.operation_id.as_ref() == Some(operation_id)
-            && proto::TaskOperationOutcome::try_from(receipt.outcome) == Ok(expected),
+            && proto::TaskOperationOutcome::try_from(receipt_verdict(&receipt)?.outcome)
+                == Ok(expected),
         "{label} did not return the exact operation and expected owner outcome: {receipt:?}"
     );
     Ok(receipt)

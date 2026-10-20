@@ -148,11 +148,13 @@ fn align_fetch_chunk_to_output_columns(
                 novarocks_type_contract::ValueTypeStorageLifetime::pure(),
             )
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let chunk_schema = Arc::new(novarocks_execution::exec::chunk::ChunkSchema::try_new(
-        slots,
-    )?);
-    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| source.to_string())?;
+    let chunk_schema = Arc::new(
+        novarocks_execution::exec::chunk::ChunkSchema::try_new(slots)
+            .map_err(|source| source.to_string())?,
+    );
+    Chunk::try_new_with_chunk_schema(batch, chunk_schema).map_err(|source| source.to_string())
 }
 
 #[cfg(test)]

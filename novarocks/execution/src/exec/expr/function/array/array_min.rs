@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, ListArray, UInt32Array};
 use arrow::compute::{cast, take};
 use std::cmp::Ordering;
@@ -25,13 +27,25 @@ pub fn eval_array_min<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "array_min requires exactly 1 prepared argument(s)",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_min expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_min expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
 
+    if list.len() != 1 && list.len() != chunk.len() {
+        return Err(expression_contract(
+            "array_min prepared list length differs from its batch",
+        ));
+    }
     let source_type = list.values().data_type().clone();
     let target_type = match arena.data_type(expr) {
         Some(t) => super::common::adjust_legacy_decimalv2_target_type(&source_type, t),
@@ -39,14 +53,8 @@ pub fn eval_array_min<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     };
     let mut values = list.values().clone();
     if values.data_type() != &target_type {
-        values = cast(&values, &target_type).map_err(|e| {
-            format!(
-                "array_min failed to cast element type {:?} -> {:?}: {}",
-                values.data_type(),
-                target_type,
-                e
-            )
-        })?;
+        values =
+            cast(&values, &target_type).map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
     let offsets = list.value_offsets();
@@ -96,6 +104,17 @@ pub fn eval_array_min<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     }
 
     let indices = UInt32Array::from(picked);
-    let out = take(values.as_ref(), &indices, None).map_err(|e| e.to_string())?;
-    Ok((super::common::cast_output(out, arena.data_type(expr), "array_min"))?)
+    novarocks_functions::selected_copy::preflight_original_take(
+        values.as_ref(),
+        novarocks_functions::selected_copy::CopyIndexView::UInt32(&indices),
+        |_| Ok(()),
+    )
+    .map_err(novarocks_functions::selected_copy::CopyError::into_kernel)?;
+    let out = take(values.as_ref(), &indices, None).map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_min take",
+            source,
+        )
+    })?;
+    super::common::cast_output(out, arena.data_type(expr), "array_min")
 }

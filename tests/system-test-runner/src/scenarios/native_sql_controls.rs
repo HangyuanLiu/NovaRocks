@@ -56,6 +56,24 @@ impl SelectedStatement {
         );
         Ok(())
     }
+    pub fn activate_deferred_faults(&self, context: &mut ScenarioContext) -> Result<()> {
+        self.verify_submission(&self.sql, context.deadline())?;
+        ensure!(
+            !self.faults.is_empty(),
+            "selected statement declares no deferred action"
+        );
+        for &(index, kind) in &self.faults {
+            ensure!(
+                kind == "task-execution-failure-after-visible-prefix",
+                "selected action is not deferred"
+            );
+            context
+                .handle()
+                .activate_selected_deferred_query_lifecycle_fault(index, kind, &self.token)?;
+        }
+        Ok(())
+    }
+
     pub fn arm(
         &self,
         context: &mut ScenarioContext,
@@ -107,6 +125,37 @@ impl SqlIntentOwner {
         binary: &Path,
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
+        self.freeze_internal(specs, replacements, cluster_size, binary, deadline, false)
+    }
+
+    /// Coordinate the first declared Root failure with the original FE protocol handoff.
+    pub fn freeze_before_schema_failure(
+        &self,
+        specs: Vec<StatementSpec>,
+        replacements: &[usize],
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<ClusterTestSessionPlan> {
+        ensure!(
+            specs.first().is_some_and(|spec| spec
+                .faults
+                .iter()
+                .any(|(_, kind)| *kind == "root-task-execution-failure-before-data")),
+            "before-schema handoff requires the declared first Root failure"
+        );
+        self.freeze_internal(specs, replacements, cluster_size, binary, deadline, true)
+    }
+
+    fn freeze_internal(
+        &self,
+        specs: Vec<StatementSpec>,
+        replacements: &[usize],
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+        before_schema_failure: bool,
+    ) -> Result<ClusterTestSessionPlan> {
         let mut owner = self
             .0
             .lock()
@@ -137,12 +186,19 @@ impl SqlIntentOwner {
             json!({"action":"observe","bearer_secret":secret}),
         );
         let mut statements = vec![];
-        for spec in specs {
+        for (statement_index, spec) in specs.into_iter().enumerate() {
             ensure!(
                 !spec.sql.trim().is_empty(),
                 "Native SQL submission must be complete"
             );
             let token = plan.fresh_domain_secret()?;
+            if before_schema_failure && statement_index == 0 {
+                add(
+                    launches.get_mut(&RoleSlot::Frontend).unwrap(),
+                    "result-handoff",
+                    json!({"action":"await-terminal-before-protocol", "statement_run_token":token}),
+                );
+            }
             let mut seen = BTreeSet::new();
             for &(index, kind) in &spec.faults {
                 ensure!(

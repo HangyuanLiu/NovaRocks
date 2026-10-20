@@ -949,7 +949,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
 }
 
 fn runtime_state() -> Arc<RuntimeState> {
-    Arc::new(RuntimeState::new(
+    Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,
@@ -981,7 +981,7 @@ pub(super) fn try_run_with_tracker(
     instance: UniqueId,
     tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
 ) -> Result<(), String> {
-    let state = Arc::new(RuntimeState::new(
+    let state = Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,

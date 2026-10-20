@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 //! The original recursive aggregate text formatter, including legacy quirks.
-use crate::aggregate_scalar::{AggScalarValue, ScalarStateError, ScalarWork};
+use crate::KernelFailure;
+use crate::aggregate_scalar::{AggScalarValue, ScalarWork};
 use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDate};
@@ -62,13 +63,15 @@ impl<T: fmt::Display + ?Sized> fmt::Display for AggregateFailureMessage<'_, T> {
 }
 
 fn date32_to_naive(days: i32) -> Option<NaiveDate> {
-    NaiveDate::from_num_days_from_ce_opt(719163 + days)
+    719163_i32
+        .checked_add(days)
+        .and_then(NaiveDate::from_num_days_from_ce_opt)
 }
 pub fn scalar_to_string(
     value: &AggScalarValue,
     data_type: &DataType,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<String, ScalarStateError> {
+) -> Result<String, KernelFailure> {
     work.step()?;
     work.flush()?;
     let result = scalar_to_string_inner(value, data_type, work);
@@ -79,18 +82,19 @@ fn scalar_to_string_inner(
     value: &AggScalarValue,
     data_type: &DataType,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<String, ScalarStateError> {
+) -> Result<String, KernelFailure> {
     match value {
         AggScalarValue::Bool(v) => Ok(if *v { "1".to_string() } else { "0".to_string() }),
         AggScalarValue::Int64(v) => Ok(v.to_string()),
         AggScalarValue::Float64(v) => Ok(v.to_string()),
         AggScalarValue::Utf8(v) => Ok(v.clone()),
         AggScalarValue::Date32(v) => {
-            let date = date32_to_naive(*v).ok_or_else(|| "invalid date32 value".to_string())?;
+            let date = date32_to_naive(*v)
+                .ok_or_else(|| KernelFailure::from_domain(FormatRange::Date32(*v)))?;
             Ok(date.format("%Y-%m-%d").to_string())
         }
         AggScalarValue::Timestamp(v) => match data_type {
-            DataType::Timestamp(unit, tz) => Ok(format_timestamp(*unit, *v, tz.as_deref())),
+            DataType::Timestamp(unit, tz) => format_timestamp(*unit, *v, tz.as_deref()),
             _ => Ok(v.to_string()),
         },
         AggScalarValue::Decimal128(v) => match data_type {
@@ -143,20 +147,22 @@ fn scalar_to_string_inner(
     }
 }
 
-fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
+fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> Result<String, KernelFailure> {
     // Align with StarRocks: omit fractional part when zero (e.g. "2020-01-01 00:10:00" not "2020-01-01 00:10:00.000000")
     let timestamp_str = match unit {
         TimeUnit::Second => {
-            let dt = DateTime::from_timestamp(value, 0)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+            let dt = DateTime::from_timestamp(value, 0).ok_or_else(|| {
+                KernelFailure::from_domain(FormatRange::Timestamp { unit, value })
+            })?;
             dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
         }
         TimeUnit::Millisecond => {
-            let seconds = value / 1_000;
+            let seconds = value.div_euclid(1_000);
             let millis = value.rem_euclid(1_000) as u32;
             let nanos = millis * 1_000_000;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+            let dt = DateTime::from_timestamp(seconds, nanos).ok_or_else(|| {
+                KernelFailure::from_domain(FormatRange::Timestamp { unit, value })
+            })?;
             if millis == 0 {
                 dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
             } else {
@@ -167,8 +173,9 @@ fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
             let seconds = value.div_euclid(1_000_000);
             let micros = value.rem_euclid(1_000_000) as u32;
             let nanos = micros * 1_000;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+            let dt = DateTime::from_timestamp(seconds, nanos).ok_or_else(|| {
+                KernelFailure::from_domain(FormatRange::Timestamp { unit, value })
+            })?;
             if micros == 0 {
                 dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
             } else {
@@ -178,8 +185,9 @@ fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
         TimeUnit::Nanosecond => {
             let seconds = value.div_euclid(1_000_000_000);
             let nanos = value.rem_euclid(1_000_000_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+            let dt = DateTime::from_timestamp(seconds, nanos).ok_or_else(|| {
+                KernelFailure::from_domain(FormatRange::Timestamp { unit, value })
+            })?;
             if nanos == 0 {
                 dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
             } else {
@@ -187,11 +195,11 @@ fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
             }
         }
     };
-    if let Some(tz) = tz {
+    Ok(if let Some(tz) = tz {
         format!("{} {}", timestamp_str, tz)
     } else {
         timestamp_str
-    }
+    })
 }
 
 fn format_decimal(unscaled: i128, scale: i8) -> String {
@@ -200,4 +208,75 @@ fn format_decimal(unscaled: i128, scale: i8) -> String {
 
 fn format_decimal256(unscaled: i256, scale: i8) -> String {
     crate::decimal_text::format_decimal256_with_scale(unscaled, scale)
+}
+
+/// Scalar range refusal is a whole-format result, never a row-mask permission.
+#[derive(Debug)]
+enum FormatRange {
+    Date32(i32),
+    Timestamp { unit: TimeUnit, value: i64 },
+}
+impl fmt::Display for FormatRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Date32(value) => write!(
+                f,
+                "aggregate date32 value {value} exceeds the calendar range"
+            ),
+            Self::Timestamp { unit, value } => write!(
+                f,
+                "aggregate timestamp {value} ({unit:?}) exceeds the calendar range"
+            ),
+        }
+    }
+}
+impl std::error::Error for FormatRange {}
+impl novarocks_failure_contract::FailureProjection for FormatRange {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &crate::DataFailureReason::NumericOutOfRange,
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for FormatRange {}
+#[cfg(test)]
+mod range_properties {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    #[test]
+    fn real_negative_millisecond_formats_the_instant_before_epoch() {
+        assert_eq!(
+            format_timestamp(TimeUnit::Millisecond, -1, None).unwrap(),
+            "1969-12-31 23:59:59.999"
+        );
+        assert_eq!(
+            format_timestamp(TimeUnit::Microsecond, -1, None).unwrap(),
+            "1969-12-31 23:59:59.999999"
+        );
+        assert_eq!(
+            format_timestamp(TimeUnit::Nanosecond, -1, None).unwrap(),
+            "1969-12-31 23:59:59.999999999"
+        );
+    }
+    #[test]
+    fn calendar_range_failure_is_typed_and_never_replaced_with_epoch_or_panics() {
+        let fact = crate::DataFailureReason::NumericOutOfRange.failure_fact();
+        for value in [i32::MAX, i32::MIN] {
+            let error = scalar_to_string(
+                &AggScalarValue::Date32(value),
+                &DataType::Date32,
+                &mut ScalarWork::new(None),
+            )
+            .unwrap_err();
+            assert_eq!(error.failure_fact(), fact);
+        }
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+        ] {
+            let error = format_timestamp(unit, i64::MAX, None).unwrap_err();
+            assert_eq!(error.failure_fact(), fact);
+        }
+    }
 }

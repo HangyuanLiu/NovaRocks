@@ -67,8 +67,8 @@ impl fmt::Display for PhysicalPropertyCodecError {
 impl std::error::Error for PhysicalPropertyCodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Control(cause) => Some(cause),
-            Self::InvalidShape(_) => None,
+            Self::Control(source) => Some(source),
+            _ => None,
         }
     }
 }

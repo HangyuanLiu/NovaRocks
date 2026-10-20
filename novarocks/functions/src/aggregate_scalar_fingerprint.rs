@@ -17,16 +17,19 @@
 //! Original ARRAY aggregate scalar fingerprint and owned comparator bodies.
 //! These original fingerprints differ from COUNT DISTINCT and are not interchangeable.
 use crate::aggregate_scalar::{
-    AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork, TrackedAggScalarValue,
+    AggScalarValue, ScalarOrdering, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
     aggregate_vec_with_capacity,
 };
 use allocator_api2::vec::Vec as ScalarVec;
 use std::cmp::Ordering;
+#[path = "aggregate_scalar_fingerprint_failure.rs"]
+mod extent_failure;
+use extent_failure::{LengthKind, checked_encoded_len_add, checked_u32_len};
 pub fn tracked_key_fingerprint<A: ScalarStateAllocator>(
     key: &TrackedAggScalarValue<A>,
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ScalarVec<u8, A>, ScalarStateError> {
+) -> Result<ScalarVec<u8, A>, crate::KernelFailure> {
     work.step()?;
     let encoded_len = tracked_scalar_encoded_len(key, work)?;
     let mut output = aggregate_vec_with_capacity(
@@ -44,16 +47,15 @@ pub fn tracked_optional_key_fingerprint<A: ScalarStateAllocator>(
     value: &Option<TrackedAggScalarValue<A>>,
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ScalarVec<u8, A>, ScalarStateError> {
+) -> Result<ScalarVec<u8, A>, crate::KernelFailure> {
     work.step()?;
     let value_len = value
         .as_ref()
         .map(|value| tracked_scalar_encoded_len(value, work))
         .transpose()?
         .unwrap_or(0);
-    let encoded_len = 1usize
-        .checked_add(value_len)
-        .ok_or_else(|| "aggregate scalar fingerprint length overflow".to_string())?;
+    let mut encoded_len = 1usize;
+    checked_encoded_len_add(&mut encoded_len, value_len)?;
     let mut output = aggregate_vec_with_capacity(
         allocator,
         encoded_len,
@@ -65,21 +67,10 @@ pub fn tracked_optional_key_fingerprint<A: ScalarStateAllocator>(
     Ok(output)
 }
 
-fn checked_encoded_len_add(total: &mut usize, additional: usize) -> Result<(), String> {
-    *total = total
-        .checked_add(additional)
-        .ok_or_else(|| "aggregate scalar fingerprint length overflow".to_string())?;
-    Ok(())
-}
-
-fn checked_u32_len(len: usize) -> Result<u32, String> {
-    u32::try_from(len).map_err(|_| "aggregate scalar fingerprint exceeds u32 length".to_string())
-}
-
 fn tracked_scalar_encoded_len<A: ScalarStateAllocator>(
     value: &TrackedAggScalarValue<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<usize, ScalarStateError> {
+) -> Result<usize, crate::KernelFailure> {
     work.step()?;
     let mut len = 1usize;
     match value {
@@ -91,12 +82,12 @@ fn tracked_scalar_encoded_len<A: ScalarStateAllocator>(
         TrackedAggScalarValue::Decimal128(_) => checked_encoded_len_add(&mut len, 16)?,
         TrackedAggScalarValue::Decimal256(_) => checked_encoded_len_add(&mut len, 32)?,
         TrackedAggScalarValue::Utf8(bytes) | TrackedAggScalarValue::Binary(bytes) => {
-            let _ = checked_u32_len(bytes.len())?;
+            let _ = checked_u32_len(LengthKind::Bytes, bytes.len())?;
             checked_encoded_len_add(&mut len, 4)?;
             checked_encoded_len_add(&mut len, bytes.len())?;
         }
         TrackedAggScalarValue::Struct(values) | TrackedAggScalarValue::List(values) => {
-            let _ = checked_u32_len(values.len())?;
+            let _ = checked_u32_len(LengthKind::Children, values.len())?;
             checked_encoded_len_add(&mut len, 4)?;
             for value in values {
                 work.step()?;
@@ -107,7 +98,7 @@ fn tracked_scalar_encoded_len<A: ScalarStateAllocator>(
             }
         }
         TrackedAggScalarValue::Map(entries) => {
-            let _ = checked_u32_len(entries.len())?;
+            let _ = checked_u32_len(LengthKind::Entries, entries.len())?;
             checked_encoded_len_add(&mut len, 4)?;
             for (key, value) in entries {
                 work.step()?;
@@ -131,7 +122,7 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
     output: &mut ScalarVec<u8, A>,
     value: &TrackedAggScalarValue<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     work.step()?;
     match value {
         TrackedAggScalarValue::Bool(value) => {
@@ -153,7 +144,8 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
         }
         TrackedAggScalarValue::Utf8(value) => {
             output.push(4);
-            output.extend_from_slice(&checked_u32_len(value.len())?.to_le_bytes());
+            output
+                .extend_from_slice(&checked_u32_len(LengthKind::Bytes, value.len())?.to_le_bytes());
             for _ in value {
                 work.step()?;
             }
@@ -179,7 +171,9 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
         }
         TrackedAggScalarValue::Map(entries) => {
             output.push(9);
-            output.extend_from_slice(&checked_u32_len(entries.len())?.to_le_bytes());
+            output.extend_from_slice(
+                &checked_u32_len(LengthKind::Entries, entries.len())?.to_le_bytes(),
+            );
             for (key, value) in entries {
                 work.step()?;
                 encode_tracked_optional_value(output, key, work)?;
@@ -196,7 +190,8 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
         }
         TrackedAggScalarValue::Binary(value) => {
             output.push(12);
-            output.extend_from_slice(&checked_u32_len(value.len())?.to_le_bytes());
+            output
+                .extend_from_slice(&checked_u32_len(LengthKind::Bytes, value.len())?.to_le_bytes());
             for _ in value {
                 work.step()?;
             }
@@ -212,9 +207,9 @@ fn encode_tracked_optional_values<A: ScalarStateAllocator>(
     output: &mut ScalarVec<u8, A>,
     values: &[Option<TrackedAggScalarValue<A>>],
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     work.step()?;
-    output.extend_from_slice(&checked_u32_len(values.len())?.to_le_bytes());
+    output.extend_from_slice(&checked_u32_len(LengthKind::Children, values.len())?.to_le_bytes());
     for value in values {
         work.step()?;
         encode_tracked_optional_value(output, value, work)?;
@@ -226,7 +221,7 @@ fn encode_tracked_optional_value<A: ScalarStateAllocator>(
     output: &mut ScalarVec<u8, A>,
     value: &Option<TrackedAggScalarValue<A>>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     work.step()?;
     if let Some(value) = value {
         output.push(1);
@@ -237,88 +232,90 @@ fn encode_tracked_optional_value<A: ScalarStateAllocator>(
     Ok(())
 }
 
+/// Strict whole-value comparison. Unordered floating values end this
+/// computation; callers with a different ordering policy use the partial API.
 pub fn compare_scalar_values(
     left: &AggScalarValue,
     right: &AggScalarValue,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Ordering, ScalarStateError> {
+) -> Result<Ordering, crate::KernelFailure> {
+    crate::aggregate_scalar::strict_scalar_ordering(
+        compare_scalar_values_partial(left, right, work)?,
+        "scalar comparison type mismatch",
+    )
+}
+/// Value ordering policy is distinct from callback failure. A consumer may
+/// choose a policy for NaN or heterogeneous kinds without swallowing errors.
+pub fn compare_scalar_values_partial(
+    left: &AggScalarValue,
+    right: &AggScalarValue,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<ScalarOrdering, crate::KernelFailure> {
+    use ScalarOrdering::Ordered;
     work.step()?;
     match (left, right) {
-        (AggScalarValue::Bool(l), AggScalarValue::Bool(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Int64(l), AggScalarValue::Int64(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Float64(l), AggScalarValue::Float64(r)) => l
+        (AggScalarValue::Bool(l), AggScalarValue::Bool(r)) => Ok(Ordered(l.cmp(r))),
+        (AggScalarValue::Int64(l), AggScalarValue::Int64(r)) => Ok(Ordered(l.cmp(r))),
+        (AggScalarValue::Float64(l), AggScalarValue::Float64(r)) => Ok(l
             .partial_cmp(r)
-            .ok_or_else(|| "float comparison is not ordered".to_string().into()),
+            .map(Ordered)
+            .unwrap_or(ScalarOrdering::UnorderedFloat)),
         (AggScalarValue::Utf8(l), AggScalarValue::Utf8(r)) => {
             work.flush()?;
-            let ord = l.cmp(r);
+            let ordering = l.cmp(r);
             work.flush()?;
-            Ok(ord)
+            Ok(Ordered(ordering))
         }
-        (AggScalarValue::Date32(l), AggScalarValue::Date32(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Timestamp(l), AggScalarValue::Timestamp(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Decimal128(l), AggScalarValue::Decimal128(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Decimal256(l), AggScalarValue::Decimal256(r)) => Ok(l.cmp(r)),
         (AggScalarValue::Binary(l), AggScalarValue::Binary(r)) => {
             work.flush()?;
-            let ord = l.cmp(r);
+            let ordering = l.cmp(r);
             work.flush()?;
-            Ok(ord)
+            Ok(Ordered(ordering))
         }
-        (AggScalarValue::Struct(l), AggScalarValue::Struct(r)) => {
-            let min_len = l.len().min(r.len());
-            for idx in 0..min_len {
+        (AggScalarValue::Date32(l), AggScalarValue::Date32(r)) => Ok(Ordered(l.cmp(r))),
+        (AggScalarValue::Timestamp(l), AggScalarValue::Timestamp(r)) => Ok(Ordered(l.cmp(r))),
+        (AggScalarValue::Decimal128(l), AggScalarValue::Decimal128(r)) => Ok(Ordered(l.cmp(r))),
+        (AggScalarValue::Decimal256(l), AggScalarValue::Decimal256(r)) => Ok(Ordered(l.cmp(r))),
+        (AggScalarValue::Struct(l), AggScalarValue::Struct(r))
+        | (AggScalarValue::List(l), AggScalarValue::List(r)) => {
+            for (left, right) in l.iter().zip(r) {
                 work.step()?;
-                let ord = compare_optional_scalar_values(&l[idx], &r[idx], work)?;
-                if !ord.is_eq() {
-                    return Ok(ord);
+                let order = compare_optional_scalar_values(left, right, work)?;
+                if !matches!(order, Ordered(Ordering::Equal)) {
+                    return Ok(order);
                 }
             }
-            Ok(l.len().cmp(&r.len()))
+            Ok(Ordered(l.len().cmp(&r.len())))
         }
         (AggScalarValue::Map(l), AggScalarValue::Map(r)) => {
-            let min_len = l.len().min(r.len());
-            for idx in 0..min_len {
+            for ((lk, lv), (rk, rv)) in l.iter().zip(r) {
                 work.step()?;
-                let (lk, lv) = &l[idx];
-                let (rk, rv) = &r[idx];
-                let key_ord = compare_optional_scalar_values(lk, rk, work)?;
-                if !key_ord.is_eq() {
-                    return Ok(key_ord);
+                let order = compare_optional_scalar_values(lk, rk, work)?;
+                if !matches!(order, Ordered(Ordering::Equal)) {
+                    return Ok(order);
                 }
-                let value_ord = compare_optional_scalar_values(lv, rv, work)?;
-                if !value_ord.is_eq() {
-                    return Ok(value_ord);
+                let order = compare_optional_scalar_values(lv, rv, work)?;
+                if !matches!(order, Ordered(Ordering::Equal)) {
+                    return Ok(order);
                 }
             }
-            Ok(l.len().cmp(&r.len()))
+            Ok(Ordered(l.len().cmp(&r.len())))
         }
-        (AggScalarValue::List(l), AggScalarValue::List(r)) => {
-            let min_len = l.len().min(r.len());
-            for idx in 0..min_len {
-                work.step()?;
-                let ord = compare_optional_scalar_values(&l[idx], &r[idx], work)?;
-                if !ord.is_eq() {
-                    return Ok(ord);
-                }
-            }
-            Ok(l.len().cmp(&r.len()))
-        }
-        _ => Err("scalar comparison type mismatch".to_string().into()),
+        _ => Ok(ScalarOrdering::MismatchedKinds),
     }
 }
-
 fn compare_optional_scalar_values(
     left: &Option<AggScalarValue>,
     right: &Option<AggScalarValue>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Ordering, ScalarStateError> {
+) -> Result<ScalarOrdering, crate::KernelFailure> {
+    use ScalarOrdering::Ordered;
     work.step()?;
     match (left, right) {
-        (None, None) => Ok(Ordering::Equal),
-        (None, Some(_)) => Ok(Ordering::Less),
-        (Some(_), None) => Ok(Ordering::Greater),
-        (Some(l), Some(r)) => compare_scalar_values(l, r, work),
+        (None, None) => Ok(Ordered(Ordering::Equal)),
+        (None, Some(_)) => Ok(Ordered(Ordering::Less)),
+        (Some(_), None) => Ok(Ordered(Ordering::Greater)),
+        (Some(left), Some(right)) => compare_scalar_values_partial(left, right, work),
     }
 }
 
@@ -336,7 +333,7 @@ fn compare_optional_scalar_values(
 pub fn key_fingerprint(
     key: &AggScalarValue,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<u8>, ScalarStateError> {
+) -> Result<Vec<u8>, crate::KernelFailure> {
     work.step()?;
     let mut out = Vec::new();
     encode_scalar(&mut out, key, work)?;
@@ -347,7 +344,7 @@ fn encode_scalar(
     out: &mut Vec<u8>,
     key: &AggScalarValue,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     work.step()?;
     match key {
         AggScalarValue::Bool(v) => {
@@ -371,7 +368,7 @@ fn encode_scalar(
         }
         AggScalarValue::Utf8(v) => {
             out.push(4);
-            let len = v.len() as u32;
+            let len = checked_u32_len(LengthKind::Bytes, v.len())?;
             out.extend_from_slice(&len.to_le_bytes());
             for _ in v.as_bytes() {
                 work.step()?;
@@ -395,7 +392,7 @@ fn encode_scalar(
         AggScalarValue::Decimal256(v) => {
             out.push(11);
             let text = v.to_string();
-            let len = text.len() as u32;
+            let len = checked_u32_len(LengthKind::Bytes, text.len())?;
             out.extend_from_slice(&len.to_le_bytes());
             for _ in text.as_bytes() {
                 work.step()?;
@@ -406,7 +403,7 @@ fn encode_scalar(
         }
         AggScalarValue::Binary(v) => {
             out.push(12);
-            let len = v.len() as u32;
+            let len = checked_u32_len(LengthKind::Bytes, v.len())?;
             out.extend_from_slice(&len.to_le_bytes());
             for _ in v {
                 work.step()?;
@@ -417,7 +414,7 @@ fn encode_scalar(
         }
         AggScalarValue::Struct(items) => {
             out.push(8);
-            let len = items.len() as u32;
+            let len = checked_u32_len(LengthKind::Children, items.len())?;
             out.extend_from_slice(&len.to_le_bytes());
             for item in items {
                 work.step()?;
@@ -432,7 +429,7 @@ fn encode_scalar(
         }
         AggScalarValue::Map(items) => {
             out.push(9);
-            let len = items.len() as u32;
+            let len = checked_u32_len(LengthKind::Entries, items.len())?;
             out.extend_from_slice(&len.to_le_bytes());
             for (k, v) in items {
                 work.step()?;
@@ -454,7 +451,7 @@ fn encode_scalar(
         }
         AggScalarValue::List(items) => {
             out.push(10);
-            let len = items.len() as u32;
+            let len = checked_u32_len(LengthKind::Children, items.len())?;
             out.extend_from_slice(&len.to_le_bytes());
             for item in items {
                 work.step()?;

@@ -369,7 +369,7 @@ fn fixed_created_validation_preserves_first_h_and_control_prefix_without_tail() 
         for at in [1, calls.len() / 2, calls.len()] {
             let (facts, mut scope) = RequestScope::new(None);
             let control = Trace {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Default::default()
             };
             let result = created_map_validation(&catalog, &bound, &args, &mut scope, &control);
@@ -425,7 +425,7 @@ impl PureCompileControl for Trace {
         assert!(units <= 256);
         let mut calls = self.calls.lock().unwrap();
         calls.push((phase, units));
-        if let Some((at, cause)) = self.stop {
+        if let Some((at, cause)) = self.stop.clone() {
             assert!(calls.len() <= at, "control observation after first refusal");
             if calls.len() == at {
                 return Err(cause);
@@ -634,7 +634,7 @@ fn dynamic_created_validation_first_refusal_and_control_have_no_tail() {
             let (facts, mut scope) = RequestScope::new(None);
             let control = Trace {
                 calls: Mutex::new(Vec::new()),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             let error =
                 created_map_validation(&catalog, &bound, &args, &mut scope, &control).unwrap_err();
@@ -857,7 +857,7 @@ fn borrowed_conversion_created_validation_keeps_exact_domains_and_original_contr
         for at in [1, calls.len() / 2, calls.len()] {
             let control = Trace {
                 calls: Mutex::new(Vec::new()),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(matches!(catalog.validate_frozen_selection_with_creator_in(
                 &bound.function_id, bound.kind, &bound.selected, req, &mut scope, &control,

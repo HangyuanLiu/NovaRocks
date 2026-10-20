@@ -73,16 +73,67 @@ enum QueryFailurePriority {
 pub(crate) struct LatchedQueryFailure {
     id: u64,
     cause: QueryFailureCause,
-    message: String,
+    body: QueryFailureBody,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QueryFailureBody {
+    CoordinatorDiagnostic(String),
+    Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
+}
+
+impl QueryFailureBody {
+    fn message(&self) -> &str {
+        match self {
+            Self::CoordinatorDiagnostic(message) => message,
+            Self::Execution(input) => input.detail().as_str(),
+        }
+    }
 }
 
 impl LatchedQueryFailure {
-    fn new(id: u64, cause: QueryFailureCause, message: String) -> Self {
-        Self { id, cause, message }
+    fn new(id: u64, cause: QueryFailureCause, body: QueryFailureBody) -> Self {
+        Self { id, cause, body }
     }
 
     pub(crate) fn message(&self) -> &str {
-        &self.message
+        self.body.message()
+    }
+
+    pub(crate) fn into_execution_error(self) -> DistributedQueryError {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        let input = match self.body {
+            QueryFailureBody::Execution(input) => input,
+            QueryFailureBody::CoordinatorDiagnostic(message) => {
+                // The coordinator's closed cause selects its own projection.
+                // Detailed diagnostics never classify a foreign domain.
+                tracing::debug!(cause = ?self.cause, diagnostic = %message, "statement attempt coordinator failed");
+                let (reason, detail) = match self.cause {
+                    QueryFailureCause::ClientCancellation => (
+                        QueryFailureReason::Cancelled,
+                        "statement execution was cancelled",
+                    ),
+                    QueryFailureCause::RemoteTransportObservation => (
+                        QueryFailureReason::ObservationLost,
+                        "statement participant observation was lost",
+                    ),
+                    QueryFailureCause::FrontendExecution
+                    | QueryFailureCause::BackendLocalFailure => (
+                        QueryFailureReason::LogicalFailureUnspecified,
+                        "statement execution failed in its coordinator",
+                    ),
+                };
+                ExecutionFailureInput::new(
+                    reason.failure_fact(),
+                    SafeDetail::truncating(detail),
+                    ExecutionFailureSite::Coordinator,
+                )
+            }
+        };
+        DistributedQueryError::from_execution(input)
     }
 }
 
@@ -121,9 +172,17 @@ impl AttemptState {
     }
 
     fn record_failure(&mut self, cause: QueryFailureCause, message: String) -> LatchedQueryFailure {
+        self.record_failure_body(cause, QueryFailureBody::CoordinatorDiagnostic(message))
+    }
+
+    fn record_failure_body(
+        &mut self,
+        cause: QueryFailureCause,
+        body: QueryFailureBody,
+    ) -> LatchedQueryFailure {
         if let Some(primary) = &self.first_failure
             && primary.cause == cause
-            && primary.message == message
+            && primary.body == body
         {
             return primary.clone();
         }
@@ -133,17 +192,17 @@ impl AttemptState {
             .next_failure_id
             .checked_add(1)
             .expect("frontend query failure id exhausted");
-        let candidate = LatchedQueryFailure::new(id, cause, message);
+        let candidate = LatchedQueryFailure::new(id, cause, body);
         match self.first_failure.as_mut() {
             None => self.first_failure = Some(candidate),
             Some(primary) if cause.priority() > primary.cause.priority() => {
                 let displaced = std::mem::replace(primary, candidate);
                 self.secondary_failures
-                    .insert((displaced.cause, displaced.message));
+                    .insert((displaced.cause, displaced.message().to_owned()));
             }
             Some(_) => {
                 self.secondary_failures
-                    .insert((candidate.cause, candidate.message));
+                    .insert((candidate.cause, candidate.message().to_owned()));
             }
         }
         self.first_failure
@@ -1241,6 +1300,11 @@ impl FrontendQueryRegistry {
     }
 
     pub(crate) fn first_failure(&self, query_id: QueryId) -> Option<String> {
+        self.first_failure_record(query_id)
+            .map(|failure| failure.message().to_owned())
+    }
+
+    pub(crate) fn first_failure_record(&self, query_id: QueryId) -> Option<LatchedQueryFailure> {
         self.state
             .lock()
             .expect("frontend query registry lock")
@@ -1251,9 +1315,29 @@ impl FrontendQueryRegistry {
                     .current_state()
                     .unwrap_or(&query.unbound_attempt)
                     .first_failure
-                    .as_ref()
-                    .map(|failure| failure.message.clone())
+                    .clone()
             })
+    }
+
+    pub(crate) fn latch_execution_failure(
+        &self,
+        query_id: QueryId,
+        cause: QueryFailureCause,
+        input: novarocks_query_application::execution_error::ExecutionFailureInput,
+    ) -> Result<LatchedQueryFailure, DistributedQueryError> {
+        let mut state = self.state.lock().expect("frontend query registry lock");
+        let query = state
+            .logical
+            .get_mut(&query_key(query_id))
+            .ok_or_else(|| self.inactive_query(query_id))?;
+        if !query.attempts.is_empty() {
+            return Err(contract_violation(
+                "query-id-only failure ingress cannot mutate an attempt-aware logical execution",
+            ));
+        }
+        Ok(query
+            .unbound_attempt
+            .record_failure_body(cause, QueryFailureBody::Execution(input)))
     }
 
     /// Records why this query failed and returns the primary cause the
@@ -1756,6 +1840,69 @@ mod tests {
     }
 
     #[test]
+    fn accepted_execution_input_survives_cleanup_diagnostics_and_earlier_observation() {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        for observation_first in [false, true] {
+            let input = ExecutionFailureInput::new(
+                QueryFailureReason::TransportCapacity.failure_fact(),
+                SafeDetail::truncating("original finite transport capacity"),
+                ExecutionFailureSite::Coordinator,
+            );
+            let mut state = AttemptState::new();
+            if observation_first {
+                state.record_failure(
+                    QueryFailureCause::RemoteTransportObservation,
+                    "peer control stream closed".to_owned(),
+                );
+            }
+            state.record_failure_body(
+                QueryFailureCause::BackendLocalFailure,
+                QueryFailureBody::Execution(input.clone()),
+            );
+            let selected = state.record_failure(
+                QueryFailureCause::FrontendExecution,
+                "late cleanup failed".to_owned(),
+            );
+            assert_eq!(
+                selected
+                    .into_execution_error()
+                    .into_execution_failure_input(),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_cancellation_cannot_be_replaced_by_a_late_execution_input() {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        let mut state = AttemptState::new();
+        state.record_failure(
+            QueryFailureCause::ClientCancellation,
+            "original cancellation diagnostic".to_owned(),
+        );
+        let later = ExecutionFailureInput::new(
+            QueryFailureReason::ResultProtocol.failure_fact(),
+            SafeDetail::truncating("late result contract failure"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let selected = state.record_failure_body(
+            QueryFailureCause::BackendLocalFailure,
+            QueryFailureBody::Execution(later),
+        );
+        let input = selected
+            .into_execution_error()
+            .into_execution_failure_input();
+        assert_eq!(input.fact(), QueryFailureReason::Cancelled.failure_fact());
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+    }
+
+    #[test]
     fn same_priority_failure_preserves_first_causal_report() {
         fn record_in_order(messages: &[&str]) -> (String, Vec<String>) {
             let mut attempt = AttemptState::new();
@@ -1768,7 +1915,8 @@ mod tests {
                     .first_failure
                     .clone()
                     .expect("primary failure")
-                    .message,
+                    .message()
+                    .to_owned(),
                 attempt
                     .secondary_failures
                     .iter()
@@ -1817,7 +1965,7 @@ mod tests {
                 query.record_failure(cause, message);
             }
             let primary = query.first_failure.expect("primary failure");
-            (primary.cause, primary.message)
+            (primary.cause, primary.message().to_owned())
         }
 
         let expected = (

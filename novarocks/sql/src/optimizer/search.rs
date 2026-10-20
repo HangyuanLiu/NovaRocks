@@ -2161,7 +2161,11 @@ mod control_tests {
                 4 => observed.len() == 2,
                 _ => unreachable!("fixture mode"),
             };
-            if stop { Err(self.error) } else { Ok(()) }
+            if stop {
+                Err(self.error.clone())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -2229,11 +2233,11 @@ mod control_tests {
         let (logical, logical_group) = logical_only_scan();
         let required = PhysicalPropertySet::any();
         for error in errors() {
-            let control = Control::new(error, 1);
+            let control = Control::new(error.clone(), 1);
             let mut search = SearchContext::new(stats(), CostOptions::default(), &control);
             assert_eq!(
                 search.optimize_group(&memo, group, &required),
-                Err(SqlCompileError::from(error))
+                Err(SqlCompileError::from(error.clone()))
             );
             assert!(search.winners.is_empty());
             assert!(search.in_progress.is_empty());
@@ -2249,7 +2253,7 @@ mod control_tests {
             control.mode.store(1, Ordering::SeqCst);
             assert_eq!(
                 search.optimize_group(&memo, group, &required),
-                Err(SqlCompileError::from(error))
+                Err(SqlCompileError::from(error.clone()))
             );
             assert_eq!(search.winners.len(), 1);
             assert_eq!(
@@ -2260,7 +2264,7 @@ mod control_tests {
             let mut logical_search = SearchContext::new(stats(), CostOptions::default(), &control);
             assert_eq!(
                 logical_search.optimize_group(&logical, logical_group, &required),
-                Err(SqlCompileError::from(error))
+                Err(SqlCompileError::from(error.clone()))
             );
             assert!(logical_search.winners.is_empty());
             assert!(logical_search.in_progress.is_empty());
@@ -2282,7 +2286,7 @@ mod control_tests {
         let (memo, group) = scan_alternatives(320);
         let required = PhysicalPropertySet::any();
         for error in errors() {
-            let control = Control::new(error, 2);
+            let control = Control::new(error.clone(), 2);
             let mut search = SearchContext::new(stats(), CostOptions::default(), &control);
             assert_eq!(
                 search.optimize_group(&memo, group, &required),
@@ -2323,11 +2327,11 @@ mod control_tests {
         let (logical, logical_group) = logical_only_scan();
         let required = PhysicalPropertySet::any();
         for error in errors() {
-            let control = Control::new(error, 3);
+            let control = Control::new(error.clone(), 3);
             let mut search = SearchContext::new(stats(), CostOptions::default(), &control);
             assert_eq!(
                 search.optimize_group(&memo, group, &required),
-                Err(SqlCompileError::from(error))
+                Err(SqlCompileError::from(error.clone()))
             );
             assert!(search.winners.is_empty());
             assert!(search.in_progress.is_empty());
@@ -2341,7 +2345,7 @@ mod control_tests {
             assert!(observed[3].1 > 0 && observed[3].1 < MAX_UNOBSERVED_COMPILE_WORK);
             drop(observed);
 
-            let empty_control = Control::new(error, 4);
+            let empty_control = Control::new(error.clone(), 4);
             let mut empty_search =
                 SearchContext::new(stats(), CostOptions::default(), &empty_control);
             assert_eq!(
@@ -2405,7 +2409,7 @@ mod statistics_control_tests {
     impl PureCompileControl for Once {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             if units > 0 && self.remaining.swap(false, Ordering::Relaxed) {
-                Err(self.error)
+                Err(self.error.clone())
             } else {
                 Ok(())
             }
@@ -2443,7 +2447,7 @@ mod statistics_control_tests {
             assert_eq!(memo.groups[root].logical_exprs.len(), 320);
             let control = Once {
                 remaining: AtomicBool::new(true),
-                error,
+                error: error.clone(),
             };
             let stats_input = OptimizerStatsInput::from_test_table_statistics(&HashMap::new());
             let result = stats_for_group(&memo.groups[root], &memo, &stats_input, &control);

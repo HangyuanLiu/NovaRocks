@@ -67,7 +67,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -499,7 +499,7 @@ fn writer_schema_actual_small_checkpoint_prefixes_and_ordinary_tails_keep_three_
         for at in 0..positive.len() {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let mut bytes = 0;
@@ -533,7 +533,7 @@ fn writer_schema_real_320_and_5000_owned_field_walks_observe_quantum_and_sample_
         for at in [0, at, positive.len() - 1] {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let mut bytes = 0;

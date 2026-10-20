@@ -45,7 +45,7 @@ mod array_struct_subfield;
 mod array_sum;
 mod array_top_n;
 mod arrays_overlap;
-mod common;
+pub(super) mod common;
 mod dispatch;
 mod element_at;
 

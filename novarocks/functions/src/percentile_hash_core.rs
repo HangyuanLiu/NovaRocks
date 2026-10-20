@@ -16,7 +16,7 @@
 // under the License.
 //! Original scalar percentile_hash row policy, with shared numeric reader/TDigest codec.
 //! No expression, argument demand, function-name dispatch or ambient authority lives here.
-use crate::percentile_input::{PercentileInputDiagnostic, numeric_value_at};
+use crate::percentile_input::{PercentileInputDiagnostic, numeric_value_at_with_failure};
 use arrow_array::ArrayRef;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Observation {
@@ -26,7 +26,7 @@ pub enum Observation {
 }
 /// Original SOME -> singleton and numeric NULL -> empty-state encoding.
 /// Existing TDigest/codec authors retain f32 rounding, NaN/signedzero/inf and
-/// infallible raw allocation behavior. These opaque allocations are not grants.
+/// required allocation refusals. These opaque allocations are not grants.
 pub trait ValueEncoder {
     type Error;
     fn single(&mut self, value: f64) -> Result<Vec<u8>, Self::Error>;
@@ -42,23 +42,33 @@ pub fn encode_numeric_with<E: ValueEncoder>(
         None => encoder.empty(),
     }
 }
-struct OriginalEncoder<E>(std::marker::PhantomData<E>);
-impl<E> ValueEncoder for OriginalEncoder<E> {
-    type Error = E;
-    fn single(&mut self, value: f64) -> Result<Vec<u8>, E> {
-        Ok(crate::approx_percentile_core::encode_single_value(value))
+struct OriginalEncoder;
+impl ValueEncoder for OriginalEncoder {
+    type Error = crate::KernelFailure;
+    fn single(&mut self, value: f64) -> Result<Vec<u8>, Self::Error> {
+        crate::approx_percentile_core::encode_single_value(value)
     }
-    fn empty(&mut self) -> Result<Vec<u8>, E> {
-        Ok(crate::approx_percentile_core::encode_empty_state())
+    fn empty(&mut self) -> Result<Vec<u8>, Self::Error> {
+        crate::approx_percentile_core::encode_empty_state()
     }
 }
-pub fn encode_numeric(value: Option<f64>) -> Vec<u8> {
-    match encode_numeric_with(
-        value,
-        &mut OriginalEncoder::<std::convert::Infallible>(std::marker::PhantomData),
-    ) {
-        Ok(value) => value,
-        Err(impossible) => match impossible {},
+pub fn encode_numeric(value: Option<f64>) -> Result<Vec<u8>, crate::KernelFailure> {
+    encode_numeric_with(value, &mut OriginalEncoder)
+}
+enum ObservedFailure<E> {
+    Control(E),
+    Kernel(crate::KernelFailure),
+}
+struct ObservedEncoder<E>(std::marker::PhantomData<E>);
+impl<E> ValueEncoder for ObservedEncoder<E> {
+    type Error = ObservedFailure<E>;
+    fn single(&mut self, value: f64) -> Result<Vec<u8>, Self::Error> {
+        OriginalEncoder
+            .single(value)
+            .map_err(ObservedFailure::Kernel)
+    }
+    fn empty(&mut self) -> Result<Vec<u8>, Self::Error> {
+        OriginalEncoder.empty().map_err(ObservedFailure::Kernel)
     }
 }
 pub fn row_with_encoder_observed<E, Encoder: ValueEncoder<Error = E>>(
@@ -66,9 +76,11 @@ pub fn row_with_encoder_observed<E, Encoder: ValueEncoder<Error = E>>(
     row: usize,
     mut observe: impl FnMut(Observation) -> Result<(), E>,
     encoder: &mut Encoder,
-) -> Result<Result<Vec<u8>, String>, E> {
+) -> Result<Result<Vec<u8>, crate::KernelFailure>, E> {
     observe(Observation::ReadBoundary)?;
-    let value = match numeric_value_at(array, row, PercentileInputDiagnostic::Hash) {
+    let value = match numeric_value_at_with_failure(array, row, &mut |failure| {
+        failure.into_failure(PercentileInputDiagnostic::Hash)
+    }) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -82,16 +94,20 @@ pub fn row_with_encoder_observed<E, Encoder: ValueEncoder<Error = E>>(
 pub fn row_observed<E>(
     array: &ArrayRef,
     row: usize,
-    observe: impl FnMut(Observation) -> Result<(), E>,
-) -> Result<Result<Vec<u8>, String>, E> {
-    row_with_encoder_observed(
+    mut observe: impl FnMut(Observation) -> Result<(), E>,
+) -> Result<Result<Vec<u8>, crate::KernelFailure>, E> {
+    match row_with_encoder_observed(
         array,
         row,
-        observe,
-        &mut OriginalEncoder::<E>(std::marker::PhantomData),
-    )
+        |event| observe(event).map_err(ObservedFailure::Control),
+        &mut ObservedEncoder(std::marker::PhantomData),
+    ) {
+        Ok(value) => Ok(value),
+        Err(ObservedFailure::Kernel(source)) => Ok(Err(source)),
+        Err(ObservedFailure::Control(source)) => Err(source),
+    }
 }
-pub fn row(array: &ArrayRef, row: usize) -> Result<Vec<u8>, String> {
+pub fn row(array: &ArrayRef, row: usize) -> Result<Vec<u8>, crate::KernelFailure> {
     match row_observed(array, row, |_| Ok::<_, std::convert::Infallible>(())) {
         Ok(value) => value,
         Err(impossible) => match impossible {},

@@ -70,7 +70,12 @@ impl QueryContextCredentialSlot {
         let mut installed = BTreeMap::new();
         for lease in announced {
             if installed.insert(lease.lease_id(), lease.clone()).is_some() {
-                return Err(rejected("credential rotation repeats a lease id"));
+                return Err(HostRejection::from_domain(
+                    TaskFailureCategory::Protocol,
+                    RepeatedCredentialLease {
+                        lease: lease.lease_id(),
+                    },
+                ));
             }
         }
         *self
@@ -159,8 +164,24 @@ impl ConnectorStorageResolver for QueryContextCredentialSlot {
     }
 }
 
-fn rejected(detail: &str) -> HostRejection {
-    HostRejection::new(TaskFailureCategory::Protocol, detail)
+#[derive(Debug)]
+struct RepeatedCredentialLease {
+    lease: CredentialLeaseId,
+}
+impl fmt::Display for RepeatedCredentialLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "credential rotation repeats lease {:?}", self.lease)
+    }
+}
+impl std::error::Error for RepeatedCredentialLease {}
+impl novarocks_execution_contract::failure::FailureProjection for RepeatedCredentialLease {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::CredentialLeaseRepeated.reason(),
+        )
+    }
 }
 
 fn vended_storage_access_denied() -> ConnectorError {
@@ -358,7 +379,22 @@ mod tests {
                 lease(1, 3, &["s3://bucket/a"]),
             ])
             .expect_err("a rotation repeating a lease id is refused");
-        assert!(rejection.detail().as_str().contains("repeats a lease id"));
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        use std::error::Error;
+        assert_eq!(rejection.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            rejection.failure_fact().reason(),
+            crate::failure_reason::WorkerFailureReason::CredentialLeaseRepeated.reason()
+        );
+        let failure = rejection.into_failure();
+        let repeated = failure
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<super::RepeatedCredentialLease>()
+            .unwrap();
+        assert_eq!(repeated.lease, lease_id(1));
         assert_eq!(slot.installed_epoch(lease_id(1)), Some(1));
         assert!(slot.resolve_vended_s3(&request("s3://bucket/a/x")).is_ok());
     }

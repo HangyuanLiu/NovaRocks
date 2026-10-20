@@ -422,7 +422,7 @@ fn canonical_scalar_actual_emission_preserves_each_success_and_ordinary_control_
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

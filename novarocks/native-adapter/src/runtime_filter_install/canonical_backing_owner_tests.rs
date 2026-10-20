@@ -126,7 +126,8 @@ fn runtime_filter_canonical_late_owner_keeps_timezone_without_layout_cache_or_ma
         let tracker = MemTracker::new_root("RF canonical independent physical backing");
         tracker.install_limit_once(1024 * 1024).unwrap();
         let stop = ConnectorStopOwner::new();
-        let creation = creator(tracker.clone(), &stop);
+        let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+        let creation = creator(tracker.clone(), &control);
         let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let main_layout = Layout::array::<u8>(unrelated_main_bytes).unwrap();
         creation.request_layout(main_layout).unwrap();

@@ -42,7 +42,9 @@ pub enum ComparisonPrepareError {
 impl ComparisonPrepareError {
     pub fn control_error(&self) -> Option<CompileControlError> {
         match self {
-            Self::Control(cause) => Some(*cause),
+            Self::Control(cause) | Self::Kernel(KernelFailure::CompileControl(cause)) => {
+                Some(cause.clone())
+            }
             Self::Kernel(KernelFailure::Cancelled) => Some(CompileControlError::Cancelled),
             Self::Kernel(KernelFailure::DeadlineExceeded) => {
                 Some(CompileControlError::DeadlineExceeded)
@@ -312,12 +314,7 @@ impl PreparedComparisonRecipe {
             work.step()?;
             self.compare_values(la.as_ref(), l, ra.as_ref(), r, &mut work)
         })();
-        if matches!(
-            result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish()?;

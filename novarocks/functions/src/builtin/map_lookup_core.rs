@@ -16,7 +16,8 @@
 // under the License.
 //! Original map key equality, reverse search, take and NULL repair author.
 use super::array_literal_core::CollectionObservation;
-use crate::largeint;
+use super::collection_arrow::{ArrowSite, arrow_failure, cast_output, contract};
+use crate::{KernelFailure, largeint};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -25,6 +26,10 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use arrow_select::take::take;
+use novarocks_failure_contract::{
+    BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+};
+
 /// This existing frozen Map has an uninhabited key. Its value type remains
 /// independent and complete, including nominal domains and nullability. It
 /// cannot contain an entry without violating the ordinary non-null key rule.
@@ -62,33 +67,28 @@ pub fn row_index(row: usize, len: usize) -> usize {
 }
 #[derive(Debug)]
 pub enum MapLookupFailure<E> {
-    Data(String),
+    Operation(KernelFailure),
     Control(E),
-}
-pub fn cast_output(out: ArrayRef, output_type: Option<&DataType>) -> Result<ArrayRef, String> {
-    let Some(target) = output_type else {
-        return Ok(out);
-    };
-    if out.data_type() == target {
-        return Ok(out);
-    }
-    arrow_cast::cast(&out, target).map_err(|e| e.to_string())
 }
 pub fn compare_keys_at(
     keys: &ArrayRef,
     key_idx: usize,
     targets: &ArrayRef,
     target_idx: usize,
-) -> Result<bool, String> {
+) -> Result<bool, KeyComparisonFailure> {
+    if key_idx >= keys.len() || target_idx >= targets.len() {
+        return Err(contract("map key comparison is outside its physical carriers").into());
+    }
     if keys.is_null(key_idx) || targets.is_null(target_idx) {
         return Ok(false);
     }
     if keys.data_type() != targets.data_type() {
-        return Err(format!(
+        return Err(contract(format_args!(
             "map key type mismatch: {:?} vs {:?}",
             keys.data_type(),
             targets.data_type()
-        ));
+        ))
+        .into());
     }
 
     match keys.data_type() {
@@ -195,18 +195,22 @@ pub fn compare_keys_at(
             let l = keys
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast key to FixedSizeBinaryArray".to_string())?;
+                .ok_or_else(|| contract("failed to downcast key to FixedSizeBinaryArray"))?;
             let r = targets
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast target to FixedSizeBinaryArray".to_string())?;
+                .ok_or_else(|| contract("failed to downcast target to FixedSizeBinaryArray"))?;
             let lv = largeint::i128_from_be_bytes(l.value(key_idx))
-                .map_err(|e| format!("map key LARGEINT decode failed: {}", e))?;
+                .map_err(|source| KernelFailure::from_domain(LookupLargeIntFailure(source)))?;
             let rv = largeint::i128_from_be_bytes(r.value(target_idx))
-                .map_err(|e| format!("map key LARGEINT decode failed: {}", e))?;
+                .map_err(|source| KernelFailure::from_domain(LookupLargeIntFailure(source)))?;
             Ok(lv == rv)
         }
-        other => Err(format!("map key compare unsupported type: {:?}", other)),
+        other => Err(KeyComparisonFailure::Row(
+            LookupRowFailure::UnsupportedKeyDomain(BoundedDetail::truncating_display(
+                format_args!("map key compare unsupported type: {:?}", other),
+            )),
+        )),
     }
 }
 
@@ -221,16 +225,18 @@ impl<'a> MapLookupInputs<'a> {
         map_arr: &'a ArrayRef,
         key_arr: &'a ArrayRef,
         check_arr: Option<&'a ArrayRef>,
-    ) -> Result<Self, String> {
-        let map = map_arr
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| format!("element_at expects MapArray, got {:?}", map_arr.data_type()))?;
+    ) -> Result<Self, KernelFailure> {
+        let map = map_arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+            contract(format_args!(
+                "element_at expects MapArray, got {:?}",
+                map_arr.data_type()
+            ))
+        })?;
         let check_arr = check_arr
             .map(|a| {
                 a.as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "element_at check flag must be BOOLEAN".to_string())
+                    .ok_or_else(|| contract("element_at check flag must be BOOLEAN"))
             })
             .transpose()?;
         Ok(Self {
@@ -240,27 +246,27 @@ impl<'a> MapLookupInputs<'a> {
         })
     }
     /// This is the v1 array-layout contract, not a guess about selected mappings.
-    pub fn validate_legacy_lengths(&self) -> Result<(), String> {
+    pub fn validate_direct_lengths(&self) -> Result<(), KernelFailure> {
         if self.key_arr.len() != 1 && self.key_arr.len() != self.map.len() {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "element_at key length mismatch: map rows={}, key rows={}",
                 self.map.len(),
                 self.key_arr.len()
-            ));
+            )));
         }
         if let Some(flags) = self.check_arr
             && flags.len() != 1
             && flags.len() != self.map.len()
         {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "element_at check flag length mismatch: map rows={}, check rows={}",
                 self.map.len(),
                 flags.len()
-            ));
+            )));
         }
         Ok(())
     }
-    pub fn legacy_rows(&self, row: usize) -> LookupRows {
+    pub fn direct_rows(&self, row: usize) -> LookupRows {
         LookupRows {
             map: row,
             key: row_index(row, self.key_arr.len()),
@@ -286,8 +292,8 @@ pub fn lookup_observed<E>(
     selection: crate::Selection<'_>,
     mut rows: impl FnMut(usize, usize) -> Result<LookupRows, E>,
     output_type: Option<&DataType>,
-    mut before_take: impl FnMut(&dyn Array, &[Option<u32>]) -> Result<(), E>,
-    mut row_error: impl FnMut(usize, String) -> Result<(), String>,
+    mut before_take: impl FnMut(&dyn Array, &UInt32Array) -> Result<(), E>,
+    mut row_error: impl FnMut(usize, LookupRowFailure) -> Result<(), KernelFailure>,
     observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, MapLookupFailure<E>> {
     let map = inputs.map;
@@ -297,33 +303,44 @@ pub fn lookup_observed<E>(
     let values = map.values();
     let offsets = map.value_offsets();
     if values.is_empty() {
-        if let Some(flags) = check_arr {
-            for (ordinal, row) in selection.iter().enumerate() {
-                observe(observer, CollectionObservation::Step)?;
-                let row = rows(ordinal, row).map_err(MapLookupFailure::Control)?;
-                let check_idx = row.check.expect("check_arr exists when check_idx exists");
+        for (ordinal, row) in selection.iter().enumerate() {
+            observe(observer, CollectionObservation::Step)?;
+            let row = rows(ordinal, row).map_err(MapLookupFailure::Control)?;
+            validate_address(inputs, row).map_err(MapLookupFailure::Operation)?;
+            if let Some(flags) = check_arr {
+                let check_idx = row.check.expect("validated flag address");
                 let strict = !flags.is_null(check_idx) && flags.value(check_idx);
                 if strict && !map.is_null(row.map) {
-                    row_error(ordinal, "Key not present in map".to_string())
-                        .map_err(MapLookupFailure::Data)?;
+                    row_error(ordinal, LookupRowFailure::MissingKey)
+                        .map_err(MapLookupFailure::Operation)?;
                 }
             }
         }
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         let out = arrow_array::new_null_array(values.data_type(), selection.len());
         observe(observer, CollectionObservation::OpaqueBoundary)?;
-        let out = cast_output(out, output_type).map_err(|cause| {
-            MapLookupFailure::Data(format!("element_at: failed to cast output: {cause}"))
-        })?;
+        let out =
+            cast_output(out, output_type, "element_at").map_err(MapLookupFailure::Operation)?;
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         return Ok(out);
     }
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let mut indices = Vec::with_capacity(selection.len());
+    super::string_failure::array_layout::<Option<u32>>(selection.len())
+        .map_err(MapLookupFailure::Operation)?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(selection.len())
+        .map_err(|source| {
+            MapLookupFailure::Operation(super::string_failure::reservation::<Option<u32>>(
+                selection.len(),
+                source,
+            ))
+        })?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     'rows: for (ordinal, row) in selection.iter().enumerate() {
         observe(observer, CollectionObservation::Step)?;
         let row = rows(ordinal, row).map_err(MapLookupFailure::Control)?;
+        validate_address(inputs, row).map_err(MapLookupFailure::Operation)?;
         let key_idx = row.key;
         let check_idx = row.check;
         let check_out_of_bounds = check_idx
@@ -351,7 +368,13 @@ pub fn lookup_observed<E>(
             for i in (start..end).rev() {
                 observe(observer, CollectionObservation::Step)?;
                 observe(observer, CollectionObservation::OpaqueBoundary)?;
-                let comparison = compare_keys_at(keys, i, key_arr, key_idx);
+                let comparison = match compare_keys_at(keys, i, key_arr, key_idx) {
+                    Ok(value) => Ok(value),
+                    Err(KeyComparisonFailure::Row(cause)) => Err(cause),
+                    Err(KeyComparisonFailure::Operation(cause)) => {
+                        return Err(MapLookupFailure::Operation(cause));
+                    }
+                };
                 observe(observer, CollectionObservation::OpaqueBoundary)?;
                 match comparison {
                     Ok(true) => {
@@ -359,8 +382,8 @@ pub fn lookup_observed<E>(
                         break;
                     }
                     Ok(false) => {}
-                    Err(message) => {
-                        row_error(ordinal, message).map_err(MapLookupFailure::Data)?;
+                    Err(cause) => {
+                        row_error(ordinal, cause).map_err(MapLookupFailure::Operation)?;
                         indices.push(None);
                         continue 'rows;
                     }
@@ -368,8 +391,8 @@ pub fn lookup_observed<E>(
             }
         }
         if found.is_none() && check_out_of_bounds {
-            row_error(ordinal, "Key not present in map".to_string())
-                .map_err(MapLookupFailure::Data)?;
+            row_error(ordinal, LookupRowFailure::MissingKey)
+                .map_err(MapLookupFailure::Operation)?;
         }
         if let Some(v) = found {
             indices.push(Some(v));
@@ -377,17 +400,17 @@ pub fn lookup_observed<E>(
             indices.push(None);
         }
     }
-    before_take(values.as_ref(), &indices).map_err(MapLookupFailure::Control)?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let indices = UInt32Array::from(indices);
-    let out =
-        take(values.as_ref(), &indices, None).map_err(|e| MapLookupFailure::Data(e.to_string()))?;
+    observe(observer, CollectionObservation::OpaqueBoundary)?;
+    before_take(values.as_ref(), &indices).map_err(MapLookupFailure::Control)?;
+    let out = take(values.as_ref(), &indices, None).map_err(|source| {
+        MapLookupFailure::Operation(arrow_failure("element_at", ArrowSite::Take, source))
+    })?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let out = apply_indices_nulls(&out, &indices);
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let out = cast_output(out, output_type).map_err(|cause| {
-        MapLookupFailure::Data(format!("element_at: failed to cast output: {cause}"))
-    })?;
+    let out = cast_output(out, output_type, "element_at").map_err(MapLookupFailure::Operation)?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     Ok(out)
 }
@@ -410,4 +433,225 @@ fn apply_indices_nulls(out: &ArrayRef, indices: &UInt32Array) -> ArrayRef {
     };
     let data = out.to_data().into_builder().nulls(Some(combined_nulls));
     arrow_array::make_array(unsafe { data.build_unchecked() })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LookupRowFailure {
+    MissingKey,
+    UnsupportedKeyDomain(BoundedDetail),
+}
+impl LookupRowFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::MissingKey => "Key not present in map",
+            Self::UnsupportedKeyDomain(detail) => detail.as_str(),
+        }
+    }
+}
+impl std::fmt::Display for LookupRowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for LookupRowFailure {}
+#[derive(Debug)]
+struct RequiredLookupRow {
+    ordinal: Option<usize>,
+    cause: LookupRowFailure,
+}
+impl std::fmt::Display for RequiredLookupRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl std::error::Error for RequiredLookupRow {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+impl FailureProjection for LookupRowFailure {
+    fn failure_fact(&self) -> FailureFact {
+        lookup_fact(
+            FailureClass::Data,
+            match self {
+                Self::MissingKey => 377,
+                Self::UnsupportedKeyDomain(_) => 378,
+            },
+        )
+    }
+}
+impl FailureProjection for RequiredLookupRow {
+    fn failure_fact(&self) -> FailureFact {
+        self.cause.failure_fact()
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for RequiredLookupRow {}
+pub fn required_row_error(ordinal: usize, cause: LookupRowFailure) -> KernelFailure {
+    KernelFailure::from_domain(RequiredLookupRow {
+        ordinal: Some(ordinal),
+        cause,
+    })
+}
+#[derive(Debug)]
+struct LookupLargeIntFailure(crate::largeint::LargeIntCarrierFailure);
+impl std::fmt::Display for LookupLargeIntFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "map key LARGEINT decode failed: {}", self.0)
+    }
+}
+impl std::error::Error for LookupLargeIntFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl FailureProjection for LookupLargeIntFailure {
+    fn failure_fact(&self) -> FailureFact {
+        self.0.failure_fact()
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for LookupLargeIntFailure {}
+fn lookup_fact(class: FailureClass, code: u16) -> FailureFact {
+    FailureFact::new(
+        class,
+        FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+    )
+}
+fn validate_address(inputs: &MapLookupInputs<'_>, rows: LookupRows) -> Result<(), KernelFailure> {
+    if rows.map >= inputs.map.len() || rows.key >= inputs.key_arr.len() {
+        return Err(contract(
+            "map lookup demanded row is outside its physical carriers",
+        ));
+    }
+    match (inputs.check_arr, rows.check) {
+        (None, None) => Ok(()),
+        (Some(flags), Some(index)) if index < flags.len() => Ok(()),
+        _ => Err(contract(
+            "map lookup flag address differs from its prepared input",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod source_properties {
+    use super::*;
+    use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+    use std::{error::Error, sync::Arc};
+    #[test]
+    fn only_explicit_strict_missing_key_becomes_a_required_row_failure() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("present");
+        builder.values().append_value(7);
+        builder.append(true).unwrap();
+        let map: ArrayRef = Arc::new(builder.finish());
+        let key: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
+        let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let weak_map = Arc::downgrade(&map);
+        let weak_key = Arc::downgrade(&key);
+        let inputs = MapLookupInputs::new(&map, &key, Some(&flags)).unwrap();
+        let error = lookup_observed(
+            &inputs,
+            crate::Selection::all(1),
+            |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
+            None,
+            |_, _| Ok(()),
+            |ordinal, cause| Err(required_row_error(ordinal, cause)),
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        let MapLookupFailure::Operation(failure) = error else {
+            panic!("originating missing-key failure");
+        };
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 377);
+        assert_eq!(failure.to_string(), "Key not present in map");
+        let original = failure
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<RequiredLookupRow>()
+            .unwrap();
+        assert_eq!(original.ordinal, Some(0));
+        drop(inputs);
+        drop(map);
+        drop(key);
+        drop(flags);
+        assert!(weak_map.upgrade().is_none());
+        assert!(weak_key.upgrade().is_none());
+    }
+    #[test]
+    fn actual_empty_value_sdk_cast_refusal_is_not_a_row_error_and_has_no_later_observer() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.append(true).unwrap();
+        let map: ArrayRef = Arc::new(builder.finish());
+        let key: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
+        let inputs = MapLookupInputs::new(&map, &key, None).unwrap();
+        let target = DataType::Struct(
+            vec![Arc::new(arrow_schema::Field::new(
+                "ResourceExhausted",
+                DataType::Int32,
+                true,
+            ))]
+            .into(),
+        );
+        let mut calls = 0;
+        let error = lookup_observed(
+            &inputs,
+            crate::Selection::all(1),
+            |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
+            Some(&target),
+            |_, _| Ok(()),
+            |_, _| panic!("SDK/metadata failures cannot enter the row journal"),
+            &mut |_| {
+                calls += 1;
+                assert!(calls <= 3, "callback after the actual SDK cast failure");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 3);
+        let MapLookupFailure::Operation(failure) = error else {
+            panic!("originating SDK cast failure");
+        };
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 375);
+        assert!(failure.failure_fact().resource().is_none());
+        assert!(
+            failure
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<arrow_schema::ArrowError>()
+        );
+    }
+}
+
+#[derive(Debug)]
+pub enum KeyComparisonFailure {
+    Row(LookupRowFailure),
+    Operation(KernelFailure),
+}
+impl From<KernelFailure> for KeyComparisonFailure {
+    fn from(cause: KernelFailure) -> Self {
+        Self::Operation(cause)
+    }
+}
+/// A required comparison has no caller-selected row ordinal at this boundary.
+/// Only the comparator's own explicit row-domain refusal may be promoted here.
+pub fn compare_keys_required(
+    keys: &ArrayRef,
+    key_idx: usize,
+    targets: &ArrayRef,
+    target_idx: usize,
+) -> Result<bool, KernelFailure> {
+    compare_keys_at(keys, key_idx, targets, target_idx).map_err(|cause| match cause {
+        KeyComparisonFailure::Operation(cause) => cause,
+        KeyComparisonFailure::Row(cause) => KernelFailure::from_domain(RequiredLookupRow {
+            ordinal: None,
+            cause,
+        }),
+    })
 }

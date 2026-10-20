@@ -1295,12 +1295,20 @@ message ReleaseQueryContextAck {
   optional QueryTerminalProfileContributionTelemetry runtime_filter = 5;
 }
 
-// The receipt of exactly one operation from a batch.
-message TaskOperationReceipt {
-  TaskOperationId operation_id = 1;
-  TaskOperationOutcome outcome = 2;
-  string safe_detail = 3;               // <= 512 bytes, redacted by the producer
-  optional string safe_field_path = 4;  // <= 256 bytes when present
+// A producer-authored operation failure, not a Task conclusion.
+message OperationDomainFailure {
+  FailureFact fact = 1; // required
+  string safe_detail = 2; // <= 512 UTF-8 bytes, redacted by the producer
+}
+message TaskOperationDomainFailure {
+  TaskOperationOutcome outcome = 1; // only the closed domain-failure subset
+  OperationDomainFailure failure = 2; // required
+}
+// Normal protocol verdicts include deferred and already-terminal outcomes.
+message TaskOperationVerdict {
+  TaskOperationOutcome outcome = 1;
+  string safe_detail = 2;
+  optional string safe_field_path = 3;
   oneof ack {
     CreateTaskAck create_task = 5;
     UpdateTaskAck update_task = 6;
@@ -1309,6 +1317,14 @@ message TaskOperationReceipt {
     TaskStatus cancel_task = 9;
     QueryContextAdmissionTicketAck query_context_admission_ticket = 10;
     QuiesceQueryContextAck quiesce_query_context = 11;
+  }
+}
+// Exactly one mandatory result per request. No Task acceptance is inferred from failure.
+message TaskOperationReceipt {
+  TaskOperationId operation_id = 1;
+  oneof result {
+    TaskOperationVerdict verdict = 2;
+    TaskOperationDomainFailure domain_failure = 3;
   }
 }
 
@@ -1334,14 +1350,75 @@ enum TaskState {
   TASK_STATE_FAILED = 10;
 }
 
-enum TaskFailureCategory {
-  TASK_FAILURE_CATEGORY_UNSPECIFIED = 0;
-  TASK_FAILURE_CATEGORY_EXECUTION = 1;
-  TASK_FAILURE_CATEGORY_RESOURCE_EXHAUSTED = 2;
-  TASK_FAILURE_CATEGORY_EXCHANGE = 3;
-  TASK_FAILURE_CATEGORY_PROTOCOL = 4;
-  TASK_FAILURE_CATEGORY_INTERNAL = 5;
-  TASK_FAILURE_CATEGORY_UNSUPPORTED = 6;
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  FAILURE_CLASS_DATA = 1;
+  FAILURE_CLASS_DEPENDENCY = 2;
+  FAILURE_CLASS_RESOURCE = 3;
+  FAILURE_CLASS_REPRESENTATION = 4;
+  FAILURE_CLASS_INVARIANT = 5;
+  FAILURE_CLASS_UNEXPECTED = 6;
+  FAILURE_CLASS_CONTROL = 7;
+  FAILURE_CLASS_UNSUPPORTED = 8;
+}
+
+enum FailureEvidence {
+  FAILURE_EVIDENCE_UNSPECIFIED = 0;
+  FAILURE_EVIDENCE_ORIGINATING = 1;
+  FAILURE_EVIDENCE_STOP_OBSERVATION = 2;
+}
+
+enum FailureResourceScope {
+  FAILURE_RESOURCE_SCOPE_UNSPECIFIED = 0;
+  FAILURE_RESOURCE_SCOPE_REQUEST = 1;
+  FAILURE_RESOURCE_SCOPE_OPERATOR = 2;
+  FAILURE_RESOURCE_SCOPE_DRIVER = 3;
+  FAILURE_RESOURCE_SCOPE_TASK = 4;
+  FAILURE_RESOURCE_SCOPE_QUERY = 5;
+  FAILURE_RESOURCE_SCOPE_PROCESS = 6;
+}
+
+enum FailureResourceDimension {
+  FAILURE_RESOURCE_DIMENSION_UNSPECIFIED = 0;
+  FAILURE_RESOURCE_DIMENSION_BYTES = 1;
+  FAILURE_RESOURCE_DIMENSION_ITEMS = 2;
+  FAILURE_RESOURCE_DIMENSION_POSITIONS = 3;
+}
+
+enum FailureRepresentationBoundary {
+  FAILURE_REPRESENTATION_BOUNDARY_UNSPECIFIED = 0;
+  FAILURE_REPRESENTATION_BOUNDARY_MINIMUM_UNIT = 1;
+  FAILURE_REPRESENTATION_BOUNDARY_SINGLE_OUTPUT = 2;
+}
+
+// Domains own stable nonzero u16 identifiers; unknown valid identifiers survive.
+message FailureReason { uint32 domain = 1; uint32 code = 2; }
+message FailureRowPosition { uint64 selected_ordinal = 1; uint64 batch_row = 2; }
+message FailureResourceFacts {
+  optional FailureResourceScope request_scope = 1;
+  optional FailureResourceScope constraint_scope = 2;
+  FailureResourceDimension dimension = 3;
+  optional uint64 requested = 4;
+  optional uint64 required_growth = 5;
+  optional uint64 limit = 6;
+  optional uint64 live = 7;
+  optional uint64 committed = 8;
+}
+message FailureRepresentationLayout { uint32 domain = 1; uint32 code = 2; }
+message FailureRepresentationFacts {
+  FailureRepresentationBoundary boundary = 1;
+  FailureRepresentationLayout layout = 2;
+  optional uint64 required = 3;
+  optional uint64 extent_limit = 4;
+  optional uint64 representable_prefix = 5;
+}
+message FailureFact {
+  FailureClass class = 1;
+  FailureEvidence evidence = 2;
+  FailureReason reason = 3;
+  FailureRowPosition row_position = 4;
+  FailureResourceFacts resource = 5;
+  FailureRepresentationFacts representation = 6;
 }
 
 enum TaskFailurePhase {
@@ -1351,7 +1428,7 @@ enum TaskFailurePhase {
 }
 
 message TaskFailure {
-  TaskFailureCategory category = 1;
+  FailureFact fact = 1;  // required; authored by the original failure domain
   string safe_detail = 2;  // <= 512 bytes, redacted by the producer
   TaskFailurePhase phase = 3;
 }
@@ -1597,17 +1674,37 @@ message FetchRootResultRequest {
   uint64 consumed_sequence = 5;
   uint64 max_wait_millis = 6;
 }
+// An actual consumption receipt. Deferred and refused reads have none.
+message RootReadReceipt {
+  uint64 accepted_consumed_sequence = 1;
+  oneof outcome {
+    bool ack_only = 2;
+    bool not_ready = 3;
+    bool retired = 4;
+    bool await_terminal_control = 5;
+    novarocks.result.RootData data = 6;
+    novarocks.result.RootEnd end = 7;
+  }
+}
+message RootReadDeferred {
+  oneof reason {
+    bool preparing = 1;
+    FailureResourceFacts read_holders_busy = 2;
+    FailureResourceFacts send_metadata_busy = 3;
+    FailureResourceFacts send_backing_busy = 4;
+  }
+}
+message RootReadRefusal {
+  FailureFact fact = 1; // required, authored by the failing domain
+  string safe_detail = 2; // <= 512 UTF-8 bytes
+}
 message FetchRootResultResponse {
   TaskIdentity root_task = 1;
   uint32 profile_id = 2;
   novarocks.result.RootOutputKind output_kind = 3;
-  uint64 accepted_consumed_sequence = 4;
-  oneof outcome {
-    bool ack_only = 5;
-    bool not_ready = 6;
-    bool retired = 7;
-    bool await_terminal_control = 8;
-    novarocks.result.RootData data = 9;
-    novarocks.result.RootEnd end = 10;
+  oneof result {
+    RootReadReceipt reply = 4;
+    RootReadDeferred deferred = 5;
+    RootReadRefusal refused = 6;
   }
 }

@@ -23,6 +23,8 @@ use novarocks_failpoint::target_binding::{StatementInputNomination, StatementWor
 use novarocks_types::FrontendProcessId;
 use std::sync::Arc;
 
+pub(crate) mod result_handoff;
+
 pub type StatementInputHook =
     Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>;
 pub type StatementNominationHook = Arc<
@@ -71,6 +73,7 @@ impl FrontendTestSessionConfig {
         let scope = role.scope();
         let allowed = [
             "statement-observation",
+            "result-handoff",
             "mv",
             "native",
             "native-observation",
@@ -109,6 +112,11 @@ impl FrontendTestSessionConfig {
         let statement = crate::preparation_diagnostics::StatementObservationOwner::from_grants(
             scope.grants_for("statement-observation"),
         )?;
+        let result_handoff =
+            result_handoff::ResultHandoffControl::from_grants(scope.grants_for("result-handoff"))?;
+        if result_handoff.is_some() && statement.is_none() {
+            return Err("result handoff control requires exact statement nomination".into());
+        }
         if !scope.grants_for("root-observation").is_empty()
             && !cfg!(feature = "mem-1-m07-root-observation")
         {
@@ -138,6 +146,7 @@ impl FrontendTestSessionConfig {
             native,
             observation,
             statement,
+            result_handoff,
             mysql_fixture: std::sync::Mutex::new(mysql_fixture),
             provider,
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
@@ -211,6 +220,7 @@ pub(crate) struct FrontendTestSession {
     pub(crate) observation:
         Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
     pub(crate) statement: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
+    pub(crate) result_handoff: Option<Arc<result_handoff::ResultHandoffControl>>,
     mysql_fixture: std::sync::Mutex<
         Option<novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization>,
     >,

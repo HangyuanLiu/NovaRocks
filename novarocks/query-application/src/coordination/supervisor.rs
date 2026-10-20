@@ -45,19 +45,22 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::api::{
     ActiveNativeAttemptOwner, DormantNativeAttemptOwner, ExecutionHandle,
     LogicalExecutionNativePort, LogicalNativeOpenError, LogicalNativeOpenRequest,
-    LogicalNativeSession, NativeAttemptConvergence, NativeAttemptPreparationError,
-    NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeContextConvergenceKind,
-    NativeRowsAttemptRuntime, QueryExecutionClient, QueryExecutionDriver, QueryExecutionError,
-    QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest, ResultSchema,
+    LogicalNativeSession, NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
+    NativeAttemptConvergence, NativeAttemptPreparationError, NativeAttemptPreparationFailure,
+    NativeAttemptTerminal, NativeContextConvergenceKind, NativeRowsAttemptRuntime,
+    QueryExecutionClient, QueryExecutionDriver, QueryExecutionError, QueryExecutionErrorKind,
+    QueryExecutionFuture, QueryExecutionRequest, ResultSchema, StatementNativeHealthFailure,
 };
+use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
 use crate::preparation::OutputContract;
+use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 
 use super::{
     LogicalExecutionActorConfig, LogicalExecutionRuntimeRegistry,
     LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
     LogicalExecutionRuntimeShutdownError, NativeAttemptDrive, RecoveryDecision, RecoveryInput,
-    RecoveryMode, ResultPumpFailure, assert_shutdown_complete, build_attempt_schedule,
-    evaluate_recovery,
+    RecoveryMode, ResultPumpFailure, SupervisedActiveNativeOwner, assert_shutdown_complete,
+    build_attempt_schedule, evaluate_recovery,
 };
 
 static NEXT_PROCESS_QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -140,6 +143,7 @@ pub enum LogicalExecutionSupervisorShutdownError {
     Registry(LogicalExecutionRuntimeRegistryError),
     SupervisorFailed(QueryExecutionError),
     SupervisorPanicked,
+    StatementNativeUnresolved(QueryExecutionError),
 }
 
 impl fmt::Display for LogicalExecutionSupervisorShutdownError {
@@ -154,6 +158,12 @@ impl fmt::Display for LogicalExecutionSupervisorShutdownError {
             ),
             Self::SupervisorFailed(error) => {
                 write!(formatter, "logical execution supervisor failed: {error}")
+            }
+            Self::StatementNativeUnresolved(error) => {
+                write!(
+                    formatter,
+                    "statement Native owner has unproven actual exit: {error}"
+                )
             }
             Self::SupervisorPanicked => {
                 formatter.write_str("logical execution supervisor task panicked")
@@ -175,6 +185,7 @@ pub struct LogicalExecutionSupervisor {
     join: Option<JoinHandle<Result<(), QueryExecutionError>>>,
     run_outcome: Option<SupervisorRunOutcome>,
     registry: LogicalExecutionRuntimeRegistry,
+    statement_native_residual_port: super::StatementNativeResidualPort,
     shutdown_complete: bool,
 }
 
@@ -215,6 +226,8 @@ impl LogicalExecutionSupervisor {
         let (starts, start_rx) = mpsc::unbounded_channel();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let registry = LogicalExecutionRuntimeRegistry::new(runtime.clone());
+        let statement_native_residual_port =
+            registry.statement_native_residual_port(config.remote_cleanup_timeout());
         let registry_handle = registry.handle();
         let driver = QueryExecutionDriverHandle {
             starts,
@@ -235,10 +248,17 @@ impl LogicalExecutionSupervisor {
                 join: Some(join),
                 run_outcome: None,
                 registry,
+                statement_native_residual_port,
                 shutdown_complete: false,
             },
             QueryExecutionClient::new(driver),
         )
+    }
+
+    /// Registers only original statement Native responsibility; no actor gate,
+    /// logical success, or second business admission is granted by this port.
+    pub fn statement_native_residual_port(&self) -> super::StatementNativeResidualPort {
+        self.statement_native_residual_port.clone()
     }
 
     pub async fn shutdown_until(
@@ -256,9 +276,21 @@ impl LogicalExecutionSupervisor {
                 .expect("unfinished supervisor retains its join handle");
             self.run_outcome = match tokio::time::timeout_at(deadline.into(), join).await {
                 Err(_) => {
-                    return Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded);
+                    // Preserve the original healthy/error boundary while the
+                    // same JoinHandle/Registry still own unresolved local work.
+                    return Err(match self.registry.statement_native_health() {
+                        Some(error) => {
+                            LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(
+                                error,
+                            )
+                        }
+                        None => LogicalExecutionSupervisorShutdownError::DeadlineExceeded,
+                    });
                 }
-                Ok(Err(_)) => Some(SupervisorRunOutcome::Panicked),
+                Ok(Err(error)) => {
+                    self.registry.record_native_supervision_join_failure(error);
+                    Some(SupervisorRunOutcome::Panicked)
+                }
                 Ok(Ok(Err(error))) => Some(SupervisorRunOutcome::Failed(error)),
                 Ok(Ok(Ok(()))) => Some(SupervisorRunOutcome::Completed),
             };
@@ -268,13 +300,23 @@ impl LogicalExecutionSupervisor {
         match self.registry.shutdown_until(deadline).await {
             Ok(()) => {}
             Err(LogicalExecutionRuntimeShutdownError::DeadlineExceeded { .. }) => {
-                return Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded);
+                return Err(match self.registry.statement_native_health() {
+                    Some(error) => {
+                        LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(error)
+                    }
+                    None => LogicalExecutionSupervisorShutdownError::DeadlineExceeded,
+                });
             }
             Err(LogicalExecutionRuntimeShutdownError::Registry(error)) => {
                 return Err(LogicalExecutionSupervisorShutdownError::Registry(error));
             }
         }
 
+        if let Some(error) = self.registry.statement_native_health() {
+            if matches!(self.run_outcome, Some(SupervisorRunOutcome::Completed)) {
+                self.run_outcome = Some(SupervisorRunOutcome::Failed(error));
+            }
+        }
         self.shutdown_complete = true;
         match self
             .run_outcome
@@ -325,11 +367,10 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
         }
         let cancellation = match owner.scope().cancellation() {
             Ok(cancellation) => cancellation,
-            Err(_) => {
-                return rejected_start(
-                    owner,
-                    "logical execution start lost its cancellation authority",
-                );
+            Err(error) => {
+                let error = work_error(error);
+                owner.complete_after_terminal_cancel_settled();
+                return Box::pin(async move { Err(error) });
             }
         };
         let (reply, response) = oneshot::channel();
@@ -369,17 +410,24 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
 /// runtime happened to poll first, since the same expiry also reaches the
 /// pre-install wait, which has always classified it.
 fn start_cancellation_error(reason: CancellationReason) -> QueryExecutionError {
-    let kind = match reason {
-        CancellationReason::DeadlineExceeded
-        | CancellationReason::FrontendDrainDeadlineExceeded => {
-            QueryExecutionErrorKind::DeadlineExceeded
-        }
-        _ => QueryExecutionErrorKind::Cancelled,
-    };
-    QueryExecutionError::new(
-        kind,
-        format!("logical execution start was cancelled before its start verdict: {reason:?}"),
+    cancellation_error(
+        reason,
+        "logical execution start was cancelled before its start verdict",
     )
+}
+
+/// Project only the actual workload cancellation verdict, without inventing a Task phase.
+fn cancellation_error(reason: CancellationReason, detail: &'static str) -> QueryExecutionError {
+    let reason = match reason {
+        CancellationReason::DeadlineExceeded
+        | CancellationReason::FrontendDrainDeadlineExceeded => QueryFailureReason::DeadlineExceeded,
+        _ => QueryFailureReason::Cancelled,
+    };
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        reason.failure_fact(),
+        SafeDetail::truncating(detail),
+        ExecutionFailureSite::Coordinator,
+    ))
 }
 
 fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFuture {
@@ -447,6 +495,12 @@ async fn run_supervisor(
         if *shutdown.borrow() {
             break;
         }
+        for task in registry.statement_native_ready_tasks() {
+            logical_tasks.spawn(task);
+        }
+        if let Some(error) = registry.statement_native_health() {
+            task_failure.get_or_insert(error);
+        }
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -454,6 +508,7 @@ async fn run_supervisor(
                     break;
                 }
             }
+            _ = registry.statement_native_changed() => {}
             command = starts.recv() => {
                 let Some(command) = command else { break };
                 logical_tasks.spawn(run_logical_execution(
@@ -472,7 +527,8 @@ async fn run_supervisor(
                     Some(Ok(Err(error))) => {
                         task_failure.get_or_insert(error);
                     }
-                    Some(Err(_)) => {
+                    Some(Err(error)) => {
+                        registry.record_native_supervision_join_failure(error);
                         task_failure.get_or_insert_with(|| QueryExecutionError::new(
                             QueryExecutionErrorKind::Failed,
                             "logical execution supervision task panicked",
@@ -483,6 +539,7 @@ async fn run_supervisor(
         }
     }
 
+    registry.close_statement_native_admission();
     starts.close();
     while let Ok(command) = starts.try_recv() {
         command.owner.complete_after_terminal_cancel_settled();
@@ -491,19 +548,30 @@ async fn run_supervisor(
             "logical execution supervisor shut down before starting the accepted request",
         )));
     }
-    while let Some(result) = logical_tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                task_failure.get_or_insert(error);
-            }
-            Err(_) => {
-                task_failure.get_or_insert_with(|| {
-                    QueryExecutionError::new(
-                        QueryExecutionErrorKind::Failed,
-                        "logical execution supervision task panicked",
-                    )
-                });
+    loop {
+        for task in registry.statement_native_ready_tasks() {
+            logical_tasks.spawn(task);
+        }
+        if let Some(error) = registry.statement_native_health() {
+            task_failure.get_or_insert(error);
+        }
+        if logical_tasks.is_empty() && registry.statement_native_count() == 0 {
+            break;
+        }
+        tokio::select! {
+            _ = registry.statement_native_changed() => {}
+            result = logical_tasks.join_next(), if !logical_tasks.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(error))) => { task_failure.get_or_insert(error); }
+                    Some(Err(error)) => {
+                        registry.record_native_supervision_join_failure(error);
+                        task_failure.get_or_insert_with(|| QueryExecutionError::new(
+                            QueryExecutionErrorKind::Failed,
+                            "logical execution supervision task panicked",
+                        ));
+                    }
+                }
             }
         }
     }
@@ -746,6 +814,29 @@ async fn run_logical_execution(
         }
     };
     let mut dormant = prepared.owner;
+    let mut active_custody = match registry.reserve_active_native_owner(
+        &registration,
+        schedule.execution(),
+        schedule.contexts(),
+    ) {
+        Ok(reservation) => Some(reservation),
+        Err(error) => {
+            let error = registry_error(error);
+            let _ = reply.send(Err(error.clone()));
+            let actor_result = actor
+                .initialization_failed(initial)
+                .await
+                .map(|_| ())
+                .or_else(actor_terminal_refusal);
+            converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
+            drop(dormant);
+            let retire_result = retire_logical(&registry, registration).await;
+            return first_supervision_error(
+                Err(error),
+                first_supervision_error(actor_result, retire_result),
+            );
+        }
+    };
     let activation = await_with_shutdown(
         catch_future_panic(dormant.activate(&schedule, None, cancellation.clone())),
         &mut shutdown,
@@ -758,6 +849,7 @@ async fn run_logical_execution(
             active
         }
         Ok(Err(failure)) => {
+            drop(active_custody.take());
             session.retire_preparation();
             let error = failure.into_failure().error().clone();
             // Initialization failure may cancel the root while the actor starts
@@ -768,13 +860,14 @@ async fn run_logical_execution(
                 .initialization_failed(initial)
                 .await
                 .map(|_| ())
-                .map_err(actor_error);
+                .or_else(actor_terminal_refusal);
             converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
             drop(dormant);
             let retire_result = retire_logical(&registry, registration).await;
             return first_supervision_error(actor_result, retire_result);
         }
         Err(()) => {
+            drop(active_custody.take());
             session.retire_preparation();
             let error = native_future_panicked("Native attempt activation panicked");
             // As above, the direct activation verdict precedes any derived
@@ -784,7 +877,7 @@ async fn run_logical_execution(
                 .initialization_failed(initial)
                 .await
                 .map(|_| ())
-                .map_err(actor_error);
+                .or_else(actor_terminal_refusal);
             converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
             drop(dormant);
             let retire_result = retire_logical(&registry, registration).await;
@@ -794,17 +887,24 @@ async fn run_logical_execution(
             );
         }
     };
-    let (mut active, rows_runtime) = active.into_parts();
+    let (original_active, rows_runtime) = active.into_parts();
+    let mut active = active_custody
+        .take()
+        .expect("reserved before activation")
+        .bind(original_active);
     match (&result_schema, rows_runtime) {
         (Some(_), Some(rows_runtime)) => {
             let running = match actor.activate(initial.ready()).await {
                 Ok(running) => running,
                 Err(error) => {
                     session.retire_preparation();
+                    let supervision = actor_terminal_refusal(error);
+                    if supervision.is_err() {
+                        let _ = requester.request(CancellationReason::Requested);
+                    }
                     let error = actor_error(error);
-                    let _ = requester.request(CancellationReason::Requested);
-                    let convergence = converge_active(
-                        active.as_mut(),
+                    let convergence = converge_supervised_active(
+                        &mut active,
                         cancellation,
                         &mut shutdown,
                         &requester,
@@ -822,7 +922,7 @@ async fn run_logical_execution(
                     let _ = reply.send(Err(error.clone()));
                     let retire_result = retire_logical(&registry, registration).await;
                     return first_supervision_error(
-                        Err(error),
+                        supervision,
                         first_supervision_error(convergence_result, retire_result),
                     );
                 }
@@ -854,18 +954,17 @@ async fn run_logical_execution(
         }
         (Some(_), None) => {
             session.retire_preparation();
-            let error = QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
+            let error = result_protocol_error(
                 "Native activated a row execution without its root result runtime",
             );
             let actor_result = actor
                 .initialization_failed(initial)
                 .await
                 .map(|_| ())
-                .map_err(actor_error);
+                .or_else(actor_terminal_refusal);
             let _ = requester.request(CancellationReason::Requested);
-            let convergence = converge_active(
-                active.as_mut(),
+            let convergence = converge_supervised_active(
+                &mut active,
                 cancellation,
                 &mut shutdown,
                 &requester,
@@ -892,18 +991,17 @@ async fn run_logical_execution(
         }
         (None, Some(_)) => {
             session.retire_preparation();
-            let error = QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
+            let error = result_protocol_error(
                 "Native attached a root result runtime to a completion-only execution",
             );
             let actor_result = actor
                 .initialization_failed(initial)
                 .await
                 .map(|_| ())
-                .map_err(actor_error);
+                .or_else(actor_terminal_refusal);
             let _ = requester.request(CancellationReason::Requested);
-            let convergence = converge_active(
-                active.as_mut(),
+            let convergence = converge_supervised_active(
+                &mut active,
                 cancellation,
                 &mut shutdown,
                 &requester,
@@ -934,10 +1032,13 @@ async fn run_logical_execution(
         Ok(running) => running,
         Err(error) => {
             session.retire_preparation();
+            let supervision = actor_terminal_refusal(error);
+            if supervision.is_err() {
+                let _ = requester.request(CancellationReason::Requested);
+            }
             let error = actor_error(error);
-            let _ = requester.request(CancellationReason::Requested);
-            let convergence = converge_active(
-                active.as_mut(),
+            let convergence = converge_supervised_active(
+                &mut active,
                 cancellation,
                 &mut shutdown,
                 &requester,
@@ -955,18 +1056,19 @@ async fn run_logical_execution(
             let _ = reply.send(Err(error.clone()));
             let retire_result = retire_logical(&registry, registration).await;
             return first_supervision_error(
-                Err(error),
+                supervision,
                 first_supervision_error(convergence_result, retire_result),
             );
         }
     };
     let drive = NativeAttemptDrive::new(&running);
     let terminal = await_with_shutdown(
-        catch_future_panic(active.run(&drive, cancellation.clone())),
+        catch_future_panic(active.as_mut().run(&drive, cancellation.clone())),
         &mut shutdown,
         &requester,
     )
     .await;
+    active.begin_terminal_cut(Instant::now());
     session.retire_preparation();
     let (actor_result, convergence) = match terminal {
         Ok(NativeAttemptTerminal::Completed) => {
@@ -989,13 +1091,13 @@ async fn run_logical_execution(
                     Err(error)
                 }
                 Err(error) => {
-                    let error = actor_error(error);
-                    let _ = reply.send(Err(error.clone()));
-                    Err(error)
+                    let supervision = actor_terminal_refusal(error);
+                    let _ = reply.send(Err(actor_error(error)));
+                    supervision
                 }
             };
-            let convergence = converge_active(
-                active.as_mut(),
+            let convergence = converge_supervised_active(
+                &mut active,
                 cancellation,
                 &mut shutdown,
                 &requester,
@@ -1011,10 +1113,10 @@ async fn run_logical_execution(
                 .fail_attempt_with_error(running, client_error.clone())
                 .await
                 .map(|_| ())
-                .map_err(actor_error);
+                .or_else(actor_terminal_refusal);
             let _ = reply.send(Err(client_error));
-            let convergence = converge_active(
-                active.as_mut(),
+            let convergence = converge_supervised_active(
+                &mut active,
                 cancellation,
                 &mut shutdown,
                 &requester,
@@ -1030,10 +1132,10 @@ async fn run_logical_execution(
                 .fail_attempt_with_error(running, error.clone())
                 .await
                 .map(|_| ())
-                .map_err(actor_error);
+                .or_else(actor_terminal_refusal);
             let _ = reply.send(Err(error.clone()));
-            let convergence = converge_active(
-                active.as_mut(),
+            let convergence = converge_supervised_active(
+                &mut active,
                 cancellation,
                 &mut shutdown,
                 &requester,
@@ -1063,7 +1165,7 @@ async fn run_logical_execution(
 
 struct RowsAttempt {
     schedule: super::AttemptSchedule,
-    active: Box<dyn ActiveNativeAttemptOwner>,
+    active: SupervisedActiveNativeOwner,
     running: super::RunningAttemptPermit,
     runtime: NativeRowsAttemptRuntime,
 }
@@ -1079,12 +1181,16 @@ type ResidualRowsConvergence = JoinSet<(
 #[derive(Debug)]
 enum ActiveAttemptConvergence {
     Evidence(NativeAttemptConvergence),
-    RemoteTrackingEnded,
+    RemoteTrackingEnded {
+        exact_contexts: Box<[novarocks_execution_contract::QueryContextRef]>,
+    },
+    Unresolved(StatementNativeHealthFailure),
+    Recorded(Result<(), QueryExecutionError>),
 }
 
 fn supervise_residual_rows_attempt(
     residuals: &mut ResidualRowsConvergence,
-    mut active: Box<dyn ActiveNativeAttemptOwner>,
+    mut active: SupervisedActiveNativeOwner,
     contexts: Box<[novarocks_execution_contract::QueryContextRef]>,
     cancellation: novarocks_workload_control::CancellationView,
     mut shutdown: watch::Receiver<bool>,
@@ -1092,8 +1198,8 @@ fn supervise_residual_rows_attempt(
     cleanup_timeout: Duration,
 ) {
     residuals.spawn(async move {
-        let convergence = converge_active(
-            active.as_mut(),
+        let convergence = converge_supervised_active(
+            &mut active,
             cancellation,
             &mut shutdown,
             &requester,
@@ -1106,7 +1212,7 @@ fn supervise_residual_rows_attempt(
 
 #[allow(clippy::too_many_arguments)]
 async fn converge_rows_attempts(
-    active: &mut dyn ActiveNativeAttemptOwner,
+    active: &mut SupervisedActiveNativeOwner,
     active_contexts: &[novarocks_execution_contract::QueryContextRef],
     residuals: &mut ResidualRowsConvergence,
     cancellation: novarocks_workload_control::CancellationView,
@@ -1117,7 +1223,8 @@ async fn converge_rows_attempts(
     cleanup_timeout: Duration,
 ) -> Result<(), QueryExecutionError> {
     let active_convergence =
-        converge_active(active, cancellation, shutdown, requester, cleanup_timeout).await;
+        converge_supervised_active(active, cancellation, shutdown, requester, cleanup_timeout)
+            .await;
     let result = record_reported_active_convergence(
         registry,
         registration,
@@ -1143,10 +1250,14 @@ async fn converge_residual_rows_attempts(
                 record_reported_active_convergence(registry, registration, &contexts, convergence)
                     .await
             }
-            Err(error) => Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::Failed,
-                format!("residual Native attempt convergence task failed: {error}"),
-            )),
+            Err(error) => {
+                let diagnostic = QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed,
+                    format!("residual Native attempt convergence task failed: {error}"),
+                );
+                registry.record_native_supervision_join_failure(error);
+                Err(diagnostic)
+            }
         };
         result = first_supervision_error(result, convergence);
     }
@@ -1188,9 +1299,8 @@ async fn drive_rows_attempt_until_pump_decision(
             }
             outcome = &mut native_run, if terminal_sender.is_some() => {
                 let terminal = outcome.unwrap_or_else(|()| {
-                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                        super::AttemptFailureClass::ExecutionFailure,
-                        native_future_panicked("Native row attempt run panicked"),
+                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                        native_future_panic_input("Native row attempt run panicked"),
                     ))
                 });
                 terminal_sender
@@ -1227,9 +1337,12 @@ async fn supervise_rows(
         // Every attempt, the first and each replacement, runs the activated
         // plan itself: the one the description froze, by identity.
         if !Arc::ptr_eq(active_plan.plan(), description.completed_candidate().plan()) {
-            return Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
-                "replacement attempt lost the activated physical plan",
+            return Err(QueryExecutionError::from_execution(
+                ExecutionFailureInput::new(
+                    QueryFailureReason::PreparationProtocol.failure_fact(),
+                    SafeDetail::truncating("replacement attempt lost the activated physical plan"),
+                    ExecutionFailureSite::Coordinator,
+                ),
             ));
         }
         let drive = NativeAttemptDrive::new(&attempt.running);
@@ -1245,13 +1358,14 @@ async fn supervise_rows(
             requester,
         )
         .await;
+        attempt.active.begin_terminal_cut(Instant::now());
         drop(drive);
 
         match pump_result {
             Ok(super::LogicalConclusion::Succeeded) => {
                 session.retire_preparation();
                 return converge_rows_attempts(
-                    attempt.active.as_mut(),
+                    &mut attempt.active,
                     attempt.schedule.contexts(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -1266,7 +1380,7 @@ async fn supervise_rows(
             Ok(conclusion) => {
                 session.retire_preparation();
                 let convergence = converge_rows_attempts(
-                    attempt.active.as_mut(),
+                    &mut attempt.active,
                     attempt.schedule.contexts(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -1288,7 +1402,7 @@ async fn supervise_rows(
             Err(ResultPumpFailure::Concluded(failure)) => {
                 session.retire_preparation();
                 let convergence = converge_rows_attempts(
-                    attempt.active.as_mut(),
+                    &mut attempt.active,
                     attempt.schedule.contexts(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -1311,7 +1425,7 @@ async fn supervise_rows(
             Err(ResultPumpFailure::ActorOutcomeUnknown(failure)) => {
                 session.retire_preparation();
                 let convergence = converge_rows_attempts(
-                    attempt.active.as_mut(),
+                    &mut attempt.active,
                     attempt.schedule.contexts(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -1347,9 +1461,9 @@ async fn supervise_rows(
                         .fail_logical(actor)
                         .await
                         .map(|_| ())
-                        .map_err(actor_error);
+                        .or_else(actor_terminal_refusal);
                     let convergence = converge_rows_attempts(
-                        attempt.active.as_mut(),
+                        &mut attempt.active,
                         attempt.schedule.contexts(),
                         &mut residuals,
                         cancellation,
@@ -1371,9 +1485,9 @@ async fn supervise_rows(
                             .fail_logical(actor)
                             .await
                             .map(|_| ())
-                            .map_err(actor_error);
+                            .or_else(actor_terminal_refusal);
                         let convergence = converge_rows_attempts(
-                            attempt.active.as_mut(),
+                            &mut attempt.active,
                             attempt.schedule.contexts(),
                             &mut residuals,
                             cancellation,
@@ -1409,13 +1523,10 @@ async fn supervise_rows(
                     Ok(prepared) => prepared,
                     Err(error) => {
                         session.retire_preparation();
-                        let actor_result = decision
-                            .fail_logical(actor)
-                            .await
-                            .map(|_| ())
-                            .map_err(actor_error);
+                        let actor_outcome = decision.fail_logical(actor).await;
+                        let supervision = preparation_supervision_result(error, actor_outcome);
                         let convergence = converge_rows_attempts(
-                            attempt.active.as_mut(),
+                            &mut attempt.active,
                             attempt.schedule.contexts(),
                             &mut residuals,
                             cancellation,
@@ -1426,10 +1537,7 @@ async fn supervise_rows(
                             config.remote_cleanup_timeout(),
                         )
                         .await;
-                        return first_supervision_error(
-                            Err(error),
-                            first_supervision_error(actor_result, convergence),
-                        );
+                        return first_supervision_error(supervision, convergence);
                     }
                 };
                 let qualification = match decision
@@ -1447,7 +1555,7 @@ async fn supervise_rows(
                         )
                         .await;
                         let old_convergence = converge_rows_attempts(
-                            attempt.active.as_mut(),
+                            &mut attempt.active,
                             attempt.schedule.contexts(),
                             &mut residuals,
                             scope.cancellation().map_err(work_error)?,
@@ -1459,7 +1567,7 @@ async fn supervise_rows(
                         )
                         .await;
                         return first_supervision_error(
-                            Err(actor_error(error)),
+                            actor_terminal_refusal(error),
                             first_supervision_error(replacement_convergence, old_convergence),
                         );
                     }
@@ -1495,7 +1603,7 @@ async fn supervise_rows(
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
                         return first_supervision_error(
-                            Err(actor_error(error)),
+                            actor_terminal_refusal(error),
                             first_supervision_error(replacement_convergence, old_convergence),
                         );
                     }
@@ -1521,8 +1629,40 @@ async fn supervise_rows(
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
                         return first_supervision_error(
-                            Err(actor_error(error)),
+                            actor_terminal_refusal(error),
                             first_supervision_error(replacement_convergence, old_convergence),
+                        );
+                    }
+                };
+                let mut replacement_custody = match registry.reserve_active_native_owner(
+                    registration,
+                    replacement_schedule.execution(),
+                    replacement_schedule.contexts(),
+                ) {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) => {
+                        session.retire_preparation();
+                        let actor_result = actor
+                            .initialization_failed(instantiation)
+                            .await
+                            .map(|_| ())
+                            .or_else(actor_terminal_refusal);
+                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
+                        let replacement_convergence = record_active_convergence(
+                            registry,
+                            registration,
+                            replacement_schedule.contexts(),
+                        )
+                        .await;
+                        let old_convergence =
+                            converge_residual_rows_attempts(&mut residuals, registry, registration)
+                                .await;
+                        return first_supervision_error(
+                            Err(registry_error(error)),
+                            first_supervision_error(
+                                actor_result,
+                                first_supervision_error(replacement_convergence, old_convergence),
+                            ),
                         );
                     }
                 };
@@ -1539,13 +1679,11 @@ async fn supervise_rows(
                 let activated = match activated {
                     Ok(Ok(activated)) => activated,
                     Ok(Err(failure)) => {
+                        drop(replacement_custody.take());
                         session.retire_preparation();
                         let error = failure.into_failure().error().clone();
-                        let actor_result = actor
-                            .initialization_failed(instantiation)
-                            .await
-                            .map(|_| ())
-                            .map_err(actor_error);
+                        let actor_outcome = actor.initialization_failed(instantiation).await;
+                        let supervision = preparation_supervision_result(error, actor_outcome);
                         converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
                         let replacement_convergence = record_active_convergence(
                             registry,
@@ -1557,14 +1695,12 @@ async fn supervise_rows(
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
                         return first_supervision_error(
-                            Err(error),
-                            first_supervision_error(
-                                actor_result,
-                                first_supervision_error(replacement_convergence, old_convergence),
-                            ),
+                            supervision,
+                            first_supervision_error(replacement_convergence, old_convergence),
                         );
                     }
                     Err(()) => {
+                        drop(replacement_custody.take());
                         session.retire_preparation();
                         let error = native_future_panicked(
                             "Native replacement attempt activation panicked",
@@ -1573,7 +1709,7 @@ async fn supervise_rows(
                             .initialization_failed(instantiation)
                             .await
                             .map(|_| ())
-                            .map_err(actor_error);
+                            .or_else(actor_terminal_refusal);
                         converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
                         let replacement_convergence = record_active_convergence(
                             registry,
@@ -1594,21 +1730,23 @@ async fn supervise_rows(
                     }
                 };
                 drop(dormant);
-                let (active, rows_runtime) = activated.into_parts();
+                let (original_active, rows_runtime) = activated.into_parts();
+                let active = replacement_custody
+                    .take()
+                    .expect("reserved before replacement activation")
+                    .bind(original_active);
                 let Some(rows_runtime) = rows_runtime else {
                     session.retire_preparation();
-                    let error = QueryExecutionError::new(
-                        QueryExecutionErrorKind::InvalidRequest,
-                        "Native replacement omitted its root result runtime",
-                    );
+                    let error =
+                        result_protocol_error("Native replacement omitted its root result runtime");
                     let actor_result = actor
                         .initialization_failed(instantiation)
                         .await
                         .map(|_| ())
-                        .map_err(actor_error);
+                        .or_else(actor_terminal_refusal);
                     let mut active = active;
-                    let convergence = converge_active(
-                        active.as_mut(),
+                    let convergence = converge_supervised_active(
+                        &mut active,
                         cancellation,
                         shutdown,
                         requester,
@@ -1639,8 +1777,8 @@ async fn supervise_rows(
                     Err(error) => {
                         session.retire_preparation();
                         let mut active = active;
-                        let convergence = converge_active(
-                            active.as_mut(),
+                        let convergence = converge_supervised_active(
+                            &mut active,
                             cancellation,
                             shutdown,
                             requester,
@@ -1658,7 +1796,7 @@ async fn supervise_rows(
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
                         return first_supervision_error(
-                            Err(actor_error(error)),
+                            actor_terminal_refusal(error),
                             first_supervision_error(replacement_convergence, old_convergence),
                         );
                     }
@@ -1694,16 +1832,17 @@ async fn prepare_native_attempt(
     let prepared = tokio::select! {
         biased;
         reason = cancellation.cancelled() => {
-            return Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::Cancelled,
-                format!("Native replacement preparation was cancelled: {reason:?}"),
+            return Err(cancellation_error(
+                cancellation.reason().unwrap_or(reason),
+                "Native replacement preparation was cancelled",
             ));
         }
         _ = tokio::time::sleep_until(deadline) => {
-            return Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::Failed,
-                "Native replacement preparation exceeded its recovery budget",
-            ));
+            return Err(QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                QueryFailureReason::RecoveryPreparationBudgetExceeded.failure_fact(),
+                SafeDetail::truncating("Native replacement preparation exceeded its recovery budget"),
+                ExecutionFailureSite::Coordinator,
+            )));
         }
         prepared = &mut preparation => prepared,
     }
@@ -1760,8 +1899,26 @@ async fn record_reported_active_convergence(
     expected_contexts: &[novarocks_execution_contract::QueryContextRef],
     convergence: ActiveAttemptConvergence,
 ) -> Result<(), QueryExecutionError> {
-    let ActiveAttemptConvergence::Evidence(convergence) = convergence else {
-        return record_remote_tracking_ended(registry, registration, expected_contexts).await;
+    let convergence = match convergence {
+        ActiveAttemptConvergence::Recorded(result) => return result,
+        ActiveAttemptConvergence::Unresolved(failure) => {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                failure.detail(),
+            ));
+        }
+        ActiveAttemptConvergence::RemoteTrackingEnded { exact_contexts } => {
+            let expected = expected_contexts.iter().copied().collect::<BTreeSet<_>>();
+            let reported = exact_contexts.iter().copied().collect::<BTreeSet<_>>();
+            if expected != reported || reported.len() != exact_contexts.len() {
+                return Err(QueryExecutionError::new(
+                    QueryExecutionErrorKind::InvalidRequest,
+                    "Native remote tracking omitted or duplicated original contexts",
+                ));
+            }
+            return record_remote_tracking_ended(registry, registration, expected_contexts).await;
+        }
+        ActiveAttemptConvergence::Evidence(convergence) => convergence,
     };
     let NativeAttemptConvergence::Contexts(facts) = convergence else {
         return record_active_convergence(registry, registration, expected_contexts).await;
@@ -1844,6 +2001,37 @@ async fn converge_dormant(
     }
 }
 
+async fn converge_supervised_active(
+    owner: &mut SupervisedActiveNativeOwner,
+    cancellation: novarocks_workload_control::CancellationView,
+    shutdown: &mut watch::Receiver<bool>,
+    requester: &novarocks_workload_control::WorkCancellationRequester,
+    cleanup_timeout: Duration,
+) -> ActiveAttemptConvergence {
+    let request = owner.request(cancellation, cleanup_timeout);
+    let (outcome, deadline) =
+        converge_active_request(owner.as_mut(), request, shutdown, requester).await;
+    owner.shorten_remote_deadline(deadline);
+    let result = match outcome {
+        ActiveAttemptConvergence::Evidence(evidence) => {
+            owner
+                .record_and_close(NativeActiveConvergenceClosure::Evidence(evidence))
+                .await
+        }
+        ActiveAttemptConvergence::RemoteTrackingEnded { exact_contexts } => {
+            owner
+                .record_and_close(NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                    exact_contexts,
+                })
+                .await
+        }
+        ActiveAttemptConvergence::Unresolved(failure) => Err(owner.retain_unresolved(failure)),
+        ActiveAttemptConvergence::Recorded(result) => result,
+    };
+    ActiveAttemptConvergence::Recorded(result)
+}
+
+#[cfg(test)]
 async fn converge_active(
     owner: &mut dyn ActiveNativeAttemptOwner,
     cancellation: novarocks_workload_control::CancellationView,
@@ -1851,36 +2039,77 @@ async fn converge_active(
     requester: &novarocks_workload_control::WorkCancellationRequester,
     cleanup_timeout: Duration,
 ) -> ActiveAttemptConvergence {
-    let deadline = tokio::time::Instant::now() + cleanup_timeout;
-    let mut shutdown_open = true;
+    converge_active_request(
+        owner,
+        NativeActiveConvergenceRequest::new(cancellation, Instant::now() + cleanup_timeout),
+        shutdown,
+        requester,
+    )
+    .await
+    .0
+}
+
+async fn converge_active_request(
+    owner: &mut dyn ActiveNativeAttemptOwner,
+    request: NativeActiveConvergenceRequest,
+    shutdown: &mut watch::Receiver<bool>,
+    requester: &novarocks_workload_control::WorkCancellationRequester,
+) -> (ActiveAttemptConvergence, Instant) {
+    let cancellation = request.cancellation().clone();
+    let mut deadline = request.remote_observation_deadline();
+    let mut shutdown_cut = false;
     loop {
-        let convergence = async { owner.converge(cancellation.clone()).await };
-        tokio::select! {
-            result = tokio::time::timeout_at(deadline, catch_future_panic(convergence)) => {
-                match result {
-                    Ok(Ok(convergence)) => return ActiveAttemptConvergence::Evidence(convergence),
-                    Ok(Err(())) => {
-                        let _ = requester.request(CancellationReason::Requested);
-                        if tokio::time::Instant::now() >= deadline {
-                            return ActiveAttemptConvergence::RemoteTrackingEnded;
-                        }
-                        tokio::time::sleep(NATIVE_CONVERGENCE_PANIC_BACKOFF).await;
-                    }
-                    Err(_) => return ActiveAttemptConvergence::RemoteTrackingEnded,
-                }
-            }
-            changed = shutdown.changed(), if shutdown_open => {
-                shutdown_open = changed.is_ok();
-                if !shutdown_open || *shutdown.borrow() {
-                    let _ = requester.request(CancellationReason::ServerShutdown);
-                    // The FE process is leaving and can no longer own a
-                    // remote observation. Do not let its optional cleanup
-                    // window overrun the process shutdown deadline; Workers
-                    // retain their lease-backed responsibility.
-                    return ActiveAttemptConvergence::RemoteTrackingEnded;
-                }
-            }
+        if *shutdown.borrow() && !shutdown_cut {
+            let _ = requester.request(CancellationReason::ServerShutdown);
+            deadline = deadline.min(Instant::now());
+            shutdown_cut = true;
         }
+        enum Turn {
+            Closed(
+                Result<
+                    Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure>,
+                    StatementNativeHealthFailure,
+                >,
+            ),
+            Shutdown,
+        }
+        let turn_deadline = deadline;
+        let turn = {
+            let convergence = super::catch_native_convergence_panic(async {
+                owner
+                    .converge(NativeActiveConvergenceRequest::new(
+                        cancellation.clone(),
+                        turn_deadline,
+                    ))
+                    .await
+            });
+            tokio::pin!(convergence);
+            tokio::select! {
+                result = &mut convergence => Turn::Closed(result),
+                changed = shutdown.changed(), if !shutdown_cut => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        let _ = requester.request(CancellationReason::ServerShutdown);
+                        deadline = deadline.min(Instant::now());
+                        shutdown_cut = true;
+                    }
+                    Turn::Shutdown
+                }
+            }
+        };
+        let result = match turn {
+            Turn::Shutdown => continue,
+            Turn::Closed(result) => result,
+        };
+        let outcome = match result {
+            Ok(Ok(NativeActiveConvergenceClosure::Evidence(evidence))) => {
+                ActiveAttemptConvergence::Evidence(evidence)
+            }
+            Ok(Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_contexts })) => {
+                ActiveAttemptConvergence::RemoteTrackingEnded { exact_contexts }
+            }
+            Ok(Err(health)) | Err(health) => ActiveAttemptConvergence::Unresolved(health),
+        };
+        return (outcome, deadline);
     }
 }
 
@@ -2026,6 +2255,9 @@ async fn retire_logical(
     registry: &super::LogicalExecutionRuntimeRegistryHandle,
     registration: super::LogicalExecutionRegistration,
 ) -> Result<(), QueryExecutionError> {
+    if let Some(error) = registry.active_native_registration_health(&registration) {
+        return Err(error);
+    }
     registry
         .join_and_retire(registration)
         .await
@@ -2040,7 +2272,19 @@ fn first_supervision_error(
 }
 
 fn contract_error(error: crate::api::NativeExecutionContractError) -> QueryExecutionError {
-    QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        error.failure_fact(),
+        error.safe_detail(),
+        ExecutionFailureSite::Coordinator,
+    ))
+}
+
+fn result_protocol_error(detail: &'static str) -> QueryExecutionError {
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        QueryFailureReason::ResultProtocol.failure_fact(),
+        SafeDetail::truncating(detail),
+        ExecutionFailureSite::Coordinator,
+    ))
 }
 
 fn native_open_error(error: LogicalNativeOpenError) -> QueryExecutionError {
@@ -2057,46 +2301,142 @@ fn native_prepare_error(error: NativeAttemptPreparationError) -> QueryExecutionE
     }
 }
 
+/// Only a terminal disposition authored by the actor proves this command
+/// lost to an already accepted conclusion. Other refusals remain failures.
+fn actor_terminal_refusal(
+    error: super::LogicalExecutionActorError,
+) -> Result<(), QueryExecutionError> {
+    match error {
+        super::LogicalExecutionActorError::ExecutionConcluded(_) => Ok(()),
+        error => Err(actor_error(error)),
+    }
+}
+
+fn preparation_supervision_result(
+    error: QueryExecutionError,
+    actor_outcome: Result<super::LogicalConclusion, super::LogicalExecutionActorError>,
+) -> Result<(), QueryExecutionError> {
+    let accepted_control_conclusion = matches!(
+        &actor_outcome,
+        Err(super::LogicalExecutionActorError::ExecutionConcluded(_))
+    ) && matches!(
+        error.kind(),
+        QueryExecutionErrorKind::Cancelled | QueryExecutionErrorKind::DeadlineExceeded
+    );
+    let actor_result = actor_outcome.map(|_| ()).or_else(actor_terminal_refusal);
+    if accepted_control_conclusion {
+        actor_result
+    } else {
+        first_supervision_error(Err(error), actor_result)
+    }
+}
+
 fn actor_error(error: super::LogicalExecutionActorError) -> QueryExecutionError {
-    QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        error.failure_fact(),
+        error.safe_detail(),
+        ExecutionFailureSite::Coordinator,
+    ))
 }
 
 fn registry_error(error: LogicalExecutionRuntimeRegistryError) -> QueryExecutionError {
-    QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        error.failure_fact(),
+        error.safe_detail(),
+        ExecutionFailureSite::Coordinator,
+    ))
 }
 
 fn work_error(error: WorkError) -> QueryExecutionError {
-    let kind = match error {
-        WorkError::Cancelled(_) => QueryExecutionErrorKind::Cancelled,
-        WorkError::CapacityWaitTimeout => QueryExecutionErrorKind::DeadlineExceeded,
-        WorkError::Capacity(_) | WorkError::NotReady | WorkError::Closed => {
-            QueryExecutionErrorKind::Rejected
-        }
-        _ => QueryExecutionErrorKind::Failed,
-    };
-    QueryExecutionError::new(kind, error.to_string())
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        error.failure_fact(),
+        SafeDetail::truncating("query workload control refused the operation"),
+        ExecutionFailureSite::Coordinator,
+    ))
 }
 
 fn pre_install_cancellation_error(reason: CancellationReason) -> QueryExecutionError {
-    let kind = match reason {
-        CancellationReason::DeadlineExceeded
-        | CancellationReason::FrontendDrainDeadlineExceeded => {
-            QueryExecutionErrorKind::DeadlineExceeded
-        }
-        _ => QueryExecutionErrorKind::Cancelled,
-    };
-    QueryExecutionError::new(
-        kind,
-        format!("logical execution cancelled before actor installation: {reason:?}"),
+    cancellation_error(
+        reason,
+        "logical execution cancelled before actor installation",
+    )
+}
+
+fn native_future_panic_input(message: &'static str) -> ExecutionFailureInput {
+    ExecutionFailureInput::new(
+        QueryFailureReason::NativeFuturePanicked.failure_fact(),
+        SafeDetail::truncating(message),
+        ExecutionFailureSite::Coordinator,
     )
 }
 
 fn native_future_panicked(message: &'static str) -> QueryExecutionError {
-    QueryExecutionError::new(QueryExecutionErrorKind::Failed, message)
+    QueryExecutionError::from_execution(native_future_panic_input(message))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_actor_disposition_does_not_hide_invalid_phase_or_service_invariants() {
+        use super::super::{LogicalConclusion, LogicalExecutionActorError};
+        assert!(
+            actor_terminal_refusal(LogicalExecutionActorError::ExecutionConcluded(
+                LogicalConclusion::Cancelled
+            ))
+            .is_ok()
+        );
+        for error in [
+            LogicalExecutionActorError::WrongPhase,
+            LogicalExecutionActorError::StaleAuthority,
+            LogicalExecutionActorError::WrongExecution,
+            LogicalExecutionActorError::InvariantViolation,
+            LogicalExecutionActorError::MailboxClosed,
+        ] {
+            let failure = actor_terminal_refusal(error).unwrap_err();
+            assert_eq!(
+                failure.execution_failure().unwrap().fact(),
+                error.failure_fact()
+            );
+            let cancellation = cancellation_error(
+                CancellationReason::Requested,
+                "the preparation observed workload cancellation",
+            );
+            assert!(preparation_supervision_result(cancellation, Err(error)).is_err());
+        }
+    }
+
+    #[test]
+    fn producer_failures_keep_their_facts_instead_of_claiming_query_cancellation_or_deadline() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureEvidence};
+        let source = super::super::LogicalExecutionActorError::WrongPhase;
+        let error = super::actor_error(source);
+        let input = error.execution_failure().unwrap();
+        assert_eq!(input.fact(), source.failure_fact());
+        assert_eq!(input.detail(), &source.safe_detail());
+        assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            input.attempt_class(),
+            super::super::AttemptFailureClass::ExecutionFailure
+        );
+
+        let source = WorkError::CapacityWaitTimeout;
+        let error = super::work_error(source.clone());
+        let input = error.execution_failure().unwrap();
+        assert_eq!(input.fact(), source.failure_fact());
+        assert_eq!(input.fact().class(), FailureClass::Resource);
+        assert_eq!(input.fact().resource(), None);
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Rejected);
+
+        let source = WorkError::Cancelled(CancellationReason::Requested);
+        let error = super::work_error(source.clone());
+        let input = error.execution_failure().unwrap();
+        assert_eq!(input.fact(), source.failure_fact());
+        assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+    }
+
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
@@ -2137,6 +2477,62 @@ mod tests {
     };
 
     use super::*;
+
+    /// A test-owned injected failure is a legal execution failure, not a
+    /// production protocol violation or a fictitious Task failure.
+    #[derive(Clone, Copy, Debug)]
+    enum FixtureFailureReason {
+        InjectedExecution,
+    }
+    impl FailureProjection for FixtureFailureReason {
+        fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+            use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason};
+            match self {
+                Self::InjectedExecution => FailureFact::new(
+                    FailureClass::Unexpected,
+                    FailureReason::new(
+                        std::num::NonZeroU16::MAX,
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
+            }
+        }
+    }
+    fn fixture_execution_input(message: &'static str) -> ExecutionFailureInput {
+        ExecutionFailureInput::new(
+            FixtureFailureReason::InjectedExecution.failure_fact(),
+            SafeDetail::truncating(message),
+            ExecutionFailureSite::Coordinator,
+        )
+    }
+    fn fixture_cancellation_input(
+        reason: CancellationReason,
+        message: &'static str,
+    ) -> ExecutionFailureInput {
+        let reason = match reason {
+            CancellationReason::DeadlineExceeded
+            | CancellationReason::FrontendDrainDeadlineExceeded => {
+                QueryFailureReason::DeadlineExceeded
+            }
+            _ => QueryFailureReason::Cancelled,
+        };
+        ExecutionFailureInput::new(
+            reason.failure_fact(),
+            SafeDetail::truncating(message),
+            ExecutionFailureSite::Coordinator,
+        )
+    }
+    fn fixture_root_reply_failure(
+        root: novarocks_execution_contract::TaskIdentity,
+        error: WorkError,
+    ) -> super::super::RootResultFetchFailure {
+        tracing::debug!(error = %error, "fixture root retained reply violated its contract");
+        super::super::RootResultFetchFailure::from_input(ExecutionFailureInput::new(
+            QueryFailureReason::ResultProtocol.failure_fact(),
+            SafeDetail::truncating("fixture root reply violated its retained window contract"),
+            ExecutionFailureSite::RootRead { root },
+        ))
+    }
 
     /// Scheduling facts for a request whose plan reads no provider.
     ///
@@ -2179,9 +2575,16 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: novarocks_workload_control::CancellationView,
+            request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { std::future::pending::<NativeAttemptConvergence>().await })
+            // No local work exists in this fixture; only remote observation is
+            // stuck. The true owner, rather than the supervisor, ends it.
+            Box::pin(async move {
+                tokio::time::sleep_until(request.remote_observation_deadline().into()).await;
+                Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                    exact_contexts: Box::new([]),
+                })
+            })
         }
     }
 
@@ -2204,7 +2607,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            ActiveAttemptConvergence::RemoteTrackingEnded
+            ActiveAttemptConvergence::RemoteTrackingEnded { .. }
         ));
         root.owner.complete();
         root.business.release();
@@ -2234,9 +2637,62 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            ActiveAttemptConvergence::RemoteTrackingEnded
+            ActiveAttemptConvergence::RemoteTrackingEnded { .. }
         ));
         root.owner.complete();
+        root.business.release();
+    }
+
+    #[derive(Debug)]
+    struct HeldLocalConvergence(Arc<tokio::sync::Notify>);
+    impl ActiveNativeAttemptOwner for HeldLocalConvergence {
+        fn run<'a>(
+            &'a mut self,
+            _drive: &'a NativeAttemptDrive,
+            _cancel: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            Box::pin(async { NativeAttemptTerminal::Completed })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _request: NativeActiveConvergenceRequest,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async move {
+                self.0.notified().await;
+                Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                    exact_contexts: Box::new([]),
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn shutdown_remote_budget_never_closes_a_held_original_local_owner() {
+        let (_control, root) = governance();
+        let cancellation = root.owner.scope().cancellation().unwrap();
+        let requester = root.owner.cancellation_requester();
+        let (shutdown_sender, mut shutdown) = watch::channel(false);
+        shutdown_sender.send_replace(true);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut owner = HeldLocalConvergence(Arc::clone(&release));
+        let convergence = converge_active(
+            &mut owner,
+            cancellation,
+            &mut shutdown,
+            &requester,
+            Duration::from_secs(30),
+        );
+        tokio::pin!(convergence);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut convergence)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        assert!(matches!(
+            convergence.await,
+            ActiveAttemptConvergence::RemoteTrackingEnded { .. }
+        ));
+        root.owner.complete_after_terminal_cancel_settled();
         root.business.release();
     }
 
@@ -2439,12 +2895,12 @@ mod tests {
                         .unwrap(),
                     ),
                 };
-                crate::api::RetainedRootReply::try_new(reply, guard, 64 * 1024).map_err(|error| {
-                    super::super::RootResultFetchFailure::new(
-                        AttemptFailureClass::ContractViolation,
-                        work_error(error),
-                    )
-                })
+                crate::api::RetainedRootReply::try_new(
+                    novarocks_execution_contract::root_result::RootReadResponse::Reply(reply),
+                    guard,
+                    64 * 1024,
+                )
+                .map_err(|error| fixture_root_reply_failure(request.root_task(), error))
             })
         }
         fn seal(
@@ -2558,11 +3014,20 @@ mod tests {
     #[tokio::test]
     async fn cancelled_rejected_start_settles_uninstalled_control() {
         let (control, root) = governance();
+        let cancellation = root.owner.scope().cancellation().unwrap();
         root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let error = match rejected_start(root.owner, "supervisor closed").await {
+            Err(error) => error,
+            Ok(_) => panic!("closed supervisor cannot accept the start"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Rejected);
         assert!(
-            rejected_start(root.owner, "supervisor closed")
-                .await
-                .is_err()
+            error.execution_failure().is_none(),
+            "local admission is not a Task failure"
+        );
+        assert_eq!(
+            cancellation.reason(),
+            Some(CancellationReason::DeadlineExceeded)
         );
         root.business.release();
         assert_eq!(control.snapshot().root_responsibilities, 0);
@@ -2635,13 +3100,9 @@ mod tests {
             self.activated.store(true, Ordering::SeqCst);
             Box::pin(async move {
                 Err(NativeAttemptActivationFailure::new(
-                    NativeAttemptPreparationFailure::new(
-                        AttemptFailureClass::ExecutionFailure,
-                        QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "injected Native activation failure",
-                        ),
-                    ),
+                    NativeAttemptPreparationFailure::from_input(fixture_execution_input(
+                        "injected Native activation failure",
+                    )),
                 ))
             })
         }
@@ -2709,6 +3170,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_contract_wrappers_keep_original_fact_and_safe_detail() {
+        use crate::api::NativeExecutionContractError;
+        for source in [
+            NativeExecutionContractError::ForeignAttemptTicket,
+            NativeExecutionContractError::AttemptPreparationRetired,
+        ] {
+            for error in [
+                native_open_error(source.into()),
+                native_prepare_error(source.into()),
+            ] {
+                let input = error
+                    .execution_failure()
+                    .expect("native contract author must retain its fact");
+                assert_eq!(input.fact(), source.failure_fact());
+                assert_eq!(input.detail(), &source.safe_detail());
+                assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+                assert_eq!(
+                    input.topology_requirement(),
+                    crate::api::NativeAttemptTopologyRequirement::LiveSnapshot
+                );
+                assert_eq!(
+                    input.user_error().phase(),
+                    novarocks_user_error::ErrorPhase::Execution
+                );
+                assert_eq!(input.user_error().location(), None);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn activation_failure_retains_residual_and_retires_exact_registry_entry() {
         let (native, attempts, opened, activated, residual) = failing_native();
@@ -2727,6 +3218,12 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.message(), "injected Native activation failure");
+        assert_eq!(
+            error.execution_failure(),
+            Some(&fixture_execution_input(
+                "injected Native activation failure"
+            ))
+        );
         root.business.release();
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(1))
@@ -2909,24 +3406,22 @@ mod tests {
             cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptRunFuture<'a> {
             Box::pin(async move {
-                let _ = cancellation.cancelled().await;
-                NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                    AttemptFailureClass::ExecutionFailure,
-                    QueryExecutionError::new(
-                        QueryExecutionErrorKind::Cancelled,
-                        "Rows test attempt was cancelled",
-                    ),
+                let reason = cancellation.cancelled().await;
+                NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                    fixture_cancellation_input(reason, "Rows test attempt was cancelled"),
                 ))
             })
         }
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: novarocks_workload_control::CancellationView,
+            _cancellation: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 self.converged.store(true, Ordering::SeqCst);
-                NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
             })
         }
     }
@@ -3055,20 +3550,14 @@ mod tests {
                 tokio::select! {
                     terminal = run => terminal,
                     _ = signals.trigger_failure.notified() => {
-                        NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                            AttemptFailureClass::ExecutionFailure,
-                            QueryExecutionError::new(
-                                QueryExecutionErrorKind::Failed,
-                                "held-convergence fixture execution failure",
-                            ),
-                        ))
+                        NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(fixture_execution_input("held-convergence fixture execution failure")))
                     }
                 }
             })
         }
         fn converge<'a>(
             &'a mut self,
-            cancellation: novarocks_workload_control::CancellationView,
+            cancellation: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             let signals = Arc::clone(&self.signals);
             Box::pin(async move {
@@ -3122,13 +3611,12 @@ mod tests {
                         .expect("one nonempty byte is a bounded root data body"),
                     ),
                 };
-                let retained = crate::api::RetainedRootReply::try_new(reply, guard, 64 * 1024)
-                    .map_err(|error| {
-                        super::super::RootResultFetchFailure::new(
-                            AttemptFailureClass::ContractViolation,
-                            work_error(error),
-                        )
-                    })?;
+                let retained = crate::api::RetainedRootReply::try_new(
+                    novarocks_execution_contract::root_result::RootReadResponse::Reply(reply),
+                    guard,
+                    64 * 1024,
+                )
+                .map_err(|error| fixture_root_reply_failure(request.root_task(), error))?;
                 let transport = retained.retain_physical_guard();
                 *signals.transport.lock().expect("fixture transport lock") = Some(transport);
                 *signals.reply.lock().expect("fixture reply lock") = Some(retained);
@@ -3396,13 +3884,9 @@ mod tests {
             match self.phase {
                 InitialTerminalPhase::ActivateFailure => Box::pin(async {
                     Err(NativeAttemptActivationFailure::new(
-                        NativeAttemptPreparationFailure::new(
-                            AttemptFailureClass::ExecutionFailure,
-                            QueryExecutionError::new(
-                                QueryExecutionErrorKind::Failed,
-                                "initial terminal fixture activation failure",
-                            ),
-                        ),
+                        NativeAttemptPreparationFailure::from_input(fixture_execution_input(
+                            "initial terminal fixture activation failure",
+                        )),
                     ))
                 }),
                 InitialTerminalPhase::ActivatePanic => {
@@ -3458,12 +3942,8 @@ mod tests {
                 // than returning an unqualified synthetic Completed verdict.
                 InitialTerminalPhase::CompletionSuccess => self.inner.run(drive, cancellation),
                 InitialTerminalPhase::CompletionFailure => Box::pin(async {
-                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                        AttemptFailureClass::ExecutionFailure,
-                        QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "initial terminal fixture run failure",
-                        ),
+                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                        fixture_execution_input("initial terminal fixture run failure"),
                     ))
                 }),
                 InitialTerminalPhase::CompletionPanic => {
@@ -3474,7 +3954,7 @@ mod tests {
         }
         fn converge<'a>(
             &'a mut self,
-            cancellation: novarocks_workload_control::CancellationView,
+            cancellation: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             let signals = Arc::clone(&self.signals);
             Box::pin(async move {
@@ -3845,10 +4325,14 @@ mod tests {
         fn abandon(self: Box<Self>) {}
     }
 
+    fn fixture_recovery_backends(processes: usize) -> Box<[BackendProcessId]> {
+        (0..processes).map(|_| BackendProcessId::new_v7()).collect()
+    }
+
     #[derive(Debug)]
     struct RecoveringRowsPreparationPort {
         relay_window: Option<TestWindow>,
-        backend: BackendProcessId,
+        backends: Box<[BackendProcessId]>,
         prepares: Arc<AtomicU64>,
         runs: Arc<AtomicU64>,
         convergences: Arc<AtomicU64>,
@@ -3870,13 +4354,33 @@ mod tests {
             request: NativeAttemptPreparationRequest,
         ) -> NativeAttemptPreparationFuture {
             let ordinal = self.prepares.fetch_add(1, Ordering::SeqCst) + 1;
+            // Every process identity was created with this fixture, before
+            // any BackendLost input. Previously failed processes are not reused.
+            let requirement = request.topology_requirement();
+            let backend = self
+                .backends
+                .iter()
+                .copied()
+                .skip(usize::try_from(ordinal - 1).unwrap())
+                .find(|process| match requirement {
+                    crate::api::NativeAttemptTopologyRequirement::LiveSnapshot => true,
+                    crate::api::NativeAttemptTopologyRequirement::ExcludeProcess(excluded) => {
+                        *process != excluded
+                    }
+                })
+                .expect("fixture has enough original nonexcluded process identities");
+            if let crate::api::NativeAttemptTopologyRequirement::ExcludeProcess(excluded) =
+                requirement
+            {
+                assert_ne!(backend, excluded);
+            }
             let owner = RecoveringRowsDormantOwner {
                 relay_window: self
                     .relay_window
                     .as_ref()
                     .expect("fixture window was admitted")
                     .clone(),
-                backend: self.backend,
+                backend,
                 ordinal,
                 runs: Arc::clone(&self.runs),
                 convergences: Arc::clone(&self.convergences),
@@ -4009,21 +4513,21 @@ mod tests {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 if self.ordinal <= self.failures_before_success {
-                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                        AttemptFailureClass::RecoverableInfrastructure,
-                        QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "injected pre-visibility infrastructure failure",
+                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                        ExecutionFailureInput::new(
+                            QueryFailureReason::BackendLost.failure_fact(),
+                            SafeDetail::truncating(
+                                "injected pre-visibility infrastructure failure",
+                            ),
+                            ExecutionFailureSite::Backend {
+                                process: self.context.backend_process_id(),
+                            },
                         ),
                     ))
                 } else {
-                    let _ = cancellation.cancelled().await;
-                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                        AttemptFailureClass::ExecutionFailure,
-                        QueryExecutionError::new(
-                            QueryExecutionErrorKind::Cancelled,
-                            "replacement attempt was cancelled",
-                        ),
+                    let reason = cancellation.cancelled().await;
+                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                        fixture_cancellation_input(reason, "replacement attempt was cancelled"),
                     ))
                 }
             })
@@ -4031,20 +4535,35 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: novarocks_workload_control::CancellationView,
+            request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 if self.ordinal == 1 && self.block_initial_convergence {
-                    self.allow_initial_convergence.notified().await;
+                    // This fixture has no local close work: the held fact is
+                    // only its original remote observation. Shutdown can end
+                    // that wait without fabricating WorkerStopped evidence.
+                    tokio::select! {
+                        biased;
+                        _ = self.allow_initial_convergence.notified() => {}
+                        _ = tokio::time::sleep_until(request.remote_observation_deadline().into()) => {
+                            return Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                                exact_contexts: vec![self.context].into_boxed_slice(),
+                            });
+                        }
+                    }
                 }
                 self.convergences.fetch_add(1, Ordering::SeqCst);
-                if self.ordinal == 1 {
-                    NativeAttemptConvergence::contexts(vec![
-                        crate::api::NativeContextConvergence::worker_process_replaced(self.context),
-                    ])
-                } else {
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
-                }
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    if self.ordinal == 1 {
+                        NativeAttemptConvergence::contexts(vec![
+                            crate::api::NativeContextConvergence::worker_process_replaced(
+                                self.context,
+                            ),
+                        ])
+                    } else {
+                        NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
+                    },
+                ))
             })
         }
     }
@@ -4092,7 +4611,11 @@ mod tests {
         }
     }
 
-    async fn exercise_held_replacement_preparation(cancel: bool, release: bool) {
+    async fn exercise_held_replacement_preparation(
+        cancel_reason: Option<CancellationReason>,
+        release: bool,
+    ) {
+        let cancel = cancel_reason.is_some();
         let prepares = Arc::new(AtomicU64::new(0));
         let runs = Arc::new(AtomicU64::new(0));
         let convergences = Arc::new(AtomicU64::new(0));
@@ -4102,7 +4625,7 @@ mod tests {
         let attempts = HeldReplacementPreparationPort {
             inner: RecoveringRowsPreparationPort {
                 relay_window: None,
-                backend: BackendProcessId::new_v7(),
+                backends: fixture_recovery_backends(2),
                 prepares: Arc::clone(&prepares),
                 runs: Arc::clone(&runs),
                 convergences: Arc::clone(&convergences),
@@ -4117,6 +4640,7 @@ mod tests {
         };
         let (control, root) = governance();
         let scope = root.owner.scope();
+        let requester = root.owner.cancellation_requester();
         let mut config = supervisor_config();
         config.rows.replacement_reservation_valid_for = if cancel || release {
             Duration::from_secs(30)
@@ -4169,7 +4693,11 @@ mod tests {
             delivery.complete();
             assert_eq!(runs.load(Ordering::SeqCst), 2);
         }
-        if cancel || release {
+        if let Some(reason) = cancel_reason.clone() {
+            requester.request(reason.clone()).unwrap();
+            requester.request(CancellationReason::Requested).unwrap();
+            assert_eq!(scope.cancellation().unwrap().reason(), Some(reason));
+        } else if release {
             handle.request_cancel().unwrap();
         }
         let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -4179,17 +4707,49 @@ mod tests {
             panic!("the stream must expose the failed logical execution");
         };
         if cancel || release {
-            assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+            let expected = match cancel_reason.as_ref() {
+                Some(
+                    CancellationReason::DeadlineExceeded
+                    | CancellationReason::FrontendDrainDeadlineExceeded,
+                ) => QueryFailureReason::DeadlineExceeded,
+                _ => QueryFailureReason::Cancelled,
+            };
+            let input = error
+                .execution_failure()
+                .expect("public cancellation retains canonical input");
+            assert_eq!(input.fact(), expected.failure_fact());
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
             assert_eq!(
-                error.to_string(),
-                "logical execution was cancelled before success EOF"
+                error.kind(),
+                if matches!(expected, QueryFailureReason::DeadlineExceeded) {
+                    QueryExecutionErrorKind::DeadlineExceeded
+                } else {
+                    QueryExecutionErrorKind::Cancelled
+                },
             );
+            if matches!(expected, QueryFailureReason::Cancelled) {
+                assert_eq!(
+                    error.to_string(),
+                    "logical execution was cancelled before success EOF"
+                );
+            }
         } else {
             assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
             assert_eq!(
                 error.to_string(),
                 "injected pre-visibility infrastructure failure"
             );
+            let original = error
+                .execution_failure()
+                .expect("the originating attempt failure remains canonical");
+            assert_eq!(
+                original.fact(),
+                QueryFailureReason::BackendLost.failure_fact()
+            );
+            assert!(matches!(
+                original.site(),
+                ExecutionFailureSite::Backend { .. }
+            ));
         }
         if !release {
             assert_eq!(
@@ -4213,15 +4773,7 @@ mod tests {
         if release {
             shutdown.unwrap();
         } else if cancel {
-            let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
-            else {
-                panic!("the supervisor must retain the exact preparation cancellation");
-            };
-            assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
-            assert_eq!(
-                error.to_string(),
-                "Native replacement preparation was cancelled: Requested"
-            );
+            shutdown.expect("accepted query cancellation is not a supervisor health failure");
         } else {
             let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
             else {
@@ -4232,6 +4784,7 @@ mod tests {
                 error.to_string(),
                 "Native replacement preparation exceeded its recovery budget"
             );
+            assert_recovery_preparation_budget_input(&error);
         }
         acknowledge_all_control(&control);
         scope.wait_released().await;
@@ -4253,7 +4806,7 @@ mod tests {
         let attempts = HeldReplacementPreparationPort {
             inner: RecoveringRowsPreparationPort {
                 relay_window: None,
-                backend: BackendProcessId::new_v7(),
+                backends: fixture_recovery_backends(3),
                 prepares: Arc::clone(&prepares),
                 runs: Arc::clone(&runs),
                 convergences: Arc::clone(&convergences),
@@ -4343,6 +4896,7 @@ mod tests {
             error.message(),
             "Native replacement preparation exceeded its recovery budget"
         );
+        assert_recovery_preparation_budget_input(&error);
         acknowledge_all_control(&control);
         scope.wait_released().await;
         assert_eq!(convergences.load(Ordering::SeqCst), 2);
@@ -4350,17 +4904,46 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_preparation_budget_expires_and_converges_the_original_owner() {
-        exercise_held_replacement_preparation(false, false).await;
+        exercise_held_replacement_preparation(None, false).await;
     }
 
     #[tokio::test]
     async fn cancellation_interrupts_pending_replacement_preparation() {
-        exercise_held_replacement_preparation(true, false).await;
+        exercise_held_replacement_preparation(Some(CancellationReason::Requested), false).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_deadline_interrupts_pending_replacement_preparation() {
+        exercise_held_replacement_preparation(Some(CancellationReason::DeadlineExceeded), false)
+            .await;
+    }
+
+    fn assert_recovery_preparation_budget_input(error: &QueryExecutionError) {
+        let input = error
+            .execution_failure()
+            .expect("recovery budget retains its own canonical input");
+        assert_eq!(
+            input.fact(),
+            QueryFailureReason::RecoveryPreparationBudgetExceeded.failure_fact()
+        );
+        assert_eq!(
+            input.fact().class(),
+            novarocks_execution_contract::failure::FailureClass::Dependency
+        );
+        assert_eq!(input.fact().reason().code(), 151);
+        assert_eq!(input.fact().resource(), None);
+        assert_eq!(input.fact().representation(), None);
+        assert_eq!(input.fact().row_position(), None);
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            input.topology_requirement(),
+            crate::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        );
     }
 
     #[tokio::test]
     async fn replacement_preparation_released_within_budget_can_activate() {
-        exercise_held_replacement_preparation(false, true).await;
+        exercise_held_replacement_preparation(None, true).await;
     }
 
     #[tokio::test]
@@ -4371,7 +4954,7 @@ mod tests {
         let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
         let attempts = RecoveringRowsPreparationPort {
             relay_window: None,
-            backend: BackendProcessId::new_v7(),
+            backends: fixture_recovery_backends(2),
             prepares: Arc::clone(&prepares),
             runs: Arc::clone(&runs),
             convergences: Arc::clone(&convergences),
@@ -4455,7 +5038,7 @@ mod tests {
         let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
         let attempts = RecoveringRowsPreparationPort {
             relay_window: None,
-            backend: BackendProcessId::new_v7(),
+            backends: fixture_recovery_backends(2),
             prepares,
             runs: Arc::clone(&runs),
             convergences: Arc::clone(&convergences),
@@ -4544,7 +5127,7 @@ mod tests {
         let convergences = Arc::new(AtomicU64::new(0));
         let attempts = RecoveringRowsPreparationPort {
             relay_window: None,
-            backend: BackendProcessId::new_v7(),
+            backends: fixture_recovery_backends(2),
             prepares: Arc::clone(&prepares),
             runs,
             convergences: Arc::clone(&convergences),
@@ -4584,7 +5167,20 @@ mod tests {
         else {
             panic!("invalid replacement runtime must fail the stream");
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        let input = error
+            .execution_failure()
+            .expect("the output guard authors an execution contract fact");
+        assert_eq!(
+            input.fact(),
+            QueryFailureReason::ResultProtocol.failure_fact()
+        );
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            input.user_error().phase(),
+            novarocks_user_error::ErrorPhase::Execution
+        );
+        assert_eq!(input.user_error().location(), None);
         assert_eq!(prepares.load(Ordering::SeqCst), 2);
         drop(stream);
         root.business.release();
@@ -4678,6 +5274,7 @@ mod tests {
                 );
                 Ok(ActivatedNativeAttempt::relayed_rows(
                     VisibleFailureActiveOwner {
+                        backend: root.backend_process_id(),
                         fail,
                         _status_sender: status_sender,
                     },
@@ -4696,6 +5293,7 @@ mod tests {
     }
 
     struct VisibleFailureActiveOwner {
+        backend: BackendProcessId,
         fail: Arc<tokio::sync::Notify>,
         _status_sender: super::super::AcceptedRootStatusSender,
     }
@@ -4714,11 +5312,13 @@ mod tests {
         ) -> NativeAttemptRunFuture<'a> {
             Box::pin(async move {
                 self.fail.notified().await;
-                NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                    AttemptFailureClass::RecoverableInfrastructure,
-                    QueryExecutionError::new(
-                        QueryExecutionErrorKind::Failed,
-                        "injected failure after visible output",
+                NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::BackendLost.failure_fact(),
+                        SafeDetail::truncating("injected failure after visible output"),
+                        ExecutionFailureSite::Backend {
+                            process: self.backend,
+                        },
                     ),
                 ))
             })
@@ -4726,9 +5326,13 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: novarocks_workload_control::CancellationView,
+            _cancellation: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced() })
+            Box::pin(async {
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
+            })
         }
     }
 
@@ -4886,12 +5490,8 @@ mod tests {
             match self.phase {
                 AttemptPanicPhase::Run => Box::pin(async { panic!("injected Native run panic") }),
                 AttemptPanicPhase::Converge => Box::pin(async {
-                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                        AttemptFailureClass::ExecutionFailure,
-                        QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "injected Native attempt failure",
-                        ),
+                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                        fixture_execution_input("injected Native attempt failure"),
                     ))
                 }),
                 AttemptPanicPhase::Activate => unreachable!("activation panic has no active owner"),
@@ -4900,14 +5500,16 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: novarocks_workload_control::CancellationView,
+            _cancellation: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 let previous = self.convergence_calls.fetch_add(1, Ordering::SeqCst);
                 if self.phase == AttemptPanicPhase::Converge && previous == 0 {
                     panic!("injected Native convergence panic");
                 }
-                NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
             })
         }
     }
@@ -4938,6 +5540,15 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.message(), expected_message);
+        let input = error
+            .execution_failure()
+            .expect("real Native future panic retains its input");
+        assert_eq!(
+            input.fact(),
+            QueryFailureReason::NativeFuturePanicked.failure_fact()
+        );
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
         root.business.release();
         let shutdown = supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(1))
@@ -4996,7 +5607,20 @@ mod tests {
             Ok(_) => panic!("Rows activation must transfer its exact pump runtime"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        let input = error
+            .execution_failure()
+            .expect("the output guard authors an execution contract fact");
+        assert_eq!(
+            input.fact(),
+            QueryFailureReason::ResultProtocol.failure_fact()
+        );
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            input.user_error().phase(),
+            novarocks_user_error::ErrorPhase::Execution
+        );
+        assert_eq!(input.user_error().location(), None);
         assert_eq!(
             error.message(),
             "Native activated a row execution without its root result runtime"
@@ -5014,7 +5638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn convergence_poll_panic_retries_without_losing_the_active_owner() {
+    async fn convergence_poll_panic_retains_same_owner_and_health_until_process_exit() {
         let convergence_calls = Arc::new(AtomicU64::new(0));
         let attempts = PanickingAttemptPreparationPort {
             backend: BackendProcessId::new_v7(),
@@ -5036,21 +5660,35 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.message(), "injected Native attempt failure");
+        let input = error
+            .execution_failure()
+            .expect("original injected failure is preserved");
+        assert_eq!(
+            input.fact(),
+            FixtureFailureReason::InjectedExecution.failure_fact()
+        );
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
         root.business.release();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while convergence_calls.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("ordinary finite cleanup retries a convergence panic before shutdown");
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(convergence_calls.load(Ordering::SeqCst), 2);
-        acknowledge_all_control(&control);
-        scope.wait_released().await;
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_millis(10))
+            .await;
+        assert!(matches!(
+            shutdown,
+            Err(LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(_))
+        ));
+        assert_eq!(
+            convergence_calls.load(Ordering::SeqCst),
+            1,
+            "unproven convergence is never re-polled into fabricated closure"
+        );
+        assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        assert!(
+            scope.cancellation().is_ok(),
+            "original actor scope remains present before actual exit"
+        );
+        supervisor.abandon_for_process_exit();
     }
 
     #[derive(Debug)]
@@ -5096,6 +5734,188 @@ mod tests {
             submission
                 .worker_settled(OperationOutcome::Accepted)
                 .expect("test transport publishes exact Establish success");
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ActivationCancellationSignals {
+        entered: AtomicBool,
+        release_activation: tokio::sync::Notify,
+        convergence_entered: AtomicBool,
+        release_convergence: tokio::sync::Notify,
+        converged: AtomicBool,
+    }
+
+    #[derive(Debug)]
+    struct ActivationCancellationPreparationPort {
+        backend: BackendProcessId,
+        frontend: FrontendProcessId,
+        signals: Arc<ActivationCancellationSignals>,
+    }
+
+    impl NativeAttemptPreparationPort for ActivationCancellationPreparationPort {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            let dormant = ActivationCancellationDormant {
+                inner: SuccessfulCompletionDormantOwner {
+                    backend: self.backend,
+                    expected_frontend: self.frontend,
+                },
+                signals: Arc::clone(&self.signals),
+            };
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, dormant).map_err(Into::into)
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ActivationCancellationDormant {
+        inner: SuccessfulCompletionDormantOwner,
+        signals: Arc<ActivationCancellationSignals>,
+    }
+
+    impl DormantNativeAttemptOwner for ActivationCancellationDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            self.inner.eligible_backends()
+        }
+        fn activate<'a>(
+            &'a mut self,
+            schedule: &'a AttemptSchedule,
+            admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            let signals = Arc::clone(&self.signals);
+            let activation = self.inner.activate(schedule, admissions, cancellation);
+            Box::pin(async move {
+                signals.entered.store(true, Ordering::SeqCst);
+                signals.release_activation.notified().await;
+                let activated = activation.await?;
+                let (inner, rows) = activated.into_parts();
+                assert!(rows.is_none());
+                Ok(ActivatedNativeAttempt::completion(
+                    ActivationCancellationActive { inner, signals },
+                ))
+            })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            self.inner.converge(cancellation)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ActivationCancellationActive {
+        inner: Box<dyn ActiveNativeAttemptOwner>,
+        signals: Arc<ActivationCancellationSignals>,
+    }
+
+    impl ActiveNativeAttemptOwner for ActivationCancellationActive {
+        fn run<'a>(
+            &'a mut self,
+            _drive: &'a NativeAttemptDrive,
+            _cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            Box::pin(async { panic!("an already concluded activation must never run") })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: NativeActiveConvergenceRequest,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            let signals = Arc::clone(&self.signals);
+            Box::pin(async move {
+                signals.convergence_entered.store(true, Ordering::SeqCst);
+                signals.release_convergence.notified().await;
+                let convergence = self.inner.converge(cancellation).await;
+                signals.converged.store(true, Ordering::SeqCst);
+                convergence
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_cancel_during_native_activation_retires_the_original_owner_without_poisoning_supervisor()
+     {
+        for reason in [
+            CancellationReason::Requested,
+            CancellationReason::DeadlineExceeded,
+        ] {
+            let frontend = FrontendProcessId::new_v7();
+            let signals = Arc::new(ActivationCancellationSignals::default());
+            let (control, root) = governance();
+            let scope = root.owner.scope();
+            let requester = root.owner.cancellation_requester();
+            let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x771),
+                frontend,
+                supervisor_config(),
+            );
+            let start = client.start(
+                completion_request(ActivationCancellationPreparationPort {
+                    backend: BackendProcessId::new_v7(),
+                    frontend,
+                    signals: Arc::clone(&signals),
+                }),
+                root.owner,
+            );
+            wait_preparation_exit_fact(&signals.entered).await.unwrap();
+            requester.request(reason.clone()).unwrap();
+            let error = match start.await {
+                Ok(_) => panic!("cancelled start cannot become success"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                if matches!(reason, CancellationReason::DeadlineExceeded) {
+                    QueryExecutionErrorKind::DeadlineExceeded
+                } else {
+                    QueryExecutionErrorKind::Cancelled
+                }
+            );
+            signals.release_activation.notify_one();
+            wait_preparation_exit_fact(&signals.convergence_entered)
+                .await
+                .unwrap();
+            assert!(!signals.converged.load(Ordering::SeqCst));
+            assert_ne!(control.snapshot().root_responsibilities, 0);
+            // A terminal query does not poison the process or block a sibling start.
+            let (sibling_control, sibling) = governance();
+            let sibling_scope = sibling.owner.scope();
+            let mut sibling_handle = client
+                .start(
+                    completion_request(SuccessfulCompletionPreparationPort {
+                        backend: BackendProcessId::new_v7(),
+                        expected_frontend: frontend,
+                    }),
+                    sibling.owner,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                sibling_handle.take_output(),
+                Some(crate::api::ExecutionOutput::Completion)
+            ));
+            sibling.business.release();
+            signals.release_convergence.notify_one();
+            wait_preparation_exit_fact(&signals.converged)
+                .await
+                .unwrap();
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            acknowledge_all_control(&sibling_control);
+            scope.wait_released().await;
+            sibling_scope.wait_released().await;
         }
     }
 
@@ -5244,9 +6064,13 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: novarocks_workload_control::CancellationView,
+            _cancellation: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced() })
+            Box::pin(async {
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
+            })
         }
     }
 
@@ -5348,9 +6172,13 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: novarocks_workload_control::CancellationView,
+            _cancellation: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced() })
+            Box::pin(async {
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
+            })
         }
     }
 
@@ -5710,6 +6538,18 @@ mod tests {
             QueryExecutionErrorKind::DeadlineExceeded,
             "{}",
             error.message()
+        );
+        let input = error
+            .execution_failure()
+            .expect("pre-install deadline retains canonical input");
+        assert_eq!(
+            input.fact(),
+            QueryFailureReason::DeadlineExceeded.failure_fact()
+        );
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            scope.cancellation().unwrap().reason(),
+            Some(CancellationReason::DeadlineExceeded)
         );
         root.business.release();
         supervisor

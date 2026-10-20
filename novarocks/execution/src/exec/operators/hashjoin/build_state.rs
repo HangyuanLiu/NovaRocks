@@ -35,5 +35,33 @@ use super::build_artifact::JoinBuildArtifact;
 pub(crate) trait JoinBuildSinkState: Send + Sync {
     fn partition_for_driver(&self, driver_id: i32) -> usize;
     fn dep_name(&self, partition: usize) -> &str;
-    fn set_build(&self, partition: usize, artifact: Arc<JoinBuildArtifact>) -> Result<(), String>;
+    fn set_build(
+        &self,
+        partition: usize,
+        artifact: Arc<JoinBuildArtifact>,
+    ) -> crate::runtime::fragment::ExecutionResult<()>;
+}
+
+#[derive(Debug)]
+struct JoinBuildStateContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinBuildStateContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinBuildStateContract {}
+impl novarocks_failure_contract::FailureProjection for JoinBuildStateContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinBuildStateContract.reason(),
+        )
+    }
+}
+pub(super) fn build_contract(
+    detail: impl std::fmt::Display,
+) -> crate::runtime::fragment::ExecutionFailure {
+    crate::runtime::fragment::ExecutionFailure::from_domain(JoinBuildStateContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
 }

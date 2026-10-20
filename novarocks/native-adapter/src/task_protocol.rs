@@ -98,7 +98,7 @@ pub type TaskStatusEventStream =
     Pin<Box<dyn Stream<Item = Result<proto::TaskStatusStreamEvent, tonic::Status>> + Send>>;
 
 /// The acknowledgement body carried by one task-operation receipt.
-pub type TaskOperationReceiptAck = proto::task_operation_receipt::Ack;
+pub type TaskOperationReceiptAck = proto::task_operation_verdict::Ack;
 
 /// A validated root-result read passed from the Native wire adapter to the
 /// role-local result owner.
@@ -480,9 +480,13 @@ fn apply_decoded_operations(
         if now >= operation_deadline {
             receipts.push(encode_receipt(
                 operation.envelope().operation_id(),
-                OperationOutcome::OperationTimedOut,
-                "operation exceeded its original ingress deadline",
-                None,
+                novarocks_execution_contract::operation::OperationResult::Verdict {
+                    outcome: OperationOutcome::OperationTimedOut,
+                    detail: Some(SafeDetail::truncating(
+                        "operation exceeded its original ingress deadline",
+                    )),
+                    acknowledgement: None,
+                },
             ));
             continue;
         }
@@ -722,13 +726,7 @@ pub fn encode_dynamic_filter_read(
         Some(read) => {
             let domain = encode_task_dynamic_filter_domain(read.version(), read.payload().as_ref())
                 .map_err(|error| {
-                    HostRejection::new(
-                        TaskFailureCategory::Internal,
-                        format!(
-                            "dynamic filter version {} cannot be projected: {error}",
-                            read.version().get()
-                        ),
-                    )
+                    HostRejection::from_domain(TaskFailureCategory::Internal, error)
                 })?;
             (read.version().get(), vec![domain])
         }
@@ -766,20 +764,33 @@ pub fn encode_operation_receipt<T>(
     receipt: &OperationReceipt<T>,
     encode_ack: impl FnOnce(&T) -> Option<TaskOperationReceiptAck>,
 ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
-    let ack = match receipt.acknowledgement() {
-        Some(body) => Some(encode_ack(body).ok_or_else(|| {
-            tonic::Status::internal(
-                "operation acknowledgement reports a state with no wire representation",
-            )
-        })?),
-        None => None,
+    use novarocks_execution_contract::operation::OperationResult;
+    let result = match receipt.result() {
+        OperationResult::Verdict {
+            outcome,
+            detail,
+            acknowledgement,
+        } => {
+            let acknowledgement = match acknowledgement {
+                Some(body) => Some(encode_ack(body).ok_or_else(|| {
+                    tonic::Status::internal(
+                        "operation acknowledgement reports a state with no wire representation",
+                    )
+                })?),
+                None => None,
+            };
+            OperationResult::Verdict {
+                outcome: *outcome,
+                detail: detail.clone(),
+                acknowledgement,
+            }
+        }
+        OperationResult::DomainFailure { outcome, failure } => OperationResult::DomainFailure {
+            outcome: *outcome,
+            failure: failure.clone(),
+        },
     };
-    Ok(encode_receipt(
-        receipt.operation_id(),
-        receipt.outcome(),
-        receipt.detail().map_or("", SafeDetail::as_str),
-        ack,
-    ))
+    Ok(encode_receipt(receipt.operation_id(), result))
 }
 
 const TASK_STATUS_BOOKMARK_INTERVAL: Duration = Duration::from_secs(1);

@@ -18,6 +18,9 @@ use crate::exec::chunk::Chunk;
 use arrow::array::ArrayRef;
 use novarocks_types::SlotId;
 
-pub fn eval_slot_id(slot_id: SlotId, chunk: &Chunk) -> Result<ArrayRef, String> {
+pub fn eval_slot_id(
+    slot_id: SlotId,
+    chunk: &Chunk,
+) -> Result<ArrayRef, crate::exec::chunk::ChunkAccessFailure> {
     chunk.column_by_slot_id(slot_id)
 }

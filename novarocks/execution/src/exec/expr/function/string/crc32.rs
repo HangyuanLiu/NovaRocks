@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 
 pub fn eval_crc32<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,9 +24,14 @@ pub fn eval_crc32<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let input = arena.eval(args[0], chunk)?;
-    Ok((novarocks_functions::builtin::crc32::evaluate_legacy(&input))?)
+) -> ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(expression_contract(
+            "crc32 requires exactly one prepared argument",
+        ));
+    };
+    let input = arena.eval(*argument, chunk)?;
+    novarocks_functions::builtin::crc32::evaluate_required(&input).map_err(ExecutionFailure::from)
 }
 
 #[cfg(test)]
@@ -54,7 +60,7 @@ mod legacy_crc32_contract_tests {
         367_556_721,
     ];
 
-    fn evaluate(input: ArrayRef) -> Result<Vec<Option<i64>>, String> {
+    fn evaluate(input: ArrayRef) -> ExecutionResult<Vec<Option<i64>>> {
         let slot = SlotId::new(1);
         let dtype = input.data_type().clone();
         let batch = RecordBatch::try_new(
@@ -139,6 +145,7 @@ mod legacy_crc32_contract_tests {
         assert!(
             evaluate(input)
                 .unwrap_err()
+                .to_string()
                 .contains("crc32 expects VARCHAR/BINARY input")
         );
     }

@@ -2147,11 +2147,15 @@ mod tests {
                 let steps = std::cell::RefCell::new(Vec::new());
                 let mut request = |layout| {
                     requests.borrow_mut().push(layout);
-                    Err(cause)
+                    Err(cause.clone())
                 };
                 let mut work = |units| {
                     steps.borrow_mut().push(units);
-                    if stop_at_request { Ok(()) } else { Err(cause) }
+                    if stop_at_request {
+                        Ok(())
+                    } else {
+                        Err(cause.clone())
+                    }
                 };
                 let mut creation = super::super::ConnectorReadSchemaCreation::new(
                     ValueTypeStorageLifetime::pure(),
@@ -2454,6 +2458,7 @@ mod tests {
         paused: AtomicBool,
         stopped: AtomicBool,
         retained: AtomicU64,
+        changed: futures::task::AtomicWaker,
     }
 
     impl ConnectorPreparationControl for TestPreparationControl {
@@ -2472,6 +2477,7 @@ mod tests {
         fn request_stop(&self) {
             self.stopped.store(true, Ordering::SeqCst);
             self.retained.store(0, Ordering::SeqCst);
+            self.changed.wake();
         }
 
         fn retained_input_bytes(&self) -> u64 {
@@ -2484,8 +2490,24 @@ mod tests {
 
         fn wait_drained(
             &self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-            Box::pin(async {})
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::connector::read_stack::ConnectorPreparationExit,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(futures::future::poll_fn(move |cx| {
+                self.changed.register(cx.waker());
+                if self.is_drained() {
+                    std::task::Poll::Ready(
+                        crate::connector::read_stack::ConnectorPreparationExit::Exited,
+                    )
+                } else {
+                    std::task::Poll::Pending
+                }
+            }))
         }
     }
 

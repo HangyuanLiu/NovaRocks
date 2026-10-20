@@ -33,7 +33,11 @@ use std::{
     sync::Arc,
 };
 
-fn eval(kind: FunctionKind, array: ArrayRef, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    kind: FunctionKind,
+    array: ArrayRef,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), array.data_type().clone());
     let call = arena.push_typed(
@@ -161,21 +165,18 @@ fn legacy_calendar_parts_baseline_names_and_arbitrary_output_cast_are_retained()
             .value(0),
         2024.0
     );
-    let raw = eval(
-        FunctionKind::Year,
-        text(vec![Some("2024-02-29")]),
-        DataType::Float64,
-    )
-    .unwrap();
-    assert_eq!(raw.data_type(), &DataType::Int64);
-    assert_eq!(
-        raw.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
-        2024
+    assert_frozen_calendar_contract(
+        eval(
+            FunctionKind::Year,
+            text(vec![Some("2024-02-29")]),
+            DataType::Float64,
+        )
+        .unwrap_err(),
     );
 }
 
 #[test]
-fn legacy_calendar_parts_baseline_fractional_negative_epoch_keeps_distinct_raw_projection() {
+fn calendar_year_negative_fractional_instants_remain_before_the_epoch_in_both_routes() {
     let input: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
         Some(-1),
         Some(-1_000_001),
@@ -185,7 +186,7 @@ fn legacy_calendar_parts_baseline_fractional_negative_epoch_keeps_distinct_raw_p
     ]));
     assert_eq!(
         ints(&eval(FunctionKind::Year, input.clone(), DataType::Int32).unwrap()),
-        vec![Some(1970), Some(1970), Some(1969), Some(1970), None]
+        vec![Some(1969), Some(1969), Some(1969), Some(1970), None]
     );
     assert_eq!(
         ints(&eval(FunctionKind::Date("year"), input, DataType::Int32).unwrap()),
@@ -194,27 +195,19 @@ fn legacy_calendar_parts_baseline_fractional_negative_epoch_keeps_distinct_raw_p
 }
 
 #[test]
-fn legacy_calendar_parts_baseline_invalid_date32_and_original_raw_overflow_panic() {
+fn calendar_year_outside_calendar_is_null_without_epoch_fallback_or_signed_overflow() {
     let invalid: ArrayRef = Arc::new(Date32Array::from(vec![Some(i32::MIN), None]));
     assert_eq!(
         ints(&eval(FunctionKind::Year, invalid.clone(), DataType::Int32).unwrap()),
-        vec![Some(1970), None]
+        vec![None, None]
     );
     assert_eq!(
         ints(&eval(FunctionKind::Date("year"), invalid, DataType::Int32).unwrap()),
         vec![None, None]
     );
-    if cfg!(debug_assertions) {
-        let overflow: ArrayRef = Arc::new(Date32Array::from(vec![Some(i32::MAX)]));
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| eval(
-                FunctionKind::Year,
-                overflow,
-                DataType::Int32
-            )))
-            .is_err()
-        );
-    }
+    let outside: ArrayRef = Arc::new(Date32Array::from(vec![Some(i32::MAX)]));
+    let output = eval(FunctionKind::Year, outside, DataType::Int32).unwrap();
+    assert_eq!(ints(&output), vec![None]);
     let date = NaiveDate::from_ymd_opt(40000, 1, 1).unwrap();
     let large: ArrayRef = Arc::new(Date32Array::from(vec![Some(
         date.num_days_from_ce() - 719163,
@@ -227,11 +220,11 @@ fn legacy_calendar_parts_baseline_invalid_date32_and_original_raw_overflow_panic
 fn legacy_calendar_parts_baseline_full_original_carrier_errors_remain_distinct() {
     let input: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), None]));
     assert_eq!(
-        eval(FunctionKind::Year, input.clone(), DataType::Int32).unwrap_err(),
+        (eval(FunctionKind::Year, input.clone(), DataType::Int32).unwrap_err()).to_string(),
         "year: unsupported input type: Boolean"
     );
     assert_eq!(
-        eval(FunctionKind::Date("year"), input, DataType::Int32).unwrap_err(),
+        (eval(FunctionKind::Date("year"), input, DataType::Int32).unwrap_err()).to_string(),
         "unsupported datetime input type: Boolean"
     );
 }
@@ -256,16 +249,29 @@ fn legacy_calendar_parts_baseline_explicit_year_missing_argument_and_node_error(
             .unwrap();
     let chunk = Chunk::new_with_chunk_schema(batch, metadata);
     assert_eq!(
-        arena.eval(empty, &chunk).unwrap_err(),
+        (arena.eval(empty, &chunk).unwrap_err()).to_string(),
         "year expects 1 to 1 arguments, got 0"
     );
     assert_eq!(
-        crate::exec::expr::function::eval_year(&arena, empty, &chunk).unwrap_err(),
+        (crate::exec::expr::function::eval_year(&arena, empty, &chunk).unwrap_err()).to_string(),
         "year: missing argument"
     );
     let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
     assert_eq!(
-        crate::exec::expr::function::eval_year(&arena, slot, &chunk).unwrap_err(),
+        (crate::exec::expr::function::eval_year(&arena, slot, &chunk).unwrap_err()).to_string(),
         "Year expression node type mismatch"
+    );
+}
+
+fn assert_frozen_calendar_contract(failure: crate::runtime::fragment::ExecutionFailure) {
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(274).unwrap())
+        )
     );
 }

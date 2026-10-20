@@ -1633,7 +1633,7 @@ mod call_policy_tests {
             let mut trace = self.trace.lock().unwrap();
             trace.push((phase, units));
             if self.refuse == Some(trace.len() - 1) {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -1662,11 +1662,11 @@ mod call_policy_tests {
                     let control = EqualityControl {
                         trace: Default::default(),
                         refuse: Some(stop),
-                        cause,
+                        cause: cause.clone(),
                     };
                     let error = typed_expr_semantically_eq(&first, &right, &control).unwrap_err();
                     assert!(matches!(
-                        (cause, error),
+                        (cause.clone(), error),
                         (Cause::Cancelled, SqlCompileError::Cancelled)
                             | (Cause::DeadlineExceeded, SqlCompileError::DeadlineExceeded)
                             | (Cause::ResourceExhausted, SqlCompileError::ResourceExhausted)
@@ -1970,13 +1970,13 @@ mod call_policy_tests {
                     let control = EqualityControl {
                         trace: Default::default(),
                         refuse: Some(stop),
-                        cause,
+                        cause: cause.clone(),
                     };
                     let mut aggregate = input.clone();
                     let error =
                         ensure_aggregate_output_columns(&mut aggregate, &control).unwrap_err();
                     assert!(matches!(
-                        (cause, error),
+                        (cause.clone(), error),
                         (Cause::Cancelled, SqlCompileError::Cancelled)
                             | (Cause::DeadlineExceeded, SqlCompileError::DeadlineExceeded)
                             | (Cause::ResourceExhausted, SqlCompileError::ResourceExhausted)
@@ -2053,11 +2053,11 @@ mod call_policy_tests {
                     let control = EqualityControl {
                         trace: Default::default(),
                         refuse: Some(stop),
-                        cause,
+                        cause: cause.clone(),
                     };
                     let error = run(path, &control).unwrap_err();
                     assert!(matches!(
-                        (cause, error),
+                        (cause.clone(), error),
                         (Cause::Cancelled, SqlCompileError::Cancelled)
                             | (Cause::DeadlineExceeded, SqlCompileError::DeadlineExceeded)
                             | (Cause::ResourceExhausted, SqlCompileError::ResourceExhausted)
@@ -2159,7 +2159,7 @@ mod call_policy_tests {
                     let refusing = EqualityControl {
                         trace: Default::default(),
                         refuse: Some(stop),
-                        cause,
+                        cause: cause.clone(),
                     };
                     let error = rewrite_group_by_expr_refs(
                         &source,
@@ -2168,7 +2168,7 @@ mod call_policy_tests {
                     )
                     .unwrap_err();
                     assert!(matches!(
-                        (cause, error),
+                        (cause.clone(), error),
                         (Cause::Cancelled, SqlCompileError::Cancelled)
                             | (Cause::DeadlineExceeded, SqlCompileError::DeadlineExceeded)
                             | (Cause::ResourceExhausted, SqlCompileError::ResourceExhausted)

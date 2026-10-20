@@ -19,40 +19,49 @@ use arrow::datatypes::DataType;
 pub(super) fn avg_decimal_sum_info(
     intermediate_type: &DataType,
     output_type: Option<&DataType>,
-) -> Result<(u8, i8), String> {
+) -> crate::runtime::fragment::ExecutionResult<(u8, i8)> {
     // avg(decimal) intermediate can be an opaque VARBINARY/VARCHAR blob.
     // Its scale is defined by FE arg_types (input type), so it cannot be inferred from the intermediate type alone.
     // Callers must not use this helper for Binary/Utf8 intermediates.
     if matches!(intermediate_type, DataType::Binary | DataType::Utf8) {
-        return Err(format!(
-            "avg decimal intermediate type mismatch: {:?}",
-            intermediate_type
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "avg decimal intermediate type mismatch: {:?}",
+                intermediate_type
+            ),
         ));
     }
 
     let _ = output_type;
 
     let DataType::Struct(fields) = intermediate_type else {
-        return Err(format!(
-            "avg decimal intermediate type mismatch: {:?}",
-            intermediate_type
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "avg decimal intermediate type mismatch: {:?}",
+                intermediate_type
+            ),
         ));
     };
     if fields.len() != 2 {
-        return Err("avg decimal intermediate expects 2 fields".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "avg decimal intermediate expects 2 fields",
+        ));
     }
-    let sum_field = fields
-        .first()
-        .ok_or_else(|| "avg decimal intermediate missing sum field".to_string())?;
-    let count_field = fields
-        .get(1)
-        .ok_or_else(|| "avg decimal intermediate missing count field".to_string())?;
+    let sum_field = fields.first().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(
+            "avg decimal intermediate missing sum field",
+        )
+    })?;
+    let count_field = fields.get(1).ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(
+            "avg decimal intermediate missing count field",
+        )
+    })?;
     match count_field.data_type() {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {}
         other => {
-            return Err(format!(
-                "avg decimal intermediate count type mismatch: {:?}",
-                other
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("avg decimal intermediate count type mismatch: {:?}", other),
             ));
         }
     }
@@ -60,9 +69,8 @@ pub(super) fn avg_decimal_sum_info(
         DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
             Ok((*precision, *scale))
         }
-        other => Err(format!(
-            "avg decimal intermediate sum type mismatch: {:?}",
-            other
+        other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("avg decimal intermediate sum type mismatch: {:?}", other),
         )),
     }
 }
@@ -70,7 +78,7 @@ pub(super) fn avg_decimal_sum_info(
 pub(super) fn avg_decimal_sum_scale(
     intermediate_type: &DataType,
     output_type: &DataType,
-) -> Result<i8, String> {
+) -> crate::runtime::fragment::ExecutionResult<i8> {
     let (_, scale) = avg_decimal_sum_info(intermediate_type, Some(output_type))?;
     Ok(scale)
 }

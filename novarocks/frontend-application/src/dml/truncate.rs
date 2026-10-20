@@ -180,7 +180,9 @@ fn unknown(attempt: &mut DmlPublicationAttempt, failure: TruncateFailure) -> Res
         .terminal_commit_unknown()
         .map_err(DmlError::executor)?
         .clone();
-    Err(DmlError::commit(failure.message).with_publication_terminal(terminal))
+    Err(DmlError::commit(&failure.message)
+        .with_compile_control(failure.compile_control_error())
+        .with_publication_terminal(terminal))
 }
 
 fn unknown_after_adjudication(
@@ -196,7 +198,9 @@ fn unknown_after_adjudication(
         )
         .map_err(DmlError::executor)?
         .clone();
-    Err(DmlError::commit(failure.message).with_publication_terminal(terminal))
+    Err(DmlError::commit(&failure.message)
+        .with_compile_control(failure.compile_control_error())
+        .with_publication_terminal(terminal))
 }
 
 fn finalization_state(finalization: &TruncateFinalization) -> DmlPublicationFinalization {
@@ -222,7 +226,10 @@ fn finalization_error(
 fn plan_error(error: TruncatePlanError) -> DmlError {
     match error {
         TruncatePlanError::KnownUncommitted(failure)
-        | TruncatePlanError::ContractFailure { failure, .. } => DmlError::executor(failure.message),
+        | TruncatePlanError::ContractFailure { failure, .. } => {
+            DmlError::executor(&failure.message)
+                .with_compile_control(failure.compile_control_error())
+        }
     }
 }
 

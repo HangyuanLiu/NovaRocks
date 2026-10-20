@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -570,7 +570,7 @@ fn every_prefix(mut invoke: impl FnMut(&Control) -> Result<(), Error>, ordinary:
     for at in 0..positive.len() {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(invoke(&control), Err(Error::Control(actual)) if actual == cause));
@@ -676,7 +676,7 @@ fn value_origin_real_namespace_floor_and_unique_source_scan_observe_quantum_with
             .unwrap();
     for cause in CAUSES {
         let control = Control {
-            stop: Some((at, cause)),
+            stop: Some((at, cause.clone())),
             ..Control::default()
         };
         let namespace =

@@ -18,6 +18,9 @@
 //! Immutable v1 conditional oracles before extracting value calculations.
 //! The legacy shells intentionally retain their existing argument scheduling,
 //! casts, inference, Arrow errors, and carrier quirks.
+use super::legacy_array_append_baseline_tests::{
+    assert_frozen_target as assert_expression_contract, assert_original_arrow,
+};
 use super::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::{self, FunctionKind};
@@ -31,6 +34,7 @@ use arrow::array::{
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::SlotId;
 use std::sync::Arc;
 
@@ -85,15 +89,19 @@ fn call(
     root: ExprId,
     args: &[ExprId],
     input: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     match name {
-        "ifnull" => function::eval_ifnull(arena, args[0], args[1], input),
+        "ifnull" => function::eval_ifnull(arena, root, args[0], args[1], input),
         "coalesce" => function::eval_coalesce(arena, root, args, input),
         "nullif" => function::eval_nullif(arena, root, args[0], args[1], input),
         _ => unreachable!(),
     }
 }
-fn eval(name: &str, columns: Vec<ArrayRef>, output: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &str,
+    columns: Vec<ArrayRef>,
+    output: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, root, args) = invocation(name, &columns, output);
     call(name, &arena, root, &args, &chunk(columns))
 }
@@ -191,7 +199,7 @@ fn legacy_conditional_baseline_nullif_float_nan_and_signed_zero() {
 }
 
 #[test]
-fn legacy_conditional_baseline_nullif_timestamp_four_units_loses_timezone() {
+fn conditional_nullif_timestamp_four_units_preserve_frozen_timezone() {
     macro_rules! check {
         ($array:ty, $unit:expr) => {{
             for timezone in [None, Some("UTC"), Some("Asia/Shanghai")] {
@@ -209,8 +217,9 @@ fn legacy_conditional_baseline_nullif_timestamp_four_units_loses_timezone() {
                     DataType::Timestamp($unit, timezone.map(Into::into)),
                 )
                 .unwrap();
-                let expected: ArrayRef =
-                    Arc::new(<$array>::from(vec![None, Some(2), None, Some(3)]));
+                let expected: ArrayRef = Arc::new(
+                    <$array>::from(vec![None, Some(2), None, Some(3)]).with_timezone_opt(timezone),
+                );
                 assert_array(actual, expected);
             }
         }};
@@ -362,8 +371,14 @@ fn legacy_conditional_baseline_nullif_complex_display_equality_and_slices() {
 
 #[test]
 fn legacy_conditional_baseline_nullif_unsupported_and_full_long_error() {
+    for rows in [0, 2] {
+        let input = new_null_array(&DataType::Null, rows);
+        assert_array(
+            eval("nullif", vec![input.clone(), input.clone()], DataType::Null).unwrap(),
+            input,
+        );
+    }
     let types = vec![
-        DataType::Null,
         DataType::Binary,
         DataType::LargeUtf8,
         DataType::FixedSizeList(
@@ -375,61 +390,56 @@ fn legacy_conditional_baseline_nullif_unsupported_and_full_long_error() {
         let input = new_null_array(&ty, 2);
         let expected = format!("nullif unsupported type: {ty:?}");
         let actual = eval("nullif", vec![input.clone(), input], ty).unwrap_err();
-        assert_eq!(actual.as_bytes(), expected.as_bytes());
-        if expected.contains(&"x".repeat(900)) {
-            assert!(actual.len() > 512);
+        assert_eq!(actual.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            actual.failure_fact().reason(),
+            novarocks_failure_contract::FailureReason::new(
+                novarocks_failure_contract::domain::KERNEL,
+                std::num::NonZeroU16::new(255).unwrap()
+            )
+        );
+        assert!(actual.detail().len() <= 512);
+        assert!(expected.starts_with(actual.detail()));
+        if expected.len() <= 512 {
+            assert_eq!(actual.detail(), expected);
         }
     }
 }
 
 #[test]
-fn legacy_conditional_baseline_ifnull_left_type_ignores_declared_result() {
+fn conditional_ifnull_obeys_declared_result_without_left_type_narrowing() {
     let left: ArrayRef = Arc::new(Int8Array::from(vec![Some(7), None, None]));
     let right: ArrayRef = Arc::new(Int64Array::from(vec![Some(1000), Some(120), Some(1000)]));
     assert_array(
         eval("ifnull", vec![left, right], DataType::Int64).unwrap(),
-        Arc::new(Int8Array::from(vec![Some(7), Some(120), None])),
+        Arc::new(Int64Array::from(vec![Some(7), Some(120), Some(1000)])),
     );
     let left: ArrayRef = Arc::new(NullArray::new(2));
     let right: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
     assert_array(
-        eval("ifnull", vec![left, right.clone()], DataType::Int64).unwrap(),
+        eval("ifnull", vec![left, right.clone()], DataType::Utf8).unwrap(),
         right,
     );
 }
 
 #[test]
-fn legacy_conditional_baseline_coalesce_recursive_null_head_reinfers_type() {
+fn conditional_coalesce_tail_retains_the_frozen_result_type() {
     let left: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None]));
     let right: ArrayRef = Arc::new(Int64Array::from(vec![Some(9), None]));
-    // Initial target is Utf8. The original all-NULL-head recursion evaluates
-    // the tail again and re-infers Int64, rather than returning the first cast.
     assert_array(
-        eval("coalesce", vec![left, right.clone()], DataType::Null).unwrap(),
-        right,
+        eval("coalesce", vec![left, right], DataType::Utf8).unwrap(),
+        Arc::new(StringArray::from(vec![Some("9"), None])),
     );
 }
-
 #[test]
-fn legacy_conditional_baseline_all_null_carrier_results_differ() {
+fn conditional_all_null_outputs_preserve_the_declared_null_carrier() {
     let input: ArrayRef = Arc::new(NullArray::new(3));
-    assert_array(
-        eval("ifnull", vec![input.clone(), input.clone()], DataType::Null).unwrap(),
-        input.clone(),
-    );
-    assert_array(
-        eval(
-            "coalesce",
-            vec![input.clone(), input.clone()],
-            DataType::Null,
-        )
-        .unwrap(),
-        Arc::new(Int64Array::from(vec![None::<i64>; 3])),
-    );
-    assert_eq!(
-        eval("nullif", vec![input.clone(), input], DataType::Null).unwrap_err(),
-        "nullif unsupported type: Null"
-    );
+    for name in ["ifnull", "coalesce", "nullif"] {
+        assert_array(
+            eval(name, vec![input.clone(), input.clone()], DataType::Null).unwrap(),
+            input.clone(),
+        );
+    }
 }
 
 #[test]
@@ -440,15 +450,19 @@ fn legacy_conditional_baseline_eager_hidden_child_errors_and_left_first() {
         let first = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let hidden = arena.push_typed(ExprNode::SlotId(SlotId::new(99)), DataType::Int64);
         let root = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Int64);
-        let expected = arena.eval(hidden, &input).unwrap_err();
+        let expected = arena.eval(hidden, &input).unwrap_err().to_string();
         assert_eq!(
-            call(name, &arena, root, &[first, hidden], &input).unwrap_err(),
+            call(name, &arena, root, &[first, hidden], &input)
+                .unwrap_err()
+                .to_string(),
             expected
         );
         let first_failure = arena.push_typed(ExprNode::SlotId(SlotId::new(98)), DataType::Int64);
         assert_eq!(
-            call(name, &arena, root, &[first_failure, hidden], &input).unwrap_err(),
-            arena.eval(first_failure, &input).unwrap_err()
+            call(name, &arena, root, &[first_failure, hidden], &input)
+                .unwrap_err()
+                .to_string(),
+            arena.eval(first_failure, &input).unwrap_err().to_string()
         );
     }
 }
@@ -466,41 +480,16 @@ fn legacy_conditional_baseline_raw_cast_errors_eager_and_full() {
         None,
     ));
     let good: ArrayRef = Arc::new(Int64Array::from(vec![7, 8]));
-    let raw = arrow::compute::cast(bad.as_ref(), &DataType::Int64)
-        .unwrap_err()
-        .to_string();
-    assert!(raw.len() > 512);
-    assert_eq!(
-        eval("ifnull", vec![good.clone(), bad.clone()], DataType::Int64).unwrap_err(),
-        raw
-    );
-    assert_eq!(
-        eval("coalesce", vec![good.clone(), bad.clone()], DataType::Int64).unwrap_err(),
-        format!(
-            "coalesce: failed to cast array from {:?} to {:?}: {}",
-            bad.data_type(),
-            DataType::Int64,
-            raw
-        )
-    );
-    assert_eq!(
-        eval("nullif", vec![good.clone(), bad.clone()], DataType::Int64).unwrap_err(),
-        format!(
-            "nullif failed to cast right {:?} -> {:?}: {}",
-            bad.data_type(),
-            DataType::Int64,
-            raw
-        )
-    );
-    assert_eq!(
-        eval("nullif", vec![bad.clone(), good], DataType::Int64).unwrap_err(),
-        format!(
-            "nullif failed to cast left {:?} -> {:?}: {}",
-            bad.data_type(),
-            DataType::Int64,
-            raw
-        )
-    );
+    let raw = arrow::compute::cast(bad.as_ref(), &DataType::Int64).unwrap_err();
+    assert!(raw.to_string().len() > 512);
+    for name in ["ifnull", "coalesce", "nullif"] {
+        let actual = eval(name, vec![good.clone(), bad.clone()], DataType::Int64).unwrap_err();
+        assert_original_arrow(&actual, &raw);
+        assert!(actual.detail().len() <= 512);
+    }
+    let actual = eval("nullif", vec![bad, good], DataType::Int64).unwrap_err();
+    assert_original_arrow(&actual, &raw);
+    assert!(actual.detail().len() <= 512);
 }
 
 #[test]
@@ -509,7 +498,9 @@ fn legacy_conditional_baseline_coalesce_raw_arity_and_missing_output() {
     let (arena, root, args) = invocation("coalesce", &columns, DataType::Int64);
     let input = chunk(columns.clone());
     assert_eq!(
-        call("coalesce", &arena, root, &[], &input).unwrap_err(),
+        call("coalesce", &arena, root, &[], &input)
+            .unwrap_err()
+            .to_string(),
         "coalesce: requires at least one argument"
     );
     assert_array(
@@ -517,11 +508,13 @@ fn legacy_conditional_baseline_coalesce_raw_arity_and_missing_output() {
         columns[0].clone(),
     );
     assert_eq!(
-        arena.eval(root, &input).unwrap_err(),
+        arena.eval(root, &input).unwrap_err().to_string(),
         format!("coalesce expects 2 to {} arguments, got 1", usize::MAX)
     );
     assert_eq!(
-        call("coalesce", &arena, ExprId(usize::MAX), &args, &input).unwrap_err(),
+        call("coalesce", &arena, ExprId(usize::MAX), &args, &input)
+            .unwrap_err()
+            .to_string(),
         "coalesce: missing output type"
     );
 }
@@ -559,7 +552,7 @@ fn legacy_conditional_baseline_coalesce_and_ifnull_slices_empty_and_width_cast()
             DataType::Int64,
         )
         .unwrap(),
-        Arc::new(Int32Array::from(vec![Some(10), Some(2), None])),
+        Arc::new(Int64Array::from(vec![Some(10), Some(2), None])),
     );
     for name in ["coalesce", "ifnull", "nullif"] {
         let output = eval(
@@ -569,14 +562,7 @@ fn legacy_conditional_baseline_coalesce_and_ifnull_slices_empty_and_width_cast()
         )
         .unwrap();
         assert_eq!(output.len(), 0);
-        assert_eq!(
-            output.data_type(),
-            &if name == "ifnull" {
-                DataType::Int32
-            } else {
-                DataType::Int64
-            }
-        );
+        assert_eq!(output.data_type(), &DataType::Int64);
     }
 }
 

@@ -348,7 +348,7 @@ fn assert_binding_drift_refused(name: &str, values: ArrayRef, raw_output: DataTy
         } => {
             assert_eq!(actual, name);
             let expected = format!(
-                "bind aggregate `{name}`: prepare aggregate `{name}` overload `builtin.aggregate/{name}/derived-v1`: legacy aggregate type drift: implementation intermediate=Binary, output={raw_output:?}; catalog intermediate=Binary, output=Float64"
+                "prepare aggregate `{name}` overload `builtin.aggregate/{name}/derived-v1`: fragment plan build error (expression invariant): legacy aggregate type drift: implementation intermediate=Binary, output={raw_output:?}; catalog intermediate=Binary, output=Float64"
             );
             assert_eq!(reason, expected);
         }

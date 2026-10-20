@@ -45,7 +45,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -269,7 +269,7 @@ fn every_boundary(
     for stop in 0..expected.len() {
         for cause in CAUSES {
             let refusing = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(
@@ -351,7 +351,7 @@ fn numeric_work_refusal_preserves_resource_before_later_controller_or_footer() {
         for stop in 0..trace.len() {
             for cause in CAUSES {
                 let refusing = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(matches!(run(&left, &right, SOURCE, maximum, &refusing),
@@ -447,7 +447,7 @@ fn borrowed_type_exact_cached_bound_and_original_success_tails_keep_their_trace(
             for at in 0..trace.len() {
                 for cause in CAUSES {
                     let control = Control {
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                         ..Default::default()
                     };
                     assert!(
@@ -492,7 +492,7 @@ fn borrowed_type_pure_prefix_keeps_original_ordinary_missing_source_observations
         for at in 0..expected_trace.len() {
             for cause in CAUSES {
                 let control = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(matches!(
@@ -542,7 +542,7 @@ fn admitted_comparison_preserves_original_bound_trace_and_every_actual_control_e
     for at in 0..trace.len() {
         for cause in CAUSES {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(

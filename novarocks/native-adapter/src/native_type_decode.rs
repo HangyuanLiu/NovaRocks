@@ -23,6 +23,7 @@
 use crate::native_type_construction::{
     NativeTypeConstruction, NativeTypeConstructionError, NativeTypeFactory,
 };
+use novarocks_execution_contract::failure::{FailureFact, FailureProjection, SharedFailureCause};
 use novarocks_functions::FunctionValueType;
 use novarocks_plan_codec::{
     execution_type_table::{
@@ -32,26 +33,36 @@ use novarocks_plan_codec::{
     host_projection_v2::ProjectionFailure,
     value_type_table::LogicalTypeCodecError,
 };
-use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError};
 use novarocks_proto_models::{common, plan};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueTypeStorageLifetime};
 use std::{alloc::Layout, error::Error, fmt};
 
-/// Exact protocol or creator cause, independent of any fragment-tree decoder.
+/// Exact protocol, creator, or field-scoped domain cause, independent of any fragment-tree decoder.
 #[derive(Debug)]
 pub(crate) enum NativeTypeDecodeError {
     Protocol(ProtocolError),
     Construction(NativeTypeConstructionError),
+    Source {
+        path: FieldPath,
+        cause: SharedFailureCause,
+    },
 }
 impl NativeTypeDecodeError {
     pub(crate) fn construction_cause(&self) -> Option<&NativeTypeConstructionError> {
         match self {
             Self::Construction(cause) => Some(cause),
-            Self::Protocol(_) => None,
+            Self::Protocol(_) | Self::Source { .. } => None,
         }
     }
-    fn invalid_value(path: FieldPath, detail: impl fmt::Display) -> Self {
-        ProtocolError::new(path, ProtocolErrorKind::InvalidValue, detail.to_string()).into()
+    pub(crate) fn from_domain<E>(path: FieldPath, cause: E) -> Self
+    where
+        E: Error + FailureProjection + Send + Sync + 'static,
+    {
+        Self::Source {
+            path,
+            cause: SharedFailureCause::new(cause),
+        }
     }
 }
 impl fmt::Display for NativeTypeDecodeError {
@@ -59,6 +70,9 @@ impl fmt::Display for NativeTypeDecodeError {
         match self {
             Self::Protocol(cause) => cause.fmt(f),
             Self::Construction(cause) => cause.fmt(f),
+            Self::Source { path, cause } => {
+                write!(f, "native type decode error at {path}: {cause}")
+            }
         }
     }
 }
@@ -67,6 +81,16 @@ impl Error for NativeTypeDecodeError {
         match self {
             Self::Protocol(cause) => Some(cause),
             Self::Construction(cause) => Some(cause),
+            Self::Source { cause, .. } => Some(cause),
+        }
+    }
+}
+impl FailureProjection for NativeTypeDecodeError {
+    fn failure_fact(&self) -> FailureFact {
+        match self {
+            Self::Protocol(cause) => cause.failure_fact(),
+            Self::Construction(cause) => cause.failure_fact(),
+            Self::Source { cause, .. } => cause.failure_fact(),
         }
     }
 }
@@ -89,17 +113,12 @@ impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
 }
 impl From<novarocks_type_contract::ValueTypeError> for NativeTypeDecodeError {
     fn from(cause: novarocks_type_contract::ValueTypeError) -> Self {
-        Self::invalid_value(FieldPath::root("type"), cause)
+        Self::from_domain(FieldPath::root("type"), cause)
     }
 }
 impl From<novarocks_local_program::FilterMembershipSchemaError> for NativeTypeDecodeError {
     fn from(cause: novarocks_local_program::FilterMembershipSchemaError) -> Self {
-        match cause {
-            novarocks_local_program::FilterMembershipSchemaError::Resource(cause) => cause.into(),
-            cause => {
-                Self::invalid_value(FieldPath::root("runtime_filter").field("membership"), cause)
-            }
-        }
+        Self::from_domain(FieldPath::root("runtime_filter").field("membership"), cause)
     }
 }
 
@@ -137,14 +156,7 @@ impl<'a> NativeTypeDecodeResources<'a> {
 }
 
 pub(crate) fn table_error(error: LogicalTypeCodecError, path: FieldPath) -> NativeTypeDecodeError {
-    match error {
-        LogicalTypeCodecError::Control(error) => NativeTypeConstructionError::Control(error).into(),
-        LogicalTypeCodecError::ResourceSource(_) => NativeTypeConstructionError::Resource(
-            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
-        )
-        .into(),
-        error => NativeTypeDecodeError::invalid_value(path, error),
-    }
+    NativeTypeDecodeError::from_domain(path, error)
 }
 pub(crate) fn table_failure(
     error: ProjectionFailure<LogicalTypeCodecError, NativeTypeConstructionError>,
@@ -291,7 +303,7 @@ mod tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.calls.lock().unwrap().push((phase, units));
             if self.refuse.load(Ordering::SeqCst) {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -302,6 +314,131 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             refuse: AtomicBool::new(false),
             cause,
+        }
+    }
+
+    fn assert_domain_source<E>(
+        original: E,
+        expected_path: FieldPath,
+        convert: impl FnOnce(E) -> NativeTypeDecodeError,
+    ) -> NativeTypeDecodeError
+    where
+        E: Error + FailureProjection + Send + Sync + 'static,
+    {
+        let expected = original.failure_fact();
+        let decoded = convert(original);
+        assert_eq!(decoded.failure_fact(), expected);
+        let NativeTypeDecodeError::Source { path, cause } = &decoded else {
+            panic!("the original domain cause must not become a protocol error");
+        };
+        assert_eq!(path, &expected_path);
+        assert!(decoded.to_string().contains(&expected_path.to_string()));
+        let retained = cause.downcast_ref::<E>().unwrap();
+        assert!(std::ptr::eq(
+            retained,
+            decoded
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .downcast_ref::<E>()
+                .unwrap(),
+        ));
+        decoded
+    }
+
+    #[test]
+    fn intrinsic_value_and_membership_conversions_keep_the_original_domain_and_path() {
+        use novarocks_local_program::FilterMembershipSchemaError;
+        use novarocks_type_contract::{
+            ValueTypeError, owned_resources::layout::LayoutResourceError,
+        };
+        for original in [
+            ValueTypeError::TooDeep,
+            ValueTypeError::InvalidType("memory exhausted unsupported cancelled"),
+        ] {
+            assert_domain_source(
+                original,
+                FieldPath::root("type"),
+                NativeTypeDecodeError::from,
+            );
+        }
+        for original in [
+            FilterMembershipSchemaError::DigestMismatch,
+            FilterMembershipSchemaError::Resource(LayoutResourceError::Arithmetic),
+            FilterMembershipSchemaError::TimezoneLengthOverflow {
+                required: usize::MAX,
+                source: u32::try_from(u64::MAX).unwrap_err(),
+            },
+        ] {
+            assert_domain_source(
+                original,
+                FieldPath::root("runtime_filter").field("membership"),
+                NativeTypeDecodeError::from,
+            );
+        }
+    }
+
+    #[test]
+    fn type_table_codec_causes_keep_the_whole_author_fact_and_original_source_chain() {
+        use novarocks_type_contract::ExecutionValueTypeError;
+        for original in [
+            LogicalTypeCodecError::InvalidShape("memory exhausted unsupported cancelled"),
+            LogicalTypeCodecError::ResourceSource("original source model"),
+            LogicalTypeCodecError::ValueType(ExecutionValueTypeError::Depth),
+            LogicalTypeCodecError::ValueType(ExecutionValueTypeError::Invalid("unsupported")),
+            LogicalTypeCodecError::Control(CompileControlError::Cancelled),
+            LogicalTypeCodecError::Control(CompileControlError::DeadlineExceeded),
+            LogicalTypeCodecError::Control(CompileControlError::ResourceExhausted),
+        ] {
+            let path = FieldPath::root("runtime_filter")
+                .field("type_table")
+                .index(3);
+            assert_domain_source(original, path.clone(), |original| {
+                table_error(original, path)
+            });
+        }
+    }
+
+    #[test]
+    fn protocol_and_host_construction_project_the_original_facts_without_text_classification() {
+        use novarocks_execution_contract::failure::FailureClass;
+        use novarocks_proto_codec::ProtocolErrorKind;
+        let protocol = ProtocolError::new(
+            FieldPath::root("type"),
+            ProtocolErrorKind::InvalidValue,
+            "memory exhausted cancelled unsupported",
+        );
+        let expected = protocol.failure_fact();
+        let decoded = NativeTypeDecodeError::from(protocol);
+        assert_eq!(decoded.failure_fact(), expected);
+        assert_eq!(decoded.failure_fact().class(), FailureClass::Data);
+        assert!(
+            decoded
+                .source()
+                .unwrap()
+                .downcast_ref::<ProtocolError>()
+                .is_some()
+        );
+        for original in [
+            NativeTypeConstructionError::Control(CompileControlError::Cancelled),
+            NativeTypeConstructionError::Control(CompileControlError::DeadlineExceeded),
+            NativeTypeConstructionError::Control(CompileControlError::ResourceExhausted),
+        ] {
+            let expected = original.failure_fact();
+            let decoded = table_failure(
+                ProjectionFailure::Host(original.clone()),
+                FieldPath::root("type"),
+            );
+            assert_eq!(decoded.failure_fact(), expected);
+            assert_eq!(decoded.construction_cause(), Some(&original));
+            assert_eq!(
+                decoded
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<NativeTypeConstructionError>(),
+                Some(&original),
+            );
         }
     }
 
@@ -334,7 +471,7 @@ mod tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = control(cause);
+            let control = control(cause.clone());
             let tracker = MemTracker::new_root("shared native type control");
             let creation =
                 NativeTypeConstruction::try_with_control(tracker.clone(), &control).unwrap();
@@ -345,7 +482,7 @@ mod tests {
             let failure = resources.request(Layout::new::<u64>()).unwrap_err();
             assert_eq!(
                 failure.construction_cause(),
-                Some(&NativeTypeConstructionError::Control(cause))
+                Some(&NativeTypeConstructionError::Control(cause.clone()))
             );
             assert_eq!(
                 tracker.current(),
@@ -355,7 +492,7 @@ mod tests {
             let failure = resources.finish().unwrap_err();
             assert_eq!(
                 failure.construction_cause(),
-                Some(&NativeTypeConstructionError::Control(cause))
+                Some(&NativeTypeConstructionError::Control(cause.clone()))
             );
         }
     }

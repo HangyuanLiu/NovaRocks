@@ -40,7 +40,10 @@ fn chunk(arrays: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, cs)
 }
-pub(super) fn original(arrays: Vec<ArrayRef>, negated: bool) -> Result<ArrayRef, String> {
+pub(super) fn original(
+    arrays: Vec<ArrayRef>,
+    negated: bool,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     assert!(!arrays.is_empty());
     let mut arena = ExprArena::default();
     let children = arrays
@@ -177,7 +180,7 @@ fn throwing(arena: &mut ExprArena, message: String) -> ExprId {
     )
 }
 #[test]
-fn inlist_original_matching_candidate_still_evaluates_later_full_error() {
+fn inlist_matching_candidate_still_requires_the_later_assertion() {
     let c = chunk(vec![Arc::new(Int32Array::from(vec![1]))]);
     for negated in [false, true] {
         let mut arena = ExprArena::default();
@@ -193,7 +196,22 @@ fn inlist_original_matching_candidate_still_evaluates_later_full_error() {
             },
             DataType::Boolean,
         );
-        assert_eq!(arena.eval(root, &c).unwrap_err(), message);
+        let failure = arena.eval(root, &c).unwrap_err();
+        use novarocks_failure_contract::{
+            BoundedDetail, FailureClass, FailureFact, FailureProjection,
+        };
+        assert_eq!(
+            failure.failure_fact(),
+            FailureFact::new(
+                FailureClass::Data,
+                crate::runtime::fragment::ExecutionReason::AssertionFailed.reason()
+            )
+        );
+        assert_eq!(
+            failure.detail(),
+            BoundedDetail::truncating(&message).as_str()
+        );
+        assert!(failure.detail().len() <= 512);
     }
 }
 #[test]
@@ -223,7 +241,10 @@ fn inlist_original_empty_invocation_skips_missing_candidate_but_not_source() {
             },
             DataType::Boolean,
         );
-        assert_eq!(arena.eval(root, &c).unwrap_err(), message);
+        let observed = arena.eval(root, &c).unwrap_err();
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(observed.failure_fact(), message.failure_fact());
+        assert_eq!(observed.detail(), message.detail());
     }
 }
 #[test]
@@ -248,7 +269,7 @@ fn inlist_original_first_comparison_error_precedes_later_expression() {
         },
         DataType::Boolean,
     );
-    assert_eq!(arena.eval(root, &c).unwrap_err(), expected);
+    assert_eq!((arena.eval(root, &c).unwrap_err()).to_string(), expected);
 }
 
 /// Evaluate the original required CASE operand through its existing arena owner.

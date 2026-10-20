@@ -119,7 +119,7 @@ impl DiagnosticRenderer for BorrowedRenderer<'_> {
         if writer.refused {
             return Ok(Err(fmt::Error));
         }
-        result.map_err(|error| ConstantError::Arrow(error.to_string()))?;
+        result.map_err(ConstantError::arrow_diagnostic)?;
         writer.work.flush()?;
         Ok(Ok(()))
     }
@@ -236,7 +236,7 @@ fn format_value_with<R: DiagnosticRenderer>(
     work.flush()?;
     let formatter = ArrayFormatter::try_new(value.pool.array().as_ref(), &options);
     work.flush()?;
-    let formatter = formatter.map_err(|error| ConstantError::Arrow(error.to_string()))?;
+    let formatter = formatter.map_err(ConstantError::arrow_validation)?;
     renderer.render(work, |writer| {
         formatter.value(value.ordinal() as usize).write(writer)
     })
@@ -245,7 +245,7 @@ fn format_value_with<R: DiagnosticRenderer>(
 fn write_text(writer: &mut dyn Write, args: fmt::Arguments<'_>) -> Result<(), ArrowError> {
     writer
         .write_fmt(args)
-        .map_err(|_| ArrowError::CastError("constant diagnostic write failed".to_owned()))
+        .map_err(|source| ArrowError::ExternalError(Box::new(source)))
 }
 
 fn render(
@@ -259,17 +259,14 @@ fn render(
         if let Some(primary) = counter.error.take() {
             return Err(primary);
         }
-        result.map_err(|error| ConstantError::Arrow(error.to_string()))?;
+        result.map_err(ConstantError::arrow_diagnostic)?;
         counter.length
     };
     work.flush()?;
     // The exact first-pass count avoids repeated String reallocation while
     // retaining a checked pre-growth bound. This remains a requested library
     // allocation with opaque checks, not a host allocation grant.
-    let mut reserved = String::new();
-    reserved
-        .try_reserve_exact(bound)
-        .map_err(|_| ConstantError::Limit("constant diagnostic allocation failed"))?;
+    let reserved = reserve_output(bound)?;
     work.flush()?;
     let output = {
         let mut writer = ObservedWriter::output(work, bound);
@@ -278,7 +275,7 @@ fn render(
         if let Some(primary) = writer.error.take() {
             return Err(primary);
         }
-        result.map_err(|error| ConstantError::Arrow(error.to_string()))?;
+        result.map_err(ConstantError::arrow_diagnostic)?;
         if writer.length != bound {
             return Err(ConstantError::Invalid(
                 "constant diagnostic changed between observed writes",
@@ -386,3 +383,13 @@ impl Write for ObservedWriter<'_, '_> {
 #[cfg(test)]
 #[path = "diagnostic/tests.rs"]
 mod tests;
+
+fn reserve_output(bound: usize) -> Result<String, ConstantError> {
+    std::alloc::Layout::array::<u8>(bound)
+        .map_err(|source| ConstantError::array_backing::<u8>(bound, source))?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(bound)
+        .map_err(ConstantError::allocation)?;
+    Ok(output)
+}

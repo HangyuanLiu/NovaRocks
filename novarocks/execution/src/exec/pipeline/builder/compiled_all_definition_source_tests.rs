@@ -364,7 +364,7 @@ impl PureCompileControl for Meter {
         let mut events = self.events.lock().unwrap();
         let ordinal = events.len();
         events.push(units);
-        if let Some((at, cause)) = self.fail
+        if let Some((at, cause)) = self.fail.clone()
             && at == ordinal
         {
             return Err(cause);
@@ -406,7 +406,7 @@ fn all_definition_source_first_control_cause_stops_every_callback_prefix() {
         for stop in 1..=total {
             let meter = Meter {
                 events: Mutex::new(Vec::new()),
-                fail: Some((stop, cause)),
+                fail: Some((stop, cause.clone())),
             };
             let mut work = CompileCheckpoints::try_new(&meter, CompilePhase::Encode).unwrap();
             let mut captures = 0;
@@ -419,11 +419,11 @@ fn all_definition_source_first_control_cause_stops_every_callback_prefix() {
                     work.flush()
                 },
             );
-            assert_eq!(result, Err(cause));
+            assert_eq!(result, Err(cause.clone()));
             assert_eq!(captures, stop);
             let events = meter.events.lock().unwrap().clone();
             assert_eq!(events.len(), stop + 1);
-            assert_eq!(work.flush(), Err(cause));
+            assert_eq!(work.flush(), Err(cause.clone()));
             assert_eq!(*meter.events.lock().unwrap(), events);
         }
     }

@@ -396,7 +396,7 @@ fn decimal_float_compile_callbacks_preserve_primary_causes_on_success_and_reject
                 assert!(at <= stop, "callback after primary compile refusal");
             }
             calls.push((phase, items));
-            if let Some((stop, cause)) = self.refusal {
+            if let Some((stop, cause)) = self.refusal.clone() {
                 if at == stop {
                     return Err(cause);
                 }
@@ -449,7 +449,7 @@ fn decimal_float_compile_callbacks_preserve_primary_causes_on_success_and_reject
                 ] {
                     let control = CompileControl {
                         calls: Mutex::new(Vec::new()),
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                     };
                     let failure = PreparedCastRecipe::try_new(
                         operation,

@@ -1226,7 +1226,10 @@ pub(crate) mod tests {
             novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
         );
         operations.seal();
-        runtime.block_on(operations.exited()).unwrap();
+        assert_eq!(
+            runtime.block_on(operations.exited()),
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
         assert_eq!(operations.live_operations(), 0);
     }
 }

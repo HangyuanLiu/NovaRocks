@@ -37,10 +37,7 @@ fn direction(kind: &AggKind) -> novarocks_functions::builtin::aggregate_by_core:
 }
 struct LegacyByBuffer(Vec<u8>);
 impl novarocks_functions::builtin::aggregate_by_core::ByEncodeBuffer for LegacyByBuffer {
-    fn push(
-        &mut self,
-        byte: u8,
-    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+    fn push(&mut self, byte: u8) -> Result<(), novarocks_functions::KernelFailure> {
         self.0.push(byte);
         Ok(())
     }
@@ -48,7 +45,7 @@ impl novarocks_functions::builtin::aggregate_by_core::ByEncodeBuffer for LegacyB
         &mut self,
         bytes: &[u8],
         _work: &mut novarocks_functions::aggregate_scalar::ScalarWork<'_, '_>,
-    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+    ) -> Result<(), novarocks_functions::KernelFailure> {
         self.0.extend_from_slice(bytes);
         Ok(())
     }
@@ -73,18 +70,30 @@ impl AggregateFunction for MaxMinByAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let kind = kind_from_name(func.name.as_str())
-            .ok_or_else(|| format!("unsupported max_by/min_by: {}", func.name))?;
-        let data_type = input_type.ok_or_else(|| "max_by/min_by input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let kind = kind_from_name(func.name.as_str()).ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "unsupported max_by/min_by: {}",
+                func.name
+            ))
+        })?;
+        let data_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "max_by/min_by input type missing",
+            )
+        })?;
 
         if input_is_intermediate {
-            let sig = super::super::agg_type_signature(func)
-                .ok_or_else(|| "max_by/min_by type signature missing".to_string())?;
-            let output_type = sig
-                .output_type
-                .as_ref()
-                .ok_or_else(|| "max_by/min_by output type signature missing".to_string())?;
+            let sig = super::super::agg_type_signature(func).ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "max_by/min_by type signature missing",
+                )
+            })?;
+            let output_type = sig.output_type.as_ref().ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "max_by/min_by output type signature missing",
+                )
+            })?;
             return Ok(AggSpec {
                 kind,
                 output_type: output_type.clone(),
@@ -97,7 +106,11 @@ impl AggregateFunction for MaxMinByAgg {
         match data_type {
             DataType::Struct(fields) => {
                 if fields.len() != 2 {
-                    return Err("max_by/min_by expects 2 arguments".to_string());
+                    return Err(
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            "max_by/min_by expects 2 arguments",
+                        ),
+                    );
                 }
                 let value_type = fields[0].data_type().clone();
                 Ok(AggSpec {
@@ -108,10 +121,12 @@ impl AggregateFunction for MaxMinByAgg {
                     count_all: false,
                 })
             }
-            other => Err(format!(
-                "max_by/min_by expects struct input, got {:?}",
-                other
-            )),
+            other => Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "max_by/min_by expects struct input, got {:?}",
+                    other
+                )),
+            ),
         }
     }
 
@@ -129,10 +144,10 @@ impl AggregateFunction for MaxMinByAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "max_by/min_by input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("max_by/min_by input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -140,14 +155,17 @@ impl AggregateFunction for MaxMinByAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "max_by/min_by merge input missing".to_string())?;
-        let bin = arr
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "max_by/min_by merge input missing",
+            )
+        })?;
+        let bin = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "failed to downcast to BinaryArray",
+            )
+        })?;
         Ok(AggInputView::Binary(bin))
     }
 
@@ -161,9 +179,11 @@ impl AggregateFunction for MaxMinByAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked max_by/min_by state requires a memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked max_by/min_by state requires a memory tracker",
+            )
         })?;
         unsafe {
             ptr.cast::<MaxMinByState>()
@@ -192,16 +212,24 @@ impl AggregateFunction for MaxMinByAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("max_by/min_by batch input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "max_by/min_by batch input type mismatch",
+            ));
         };
         let struct_arr = array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "max_by/min_by expects struct input".to_string())?;
+            .ok_or_else(|| {
+                crate::exec::expr::agg::views::aggregate_input_contract(
+                    "max_by/min_by expects struct input",
+                )
+            })?;
         if struct_arr.num_columns() != 2 {
-            return Err("max_by/min_by expects 2 arguments".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "max_by/min_by expects 2 arguments",
+            ));
         }
         let value_arr = struct_arr.column(0);
         let key_arr = struct_arr.column(1);
@@ -217,7 +245,7 @@ impl AggregateFunction for MaxMinByAgg {
                     row,
                     &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         }
         Ok(())
     }
@@ -228,9 +256,11 @@ impl AggregateFunction for MaxMinByAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Binary(arr) = input else {
-            return Err("max_by/min_by merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "max_by/min_by merge input type mismatch",
+            ));
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             if arr.is_null(row) {
@@ -244,7 +274,7 @@ impl AggregateFunction for MaxMinByAgg {
                     bytes,
                     &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         }
         Ok(())
     }
@@ -255,9 +285,9 @@ impl AggregateFunction for MaxMinByAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         if output_intermediate {
-            let mut builder = BinaryBuilder::new();
+            let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
             for &base in group_states {
                 let state = unsafe { &*((base as *mut u8).add(offset) as *const MaxMinByState) };
                 let mut buf = LegacyByBuffer(Vec::new());
@@ -266,14 +296,14 @@ impl AggregateFunction for MaxMinByAgg {
                         &mut buf,
                         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
                     )
-                    .map_err(|error| error.to_string())?
+                    .map_err(crate::runtime::fragment::ExecutionFailure::from)?
                 {
-                    builder.append_value(&buf.0);
+                    builder.append_value(&buf.0)?;
                 } else {
-                    builder.append_null();
+                    builder.append_null()?;
                 }
             }
-            return Ok(std::sync::Arc::new(builder.finish()));
+            return Ok(std::sync::Arc::new(builder.finish()?));
         }
 
         let mut values = Vec::with_capacity(group_states.len());
@@ -284,7 +314,7 @@ impl AggregateFunction for MaxMinByAgg {
                     .output(&mut novarocks_functions::aggregate_scalar::ScalarWork::new(
                         None,
                     ))
-                    .map_err(|error| error.to_string())?,
+                    .map_err(crate::runtime::fragment::ExecutionFailure::from)?,
             );
         }
         build_scalar_array(&spec.output_type, values)
@@ -793,7 +823,33 @@ mod tests {
         let error = MaxMinByAgg
             .update_batch(&spec, 0, &[state_ptr], &AggInputView::Any(&rejected))
             .unwrap_err();
-        assert!(error.contains("ResourceExhausted"));
+        {
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            use std::error::Error;
+            let fact = error.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Resource);
+            assert_eq!(fact.reason().code(), 169);
+            let resource = fact.resource().unwrap();
+            assert_eq!(resource.requested, Some(4));
+            assert_eq!(
+                resource.limit, None,
+                "the container erased the tracker constraint"
+            );
+            assert_eq!(resource.committed, None);
+            let mut source = error.source();
+            let mut real_refusal = false;
+            while let Some(actual) = source {
+                real_refusal |= actual
+                    .is::<novarocks_functions::allocation_failure::AllocationRefusal<
+                        allocator_api2::collections::TryReserveError,
+                    >>();
+                source = actual.source();
+            }
+            assert!(
+                real_refusal,
+                "the original allocator-api2 refusal remains the source"
+            );
+        }
         assert_eq!(tracker.current(), 4);
 
         let output = MaxMinByAgg

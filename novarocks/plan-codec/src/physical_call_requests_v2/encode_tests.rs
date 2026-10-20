@@ -45,7 +45,7 @@ impl PureCompileControl for Control {
             return Ok(());
         }
         assert_eq!(phase, CompilePhase::Encode);
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         if let Some((end, _)) = stop {
@@ -546,7 +546,7 @@ fn prefixes(f: &Fixture, bad: bool) {
     for at in 0..trace.len() {
         for cause in CAUSES {
             let c = Control::default();
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             let result = prepare_call_requests_encode(
                 f.fragment.call_requests(),
                 &types,
@@ -697,7 +697,7 @@ fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_
                 &c,
             )
             .unwrap();
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             assert!(
                 matches!(encode_call_requests(token),Err(Error::Control(actual)) if actual==cause)
             );

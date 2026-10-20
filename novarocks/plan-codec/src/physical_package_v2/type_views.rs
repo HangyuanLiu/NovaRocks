@@ -62,7 +62,14 @@ impl fmt::Display for TypeViewError {
         }
     }
 }
-impl std::error::Error for TypeViewError {}
+impl std::error::Error for TypeViewError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::SourceModel(_) | Self::InvalidSource(_) => None,
+        }
+    }
+}
 fn add(a: usize, b: usize) -> Result<usize, TypeViewError> {
     a.checked_add(b)
         .ok_or(CompileControlError::ResourceExhausted.into())
@@ -974,7 +981,7 @@ mod tests {
                 assert!(at <= stop, "callback after refusal");
             }
             events.push(units);
-            if let Some((stop, cause)) = self.stop
+            if let Some((stop, cause)) = self.stop.clone()
                 && at == stop
             {
                 return Err(cause);
@@ -1120,7 +1127,7 @@ mod tests {
         assert!(result.is_ok());
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let (result, actual) = run(Some((at, cause)));
+                let (result, actual) = run(Some((at, cause.clone())));
                 assert!(matches!(result, Err(TypeViewError::Control(actual)) if actual == cause));
                 assert_eq!(actual, trace[..=at]);
             }
@@ -1365,9 +1372,9 @@ mod tests {
     #[test]
     fn exact_batch_and_future_prefix_gate_known_growth_before_pending_copy_control() {
         let package = package();
-        let run = |stop, axis: Option<usize>, future| {
+        let run = |stop: Option<(usize, CompileControlError)>, axis: Option<usize>, future| {
             let control = Control {
-                stop,
+                stop: stop.clone(),
                 ..Default::default()
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
@@ -1375,8 +1382,8 @@ mod tests {
             let mut admit = |facts: &TypeViewFacts| {
                 if facts.allocation_requests_upper_bound > 0 {
                     request_hooks.set(request_hooks.get() + 1);
-                    if let Some((_, cause)) = stop {
-                        return Err(cause);
+                    if let Some((_, cause)) = &stop {
+                        return Err(cause.clone());
                     }
                 }
                 Ok(())
@@ -1579,7 +1586,7 @@ mod tests {
         assert!(trace.len() > 2);
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let (result, stopped) = run(Some((at, cause)));
+                let (result, stopped) = run(Some((at, cause.clone())));
                 assert!(matches!(result, Err(TypeViewError::Control(actual)) if actual == cause));
                 assert_eq!(stopped, trace[..=at]);
             }

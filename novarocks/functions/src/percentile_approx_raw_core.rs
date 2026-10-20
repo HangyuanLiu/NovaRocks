@@ -35,25 +35,21 @@ pub trait QuantileEvaluator {
     fn payload_failure(
         &mut self,
         failure: PercentilePayloadFailure<'_>,
-    ) -> Result<String, Self::Error> {
-        Ok(failure
-            .message(PercentileInputDiagnostic::ApproxRaw)
-            .to_string())
+    ) -> Result<crate::KernelFailure, Self::Error> {
+        Ok(failure.into_failure(PercentileInputDiagnostic::ApproxRaw))
     }
     fn numeric_failure(
         &mut self,
         failure: PercentileNumericFailure<'_>,
-    ) -> Result<String, Self::Error> {
-        Ok(failure
-            .message(PercentileInputDiagnostic::ApproxRaw)
-            .to_string())
+    ) -> Result<crate::KernelFailure, Self::Error> {
+        Ok(failure.into_failure(PercentileInputDiagnostic::ApproxRaw))
     }
 
     fn quantile(
         &mut self,
         payload: &[u8],
         quantile: f64,
-    ) -> Result<Result<Option<f64>, String>, Self::Error>;
+    ) -> Result<Result<Option<f64>, crate::KernelFailure>, Self::Error>;
 }
 pub struct OriginalQuantileEvaluator;
 impl QuantileEvaluator for OriginalQuantileEvaluator {
@@ -62,7 +58,7 @@ impl QuantileEvaluator for OriginalQuantileEvaluator {
         &mut self,
         payload: &[u8],
         quantile: f64,
-    ) -> Result<Result<Option<f64>, String>, Self::Error> {
+    ) -> Result<Result<Option<f64>, crate::KernelFailure>, Self::Error> {
         Ok((|| {
             let state = crate::approx_percentile_core::decode_state(payload)?;
             crate::approx_percentile_core::quantile_from_state(&state, Some(quantile))
@@ -78,7 +74,7 @@ pub fn row_with_evaluator_observed<E: QuantileEvaluator>(
     quantile_row: usize,
     mut observe: impl FnMut(Observation) -> Result<(), E::Error>,
     evaluator: &mut E,
-) -> Result<Result<Option<f64>, String>, E::Error> {
+) -> Result<Result<Option<f64>, crate::KernelFailure>, E::Error> {
     observe(Observation::ReadBoundary)?;
     let payload = match payload_bytes_at_with_failure(payloads, payload_row, &mut |failure| {
         evaluator.payload_failure(failure)
@@ -107,7 +103,11 @@ pub fn row_with_evaluator_observed<E: QuantileEvaluator>(
         _ => Ok(Ok(None)),
     }
 }
-pub fn row(payloads: &ArrayRef, row: usize, quantiles: &ArrayRef) -> Result<Option<f64>, String> {
+pub fn row(
+    payloads: &ArrayRef,
+    row: usize,
+    quantiles: &ArrayRef,
+) -> Result<Option<f64>, crate::KernelFailure> {
     match row_with_evaluator_observed(
         payloads,
         row,
@@ -121,7 +121,10 @@ pub fn row(payloads: &ArrayRef, row: usize, quantiles: &ArrayRef) -> Result<Opti
     }
 }
 /// The original batch builder allocation, traversal order and NULL policy.
-pub fn evaluate_legacy(payloads: &ArrayRef, quantiles: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn evaluate_required(
+    payloads: &ArrayRef,
+    quantiles: &ArrayRef,
+) -> Result<ArrayRef, crate::KernelFailure> {
     let mut builder = Float64Builder::with_capacity(payloads.len());
     for index in 0..payloads.len() {
         match row(payloads, index, quantiles)? {

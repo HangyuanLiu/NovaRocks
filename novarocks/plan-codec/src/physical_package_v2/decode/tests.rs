@@ -39,7 +39,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -315,7 +315,7 @@ fn caller_control_cause_stays_primary_across_the_receiver() {
             CompileControlError::ResourceExhausted,
         ] {
             let stop = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert!(

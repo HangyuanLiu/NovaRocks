@@ -29,7 +29,7 @@ use arrow_array::{Array, ArrayRef, Float64Array, StringArray, TimestampMicroseco
 use arrow_schema::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
 use novarocks_type_contract::ValueLogicalType;
-use std::{alloc::Layout, cell::RefCell, sync::Arc};
+use std::{alloc::Layout, sync::Arc};
 #[derive(Clone, Copy, Debug)]
 pub enum ExtremaOperation {
     Greatest,
@@ -147,7 +147,7 @@ pub(super) fn validate_target(contract: &ScalarCallContract) -> Result<(), Kerne
         let empty =
             Arc::new(TimestampMicrosecondArray::from(Vec::<Option<i64>>::new())) as ArrayRef;
         cast_output(empty, Some(contract.result_type().data_type()))
-            .map_err(|message| invalid(&message))?;
+            .map_err(MathNumericError::into_kernel)?;
     }
     Ok(())
 }
@@ -180,35 +180,27 @@ pub(super) fn evaluate<'a>(
     work.finish_result(result)
 }
 /// The caller owns eager child evaluation. This boundary receives values only
-/// and projects each original raw diagnostic before the bounded owner boundary.
+/// and preserves domain causes at the bounded owner boundary.
 pub fn evaluate_legacy(
     operation: ExtremaOperation,
     arrays: &[ArrayRef],
     rows: usize,
     target: Option<&DataType>,
-) -> Result<ArrayRef, String> {
-    let raw = RefCell::new(None);
-    let boundary = |message: &str| {
-        *raw.borrow_mut() = Some(message.to_string());
-        Err(KernelFailure::InstanceFailed)
-    };
+) -> Result<ArrayRef, KernelFailure> {
     let arguments = arrays
         .iter()
         .map(EvaluatedArgument::Column)
         .collect::<Vec<_>>();
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
-    match evaluate_values(
+    evaluate_values(
         operation,
         &arguments,
         Selection::all(rows),
         target,
         true,
         &mut work,
-        Some(&boundary),
-    ) {
-        Ok(output) => Ok(output),
-        Err(failure) => Err(raw.into_inner().unwrap_or_else(|| legacy_failure(failure))),
-    }
+        None,
+    )
 }
 fn evaluate_values(
     operation: ExtremaOperation,
@@ -332,7 +324,7 @@ fn evaluate_values(
     let mut views = reserve(args.len(), work)?;
     for arg in args {
         work.step()?;
-        views.push(NumericArrayView::new(arg.array()).map_err(|e| raw_error(e, boundary))?);
+        views.push(NumericArrayView::new(arg.array()).map_err(KernelFailure::from_domain)?);
     }
     let mut values = reserve(selection.len(), work)?;
     for ordinal in 0..selection.len() {
@@ -376,10 +368,7 @@ fn cast(
         MathNumericObservation::Step => work.step(),
         MathNumericObservation::OpaqueBoundary => work.flush(),
     })
-    .map_err(|error| match error {
-        MathNumericError::Legacy(message) => raw_error(message, boundary),
-        MathNumericError::Kernel(failure) => failure,
-    })?;
+    .map_err(MathNumericError::into_kernel)?;
     work.flush()?;
     Ok(out)
 }
@@ -391,14 +380,6 @@ impl KernelEvaluationControl for LegacyControl {
 
     fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
         Ok(())
-    }
-}
-fn legacy_failure(failure: KernelFailure) -> String {
-    match failure {
-        KernelFailure::InvalidProgram(e)
-        | KernelFailure::Internal(e)
-        | KernelFailure::Operational(e) => e.message().to_string(),
-        other => format!("extrema shared value calculation failed: {other:?}"),
     }
 }
 

@@ -197,10 +197,16 @@ impl RefreshError {
         }
     }
 
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
+    }
+
+    pub fn compile_interruption(cause: novarocks_type_contract::CompileControlError) -> Self {
+        Self {
+            kind: RefreshErrorKind::UserError,
+            message: cause.to_string(),
+            compile_control: Some(cause),
+        }
     }
 
     pub fn user(message: impl Into<String>) -> Self {
@@ -357,7 +363,7 @@ mod tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let compile = novarocks_sql::compiler::SqlCompileError::from(control);
+            let compile = novarocks_sql::compiler::SqlCompileError::from(control.clone());
             let expected = compile.to_string();
             let error = RefreshError::from(compile);
             assert_eq!(error.message, expected);

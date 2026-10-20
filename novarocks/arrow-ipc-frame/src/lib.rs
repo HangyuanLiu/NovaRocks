@@ -143,6 +143,16 @@ pub enum AlignmentError {
     Overflow,
 }
 
+impl std::fmt::Display for AlignmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAlignment => f.write_str("IPC alignment must be a nonzero power of two"),
+            Self::Overflow => f.write_str("aligned IPC offset overflows usize"),
+        }
+    }
+}
+impl std::error::Error for AlignmentError {}
+
 /// Rounds up to an explicit nonzero power-of-two alignment.
 pub fn align_up(offset: usize, alignment: usize) -> Result<usize, AlignmentError> {
     if !alignment.is_power_of_two() {
@@ -157,3 +167,43 @@ pub fn align_up(offset: usize, alignment: usize) -> Result<usize, AlignmentError
 
 #[cfg(test)]
 mod tests;
+
+impl std::fmt::Display for RangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IPC range {self:?}")
+    }
+}
+impl std::error::Error for RangeError {}
+impl std::fmt::Display for PrefixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IPC prefix {self:?}")
+    }
+}
+impl std::error::Error for PrefixError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Range(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl std::fmt::Display for StandardPrefixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IPC standard prefix {self:?}")
+    }
+}
+impl std::error::Error for StandardPrefixError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Prefix(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidLength {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IPC length is negative or exceeds the addressable range")
+    }
+}
+impl std::error::Error for InvalidLength {}

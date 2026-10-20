@@ -34,8 +34,15 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
     }
 }
 
-fn dev_from_ave_spec_from_input_type(name: &str, data_type: &DataType) -> Result<AggSpec, String> {
-    let kind = kind_from_name(name).ok_or_else(|| format!("unsupported agg function: {name}"))?;
+fn dev_from_ave_spec_from_input_type(
+    name: &str,
+    data_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+    let kind = kind_from_name(name).ok_or_else(|| {
+        crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+            "unsupported agg function: {name}"
+        ))
+    })?;
     match data_type {
         DataType::Int8
         | DataType::Int16
@@ -49,7 +56,12 @@ fn dev_from_ave_spec_from_input_type(name: &str, data_type: &DataType) -> Result
             input_arg_type: None,
             count_all: false,
         }),
-        other => Err(format!("{} unsupported input type: {:?}", name, other)),
+        other => Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "{} unsupported input type: {:?}",
+                name, other
+            )),
+        ),
     }
 }
 
@@ -57,23 +69,33 @@ fn dev_from_ave_spec_from_intermediate_type(
     func: &AggFunction,
     name: &str,
     data_type: &DataType,
-) -> Result<AggSpec, String> {
-    let kind = kind_from_name(name).ok_or_else(|| format!("unsupported agg function: {name}"))?;
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+    let kind = kind_from_name(name).ok_or_else(|| {
+        crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+            "unsupported agg function: {name}"
+        ))
+    })?;
 
     match data_type {
         DataType::Binary | DataType::Utf8 => {
             // When the intermediate is opaque, rely on FE signatures.
-            let sig = agg_type_signature(func)
-                .ok_or_else(|| format!("{name} intermediate type signature missing"))?;
-            let output_type = sig
-                .output_type
-                .as_ref()
-                .ok_or_else(|| format!("{name} intermediate output_type signature missing"))?;
+            let sig = agg_type_signature(func).ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "{name} intermediate type signature missing"
+                ))
+            })?;
+            let output_type = sig.output_type.as_ref().ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "{name} intermediate output_type signature missing"
+                ))
+            })?;
             if !matches!(output_type, DataType::Float64) {
-                return Err(format!(
-                    "{name} intermediate output type unsupported: {:?}",
-                    output_type
-                ));
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "{name} intermediate output type unsupported: {:?}",
+                        output_type
+                    )),
+                );
             }
             Ok(AggSpec {
                 kind,
@@ -83,10 +105,12 @@ fn dev_from_ave_spec_from_intermediate_type(
                 count_all: false,
             })
         }
-        other => Err(format!(
-            "{name} intermediate unsupported input type: {:?}",
-            other
-        )),
+        other => Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "{name} intermediate unsupported input type: {:?}",
+                other
+            )),
+        ),
     }
 }
 
@@ -96,14 +120,21 @@ impl AggregateFunction for VarStdAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         let name = func.name.as_str();
         if input_is_intermediate {
-            let data_type =
-                input_type.ok_or_else(|| format!("{name} intermediate input type missing"))?;
+            let data_type = input_type.ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "{name} intermediate input type missing"
+                ))
+            })?;
             dev_from_ave_spec_from_intermediate_type(func, name, data_type)
         } else {
-            let data_type = input_type.ok_or_else(|| format!("{name} input type missing"))?;
+            let data_type = input_type.ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "{name} input type missing"
+                ))
+            })?;
             dev_from_ave_spec_from_input_type(name, data_type)
         }
     }
@@ -125,10 +156,10 @@ impl AggregateFunction for VarStdAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "variance/stddev input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("variance/stddev input missing")
+        })?;
         match arr.data_type() {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                 Ok(AggInputView::Int(IntArrayView::new(arr)?))
@@ -136,9 +167,11 @@ impl AggregateFunction for VarStdAgg {
             DataType::Float32 | DataType::Float64 => {
                 Ok(AggInputView::Float(FloatArrayView::new(arr)?))
             }
-            other => Err(format!(
-                "variance/stddev input type mismatch: {:?} for {:?}",
-                other, spec.kind
+            other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format!(
+                    "variance/stddev input type mismatch: {:?} for {:?}",
+                    other, spec.kind
+                ),
             )),
         }
     }
@@ -147,20 +180,25 @@ impl AggregateFunction for VarStdAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "variance/stddev merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "variance/stddev merge input missing",
+            )
+        })?;
         match arr.data_type() {
             DataType::Binary => arr
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .map(AggInputView::Binary)
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string()),
+                .ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract(
+                        "failed to downcast to BinaryArray",
+                    )
+                }),
             DataType::Utf8 => Ok(AggInputView::Utf8(Utf8ArrayView::new(arr)?)),
-            other => Err(format!(
-                "variance/stddev merge input type mismatch: {:?}",
-                other
+            other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format!("variance/stddev merge input type mismatch: {:?}", other),
             )),
         }
     }
@@ -183,9 +221,11 @@ impl AggregateFunction for VarStdAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(input, AggInputView::Int(_) | AggInputView::Float(_)) {
-            return Err("variance/stddev update input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "variance/stddev update input type mismatch",
+            ));
         }
         super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
@@ -196,9 +236,11 @@ impl AggregateFunction for VarStdAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(input, AggInputView::Binary(_) | AggInputView::Utf8(_)) {
-            return Err("variance/stddev merge input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "variance/stddev merge input type mismatch",
+            ));
         }
         super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
@@ -209,13 +251,15 @@ impl AggregateFunction for VarStdAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         if output_intermediate
             && !matches!(spec.intermediate_type, DataType::Binary | DataType::Utf8)
         {
-            return Err(format!(
-                "variance/stddev intermediate output type unsupported: {:?}",
-                spec.intermediate_type
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "variance/stddev intermediate output type unsupported: {:?}",
+                    spec.intermediate_type
+                ),
             ));
         }
         super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)

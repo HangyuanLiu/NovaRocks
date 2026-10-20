@@ -98,7 +98,7 @@ mod control_tests {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.units.lock().unwrap().push(units);
             if self.fail_at == Some(units) {
-                Err(self.error)
+                Err(self.error.clone())
             } else {
                 Ok(())
             }
@@ -149,11 +149,11 @@ mod control_tests {
             CompileControlError::ResourceExhausted,
         ] {
             for (expr, fail_at) in [(leaf(), 0), (wide(), 256), (leaf(), 1)] {
-                let owner = control(Some(fail_at), error);
+                let owner = control(Some(fail_at), error.clone());
                 let mut memo = Memo::new();
                 assert_class(
                     opt_expr_to_memo(&expr, &mut memo, &owner).unwrap_err(),
-                    error,
+                    error.clone(),
                 );
                 if fail_at == 0 {
                     assert!(memo.groups.is_empty());

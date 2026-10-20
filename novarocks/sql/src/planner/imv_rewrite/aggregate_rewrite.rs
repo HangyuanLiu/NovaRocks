@@ -4412,7 +4412,7 @@ mod tests {
                 let mut trace = self.trace.lock().unwrap();
                 trace.push((phase, units));
                 if self.refuse == Some(trace.len() - 1) {
-                    Err(self.cause)
+                    Err(self.cause.clone())
                 } else {
                     Ok(())
                 }
@@ -4462,7 +4462,7 @@ mod tests {
                     let control = Control {
                         trace: Default::default(),
                         refuse: Some(index),
-                        cause,
+                        cause: cause.clone(),
                     };
                     assert!(
                         matches!(group_key_names(aggregate, &control), Err(error) if error == SqlCompileError::from(cause))

@@ -72,6 +72,40 @@ pub struct TypedReadAttemptContext {
     published: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadExecutionRegistrationError {
+    StatePoisoned,
+    Duplicate { plan_node_id: i32 },
+}
+impl std::fmt::Display for ReadExecutionRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StatePoisoned => f.write_str("typed read context lock poisoned"),
+            Self::Duplicate { plan_node_id } => write!(
+                f,
+                "duplicate typed read execution for plan node {plan_node_id}"
+            ),
+        }
+    }
+}
+impl std::error::Error for ReadExecutionRegistrationError {}
+impl novarocks_execution_contract::failure::FailureProjection for ReadExecutionRegistrationError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        match self {
+            Self::StatePoisoned => FailureFact::new(
+                FailureClass::Unexpected,
+                R::ReadRegistrationPoisoned.reason(),
+            ),
+            Self::Duplicate { .. } => FailureFact::new(
+                FailureClass::Invariant,
+                R::ReadRegistrationDuplicate.reason(),
+            ),
+        }
+    }
+}
+
 impl TypedReadAttemptContext {
     pub fn new() -> Self {
         Self {
@@ -84,17 +118,20 @@ impl TypedReadAttemptContext {
         &self,
         plan_node_id: i32,
         execution: ConnectorExecutionReadBinding,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReadExecutionRegistrationError> {
         let mut entries = self
             .entries
             .lock()
-            .map_err(|_| "typed read context lock poisoned")?;
-        if entries.insert(plan_node_id, execution).is_some() {
-            return Err(format!(
-                "duplicate typed read execution for plan node {plan_node_id}"
-            ));
+            .map_err(|_| ReadExecutionRegistrationError::StatePoisoned)?;
+        match entries.entry(plan_node_id) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(execution);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(ReadExecutionRegistrationError::Duplicate { plan_node_id })
+            }
         }
-        Ok(())
     }
 
     pub fn publish(&self) {

@@ -77,12 +77,12 @@ fn legacy_ds_scalar_reader_baseline_lazy_nested_unsupported_actual_carrier() {
     ));
     assert!(matches!(agg_scalar_from_array(&array,0).unwrap(),Some(V::List(v)) if v.is_empty()));
     assert_eq!(
-        agg_scalar_from_array(&array, 1).unwrap_err(),
+        (agg_scalar_from_array(&array, 1).unwrap_err()).to_string(),
         "unsupported scalar type: UInt32"
     );
     let null_unsupported: ArrayRef = Arc::new(UInt32Array::from(vec![None]));
     assert_eq!(
-        agg_scalar_from_array(&null_unsupported, 0).unwrap_err(),
+        (agg_scalar_from_array(&null_unsupported, 0).unwrap_err()).to_string(),
         "unsupported scalar type: UInt32"
     );
 }

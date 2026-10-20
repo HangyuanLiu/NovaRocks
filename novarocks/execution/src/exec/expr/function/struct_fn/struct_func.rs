@@ -15,58 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StructArray, new_null_array};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-fn assert_struct_child_type(
-    context: &str,
-    idx: usize,
-    expected: &DataType,
-    actual: &DataType,
-) -> Result<(), String> {
-    if expected == actual {
-        return Ok(());
-    }
-    let path = match check_exact(expected, actual) {
-        Ok(()) => format!("field[{idx}]"),
-        Err(mismatch) => nested_path_label(&format!("field[{idx}]"), &mismatch.nested_path),
-    };
-    Err(format!(
-        "{context} field type mismatch at {path}: expected {:?}, got {:?}",
-        expected, actual
-    ))
-}
-
+use crate::exec::expr::struct_expr::{assert_struct_child_type, finish_struct};
 fn eval_new_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     fn_name: &str,
-) -> Result<ArrayRef, __Eval::Error> {
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .ok_or_else(|| format!("{} missing output type", fn_name))?;
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let output_type = arena.data_type(expr).cloned().ok_or_else(|| {
+        crate::exec::expr::expression_contract(format_args!("{} missing output type", fn_name))
+    })?;
     let struct_fields = match output_type {
         DataType::Struct(fields) => fields,
         other => {
-            return Err(
-                (format!("{} output type must be Struct, got {:?}", fn_name, other)).into(),
-            );
+            return Err(crate::exec::expr::expression_contract(format_args!(
+                "{} output type must be Struct, got {:?}",
+                fn_name, other
+            )));
         }
     };
     if struct_fields.len() != args.len() {
-        return Err((format!(
+        return Err(crate::exec::expr::expression_contract(format_args!(
             "{} field count mismatch: expected {}, got {}",
             fn_name,
             struct_fields.len(),
             args.len()
-        ))
-        .into());
+        )));
     }
 
     let num_rows = chunk.len();
@@ -74,14 +55,13 @@ fn eval_new_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     for (idx, expr_id) in args.iter().enumerate() {
         let mut array = arena.eval(*expr_id, chunk)?;
         if array.len() != num_rows {
-            return Err((format!(
+            return Err(crate::exec::expr::expression_contract(format_args!(
                 "{} field length mismatch at {}: expected {}, got {}",
                 fn_name,
                 idx,
                 num_rows,
                 array.len()
-            ))
-            .into());
+            )));
         }
         let expected_type = struct_fields[idx].data_type();
         if array.data_type() == &DataType::Null && expected_type != &DataType::Null {
@@ -90,18 +70,13 @@ fn eval_new_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         if array.data_type() != expected_type
             && check_exact(expected_type, array.data_type()).is_ok()
         {
-            array = retag_column(&array, expected_type).map_err(|mismatch| {
-                let path = nested_path_label(&format!("field[{idx}]"), &mismatch.nested_path);
-                format!(
-                    "{fn_name} failed to retag field at {path}: expected {:?}, got {:?}",
-                    mismatch.expected, mismatch.actual
-                )
-            })?;
+            array = retag_column(&array, expected_type)
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
         }
         assert_struct_child_type(fn_name, idx, expected_type, array.data_type())?;
         arrays.push(array);
     }
-    Ok(Arc::new(StructArray::new(struct_fields, arrays, None)) as ArrayRef)
+    finish_struct(struct_fields, arrays)
 }
 
 pub fn eval_row<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -109,8 +84,8 @@ pub fn eval_row<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_new_struct(arena, expr, args, chunk, "row"))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_new_struct(arena, expr, args, chunk, "row")
 }
 
 pub fn eval_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -118,8 +93,8 @@ pub fn eval_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_new_struct(arena, expr, args, chunk, "struct"))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_new_struct(arena, expr, args, chunk, "struct")
 }
 
 pub fn eval_named_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -127,14 +102,13 @@ pub fn eval_named_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if args.len() < 2 || !args.len().is_multiple_of(2) {
-        return Err((format!(
+        return Err(crate::exec::expr::expression_contract(format_args!(
             "named_struct expects an even number of arguments >= 2, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
     let values: Vec<ExprId> = args.iter().skip(1).step_by(2).copied().collect();
-    Ok((eval_new_struct(arena, expr, &values, chunk, "named_struct"))?)
+    eval_new_struct(arena, expr, &values, chunk, "named_struct")
 }

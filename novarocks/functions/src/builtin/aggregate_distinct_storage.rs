@@ -117,14 +117,13 @@ pub(super) struct NumericBuffer {
     pub(super) bytes: HostVec<u8, HostAggregateAllocator>,
 }
 impl NumericDistinctBuffer for NumericBuffer {
-    fn reserve_exact(&mut self, size: usize) -> Result<(), String> {
-        self.reserve_exact_typed(size)
-            .map_err(DistinctComputationError::into_legacy_message)
-    }
-    fn reserve_exact_typed(&mut self, size: usize) -> Result<(), DistinctComputationError> {
-        self.bytes
-            .try_reserve_exact(size)
-            .map_err(|_| self.bytes.allocator().take_failure().into())
+    fn reserve_exact(&mut self, size: usize) -> Result<(), crate::KernelFailure> {
+        use crate::aggregate_scalar::ScalarStateAllocator;
+        self.bytes.try_reserve_exact(size).map_err(|source| {
+            self.bytes
+                .allocator()
+                .scalar_allocation_error("reserve numeric distinct canonical bytes", source)
+        })
     }
     fn append(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);

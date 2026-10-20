@@ -22,6 +22,8 @@
 //! be an admitted value or a transport owner's checked pool reference. This
 //! data grants no SQL provenance, effects, installed implementation or memory.
 
+pub mod kernel_failure;
+
 use novarocks_constant_contract::ConstantValue;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType,
@@ -205,10 +207,9 @@ pub enum FunctionBindingError {
     NoMatchingOverload,
     AmbiguousOverload,
     InvalidBinding(Box<str>),
-}
-
-fn invalid(message: &str) -> FunctionBindingError {
-    FunctionBindingError::InvalidBinding(message.into())
+    VariantTargetType(novarocks_type_contract::VariantTargetTypeError),
+    ValueType(novarocks_type_contract::ValueTypeError),
+    Constant(novarocks_constant_contract::ConstantError),
 }
 
 impl fmt::Display for FunctionBindingError {
@@ -244,6 +245,9 @@ impl fmt::Display for FunctionBindingError {
             Self::AmbiguousOverload => {
                 formatter.write_str("multiple declared overloads match ambiguously")
             }
+            Self::VariantTargetType(source) => source.fmt(formatter),
+            Self::ValueType(source) => write!(formatter, "invalid function binding: {source}"),
+            Self::Constant(source) => write!(formatter, "invalid function binding: {source}"),
             Self::InvalidBinding(message) => {
                 write!(formatter, "invalid function binding: {message}")
             }
@@ -251,7 +255,17 @@ impl fmt::Display for FunctionBindingError {
     }
 }
 
-impl std::error::Error for FunctionBindingError {}
+impl std::error::Error for FunctionBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::VariantTargetType(source) => Some(source),
+            Self::ValueType(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Control(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl From<CompileControlError> for FunctionBindingError {
     fn from(error: CompileControlError) -> Self {
@@ -262,7 +276,7 @@ impl From<CompileControlError> for FunctionBindingError {
 impl FunctionBindingError {
     pub fn control_error(&self) -> Option<CompileControlError> {
         match self {
-            Self::Control(error) => Some(*error),
+            Self::Control(error) => Some(error.clone()),
             _ => None,
         }
     }
@@ -270,7 +284,7 @@ impl FunctionBindingError {
 
 impl From<novarocks_type_contract::ValueTypeError> for FunctionBindingError {
     fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
-        invalid(&error.to_string())
+        Self::ValueType(error)
     }
 }
 
@@ -278,10 +292,7 @@ impl From<novarocks_constant_contract::ConstantError> for FunctionBindingError {
     fn from(error: novarocks_constant_contract::ConstantError) -> Self {
         match error {
             novarocks_constant_contract::ConstantError::Control(error) => Self::Control(error),
-            novarocks_constant_contract::ConstantError::Limit(_) => {
-                Self::Control(CompileControlError::ResourceExhausted)
-            }
-            error => invalid(&error.to_string()),
+            error => Self::Constant(error),
         }
     }
 }
@@ -299,3 +310,103 @@ fn finish_binding_work<T>(
 
 #[cfg(test)]
 mod tests;
+
+// Binding admission owns these facts regardless of whether a caller is SQL,
+// native frozen-plan validation or a compiler. Text never grants a category.
+impl novarocks_failure_contract::FailureProjection for FunctionBindingError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self {
+            Self::Control(cause) => return cause.failure_fact(),
+            Self::VariantTargetType(cause) => return cause.failure_fact(),
+            Self::ValueType(cause) => return cause.failure_fact(),
+            Self::Constant(cause) => return cause.failure_fact(),
+            Self::MissingEffectDeclaration(_) => (FailureClass::Invariant, 1),
+            Self::UnavailableImplementation(_) => (FailureClass::Unsupported, 2),
+            Self::UnknownFunction => (FailureClass::Data, 3),
+            Self::HiddenFunction => (FailureClass::Data, 4),
+            Self::MissingBindingDeclaration => (FailureClass::Invariant, 5),
+            Self::UnknownOverload(_) => (FailureClass::Invariant, 6),
+            Self::DuplicateOverload(_) => (FailureClass::Invariant, 7),
+            Self::NoMatchingOverload => (FailureClass::Data, 8),
+            Self::AmbiguousOverload => (FailureClass::Data, 9),
+            Self::InvalidBinding(_) => (FailureClass::Invariant, 10),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(
+                domain::FUNCTION_BINDING,
+                std::num::NonZeroU16::new(code).unwrap(),
+            ),
+        )
+    }
+}
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn unavailable_implementation_is_an_exact_capability_fact_without_text_classification() {
+        let overload = FunctionOverloadId::try_new("fixture/missing/pure-v1").unwrap();
+        let error = FunctionBindingError::UnavailableImplementation(overload.clone());
+        assert_eq!(
+            error.failure_fact(),
+            novarocks_failure_contract::FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::FailureReason::new(
+                    novarocks_failure_contract::domain::FUNCTION_BINDING,
+                    std::num::NonZeroU16::new(2).unwrap(),
+                ),
+            ),
+        );
+        assert!(
+            matches!(error, FunctionBindingError::UnavailableImplementation(ref actual) if actual == &overload)
+        );
+        for text in ["unsupported", "missing pure implementation", "cancelled"] {
+            let invalid = FunctionBindingError::InvalidBinding(text.into());
+            assert_eq!(invalid.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(invalid.failure_fact().reason().code(), 10);
+        }
+        assert_eq!(
+            FunctionBindingError::NoMatchingOverload
+                .failure_fact()
+                .class(),
+            FailureClass::Data,
+        );
+        assert_eq!(
+            FunctionBindingError::UnknownOverload(overload)
+                .failure_fact()
+                .class(),
+            FailureClass::Invariant,
+        );
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            assert_eq!(
+                FunctionBindingError::Control(control.clone()).failure_fact(),
+                control.failure_fact(),
+            );
+        }
+    }
+
+    #[test]
+    fn binding_diagnostic_cannot_impersonate_capacity_or_cancellation() {
+        for text in ["memory exhausted", "cancelled", "S3 403"] {
+            let cause = FunctionBindingError::InvalidBinding(text.into());
+            assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(cause.failure_fact().reason().code(), 10);
+        }
+        assert_eq!(
+            FunctionBindingError::Control(CompileControlError::ResourceExhausted).failure_fact(),
+            CompileControlError::ResourceExhausted.failure_fact()
+        );
+        assert_eq!(
+            FunctionBindingError::NoMatchingOverload
+                .failure_fact()
+                .class(),
+            FailureClass::Data
+        );
+    }
+}

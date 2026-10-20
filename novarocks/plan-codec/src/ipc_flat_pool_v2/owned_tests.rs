@@ -71,7 +71,7 @@ fn parent_flat_same_source_stream_and_every_real_prefix() {
     assert!(baseline.iter().all(|(p, _)| *p == CompilePhase::Validate));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            let control = controller(Some((at, cause)));
+            let control = controller(Some((at, cause.clone())));
             assert!(
                 matches!(run(&source,&control),Err(TypeCodecError::Control(actual))if actual==cause)
             );

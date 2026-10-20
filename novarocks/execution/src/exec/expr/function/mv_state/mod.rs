@@ -49,3 +49,5 @@ pub use min_max::{
     max_state_union, max_state_visible_key_value, min_state_union, min_state_visible_key_value,
 };
 pub use sum::sum_state_union;
+
+mod failure;

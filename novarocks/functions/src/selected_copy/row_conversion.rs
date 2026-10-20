@@ -96,7 +96,7 @@ impl<H> Model<'_, '_, '_, '_, H> {
             return Ok(());
         }
         self.exact(
-            Layout::array::<T>(len).map_err(|_| CopyError::Extent)?,
+            Layout::array::<T>(len).map_err(|source| CopyError::layout::<T>(len, source))?,
             retained,
         )
     }
@@ -178,14 +178,16 @@ impl<H> Model<'_, '_, '_, '_, H> {
         let capacity = len
             .max(4)
             .checked_next_power_of_two()
-            .ok_or(CopyError::Extent)?;
+            .ok_or_else(|| CopyError::arithmetic(None))?;
         let final_bytes = mul(capacity, width)?;
         // Older prospective buffers are temporary. The final conservative
         // private block upper belongs to its actual owning converter/encoder.
         let mut previous = 4;
         while previous < capacity {
             self.opaque(mul(previous, width)?, false)?;
-            previous = previous.checked_mul(2).ok_or(CopyError::Extent)?;
+            previous = previous
+                .checked_mul(2)
+                .ok_or_else(|| CopyError::arithmetic(None))?;
         }
         self.opaque(final_bytes, retained)
     }
@@ -206,8 +208,11 @@ impl<H> Model<'_, '_, '_, '_, H> {
             self.codec(ty)?;
         }
         self.exact(
-            arc_layout(Layout::array::<SortField>(count).map_err(|_| CopyError::Extent)?)
-                .map_err(CopyConstructionError::from)?,
+            arc_layout(
+                Layout::array::<SortField>(count)
+                    .map_err(|source| CopyError::layout::<SortField>(count, source))?,
+            )
+            .map_err(CopyConstructionError::from)?,
             true,
         )
     }
@@ -291,7 +296,9 @@ impl<H> Model<'_, '_, '_, '_, H> {
             &mut scratch,
             |event| {
                 if matches!(event, novarocks_type_contract::ValueTypeVisit::TypeNode(_)) {
-                    nodes = nodes.checked_add(1).ok_or(CopyError::Extent)?;
+                    nodes = nodes
+                        .checked_add(1)
+                        .ok_or_else(|| CopyError::arithmetic(None))?;
                 }
                 self.step()
             },
@@ -345,7 +352,9 @@ impl<H> Model<'_, '_, '_, '_, H> {
                     1,
                     mul(
                         rows_bound,
-                        usize::try_from(*width).map_err(|_| CopyError::Extent)?,
+                        usize::try_from(*width).map_err(|_| {
+                            CopyError::Invalid("copy frozen carrier has a negative width")
+                        })?,
                     )?,
                 )?,
                 DataType::RunEndEncoded(_, value) => {

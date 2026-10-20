@@ -16,16 +16,25 @@
 // under the License.
 use super::common::{datetime_from_local_now, naive_to_date32};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, Date32Array};
 use std::sync::Arc;
 
 pub fn eval_current_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
-    _arena: &__Eval,
-    _expr: ExprId,
-    _args: &[ExprId],
+    arena: &__Eval,
+    expr: ExprId,
+    args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Date32)?;
+    if args.len() != 0 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "current_date has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
     let date = datetime_from_local_now().date();
     let days = naive_to_date32(date);
     let values = vec![Some(days); chunk.len()];
@@ -33,11 +42,20 @@ pub fn eval_current_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 }
 
 pub fn eval_curdate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
-    _arena: &__Eval,
-    _expr: ExprId,
-    _args: &[ExprId],
+    arena: &__Eval,
+    expr: ExprId,
+    args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Date32)?;
+    if args.len() != 0 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "current_date has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
     let date = datetime_from_local_now().date();
     let days = naive_to_date32(date);
     let values = vec![Some(days); chunk.len()];

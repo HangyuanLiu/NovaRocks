@@ -130,7 +130,7 @@ impl fmt::Debug for AdditionalBufferLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::operators::compiled_aggregate::expression_allocation_host;
+    use crate::runtime::tracked_state_allocator::expression_allocation_host;
     use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
     use arrow::array::{Int64Array, RecordBatch};
     use novarocks_functions::FunctionValueType;
@@ -184,7 +184,7 @@ mod tests {
         let tracker = MemTracker::new_root("additional-extent-query");
         tracker.install_limit_once(64 * 1024 * 1024).unwrap();
         let mut input = source();
-        input.try_transfer_to_typed(&tracker).unwrap();
+        input.try_transfer_to(&tracker).unwrap();
         let identity = input.source_authority().owner_identity();
         let original = tracker.current();
         let ledger = AdditionalBufferLedger::prepare(
@@ -216,7 +216,7 @@ mod tests {
         other.install_limit_once(1).unwrap();
         let paid = tracker.current();
         output.transfer_to(&other);
-        output.try_transfer_to_typed(&other).unwrap();
+        output.try_transfer_to(&other).unwrap();
         assert_eq!(other.current(), 0);
         assert_eq!(tracker.current(), paid);
 
@@ -258,7 +258,7 @@ mod tests {
             Err(KernelFailure::InvalidProgram(_))
         ));
         assert_eq!(control.calls.load(Ordering::SeqCst), 0);
-        input.try_transfer_to_typed(&tracker).unwrap();
+        input.try_transfer_to(&tracker).unwrap();
         let original = tracker.current();
         let cancelled = Control {
             cancel: true,
@@ -281,7 +281,7 @@ mod tests {
     fn additional_extent_payload_limit_refusal_keeps_its_unpublished_zero_stock() {
         let tracker = MemTracker::new_root("additional-extent-stock-refusal");
         let mut input = source();
-        input.try_transfer_to_typed(&tracker).unwrap();
+        input.try_transfer_to(&tracker).unwrap();
         let ledger = AdditionalBufferLedger::prepare(
             &input,
             expression_allocation_host(tracker.clone()),
@@ -290,10 +290,14 @@ mod tests {
         .unwrap();
         let cold = tracker.current();
         tracker.install_limit_once(cold + 1).unwrap();
-        assert!(matches!(
-            ledger.initialize(2),
-            Err(KernelFailure::ResourceExhausted)
-        ));
+        let refusal = ledger
+            .initialize(2)
+            .expect_err("positive host limit refuses growth");
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&refusal).class(),
+            novarocks_failure_contract::FailureClass::Resource,
+            "{refusal:?}"
+        );
         assert!(!ledger.initialized());
         assert_eq!(tracker.current(), cold);
         ledger.initialize(0).unwrap();

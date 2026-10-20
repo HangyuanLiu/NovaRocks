@@ -552,7 +552,21 @@ impl fmt::Display for FragmentPackageError {
         }
     }
 }
-impl std::error::Error for FragmentPackageError {}
+impl std::error::Error for FragmentPackageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Requests(source) => Some(source),
+            Self::Control(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Structure(source) => Some(source),
+            Self::ExpressionUses(source) => Some(source),
+            Self::Calls(source) => Some(source),
+            Self::Pruning(source) => Some(source),
+            Self::Parameter(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 fn parameter_error(error: SemanticParameterProjectionError) -> FragmentPackageError {
     match error {

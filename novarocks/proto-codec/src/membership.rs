@@ -508,7 +508,7 @@ fn required_process_id(
         .ok_or_else(|| missing(path.clone(), "backend process id is required"))?;
     BackendProcessId::parse(raw.clone())?
         .domain()
-        .map_err(|error| ProtocolError::new(path, error.kind(), error.detail().to_owned()))
+        .map_err(|error| ProtocolError::new(path, error.kind().clone(), error.detail().to_owned()))
 }
 
 pub(crate) fn required_native_compatibility_id(
@@ -573,7 +573,7 @@ fn missing(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
 fn prefix_path(prefix: FieldPath, error: ProtocolError) -> ProtocolError {
     ProtocolError::new(
         prefix.append_segments(error.path().segments().iter().skip(1).cloned()),
-        error.kind(),
+        error.kind().clone(),
         error.detail().to_owned(),
     )
 }
@@ -803,7 +803,7 @@ mod tests {
         let mut missing = descriptor().as_proto().clone();
         missing.native_compatibility_id = None;
         let error = BackendProcessDescriptor::parse(missing).expect_err("missing id rejects");
-        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind().clone(), crate::ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
             "backend_process_descriptor.native_compatibility_id"
@@ -815,7 +815,7 @@ mod tests {
                 value: vec![7; width],
             });
             let error = BackendProcessDescriptor::parse(malformed).expect_err("bad id rejects");
-            assert_eq!(error.kind(), crate::ProtocolErrorKind::InvalidValue);
+            assert_eq!(error.kind().clone(), crate::ProtocolErrorKind::InvalidValue);
             assert_eq!(
                 error.path().to_string(),
                 "backend_process_descriptor.native_compatibility_id.value"
@@ -858,7 +858,7 @@ mod tests {
         let mut missing = original.as_proto().clone();
         missing.control_endpoint = None;
         let error = BackendProcessDescriptor::parse(missing).unwrap_err();
-        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind().clone(), crate::ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
             "backend_process_descriptor.control_endpoint"
@@ -889,7 +889,7 @@ mod tests {
             let mut malformed = original.as_proto().clone();
             malformed.control_endpoint = Some(endpoint);
             let error = BackendProcessDescriptor::parse(malformed).unwrap_err();
-            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.kind().clone(), expected_kind);
             assert!(
                 error
                     .path()
@@ -972,7 +972,7 @@ mod tests {
         let mut missing_mandatory_control = encoded.as_proto().clone();
         missing_mandatory_control.control_endpoint = None;
         let error = BackendProcessDescriptor::parse(missing_mandatory_control).unwrap_err();
-        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind().clone(), crate::ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
             "backend_process_descriptor.control_endpoint"
@@ -989,7 +989,7 @@ mod tests {
                 .clone(),
         );
         let error = BackendProcessDescriptor::parse(drifting_support).unwrap_err();
-        assert_eq!(error.kind(), crate::ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.kind().clone(), crate::ProtocolErrorKind::InvalidValue);
         assert_eq!(
             error.path().to_string(),
             "backend_process_descriptor.bounded_root_support"

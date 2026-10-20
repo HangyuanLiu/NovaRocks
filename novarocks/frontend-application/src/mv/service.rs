@@ -878,7 +878,7 @@ mod compile_control_tests {
             CompileControlError::ResourceExhausted,
         ] {
             let error = preparation_application_error(RefreshError::from(
-                novarocks_sql::compiler::SqlCompileError::from(control),
+                novarocks_sql::compiler::SqlCompileError::from(control.clone()),
             ));
             assert_eq!(error.compile_control_error(), Some(control));
             assert_eq!(error.kind(), MvApplicationErrorKind::InvalidRequest);
@@ -897,11 +897,11 @@ mod compile_control_tests {
             CompileControlError::ResourceExhausted,
         ] {
             let error = preparation_application_error(RefreshError::from(
-                novarocks_sql::compiler::SqlCompileError::from(control),
+                novarocks_sql::compiler::SqlCompileError::from(control.clone()),
             ));
             let message = error.message().to_owned();
             let disposition = application_disposition(error);
-            assert_eq!(disposition.compile_control_error(), Some(control));
+            assert_eq!(disposition.compile_control_error(), Some(control.clone()));
             assert_eq!(
                 scheduler_outcome_log_fields(&disposition),
                 Some(("invalid_definition", message.as_str()))

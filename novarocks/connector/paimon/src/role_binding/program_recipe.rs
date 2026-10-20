@@ -366,7 +366,7 @@ fn canonical(
 
 fn codec_failure(error: ConnectorCodecError) -> Failure {
     match error.compile_control_error() {
-        Some(cause) => Failure::Control(cause),
+        Some(cause) => Failure::Control(cause.clone()),
         None => Failure::Provider(error),
     }
 }

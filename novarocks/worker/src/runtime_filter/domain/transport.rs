@@ -319,6 +319,32 @@ impl fmt::Display for BackendTransportError {
 }
 
 impl std::error::Error for BackendTransportError {}
+impl novarocks_execution_contract::failure::FailureProjection for BackendTransportError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        let reason = match self {
+            Self::ZeroRouteIdentity => R::FilterTransportZeroRouteIdentity,
+            Self::IdentityKindMismatch(_) => R::FilterTransportIdentityKindMismatch,
+            Self::PayloadRequired(_) => R::FilterTransportPayloadRequired,
+            Self::PayloadForbidden(_) => R::FilterTransportPayloadForbidden,
+            Self::ProducerOpenRequired(_) => R::FilterTransportProducerOpenRequired,
+            Self::ProducerOpenForbidden(_) => R::FilterTransportProducerOpenForbidden,
+            Self::AcceptStatusRequired(_) => R::FilterTransportAcceptStatusRequired,
+            Self::AcceptStatusForbidden(_) => R::FilterTransportAcceptStatusForbidden,
+            Self::ZeroLocalPartitionCount => R::FilterTransportZeroLocalPartitionCount,
+            Self::EmptyRejectionReason => R::FilterTransportEmptyRejectionReason,
+            Self::ZeroRpcDeadline => R::FilterTransportZeroRpcDeadline,
+            Self::IdentityConflict => R::FilterTransportIdentityConflict,
+            Self::RetiredIdentity => R::FilterTransportRetiredIdentity,
+        };
+        if matches!(self, Self::RetiredIdentity) {
+            FailureFact::stop_observation(reason.reason())
+        } else {
+            FailureFact::new(FailureClass::Invariant, reason.reason())
+        }
+    }
+}
 
 /// Immutable Backend envelope. Payload bytes remain opaque here so the
 /// transport cannot interpret canonical contribution or artifact content.
@@ -1094,6 +1120,29 @@ mod tests {
         assert_eq!(
             transport.send(delivery_frame(2), start).unwrap(),
             BackendRetrySendOutcome::Shutdown
+        );
+    }
+}
+
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{FailureClass, FailureEvidence, FailureProjection};
+    #[test]
+    fn explicit_transport_retirement_is_an_observation_but_conflict_is_originating() {
+        let retired = BackendTransportError::RetiredIdentity.failure_fact();
+        assert_eq!(retired.class(), FailureClass::Control);
+        assert_eq!(retired.evidence(), FailureEvidence::StopObservation);
+        let conflict = BackendTransportError::IdentityConflict.failure_fact();
+        assert_eq!(conflict.class(), FailureClass::Invariant);
+        assert_eq!(conflict.evidence(), FailureEvidence::Originating);
+        assert_ne!(retired.reason(), conflict.reason());
+        assert_eq!(
+            BackendProducerOpenMetadata::try_new(0)
+                .unwrap_err()
+                .failure_fact()
+                .class(),
+            FailureClass::Invariant
         );
     }
 }

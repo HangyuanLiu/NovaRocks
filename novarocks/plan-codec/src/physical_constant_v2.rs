@@ -79,7 +79,17 @@ impl fmt::Display for PhysicalConstantCodecError {
         }
     }
 }
-impl std::error::Error for PhysicalConstantCodecError {}
+impl std::error::Error for PhysicalConstantCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Reader(source) => Some(source),
+            Self::Reference(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for PhysicalConstantCodecError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)

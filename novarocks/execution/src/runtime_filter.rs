@@ -187,9 +187,8 @@ impl RuntimeFilterMembershipSchema {
     pub fn new(
         data_type: &DataType,
         null_semantics: RuntimeFilterNullSemantics,
-    ) -> Result<Self, RuntimeFilterContractViolation> {
-        let canonical = FilterMembershipSchema::try_new(data_type, null_semantics.canonical())
-            .map_err(membership_schema_error)?;
+    ) -> Result<Self, FilterMembershipSchemaError> {
+        let canonical = FilterMembershipSchema::try_new(data_type, null_semantics.canonical())?;
         Ok(Self {
             canonical,
             complete_type: None,
@@ -261,9 +260,8 @@ impl RuntimeFilterMembershipSchema {
     pub fn from_canonical(
         canonical_bytes: impl AsRef<[u8]>,
         expected_digest: [u8; 32],
-    ) -> Result<Self, RuntimeFilterContractViolation> {
-        let canonical = FilterMembershipSchema::from_canonical(canonical_bytes, expected_digest)
-            .map_err(membership_schema_error)?;
+    ) -> Result<Self, FilterMembershipSchemaError> {
+        let canonical = FilterMembershipSchema::from_canonical(canonical_bytes, expected_digest)?;
         Ok(Self {
             canonical,
             complete_type: None,
@@ -314,13 +312,6 @@ impl RuntimeFilterNullSemantics {
             FilterNullSemantics::NullSafeEqual => Self::NullSafeEqual,
         }
     }
-}
-
-fn membership_schema_error(error: FilterMembershipSchemaError) -> RuntimeFilterContractViolation {
-    RuntimeFilterContractViolation::new(
-        RuntimeFilterContractViolationKind::ContractMismatch,
-        error.detail(),
-    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -496,6 +487,7 @@ pub enum RuntimeFilterContractViolationKind {
 pub struct RuntimeFilterContractViolation {
     kind: RuntimeFilterContractViolationKind,
     detail: Arc<str>,
+    source: Option<novarocks_failure_contract::SharedFailureCause>,
 }
 
 impl RuntimeFilterContractViolation {
@@ -503,6 +495,18 @@ impl RuntimeFilterContractViolation {
         Self {
             kind,
             detail: detail.into(),
+            source: None,
+        }
+    }
+    pub fn from_domain<E>(kind: RuntimeFilterContractViolationKind, source: E) -> Self
+    where
+        E: Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
+    {
+        let source = novarocks_failure_contract::SharedFailureCause::new(source);
+        Self {
+            kind,
+            detail: Arc::from(source.detail()),
+            source: Some(source),
         }
     }
     pub const fn kind(&self) -> RuntimeFilterContractViolationKind {
@@ -521,7 +525,60 @@ impl fmt::Display for RuntimeFilterContractViolation {
         )
     }
 }
-impl Error for RuntimeFilterContractViolation {}
+impl Error for RuntimeFilterContractViolation {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for RuntimeFilterContractViolationKind {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match *self {
+            RuntimeFilterContractViolationKind::MissingSession => (
+                FailureClass::Invariant,
+                ExecutionReason::FilterMissingSession,
+            ),
+            RuntimeFilterContractViolationKind::UnauthorizedBinding => (
+                FailureClass::Invariant,
+                ExecutionReason::FilterUnauthorizedBinding,
+            ),
+            RuntimeFilterContractViolationKind::ContractMismatch => (
+                FailureClass::Invariant,
+                ExecutionReason::FilterContractMismatch,
+            ),
+            RuntimeFilterContractViolationKind::RoleMismatch => {
+                (FailureClass::Invariant, ExecutionReason::FilterRoleMismatch)
+            }
+            RuntimeFilterContractViolationKind::InvalidPartitionCount => (
+                FailureClass::Invariant,
+                ExecutionReason::FilterInvalidPartitionCount,
+            ),
+            RuntimeFilterContractViolationKind::ResourceLimit => {
+                (FailureClass::Resource, ExecutionReason::FilterResourceLimit)
+            }
+            RuntimeFilterContractViolationKind::SessionClosed => {
+                (FailureClass::Control, ExecutionReason::FilterSessionClosed)
+            }
+        };
+        if matches!(self, Self::SessionClosed) {
+            FailureFact::stop_observation(reason.reason())
+        } else {
+            FailureFact::new(class, reason.reason())
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for RuntimeFilterContractViolation {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match &self.source {
+            Some(source) => source.failure_fact(),
+            None => self.kind.failure_fact(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterProducerContract {
@@ -1445,6 +1502,24 @@ mod tests {
             .expect("exact canonical bytes decode"),
             schema
         );
+        let raw = RuntimeFilterMembershipSchema::from_canonical(schema.canonical_bytes(), [0; 32])
+            .unwrap_err();
+        assert_eq!(raw, FilterMembershipSchemaError::DigestMismatch);
+        let outer: crate::runtime::fragment::ExecutionFailure = raw.into();
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&outer);
+        assert_eq!(fact.class(), novarocks_failure_contract::FailureClass::Data);
+        assert_eq!(
+            fact.reason().domain(),
+            novarocks_failure_contract::domain::LOCAL_PROGRAM.get()
+        );
+        assert_eq!(fact.reason().code(), 102);
+        let crate::runtime::fragment::ExecutionFailureCause::RuntimeFilter(
+            RuntimeFilterFailure::Schema(original),
+        ) = outer.cause()
+        else {
+            panic!("the real decoder cause must survive the execution port");
+        };
+        assert_eq!(*original, raw);
     }
 
     #[test]
@@ -1595,6 +1670,174 @@ mod typed_channel_identity_tests {
         assert_eq!(
             construct(FunctionValueType::new(DataType::Utf8, true)),
             text
+        );
+    }
+}
+
+pub(crate) fn producer_sequence_extent(
+    binding: u32,
+    current: u64,
+) -> crate::runtime::fragment::ExecutionFailure {
+    crate::runtime::fragment::ExecutionFailure::from_domain(ProducerSequenceExtent {
+        binding,
+        current,
+    })
+}
+
+#[derive(Debug)]
+struct ProducerSequenceExtent {
+    binding: u32,
+    current: u64,
+}
+impl std::fmt::Display for ProducerSequenceExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native runtime-filter binding_id={} producer sequence overflow at {}",
+            self.binding, self.current
+        )
+    }
+}
+impl std::error::Error for ProducerSequenceExtent {}
+impl novarocks_failure_contract::FailureProjection for ProducerSequenceExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope,
+        };
+        FailureFact::new(
+            FailureClass::Resource,
+            crate::runtime::fragment::ExecutionReason::FilterProducerSequence.reason(),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Operator),
+            constraint_scope: Some(ResourceScope::Operator),
+            dimension: ResourceDimension::Items,
+            requested: Some(1),
+            required_growth: Some(1),
+            limit: Some(u64::MAX),
+            live: Some(self.current),
+            committed: None,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_real_tracker_capacity(
+    failure: &(impl std::error::Error + novarocks_failure_contract::FailureProjection + 'static),
+    limit: i64,
+) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    let fact = failure.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Resource);
+    assert_eq!(fact.reason().domain(), domain::MEMORY.get());
+    assert_eq!(fact.reason().code(), 8);
+    assert!(fact.representation().is_none());
+    let resource = fact.resource().unwrap();
+    assert_eq!(resource.limit, Some(limit as u64));
+    assert!(resource.requested.unwrap() > 0);
+    assert!(resource.committed.unwrap() > limit as u64);
+    assert_eq!(resource.request_scope, None);
+    assert_eq!(resource.constraint_scope, None);
+    let mut source: &dyn std::error::Error = failure;
+    loop {
+        if let Some(original) = source.downcast_ref::<novarocks_functions::KernelCapacityRefusal>()
+        {
+            assert_eq!(original.failure_fact(), fact);
+            break;
+        }
+        source = source
+            .source()
+            .expect("the original tracker capacity receipt");
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_real_vector_refusal(
+    failure: &(impl std::error::Error + novarocks_failure_contract::FailureProjection + 'static),
+    expected_bytes: Option<u64>,
+) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    use novarocks_functions::allocation_failure::AllocationRefusal;
+    let fact = failure.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Resource);
+    assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+    assert_eq!(fact.reason().code(), 169);
+    assert!(fact.representation().is_none());
+    let resource = fact.resource().unwrap();
+    assert_eq!(resource.limit, None);
+    assert_eq!(resource.committed, None);
+    assert_eq!(resource.request_scope, None);
+    assert_eq!(resource.constraint_scope, None);
+    let mut source: &dyn std::error::Error = failure;
+    loop {
+        if let Some(original) =
+            source.downcast_ref::<AllocationRefusal<allocator_api2::collections::TryReserveError>>()
+        {
+            let allocator_api2::collections::TryReserveErrorKind::AllocError { layout, .. } =
+                original.original().kind()
+            else {
+                panic!("the actual small request must reach the allocator");
+            };
+            assert_eq!(resource.requested, Some(layout.size() as u64));
+            assert!(layout.size() > 0);
+            if let Some(expected) = expected_bytes {
+                assert_eq!(layout.size() as u64, expected);
+            }
+            assert_eq!(fact, original.failure_fact());
+            break;
+        }
+        source = source
+            .source()
+            .expect("the actual collection reservation error");
+    }
+}
+
+#[cfg(test)]
+mod contract_failure_source_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureEvidence, FailureProjection};
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    #[test]
+    fn violation_frame_keeps_original_producer_fact_and_source() {
+        let source = LayoutResourceError::Arithmetic;
+        let error = RuntimeFilterContractViolation::from_domain(
+            RuntimeFilterContractViolationKind::ContractMismatch,
+            source,
+        );
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        assert_eq!(error.failure_fact(), source.failure_fact());
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .downcast_ref::<LayoutResourceError>(),
+            Some(&source)
+        );
+    }
+    #[test]
+    fn session_close_is_observation_not_a_new_task_origin() {
+        let closed = RuntimeFilterContractViolation::new(
+            RuntimeFilterContractViolationKind::SessionClosed,
+            "the session is already closed",
+        );
+        assert_eq!(
+            closed.failure_fact().evidence(),
+            FailureEvidence::StopObservation
+        );
+        assert_eq!(closed.failure_fact().class(), FailureClass::Control);
+        let capacity = RuntimeFilterContractViolation::new(
+            RuntimeFilterContractViolationKind::ResourceLimit,
+            "actual request refused",
+        );
+        assert_eq!(
+            capacity.failure_fact().evidence(),
+            FailureEvidence::Originating
         );
     }
 }

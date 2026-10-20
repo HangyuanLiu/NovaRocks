@@ -218,7 +218,25 @@ fn binary_safe_null_is_data_not_control_failure_for_exact_sparse_domain() {
     );
 }
 #[test]
-fn long_zone_data_error_is_full_until_owner_row_projection() {
+fn malformed_timezone_metadata_preserves_parser_source_without_row_permission() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    fn assert_original(error: &KernelFailure, expected: &str) {
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Invariant);
+        assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+        assert_eq!(fact.reason().code(), 283);
+        assert!(error.to_string().len() <= 512);
+        let mut source: &dyn std::error::Error = error;
+        loop {
+            if let Some(original) = source.downcast_ref::<arrow::error::ArrowError>() {
+                assert_eq!(original.to_string(), expected);
+                break;
+            }
+            source = source
+                .source()
+                .expect("original Arrow timezone parser source");
+        }
+    }
     let ctl = control(usize::MAX, KernelFailure::Cancelled);
     let observed = ObservedControl {
         original: &ctl,
@@ -234,46 +252,43 @@ fn long_zone_data_error_is_full_until_owner_row_projection() {
     let array =
         Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]).with_timezone(zone.clone()))
             as ArrayRef;
-    // The locked Arrow parser owns this feature-dependent source diagnostic.
-    // Independently obtain its complete error, then require exact propagation.
     let expected = zone
         .parse::<arrow::array::timezone::Tz>()
         .unwrap_err()
         .to_string();
-    assert!(
-        expected.contains(&zone),
-        "the entire original zone is retained"
-    );
+    assert!(expected.contains(&zone));
+    assert!(expected.len() > 512);
     let mut values = TemporalValues::new(3, &mut work).unwrap();
     let rows = [5];
-    assert_eq!(
-        values
-            .consume(
-                S::SecondsCastOther,
-                2,
-                Selection::try_sparse(7, &rows).unwrap(),
-                &[2],
-                array.clone(),
-                &mut work
-            )
-            .unwrap(),
-        Some(expected.clone())
-    );
-    assert!(expected.len() > 512);
+    let error = values
+        .consume(
+            S::SecondsCastOther,
+            2,
+            Selection::try_sparse(7, &rows).unwrap(),
+            &[2],
+            array.clone(),
+            &mut work,
+        )
+        .unwrap_err();
+    assert_original(&error, &expected);
     let mut frame = frame(&mut work);
     frame.next = 3;
-    frame
+    let error = frame
         .attach_temporal(
             child(vec![2], array, vec![]),
             S::SecondsCastOther,
             7,
             &mut work,
         )
-        .unwrap();
-    assert_eq!(frame.errors[&2], RowDataError::new(2, &expected));
-    assert_eq!(frame.errors.len(), 1);
+        .unwrap_err();
+    assert_original(&error, &expected);
+    assert!(
+        frame.errors.is_empty(),
+        "malformed schema metadata grants no row masking permission"
+    );
     assert!(!observed.refused.load(Ordering::Relaxed));
 }
+
 fn causes() -> [KernelFailure; 7] {
     [
         KernelFailure::Cancelled,

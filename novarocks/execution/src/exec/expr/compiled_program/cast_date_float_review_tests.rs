@@ -84,10 +84,17 @@ fn arena_observation(
     );
     let demanded = arrow::compute::take(source.as_ref(), &indices, None).unwrap();
     match catch_unwind(AssertUnwindSafe(|| {
-        actual(&demanded, target, policy, allow)
+        actual(&demanded, target.clone(), policy, allow)
     })) {
         Ok(Ok(values)) => Observation::Rows(snapshot(&values), Vec::new()),
-        Ok(Err(error)) => Observation::Data(error),
+        Ok(Err(error)) => {
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            if error.failure_fact().class() == FailureClass::Data {
+                Observation::Data(error.detail().to_owned())
+            } else {
+                Observation::Kernel(format!("{error:?}"))
+            }
+        }
         Err(payload) => Observation::Panic(panic_message(payload)),
     }
 }

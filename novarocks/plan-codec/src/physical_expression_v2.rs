@@ -75,7 +75,20 @@ impl fmt::Display for ExpressionCodecError {
         }
     }
 }
-impl std::error::Error for ExpressionCodecError {}
+impl std::error::Error for ExpressionCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Semantics(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::Value(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Arena(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<novarocks_physical_plan::ExprArenaConstructionError> for ExpressionCodecError {
     fn from(value: novarocks_physical_plan::ExprArenaConstructionError) -> Self {
         match value {

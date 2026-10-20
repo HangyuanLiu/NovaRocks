@@ -117,7 +117,7 @@ fn raw_scan_rejects_unknown_duplicate_and_wrong_wire_fields_before_prost_loss() 
         decode_connector_payload(&unknown, limits(4096, 4096))
             .unwrap_err()
             .kind(),
-        ConnectorCodecErrorKind::UnknownField
+        &ConnectorCodecErrorKind::UnknownField
     );
 
     let mut duplicate = encoded.clone();
@@ -126,7 +126,7 @@ fn raw_scan_rejects_unknown_duplicate_and_wrong_wire_fields_before_prost_loss() 
         decode_connector_payload(&duplicate, limits(4096, 4096))
             .unwrap_err()
             .kind(),
-        ConnectorCodecErrorKind::DuplicateField
+        &ConnectorCodecErrorKind::DuplicateField
     );
 
     let wrong_wire = [0x08, 0x01];
@@ -134,7 +134,7 @@ fn raw_scan_rejects_unknown_duplicate_and_wrong_wire_fields_before_prost_loss() 
         decode_connector_payload(&wrong_wire, limits(4096, 4096))
             .unwrap_err()
             .kind(),
-        ConnectorCodecErrorKind::InvalidValue
+        &ConnectorCodecErrorKind::InvalidValue
     );
 }
 
@@ -145,13 +145,13 @@ fn encoded_and_decoded_retained_budgets_are_independent() {
         decode_connector_payload(&encoded, limits(encoded.len() - 1, 4096))
             .unwrap_err()
             .kind(),
-        ConnectorCodecErrorKind::Capacity
+        &ConnectorCodecErrorKind::Capacity
     );
     assert_eq!(
         decode_connector_payload(&encoded, limits(encoded.len(), 1))
             .unwrap_err()
             .kind(),
-        ConnectorCodecErrorKind::Capacity
+        &ConnectorCodecErrorKind::Capacity
     );
 }
 
@@ -168,7 +168,7 @@ fn malformed_nested_catalog_and_zero_revision_fail_closed() {
         decode_connector_payload(&encoded, limits(4096, 4096))
             .unwrap_err()
             .kind(),
-        ConnectorCodecErrorKind::VersionMismatch
+        &ConnectorCodecErrorKind::VersionMismatch
     );
 }
 
@@ -184,7 +184,7 @@ fn nested_header_and_catalog_reject_unknown_duplicate_missing_and_wrong_wire_fie
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::UnknownField
+        &ConnectorCodecErrorKind::UnknownField
     );
 
     let mut duplicate_header = raw_header().encode_to_vec();
@@ -196,7 +196,7 @@ fn nested_header_and_catalog_reject_unknown_duplicate_missing_and_wrong_wire_fie
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::DuplicateField
+        &ConnectorCodecErrorKind::DuplicateField
     );
 
     let mut wrong_wire_header = Vec::new();
@@ -212,7 +212,7 @@ fn nested_header_and_catalog_reject_unknown_duplicate_missing_and_wrong_wire_fie
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::InvalidValue
+        &ConnectorCodecErrorKind::InvalidValue
     );
 
     let mut unknown_catalog = raw_catalog().encode_to_vec();
@@ -225,7 +225,7 @@ fn nested_header_and_catalog_reject_unknown_duplicate_missing_and_wrong_wire_fie
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::UnknownField
+        &ConnectorCodecErrorKind::UnknownField
     );
 
     let mut duplicate_catalog = raw_catalog().encode_to_vec();
@@ -237,7 +237,7 @@ fn nested_header_and_catalog_reject_unknown_duplicate_missing_and_wrong_wire_fie
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::DuplicateField
+        &ConnectorCodecErrorKind::DuplicateField
     );
 
     let mut wrong_wire_catalog = raw_catalog().encode_to_vec();
@@ -250,7 +250,7 @@ fn nested_header_and_catalog_reject_unknown_duplicate_missing_and_wrong_wire_fie
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::InvalidValue
+        &ConnectorCodecErrorKind::InvalidValue
     );
 
     for malformed in [
@@ -306,7 +306,7 @@ fn raw_retained_scalar_item_and_depth_budgets_fail_independently() {
             decode_connector_payload(&encoded, limits)
                 .unwrap_err()
                 .kind(),
-            ConnectorCodecErrorKind::Capacity
+            &ConnectorCodecErrorKind::Capacity
         );
     }
 }
@@ -403,7 +403,7 @@ fn installed_binding_is_checked_before_private_payload_and_private_kind_conflict
             .decode_private(b"wrong-private-kind", &mut context)
             .unwrap_err()
             .kind(),
-        ConnectorCodecErrorKind::InconsistentFields
+        &ConnectorCodecErrorKind::InconsistentFields
     );
     assert_eq!(decoder.payload_parses.load(Ordering::SeqCst), 1);
 

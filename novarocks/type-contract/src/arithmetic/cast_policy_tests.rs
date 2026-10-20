@@ -329,7 +329,7 @@ impl PureCompileControl for Control {
         let mut calls = self.calls.lock().unwrap();
         let at = calls.len();
         calls.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -394,11 +394,11 @@ fn observed_cast_policy_wide_first_and_late_changes_preserve_all_control_callbac
             for at in 0..trace.len() {
                 let control = Control {
                     calls: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     run(&source, &target, &control),
-                    Err(Failure::Control(cause))
+                    Err(Failure::Control(cause.clone()))
                 );
                 assert_eq!(control.calls.into_inner().unwrap(), trace[..=at]);
             }

@@ -251,10 +251,18 @@ fn wire_error(owner: &str, error: ConnectorCodecError) -> ConnectorWriteCodecErr
         }
         ConnectorCodecErrorKind::DuplicateField => ProtocolErrorKind::DuplicateField,
         ConnectorCodecErrorKind::InconsistentFields => ProtocolErrorKind::InconsistentFields,
-        ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
-        ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
         ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
-        ConnectorCodecErrorKind::CompileControl(cause) => ProtocolErrorKind::CompileControl(cause),
+        ConnectorCodecErrorKind::CompileControl(cause) => {
+            ProtocolErrorKind::CompileControl(cause.clone())
+        }
+        ConnectorCodecErrorKind::Domain(_)
+        | ConnectorCodecErrorKind::Capacity
+        | ConnectorCodecErrorKind::Unsupported => {
+            return ConnectorWriteCodecError::new(
+                owner,
+                ProtocolError::from_domain(FieldPath::root("provider_payload"), error),
+            );
+        }
     };
     ConnectorWriteCodecError::new(
         owner,
@@ -272,13 +280,113 @@ mod compile_control_tests {
     use novarocks_type_contract::CompileControlError;
 
     #[test]
+    fn provider_domain_adapter_keeps_exact_resource_and_original_codec_path() {
+        use novarocks_execution_contract::failure::{FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{
+            ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorFieldPath,
+        };
+        let mut ledger =
+            ConnectorDecodeLedger::new(ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap());
+        ledger.charge_raw(7).unwrap();
+        let original = ledger.charge_raw(2).unwrap_err();
+        let codec = ConnectorCodecError::from_domain(
+            ConnectorFieldPath::root("columns").index(17),
+            original.clone(),
+        );
+        let fact = original.failure_fact();
+        let error = wire_error("iceberg", codec.clone());
+        assert_eq!(error.owner(), "iceberg");
+        assert_eq!(error.protocol().path().to_string(), "provider_payload");
+        assert!(matches!(
+            error.protocol().kind(),
+            ProtocolErrorKind::Domain(_)
+        ));
+        assert_eq!(error.protocol().failure_fact(), fact);
+        let shared = std::error::Error::source(error.protocol())
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        let preserved = shared.downcast_ref::<ConnectorCodecError>().unwrap();
+        assert_eq!(preserved, &codec);
+        assert_eq!(preserved.path().to_string(), "columns[17]");
+        let leaf = std::error::Error::source(preserved)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(leaf.downcast_ref::<ConnectorCodecError>(), Some(&original));
+    }
+
+    #[test]
+    fn nominal_capacity_and_unsupported_keep_original_fact_quantities_and_source() {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, SharedFailureCause,
+        };
+        use novarocks_spi::connector::{
+            ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorFieldPath,
+        };
+        let mut ledger =
+            ConnectorDecodeLedger::new(ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap());
+        ledger.charge_raw(7).unwrap();
+        let known = ledger.charge_raw(2).unwrap_err();
+        let unknown = ConnectorCodecError::new(
+            ConnectorFieldPath::root("payload").field("header"),
+            ConnectorCodecErrorKind::Capacity,
+            "pure compilation was cancelled",
+        );
+        let unsupported = ConnectorCodecError::new(
+            ConnectorFieldPath::root("payload").field("header"),
+            ConnectorCodecErrorKind::Unsupported,
+            "dependency permission denied",
+        );
+        for original in [known, unknown, unsupported] {
+            let fact = original.failure_fact();
+            let error = wire_error("iceberg", original.clone());
+            let protocol = error.protocol();
+            assert_eq!(error.owner(), "iceberg");
+            assert_eq!(protocol.path().to_string(), "provider_payload");
+            assert!(matches!(protocol.kind(), ProtocolErrorKind::Domain(_)));
+            assert_eq!(protocol.failure_fact(), fact);
+            let shared = std::error::Error::source(protocol)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            assert_eq!(
+                shared.downcast_ref::<ConnectorCodecError>(),
+                Some(&original)
+            );
+            if original.kind() == &ConnectorCodecErrorKind::Unsupported {
+                assert_eq!(fact.class(), FailureClass::Unsupported);
+                assert_eq!(fact.reason().code(), 166);
+                assert!(fact.resource().is_none());
+            } else {
+                assert_eq!(fact.class(), FailureClass::Resource);
+                assert_eq!(fact.reason().code(), 167);
+                if let Some(resource) = fact.resource() {
+                    assert_eq!(
+                        (
+                            resource.requested,
+                            resource.required_growth,
+                            resource.committed,
+                            resource.limit,
+                            resource.live
+                        ),
+                        (Some(2), Some(2), Some(7), Some(8), None)
+                    );
+                } else {
+                    assert_eq!(original.path().to_string(), "payload.header");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn provider_control_adapter_preserves_exact_typed_cause() {
         for cause in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let error = wire_error("paimon", ConnectorCodecError::from(cause));
+            let error = wire_error("paimon", ConnectorCodecError::from(cause.clone()));
             let outer_source = std::error::Error::source(&error).unwrap();
             assert_eq!(
                 outer_source.downcast_ref::<ProtocolError>(),
@@ -286,7 +394,7 @@ mod compile_control_tests {
             );
             assert_eq!(
                 error.protocol().kind(),
-                ProtocolErrorKind::CompileControl(cause)
+                &ProtocolErrorKind::CompileControl(cause.clone())
             );
             assert_eq!(
                 std::error::Error::source(error.protocol())
@@ -295,15 +403,29 @@ mod compile_control_tests {
                 Some(&cause)
             );
         }
-        let diagnostic = wire_error(
-            "paimon",
-            ConnectorCodecError::new(
-                novarocks_spi::connector::ConnectorFieldPath::root("payload"),
-                ConnectorCodecErrorKind::Capacity,
-                "pure compilation was cancelled",
-            ),
+        use novarocks_execution_contract::failure::{FailureProjection, SharedFailureCause};
+        let original = ConnectorCodecError::new(
+            novarocks_spi::connector::ConnectorFieldPath::root("payload"),
+            ConnectorCodecErrorKind::Capacity,
+            "pure compilation was cancelled",
         );
-        assert_eq!(diagnostic.protocol().kind(), ProtocolErrorKind::Capacity);
-        assert!(std::error::Error::source(diagnostic.protocol()).is_none());
+        let diagnostic = wire_error("paimon", original.clone());
+        assert!(matches!(
+            diagnostic.protocol().kind(),
+            ProtocolErrorKind::Domain(_)
+        ));
+        assert_eq!(
+            diagnostic.protocol().failure_fact(),
+            original.failure_fact()
+        );
+        assert!(diagnostic.protocol().failure_fact().resource().is_none());
+        let source = std::error::Error::source(diagnostic.protocol())
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            source.downcast_ref::<ConnectorCodecError>(),
+            Some(&original)
+        );
     }
 }

@@ -55,15 +55,17 @@ impl Control {
     }
 }
 impl SynchronousPreparationControl for Control {
-    fn checkpoint(&self) -> Result<(), PreparationMemoryStop> {
+    fn checkpoint(&self) -> crate::runtime::fragment::ExecutionResult<()> {
         self.checks.set(self.checks.get() + 1);
         if self.checks.get() == self.stop_at {
-            Err(PreparationMemoryStop::Abort(AbortCause::LeaseExpired))
+            Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
+            ))
         } else {
             Ok(())
         }
     }
-    fn wait(&self) -> Result<(), PreparationMemoryStop> {
+    fn wait(&self) -> crate::runtime::fragment::ExecutionResult<()> {
         panic!("a granted contract test must not enter Pending");
     }
 }
@@ -124,10 +126,8 @@ fn preparation_memory_stop_before_or_after_real_grant_never_runs_body() {
         assert!(matches!(
             result,
             Err(SynchronousPreparationFailure::Host(
-                PreparationMemoryRefusal::Stopped(PreparationMemoryStop::Abort(
-                    AbortCause::LeaseExpired
-                ))
-            ))
+                PreparationMemoryRefusal::Interrupted(ref cause)
+            )) if preparation_stop_source(cause) == Some(&PreparationMemoryStop::Abort(AbortCause::LeaseExpired))
         ));
         assert_eq!(calls.get(), 0);
         assert!(journal.body.settlement.is_none());
@@ -226,4 +226,105 @@ fn preparation_memory_body_error_wins_over_real_debt_and_policy_settlement() {
     assert_eq!(journal.body.stopped, Some(Ok(())));
     // SAFETY: release the one successful block with its original allocator/Layout.
     unsafe { allocator.dealloc(block.as_ptr(), actual) };
+}
+
+#[test]
+fn preparation_stop_is_an_observation_and_cannot_refine_another_tasks_cause() {
+    use novarocks_execution_contract::{AbortCause, CancelReason};
+    use novarocks_failure_contract::{FailureClass, FailureEvidence, FailureProjection};
+    for stop in [
+        PreparationMemoryStop::Cancel(CancelReason::UpstreamNoLongerNeeded),
+        PreparationMemoryStop::Abort(AbortCause::QueryFailed),
+        PreparationMemoryStop::Abort(AbortCause::PeerTaskFailed),
+        PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
+    ] {
+        let fact = PreparationMemoryRefusal::Interrupted(
+            crate::runtime::fragment::ExecutionFailure::from_domain(stop),
+        )
+        .failure_fact();
+        assert_eq!(fact.class(), FailureClass::Control);
+        assert_eq!(fact.evidence(), FailureEvidence::StopObservation);
+        assert_eq!(fact.reason().code(), 3);
+        assert_eq!(fact.resource(), None);
+    }
+    let setup = PreparationMemoryRefusal::MissingQueryMemory.failure_fact();
+    assert_eq!(setup.class(), FailureClass::Invariant);
+    assert_eq!(setup.evidence(), FailureEvidence::Originating);
+    let original = CapacityError::Invalid {
+        detail: "actual preparation source model",
+    };
+    let refusal = PreparationMemoryRefusal::Capacity(original);
+    assert!(
+        std::error::Error::source(&refusal)
+            .unwrap()
+            .is::<CapacityError>()
+    );
+}
+
+fn preparation_stop_source<'a>(
+    cause: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a PreparationMemoryStop> {
+    let mut current = Some(cause);
+    while let Some(cause) = current {
+        if let Some(stop) = cause.downcast_ref::<PreparationMemoryStop>() {
+            return Some(stop);
+        }
+        current = cause.source();
+    }
+    None
+}
+
+#[test]
+fn preparation_control_keeps_an_actual_originating_failure_without_inventing_stop_intent() {
+    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+    use novarocks_failure_contract::{FailureEvidence, FailureProjection};
+    struct OriginalControl(ExecutionFailure);
+    impl SynchronousPreparationControl for OriginalControl {
+        fn checkpoint(&self) -> ExecutionResult<()> {
+            Err(self.0.clone())
+        }
+        fn wait(&self) -> ExecutionResult<()> {
+            panic!("a refused control never enters Pending")
+        }
+    }
+    let raw = novarocks_functions::KernelFailure::ResourceExhausted;
+    let expected = raw.failure_fact();
+    let original: ExecutionFailure = raw.into();
+    let control = OriginalControl(original.clone());
+    let binding = bound();
+    let calls = Cell::new(0);
+    let mut journal = Journal::default();
+    let Err(SynchronousPreparationFailure::Host(
+        refusal @ PreparationMemoryRefusal::Interrupted(_),
+    )) = SynchronousPreparationMemory::new(Some(&binding), &control, journal.loan()).materialize(
+        facts(),
+        "explicit test overflow",
+        || {
+            calls.set(calls.get() + 1);
+            Ok::<_, ()>(())
+        },
+    )
+    else {
+        panic!("the control's actual refusal must win before admission or body");
+    };
+    assert_eq!(refusal.failure_fact(), expected);
+    assert_eq!(
+        refusal.failure_fact().evidence(),
+        FailureEvidence::Originating
+    );
+    let PreparationMemoryRefusal::Interrupted(source) = &refusal else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(source.cause(), original.cause()));
+    assert!(std::ptr::eq(
+        std::error::Error::source(&refusal)
+            .unwrap()
+            .downcast_ref::<ExecutionFailure>()
+            .unwrap()
+            .cause(),
+        original.cause()
+    ));
+    assert_eq!(calls.get(), 0);
+    assert!(journal.body.settlement.is_none());
+    assert_eq!(binding.account().snapshot().granted_bytes, 0);
 }

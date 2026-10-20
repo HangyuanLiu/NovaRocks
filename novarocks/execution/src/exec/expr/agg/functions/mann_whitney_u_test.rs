@@ -29,14 +29,12 @@ pub(super) struct MannWhitneyUTestAgg;
 
 type MannWhitneyState =
     novarocks_functions::builtin::aggregate_mann_whitney_core::MannWhitneyState<AggregateAllocator>;
-use novarocks_functions::aggregate_scalar::{ScalarStateError, ScalarWork};
+use novarocks_functions::aggregate_scalar::ScalarWork;
+use novarocks_functions::builtin::aggregate_mann_whitney_core::MannFailure;
 use novarocks_functions::builtin::aggregate_mann_whitney_core::MannWhitneyInput;
 
-fn legacy_error(error: ScalarStateError) -> String {
-    match error {
-        ScalarStateError::Legacy(message) | ScalarStateError::OutputAllocation(message) => message,
-        ScalarStateError::Kernel(error) => error.to_string(),
-    }
+fn mann_failure(error: MannFailure) -> crate::runtime::fragment::ExecutionFailure {
+    error.into_kernel_failure().into()
 }
 
 impl AggregateFunction for MannWhitneyUTestAgg {
@@ -45,18 +43,22 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let sig = super::super::agg_type_signature(func)
-            .ok_or_else(|| "mann_whitney_u_test type signature missing".to_string())?;
-        let output_type = sig
-            .output_type
-            .as_ref()
-            .ok_or_else(|| "mann_whitney_u_test output type missing".to_string())?;
-        let intermediate_type = sig
-            .intermediate_type
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "mann_whitney_u_test intermediate type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let sig = super::super::agg_type_signature(func).ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "mann_whitney_u_test type signature missing",
+            )
+        })?;
+        let output_type = sig.output_type.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "mann_whitney_u_test output type missing",
+            )
+        })?;
+        let intermediate_type = sig.intermediate_type.as_ref().cloned().ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "mann_whitney_u_test intermediate type missing",
+            )
+        })?;
 
         if input_is_intermediate {
             return Ok(AggSpec {
@@ -68,13 +70,24 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             });
         }
 
-        let input_type =
-            input_type.ok_or_else(|| "mann_whitney_u_test input type missing".to_string())?;
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "mann_whitney_u_test input type missing",
+            )
+        })?;
         let DataType::Struct(fields) = input_type else {
-            return Err("mann_whitney_u_test expects struct input".to_string());
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "mann_whitney_u_test expects struct input",
+                ),
+            );
         };
         if !(fields.len() == 2 || fields.len() == 3 || fields.len() == 4) {
-            return Err("mann_whitney_u_test expects 2 to 4 arguments".to_string());
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "mann_whitney_u_test expects 2 to 4 arguments",
+                ),
+            );
         }
 
         Ok(AggSpec {
@@ -97,10 +110,12 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "mann_whitney_u_test input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "mann_whitney_u_test input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -108,22 +123,29 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "mann_whitney_u_test merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "mann_whitney_u_test merge input missing",
+            )
+        })?;
         let merge_array = if let Some(struct_arr) = arr.as_any().downcast_ref::<StructArray>() {
-            struct_arr
-                .columns()
-                .first()
-                .ok_or_else(|| "mann_whitney_u_test merge struct input has no fields".to_string())?
+            struct_arr.columns().first().ok_or_else(|| {
+                crate::exec::expr::agg::views::aggregate_input_contract(
+                    "mann_whitney_u_test merge struct input has no fields",
+                )
+            })?
         } else {
             arr
         };
         let bin = merge_array
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+            .ok_or_else(|| {
+                crate::exec::expr::agg::views::aggregate_input_contract(
+                    "failed to downcast to BinaryArray",
+                )
+            })?;
         Ok(AggInputView::Binary(bin))
     }
 
@@ -141,9 +163,11 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked mann_whitney_u_test requires a memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked mann_whitney_u_test requires a memory tracker",
+            )
         })?;
         unsafe {
             ptr.cast::<MannWhitneyState>()
@@ -172,21 +196,25 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("mann_whitney_u_test input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "mann_whitney_u_test input type mismatch",
+            ));
         };
         let struct_arr = array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "mann_whitney_u_test expects struct input".to_string())?;
-        let arguments = MannWhitneyInput::try_new(struct_arr.columns())?;
+            .ok_or_else(|| {
+                super::aggregate_binding_contract("mann_whitney_u_test expects struct input")
+            })?;
+        let arguments = MannWhitneyInput::try_new(struct_arr.columns()).map_err(mann_failure)?;
         let mut work = ScalarWork::new(None);
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
             arguments
                 .update_row(state, [row; 4], &mut work)
-                .map_err(legacy_error)?;
+                .map_err(mann_failure)?;
         }
         Ok(())
     }
@@ -197,9 +225,11 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Binary(arr) = input else {
-            return Err("mann_whitney_u_test merge input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "mann_whitney_u_test merge input type mismatch",
+            ));
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             if arr.is_null(row) {
@@ -208,11 +238,11 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
             let bytes = arr.value(row);
             let other = MannWhitneyState::deserialize_in(bytes, state.allocator.clone())
-                .map_err(legacy_error)?;
+                .map_err(mann_failure)?;
             if state.is_uninitialized() {
                 *state = other;
             } else {
-                state.merge(other).map_err(legacy_error)?;
+                state.merge(other).map_err(mann_failure)?;
             }
         }
         Ok(())
@@ -224,26 +254,37 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         if output_intermediate {
             let mut builder = BinaryBuilder::new();
+            let mut output_offset = 0;
             for &base in group_states {
                 let state =
                     unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
-                let bytes = state.serialize();
+                let bytes = state.serialize().map_err(mann_failure)?;
+                output_offset =
+                    novarocks_functions::aggregate_scalar::checked_binary_output_offset(
+                        output_offset,
+                        bytes.len(),
+                    )?;
                 builder.append_value(bytes);
             }
             return Ok(Arc::new(builder.finish()));
         }
 
         let mut builder = StringBuilder::new();
+        let mut output_offset = 0;
         for &base in group_states {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
             if state.is_uninitialized() || !state.has_samples() {
                 builder.append_null();
                 continue;
             }
-            let value = state.build_result();
+            let value = state.build_result().map_err(mann_failure)?;
+            output_offset = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+                output_offset,
+                value.len(),
+            )?;
             builder.append_value(value);
         }
         Ok(Arc::new(builder.finish()))
@@ -298,7 +339,10 @@ mod tests {
                 &AggInputView::Any(&input),
             )
             .expect_err("sample vector allocation must fail closed");
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&error).class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
         assert_eq!(tracker.current(), 0);
 
         MannWhitneyUTestAgg.drop_state(&spec, state.as_mut_ptr().cast());

@@ -70,7 +70,9 @@ impl CanonicalKind {
             DataType::Binary => Ok(Self::Binary),
             DataType::LargeBinary => Ok(Self::LargeBinary),
             DataType::FixedSizeBinary(width) if *width > 0 => Ok(Self::Fixed),
-            _ => Err(IcebergThetaError::UnsupportedInputType(data_type.clone())),
+            _ => Err(IcebergThetaError::UnsupportedInputType(
+                crate::theta::theta_type_description(data_type),
+            )),
         }
     }
 
@@ -148,7 +150,11 @@ impl<'a> PreparedCanonicalBatch<'a> {
                     .as_any()
                     .downcast_ref::<$ty>()
                     .map(Self::$kind)
-                    .ok_or_else(|| IcebergThetaError::ArrayTypeMismatch(array.data_type().clone()))
+                    .ok_or_else(|| {
+                        IcebergThetaError::ArrayTypeMismatch(crate::theta::theta_type_description(
+                            array.data_type(),
+                        ))
+                    })
             };
         }
         match CanonicalKind::from_data_type(array.data_type())? {

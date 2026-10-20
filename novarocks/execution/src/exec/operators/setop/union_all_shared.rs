@@ -67,8 +67,8 @@ impl UnionAllSharedState {
         }
     }
 
-    pub(crate) fn push_chunk(&self, state: &RuntimeState, mut chunk: Chunk) {
-        if let Some(tracker) = self.queue_mem_tracker(state).as_ref() {
+    pub(crate) fn push_chunk(&self, tracker: Option<&Arc<MemTracker>>, mut chunk: Chunk) {
+        if let Some(tracker) = tracker {
             chunk.transfer_to(tracker);
         }
         let notify = self.observable.defer_notify();
@@ -83,19 +83,14 @@ impl UnionAllSharedState {
         }
     }
 
-    pub(crate) fn pop_chunk(&self) -> Option<Chunk> {
+    pub(crate) fn next_chunk(&self) -> crate::exec::pipeline::shape::SourceRead {
+        use crate::exec::pipeline::shape::SourceRead;
         let mut guard = self.inner.lock().expect("union all state lock");
-        guard.buffer.pop_front()
-    }
-
-    pub(crate) fn has_buffered(&self) -> bool {
-        let guard = self.inner.lock().expect("union all state lock");
-        !guard.buffer.is_empty()
-    }
-
-    pub(crate) fn remaining_producers(&self) -> usize {
-        let guard = self.inner.lock().expect("union all state lock");
-        guard.remaining_producers
+        match guard.buffer.pop_front() {
+            Some(chunk) => SourceRead::Chunk(chunk),
+            None if guard.remaining_producers == 0 => SourceRead::Finished,
+            None => SourceRead::Pending,
+        }
     }
 
     pub(crate) fn producer_finished(&self) {
@@ -116,7 +111,7 @@ impl UnionAllSharedState {
         Arc::clone(&self.observable)
     }
 
-    fn queue_mem_tracker(&self, state: &RuntimeState) -> Option<Arc<MemTracker>> {
+    pub(crate) fn queue_mem_tracker(&self, state: &RuntimeState) -> Option<Arc<MemTracker>> {
         let root = state.mem_tracker()?;
         let label = self.label.clone();
         let tracker = self

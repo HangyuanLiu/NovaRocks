@@ -23,13 +23,13 @@ use arrow_schema::{DataType, TimeUnit};
 
 /// Render one already evaluated, non-NULL primitive value. The caller owns
 /// address, NULL and control validation; no arena or runtime policy is read.
-pub fn render(array: &dyn Array, row: usize) -> Result<String, &'static str> {
+pub fn render(array: &dyn Array, row: usize) -> Result<String, CarrierTextFailure> {
     macro_rules! integer {
         ($ty:ty) => {
             array
                 .as_any()
                 .downcast_ref::<$ty>()
-                .ok_or("text cast carrier downcast failed")?
+                .ok_or_else(|| CarrierTextFailure::new("text cast carrier downcast failed"))?
                 .value(row)
                 .to_string()
         };
@@ -48,14 +48,14 @@ pub fn render(array: &dyn Array, row: usize) -> Result<String, &'static str> {
             array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or("text cast carrier downcast failed")?
+                .ok_or_else(|| CarrierTextFailure::new("text cast carrier downcast failed"))?
                 .value(row),
         ),
         DataType::Float64 => format_float64_for_varchar(
             array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or("text cast carrier downcast failed")?
+                .ok_or_else(|| CarrierTextFailure::new("text cast carrier downcast failed"))?
                 .value(row),
         ),
         DataType::Timestamp(unit, tz) => {
@@ -63,30 +63,57 @@ pub fn render(array: &dyn Array, row: usize) -> Result<String, &'static str> {
                 TimeUnit::Second => array
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
-                    .ok_or("text cast carrier downcast failed")?
+                    .ok_or_else(|| CarrierTextFailure::new("text cast carrier downcast failed"))?
                     .value(row),
                 TimeUnit::Millisecond => array
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
-                    .ok_or("text cast carrier downcast failed")?
+                    .ok_or_else(|| CarrierTextFailure::new("text cast carrier downcast failed"))?
                     .value(row),
                 TimeUnit::Microsecond => array
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or("text cast carrier downcast failed")?
+                    .ok_or_else(|| CarrierTextFailure::new("text cast carrier downcast failed"))?
                     .value(row),
                 TimeUnit::Nanosecond => array
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
-                    .ok_or("text cast carrier downcast failed")?
+                    .ok_or_else(|| CarrierTextFailure::new("text cast carrier downcast failed"))?
                     .value(row),
             };
             format_timestamp_for_varchar(unit, value, tz.as_deref())
         }
-        _ => return Err("text cast requires an exact primitive carrier"),
+        _ => {
+            return Err(CarrierTextFailure::new(
+                "text cast requires an exact primitive carrier",
+            ));
+        }
     })
 }
 
+#[derive(Debug)]
+pub struct CarrierTextFailure(novarocks_failure_contract::BoundedDetail);
+impl CarrierTextFailure {
+    fn new(detail: impl std::fmt::Display) -> Self {
+        Self(novarocks_failure_contract::BoundedDetail::truncating_display(detail))
+    }
+}
+impl std::fmt::Display for CarrierTextFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for CarrierTextFailure {}
+impl novarocks_failure_contract::FailureProjection for CarrierTextFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(206).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for CarrierTextFailure {}
 #[cfg(test)]
 mod tests {
     use super::*;

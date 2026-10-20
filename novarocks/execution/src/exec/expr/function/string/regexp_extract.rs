@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, StringArray};
 
 pub fn eval_regexp_extract<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,7 +24,7 @@ pub fn eval_regexp_extract<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
@@ -31,18 +32,17 @@ pub fn eval_regexp_extract<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp_extract expects string".to_string())?;
+        .ok_or_else(|| expression_contract("regexp_extract expects string"))?;
     let _p_arr = pat_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp_extract expects string".to_string())?;
+        .ok_or_else(|| expression_contract("regexp_extract expects string"))?;
     let _indices = super::common::downcast_int_arg_array(&idx_arr, "regexp_extract")?;
     let len = s_arr.len();
-    Ok(
-        (novarocks_functions::builtin::string_extended::evaluate_legacy(
-            novarocks_functions::builtin::string_extended::StringOperation::RegexpExtract,
-            &[str_arr, pat_arr, idx_arr],
-            len,
-        ))?,
+    novarocks_functions::builtin::string_extended::evaluate_required(
+        novarocks_functions::builtin::string_extended::StringOperation::RegexpExtract,
+        &[str_arr, pat_arr, idx_arr],
+        len,
     )
+    .map_err(ExecutionFailure::from)
 }

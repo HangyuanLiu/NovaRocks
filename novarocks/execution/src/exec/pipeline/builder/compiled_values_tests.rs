@@ -411,7 +411,7 @@ fn cell_site(row: u32, column: u32) -> ProgramExpressionRootSite {
 }
 
 fn failure(program: &Arc<LocalProgram>) -> ExecutionFailure {
-    let state = Arc::new(RuntimeState::new(
+    let state = Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,

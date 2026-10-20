@@ -27,7 +27,6 @@ use crate::{
 use arrow_array::{Array, ListArray, MapArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-use std::alloc::Layout;
 
 struct CollectionOffsets<'a> {
     offsets: &'a [i32],
@@ -71,22 +70,6 @@ fn checked_input<'a>(
     }
 }
 
-fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
-    let values = Layout::array::<i32>(rows)
-        .map_err(|_| KernelFailure::ResourceExhausted)?
-        .size();
-    let bitmap = rows
-        .checked_add(63)
-        .map(|bits| bits / 64)
-        .and_then(|words| words.checked_mul(8))
-        .ok_or(KernelFailure::ResourceExhausted)?;
-    Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
-    values
-        .checked_add(bitmap)
-        .ok_or(KernelFailure::ResourceExhausted)?;
-    Ok(())
-}
-
 pub(super) fn evaluate_collection_cardinality<'a>(
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
@@ -116,10 +99,6 @@ pub(super) fn evaluate_collection_cardinality<'a>(
         work.borrow_mut().step()?;
         let collection = collection?;
         let selection = input.selection();
-        output_capacity(selection.len())?;
-        // Original shared body retains Vec<Option<i32>> as well as the final Arrow value/validity buffers.
-        Layout::array::<Option<i32>>(selection.len())
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
         let mut observer = |event| match event {
             super::array_literal_core::CollectionObservation::Step => work.borrow_mut().step(),
             super::array_literal_core::CollectionObservation::OpaqueBoundary => {
@@ -169,7 +148,7 @@ pub(super) fn evaluate_collection_cardinality<'a>(
         )
         .map_err(|failure| match failure {
             super::collection_offset_count::OffsetCountFailure::Control(cause) => cause,
-            super::collection_offset_count::OffsetCountFailure::Data(message) => internal(&message),
+            super::collection_offset_count::OffsetCountFailure::Operation(cause) => cause,
         })?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,

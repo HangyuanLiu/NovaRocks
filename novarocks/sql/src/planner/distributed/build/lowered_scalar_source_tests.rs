@@ -60,7 +60,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after the original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -438,7 +438,7 @@ fn scalar_journal_loan_success_and_ordinary_errors_observe_every_original_contro
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(matches!(loan(&owner, fragment, source, &control),
@@ -580,7 +580,7 @@ fn scalar_journal_capture_and_actual_recording_preserve_every_lowering_control_p
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

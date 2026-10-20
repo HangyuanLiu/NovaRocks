@@ -112,7 +112,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original control failure");
         }
         trace.push((phase, units));
-        if let Some((stop, cause)) = self.refusal
+        if let Some((stop, cause)) = self.refusal.clone()
             && at == stop
         {
             return Err(cause);
@@ -248,7 +248,7 @@ fn compare_prefixes(
         for cause in CAUSES {
             let refusing = Control {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&refusing), Err(FragmentStructureError::Control(actual)) if actual == cause),

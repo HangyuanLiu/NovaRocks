@@ -59,7 +59,10 @@ fn fixture(inputs: Vec<ArrayRef>, rows: usize) -> (ExprArena, Vec<ExprId>, Chunk
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
 
-fn raw(value: ArrayRef, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    value: ArrayRef,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = value.len();
     let (mut arena, args, chunk) = fixture(vec![value], rows);
     let expr = output.map_or(ExprId(usize::MAX), |ty| {
@@ -94,16 +97,20 @@ fn legacy_abs_raw_same_width_minima_preserve_complete_old_error() {
         ),
     ] {
         assert_eq!(
-            raw(value, Some(ty.clone())).unwrap_err(),
+            raw(value, Some(ty.clone())).unwrap_err().to_string(),
             format!("abs overflow on {ty:?} minimum; FE should promote result type")
         );
     }
     assert_eq!(
-        raw(Arc::new(Int8Array::from(vec![-1])), None).unwrap_err(),
+        raw(Arc::new(Int8Array::from(vec![-1])), None)
+            .unwrap_err()
+            .to_string(),
         "abs: missing output type"
     );
     assert_eq!(
-        raw(Arc::new(Int8Array::from(vec![-1])), Some(DataType::Boolean)).unwrap_err(),
+        raw(Arc::new(Int8Array::from(vec![-1])), Some(DataType::Boolean))
+            .unwrap_err()
+            .to_string(),
         "abs: unsupported output type from FE plan: Boolean"
     );
 }
@@ -188,7 +195,9 @@ fn legacy_abs_raw_decimal128_256_precision_metadata_and_minimum_errors_are_origi
             .unwrap(),
     );
     assert_eq!(
-        raw(src, Some(DataType::Decimal128(38, 0))).unwrap_err(),
+        raw(src, Some(DataType::Decimal128(38, 0)))
+            .unwrap_err()
+            .to_string(),
         "abs overflow on Decimal128 minimum"
     );
     let src: ArrayRef = Arc::new(
@@ -211,7 +220,9 @@ fn legacy_abs_raw_decimal128_256_precision_metadata_and_minimum_errors_are_origi
             .unwrap(),
     );
     assert_eq!(
-        raw(src, Some(DataType::Decimal256(76, 0))).unwrap_err(),
+        raw(src, Some(DataType::Decimal256(76, 0)))
+            .unwrap_err()
+            .to_string(),
         "abs overflow on Decimal256 minimum"
     );
 }

@@ -22,6 +22,7 @@ use crate::exec::expr::{ExprNode, LiteralValue};
 use arrow::array::{Int64Array, LargeStringArray, NullArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_failure_contract::FailureProjection;
 use novarocks_types::SlotId;
 fn chunk(input: ArrayRef) -> Chunk {
     let batch = RecordBatch::try_new(
@@ -44,7 +45,7 @@ fn invoke(
     output: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     match name {
         "upper" => eval_upper(arena, args[0], chunk),
         "lower" => eval_lower(arena, output, args, chunk),
@@ -52,7 +53,7 @@ fn invoke(
         _ => unreachable!(),
     }
 }
-fn evaluate(name: &str, input: ArrayRef, target: DataType) -> Result<ArrayRef, String> {
+fn evaluate(name: &str, input: ArrayRef, target: DataType) -> ExecutionResult<ArrayRef> {
     let mut arena = ExprArena::default();
     let arg = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), input.data_type().clone());
     let output = arena.push_typed(ExprNode::Literal(LiteralValue::Null), target);
@@ -164,33 +165,34 @@ fn legacy_string_case_baseline_output_type_is_ignored_and_source_is_not_cast() {
             Arc::new(NullArray::new(1)),
             Arc::new(LargeStringArray::from(vec!["AbC"])),
         ] {
+            let failure = evaluate(name, input, DataType::Utf8).unwrap_err();
+            assert_eq!(failure.to_string(), expected_error);
             assert_eq!(
-                evaluate(name, input, DataType::Utf8).unwrap_err(),
-                expected_error
+                failure.failure_fact().class(),
+                novarocks_failure_contract::FailureClass::Invariant
             );
+            assert_eq!(failure.failure_fact().reason().code(), 359);
         }
     }
 }
 #[test]
-fn legacy_string_case_baseline_raw_lower_arity_and_unused_tail() {
+fn lower_case_requires_the_exact_prepared_unary_shape() {
     let input = Arc::new(StringArray::from(vec!["AbC"])) as ArrayRef;
     let chunk = chunk(input);
     let mut arena = ExprArena::default();
     let arg = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
     let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Utf8);
     for name in ["lower", "lcase"] {
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(
-                name,
-                &arena,
-                arg,
-                &[],
-                &chunk
-            )))
-            .is_err()
-        );
+        for arguments in [&[][..], &[arg, missing][..]] {
+            let failure = invoke(name, &arena, arg, arguments, &chunk).unwrap_err();
+            assert_eq!(
+                failure.failure_fact().class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            assert_eq!(failure.failure_fact().reason().code(), 430);
+        }
         assert_rows(
-            invoke(name, &arena, arg, &[arg, missing], &chunk).unwrap(),
+            invoke(name, &arena, arg, &[arg], &chunk).unwrap(),
             vec![Some("abc")],
         );
     }
@@ -202,10 +204,10 @@ fn legacy_string_case_baseline_child_error_precedes_carrier_validation() {
     let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Int64);
     let expected = arena.eval(missing, &chunk).unwrap_err();
     for name in ["lower", "lcase", "upper"] {
-        assert_eq!(
-            invoke(name, &arena, missing, &[missing], &chunk).unwrap_err(),
-            expected
-        );
+        let failure = invoke(name, &arena, missing, &[missing], &chunk).unwrap_err();
+        assert_eq!(failure.failure_fact(), expected.failure_fact());
+        assert_eq!(failure.to_string(), expected.to_string());
+        assert!(!failure.same_occurrence(&expected));
     }
 }
 #[test]

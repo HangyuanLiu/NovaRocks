@@ -56,7 +56,7 @@ impl PureCompileControl for Control {
             assert!(index <= at, "rejected control was invoked again");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if at == index => Err(cause),
             _ => Ok(()),
         }
@@ -277,7 +277,7 @@ fn check_callbacks(fixture: &Fixture, success: bool, quantum_only: bool) {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusing = Control::at(index, cause);
+            let refusing = Control::at(index, cause.clone());
             assert_cause(fixture.construct(&refusing).unwrap_err(), cause);
             assert_eq!(refusing.trace(), trace[..=index]);
         }
@@ -444,7 +444,7 @@ fn check_relation_callbacks(node: &PlanUnpivotNode, input: &[OutputColumn], succ
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusing = Control::at(index, cause);
+            let refusing = Control::at(index, cause.clone());
             assert_cause(
                 node.validate_against(input, policy(), &refusing)
                     .unwrap_err(),

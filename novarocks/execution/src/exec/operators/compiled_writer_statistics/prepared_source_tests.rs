@@ -148,17 +148,28 @@ fn plan_tree_prepared_partial_and_last_independent_schema_keep_actual_creation()
     let mut operator = create(&source);
     operator.prepare().unwrap();
     operator.bind_runtime_state(&source.state).unwrap();
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .set_finishing(&source.state)
-        .unwrap();
-    let output = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&source.state)
-        .unwrap()
-        .unwrap();
+    let error = source.state.error_state();
+    let mut work = crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+    let mut ctx = StepContext::new(&error, &mut work);
+    let step = operator.as_mut();
+    assert!(matches!(step.initial_step(), NextStep::NeedInput));
+    step.finish(&mut ctx).unwrap();
+    let paused = step.drive(&mut ctx).unwrap();
+    assert!(paused.output.is_none());
+    assert!(matches!(paused.next, NextStep::Yield));
+    ctx.work().begin_turn(8).unwrap();
+    let completed = step.drive(&mut ctx).unwrap();
+    assert!(matches!(completed.next, NextStep::Finished));
+    let output = completed
+        .output
+        .expect("empty-input intermediate state row");
+    step.finish(&mut ctx).unwrap();
+    let repeated = step.drive(&mut ctx).unwrap();
+    assert!(
+        repeated.output.is_none(),
+        "EOS cannot duplicate the state row"
+    );
+    assert!(matches!(repeated.next, NextStep::Finished));
     assert_eq!(output.len(), 1, "original partial empty-input state row");
     assert_eq!(output.columns().len(), 2, "original c1/c2 Theta channels");
     for (array, call) in output.columns().iter().zip(source.calls.calls()) {
@@ -268,8 +279,12 @@ fn plan_tree_prepared_partial_preserves_first_memory_and_original_caller_without
         .factory
         .begin_compiled_layout_construction(&source.output)
         .unwrap();
-    let original = ExecutionFailure::from("original writer preparation stop".to_owned())
-        .at_operator(2, crate::runtime::fragment::PipelineOperation::Admission);
+    let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new(
+            &("original writer preparation stop".to_owned()),
+        ),
+    ))
+    .at_operator(2, crate::runtime::fragment::PipelineOperation::Admission);
     source.state.error_state().set_error(original.clone());
     let before = source.tracker.allocated();
     let failure = CompiledWriterPartialFactory::create_prepared_in(

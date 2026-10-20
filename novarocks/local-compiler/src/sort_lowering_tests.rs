@@ -435,7 +435,7 @@ fn global_sort_component_success_and_missing_key_every_actual_control_prefix() {
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 let error = component(&package, &control, missing).unwrap_err();
                 assert!(is_control(&error, cause));
                 assert_eq!(control.trace(), trace[..at]);
@@ -455,7 +455,7 @@ fn global_sort_public_compilation_all_actual_first_causes_and_wide_key_quantum()
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             let error = compile(package.clone(), &control).unwrap_err();
             assert!(is_control(&error, cause));
             assert_eq!(control.trace(), trace[..at]);
@@ -478,7 +478,7 @@ fn global_sort_public_compilation_all_actual_first_causes_and_wide_key_quantum()
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(is_control(
                 &component(&wide, &control, false).unwrap_err(),
                 cause

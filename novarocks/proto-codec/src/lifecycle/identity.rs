@@ -76,7 +76,7 @@ mod tests {
             ..Default::default()
         })
         .expect_err("query id is required");
-        assert_eq!(missing_query_id.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(missing_query_id.kind(), &ProtocolErrorKind::MissingField);
         assert_eq!(
             missing_query_id.path().to_string(),
             "query_execution_id.query_id"

@@ -773,6 +773,8 @@ mod statement_observation_tests {
             execution_id,
             error_source: None,
             primary_error: None,
+            failure: None,
+            worker_contexts_converged: false,
             runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                 RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
             ),
@@ -1236,6 +1238,8 @@ mod session_owner_tests {
                 execution_id,
                 error_source: None,
                 primary_error: None,
+                failure: None,
+                worker_contexts_converged: false,
                 runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 ),

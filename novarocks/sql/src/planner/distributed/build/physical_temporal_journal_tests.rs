@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        match self.refuse {
+        match self.refuse.clone() {
             Some((at, cause)) if at == trace.len() => Err(cause),
             _ => Ok(()),
         }
@@ -233,7 +233,7 @@ fn actual_emitted_journal_author_preserves_each_compile_cause_at_every_checkpoin
             ] {
                 let control = Control {
                     trace: Mutex::new(vec![]),
-                    refuse: Some((at, cause)),
+                    refuse: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(author_physical_occurrences_from_journal_observed(&owner,fragment,&control),Err(ExpressionOccurrenceError::Control(actual)) if actual==cause)

@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Immutable actual v1 SHA2 carrier, NULL, selector and admission-order baselines.
+use super::legacy_array_append_baseline_tests::{
+    assert_frozen_target as assert_expression_contract, assert_original_arrow,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::{FunctionKind, encryption::eval_encryption_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
@@ -26,6 +29,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::SlotId;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -37,7 +41,11 @@ fn strings(v: Vec<Option<&str>>) -> ArrayRef {
 fn bits(v: Vec<Option<i64>>) -> ArrayRef {
     Arc::new(Int64Array::from(v))
 }
-fn raw(input: ArrayRef, length: ArrayRef, target: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    input: ArrayRef,
+    length: ArrayRef,
+    target: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ids = [SlotId::new(1), SlotId::new(2)];
     let types = [input.data_type().clone(), length.data_type().clone()];
     let batch = RecordBatch::try_new(
@@ -165,19 +173,19 @@ fn legacy_sha2_extra_raw_byte_carriers_and_original_int32_bigint_projection() {
 fn legacy_sha2_reader_error_order_full_text_precedes_null_mask() {
     let bad = Arc::new(Int64Array::from(vec![None])) as ArrayRef;
     assert_eq!(
-        raw(bad, strings(vec![None]), None).unwrap_err(),
+        (raw(bad, strings(vec![None]), None).unwrap_err()).to_string(),
         "sha2: arg0 must be VARCHAR or VARBINARY"
     );
     // Compare the exact original Arrow cast diagnostic, including its full carrier detail.
     let wrong = Arc::new(BinaryArray::from(vec![None::<&[u8]>])) as ArrayRef;
     let expected = arrow::compute::cast(&wrong, &DataType::Int64).unwrap_err();
     assert_eq!(
-        raw(strings(vec![None]), wrong, None).unwrap_err(),
+        (raw(strings(vec![None]), wrong, None).unwrap_err()).to_string(),
         format!("sha2: failed to cast arg1 to BIGINT: {expected}")
     );
 }
 #[test]
-fn legacy_sha2_index_panic_precedes_absent_child_and_long_stream_has_original_digest() {
+fn legacy_sha2_prepared_arity_precedes_absent_child_and_long_stream_has_original_digest() {
     let mut arena = ExprArena::default();
     let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
     let schema =
@@ -187,16 +195,8 @@ fn legacy_sha2_index_panic_precedes_absent_child_and_long_stream_has_original_di
         ExprNode::Literal(crate::exec::expr::LiteralValue::Null),
         DataType::Utf8,
     );
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| eval_encryption_function(
-            "sha2",
-            &arena,
-            expr,
-            &[],
-            &chunk
-        )))
-        .is_err()
-    );
+    let error = eval_encryption_function("sha2", &arena, expr, &[], &chunk).unwrap_err();
+    assert_expression_contract(&error);
     let long = "é中\0".repeat(200);
     // Independently frozen Python hashlib SHA256, not the production helper.
     assert_eq!(

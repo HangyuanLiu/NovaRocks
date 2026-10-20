@@ -51,7 +51,7 @@ fn percentile_hash_core_original_long_error_has_no_success_footer() {
     .unwrap()
     .unwrap_err();
     assert_eq!(
-        error,
+        error.to_string(),
         "percentile_hash: unsupported numeric input type Utf8"
     );
     assert_eq!(trace, vec![Observation::ReadBoundary]);

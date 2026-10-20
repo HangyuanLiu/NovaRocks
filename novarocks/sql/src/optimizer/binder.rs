@@ -696,7 +696,11 @@ mod tests {
                         && units < novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK
                 }
             };
-            if stop { Err(self.error) } else { Ok(()) }
+            if stop {
+                Err(self.error.clone())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -754,7 +758,7 @@ mod tests {
         let [left, right] = memo.groups[root].logical_exprs[0].children.as_slice() else {
             panic!("binary root")
         };
-        let control = Control::new(control_errors()[0], Stop::Never);
+        let control = Control::new(control_errors()[0].clone(), Stop::Never);
         let bindings = bind(&pattern, &memo, root, 0, &control).expect("bindings");
         assert_eq!(bindings.len(), 320);
         for (index, binding) in bindings.iter().enumerate() {
@@ -806,10 +810,10 @@ mod tests {
                 (&Pattern::Leaf, 999),
                 (&nonmatching, root),
             ] {
-                let control = Control::new(error, Stop::Entry);
+                let control = Control::new(error.clone(), Stop::Entry);
                 assert_eq!(
                     bind(pattern, &memo, group, 0, &control).unwrap_err(),
-                    SqlCompileError::from(error)
+                    SqlCompileError::from(error.clone())
                 );
                 assert_eq!(*control.observations.lock().unwrap(), vec![0]);
             }
@@ -824,10 +828,10 @@ mod tests {
             // units reaches real cartesian copies after both child groups were
             // matched. Neither stop can escape as an empty/partial match set.
             for limit in [256, 1024] {
-                let control = Control::new(error, Stop::AtUnits(limit));
+                let control = Control::new(error.clone(), Stop::AtUnits(limit));
                 assert_eq!(
                     bind(&pattern, &memo, root, 0, &control).unwrap_err(),
-                    SqlCompileError::from(error)
+                    SqlCompileError::from(error.clone())
                 );
                 let observed = control.observations.lock().unwrap();
                 assert_eq!(observed[0], 0);
@@ -841,7 +845,7 @@ mod tests {
     fn binding_finish_failure_discards_real_matches_and_stays_typed() {
         let (memo, root, pattern) = cartesian_fixture(16, 20);
         for error in control_errors() {
-            let control = Control::new(error, Stop::Finish);
+            let control = Control::new(error.clone(), Stop::Finish);
             assert_eq!(
                 bind(&pattern, &memo, root, 0, &control).unwrap_err(),
                 SqlCompileError::from(error)

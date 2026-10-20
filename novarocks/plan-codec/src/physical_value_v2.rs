@@ -121,12 +121,12 @@ impl fmt::Display for ValueCodecError {
 impl std::error::Error for ValueCodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Control(e) => Some(e),
-            Self::Payload(e) => Some(e),
-            Self::Type(e) => Some(e),
-            Self::Origin(e) => Some(e),
-            Self::Index(e) => Some(e),
-            Self::InvalidShape(_) => None,
+            Self::Control(source) => Some(source),
+            Self::Payload(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Origin(source) => Some(source),
+            Self::Index(source) => Some(source),
+            _ => None,
         }
     }
 }

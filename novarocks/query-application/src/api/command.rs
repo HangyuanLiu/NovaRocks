@@ -162,10 +162,8 @@ impl CommandError {
         failure.compile_control = Some(error);
         failure
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 
     pub const fn kind(&self) -> CommandErrorKind {
@@ -185,7 +183,13 @@ impl fmt::Display for CommandError {
     }
 }
 
-impl Error for CommandError {}
+impl Error for CommandError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.compile_control
+            .as_ref()
+            .map(|cause| cause as &dyn Error)
+    }
+}
 
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
     fn execute(
@@ -431,9 +435,9 @@ mod compile_control_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let error = CommandError::from_compile_control(control);
-            assert_eq!(error.compile_control_error(), Some(control));
-            assert_eq!(error.clone().compile_control_error(), Some(control));
+            let error = CommandError::from_compile_control(control.clone());
+            assert_eq!(error.compile_control_error(), Some(control.clone()));
+            assert_eq!(error.clone().compile_control_error(), Some(control.clone()));
             assert_eq!(
                 CommandError::from(control.to_string()).compile_control_error(),
                 None

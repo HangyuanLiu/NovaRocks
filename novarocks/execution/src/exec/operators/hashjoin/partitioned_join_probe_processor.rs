@@ -27,9 +27,9 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::hash_join_probe_core::{HashJoinProbeCore, join_type_str};
@@ -38,8 +38,14 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
 use crate::exec::pipeline::dependency::DependencyHandle;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputConstructionFactory, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    shape::{Transform, TransformKernel},
+    step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
+    step_context::StepContext,
+};
 use crate::runtime::runtime_state::RuntimeState;
 use tracing::debug;
 
@@ -57,7 +63,6 @@ pub struct PartitionedJoinProbeProcessorFactory {
     right_chunk_schema: ChunkSchemaRef,
     join_scope_chunk_schema: ChunkSchemaRef,
     state: Arc<PartitionedJoinSharedState>,
-    max_buffered_probe_chunks: usize,
 }
 
 impl PartitionedJoinProbeProcessorFactory {
@@ -74,7 +79,7 @@ impl PartitionedJoinProbeProcessorFactory {
         join_scope_chunk_schema: ChunkSchemaRef,
         state: Arc<PartitionedJoinSharedState>,
     ) -> Self {
-        let mut factory = Self::new_in_mode(
+        Self::new_in_mode(
             arena,
             join_type,
             probe_keys,
@@ -85,17 +90,7 @@ impl PartitionedJoinProbeProcessorFactory {
             right_chunk_schema,
             join_scope_chunk_schema,
             state,
-        );
-        factory.max_buffered_probe_chunks = 1;
-        factory
-    }
-
-    pub(crate) fn with_max_buffered_probe_chunks(
-        mut self,
-        max_buffered_probe_chunks: usize,
-    ) -> Self {
-        self.max_buffered_probe_chunks = max_buffered_probe_chunks.max(1);
-        self
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -125,7 +120,6 @@ impl PartitionedJoinProbeProcessorFactory {
             right_chunk_schema,
             join_scope_chunk_schema,
             state,
-            max_buffered_probe_chunks: 1,
         }
     }
 }
@@ -145,19 +139,13 @@ impl OperatorFactory for PartitionedJoinProbeProcessorFactory {
             join_type_str(self.join_type),
             self.probe_keys.len()
         );
-        Box::new(PartitionedJoinProbeProcessorOperator {
+        Box::new(Transform::hydrating(PartitionedJoinProbeProcessorKernel {
             name: self.name.clone(),
             node_id: self.node_id,
             driver_id,
             state: Arc::clone(&self.state),
             partition,
             dep: self.state.dep_handle(partition),
-            max_buffered_probe_chunks: self.max_buffered_probe_chunks,
-            buffered: VecDeque::new(),
-            pending_output: None,
-            finishing: false,
-            finishing_done: false,
-            finished: false,
             core: HashJoinProbeCore::new_native(
                 Arc::clone(&self.arena),
                 self.join_type,
@@ -173,53 +161,29 @@ impl OperatorFactory for PartitionedJoinProbeProcessorFactory {
             input_rows: 0,
             input_chunks: 0,
             profile_initialized: false,
+            finalizing: false,
             profiles: None,
-            evaluation_arena: Arc::clone(&self.arena),
-            construction: None,
-            evaluation_control: None,
-        })
+        }))
     }
 }
 
-struct PartitionedJoinProbeProcessorOperator {
-    evaluation_arena: Arc<ExprArena>,
-    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
-    evaluation_control: Option<super::super::compiled_expression::RuntimeKernelControl>,
+struct PartitionedJoinProbeProcessorKernel {
     name: String,
     node_id: i32,
     driver_id: i32,
     state: Arc<PartitionedJoinSharedState>,
     partition: usize,
     dep: DependencyHandle,
-    max_buffered_probe_chunks: usize,
-    buffered: VecDeque<Chunk>,
-    pending_output: Option<Chunk>,
-    finishing: bool,
-    finishing_done: bool,
-    finished: bool,
     core: HashJoinProbeCore,
     buffered_rows: u64,
     input_rows: u64,
     input_chunks: u64,
     profile_initialized: bool,
+    finalizing: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
 }
 
-impl Operator for PartitionedJoinProbeProcessorOperator {
-    fn creates_typed_storage(&self) -> bool {
-        true
-    }
-    fn set_construction_factory(
-        &mut self,
-        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-    ) {
-        self.construction = Some(factory);
-    }
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        self.evaluation_control =
-            Some(super::super::compiled_expression::RuntimeKernelControl::new(state.error_state()));
-        Ok(())
-    }
+impl OperatorLifecycle for PartitionedJoinProbeProcessorKernel {
     fn name(&self) -> &str {
         &self.name
     }
@@ -228,142 +192,111 @@ impl Operator for PartitionedJoinProbeProcessorOperator {
         self.profiles = Some(profiles);
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn creates_typed_storage(&self) -> bool {
+        true
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.core.set_construction_factory(factory);
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.core.release_owned();
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
+    }
+    fn cancel(&mut self) {
+        self.core.release_owned();
+    }
+    fn on_driver_failure(&mut self) {
+        self.core.release_owned();
     }
 }
-
-impl ProcessorOperator for PartitionedJoinProbeProcessorOperator {
-    fn need_input(&self) -> bool {
-        if self.finishing
-            || self.finished
-            || self.pending_output.is_some()
-            || self.core.has_pending_output()
-        {
-            return false;
-        }
-        if self.core.is_build_loaded() || self.state.is_partition_ready(self.partition) {
-            return true;
-        }
-        self.buffered.len() < self.max_buffered_probe_chunks
-    }
-
-    fn has_output(&self) -> bool {
-        if self.pending_output.is_some() {
-            return true;
-        }
-        if self.core.has_pending_output() {
-            return true;
-        }
-        if !self.finishing
-            && !self.buffered.is_empty()
-            && (self.core.is_build_loaded() || self.state.is_partition_ready(self.partition))
-        {
-            return true;
-        }
-        self.finishing
-            && !self.finishing_done
-            && (self.core.is_build_loaded() || self.state.is_partition_ready(self.partition))
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.init_profile_if_needed();
-        if self.finishing {
-            return Err("partitioned join probe received input after set_finishing"
-                .to_string()
-                .into());
-        }
-        if self.pending_output.is_some() {
-            return Err(
-                "partitioned join probe received input while output buffer is full"
-                    .to_string()
-                    .into(),
-            );
-        }
-        if !self.core.is_build_loaded() && !self.state.is_partition_ready(self.partition) {
-            if self.buffered.len() >= self.max_buffered_probe_chunks {
-                return Err("partitioned join probe buffer is full".to_string().into());
-            }
-            if !chunk.is_empty() {
-                self.buffered_rows = self.buffered_rows.saturating_add(chunk.len() as u64);
-            }
-            self.buffered.push_back(chunk);
-            return Ok(());
-        }
-        if !self.core.is_build_loaded() {
-            self.load_build_side()?;
-        }
-        if !chunk.is_empty() {
-            self.input_rows = self.input_rows.saturating_add(chunk.len() as u64);
-            self.input_chunks = self.input_chunks.saturating_add(1);
-        }
-        let out = self.process_one(chunk)?;
-        self.pending_output = out;
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.pending_output.is_none() {
-            if self.core.has_pending_output() {
-                self.pending_output = self.core.pop_pending_output()?;
-            } else if !self.finishing
-                && !self.buffered.is_empty()
-                && (self.core.is_build_loaded() || self.state.is_partition_ready(self.partition))
-            {
-                if !self.core.is_build_loaded() {
-                    self.load_build_side()?;
-                }
-                let out = self.join_buffered(false)?;
-                self.pending_output = out;
-            } else if self.finishing && !self.finishing_done {
-                let out = self.finish_one()?;
-                self.pending_output = out;
-                self.finishing_done = true;
-            }
-        }
-        let out = self.pending_output.take();
-        if self.finishing
-            && self.finishing_done
-            && self.pending_output.is_none()
-            && !self.core.has_pending_output()
-        {
-            self.finished = true;
-        }
-        Ok(out)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.init_profile_if_needed();
-        self.finishing = true;
-        Ok(())
-    }
-
-    fn precondition_dependency(
+impl InputEncodingPolicy for PartitionedJoinProbeProcessorKernel {}
+impl TransformKernel for PartitionedJoinProbeProcessorKernel {
+    fn admission(
         &self,
-    ) -> Option<crate::exec::pipeline::dependency::DependencyHandle> {
-        if self.core.is_build_loaded() || self.state.is_partition_ready(self.partition) {
-            None
-        } else {
-            Some(self.dep.clone())
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        Ok(self.build_wait().map(AdmissionNext::Wait))
+    }
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        self.init_profile_if_needed();
+        let result = (|| {
+            self.load_build_side()?;
+            if !chunk.is_empty() {
+                self.input_rows = self.input_rows.saturating_add(
+                    u64::try_from(chunk.len()).expect("supported row count fits u64"),
+                );
+                self.input_chunks = self.input_chunks.saturating_add(1);
+            }
+            self.core.accept_probe(ctx, chunk)
+        })();
+        self.complete_step(ctx, result)
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.finalizing {
+            return self.advance_finalization(ctx);
         }
+        let result = self.core.drive_probe(ctx);
+        if result.is_err() {
+            self.core.release_owned();
+        }
+        result
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        self.finalizing = true;
+        self.advance_finalization(ctx)
     }
 }
 
-impl PartitionedJoinProbeProcessorOperator {
+impl PartitionedJoinProbeProcessorKernel {
+    // EOS is signalled once by the shape. Build readiness can arrive later;
+    // that wake must resume this same finalization instead of requesting input.
+    fn advance_finalization(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(wait) = self.build_wait() {
+            return Ok(StepResult::new(None, NextStep::Wait(wait), 0));
+        }
+        self.init_profile_if_needed();
+        let result = self
+            .finish_one()
+            .map(|output| StepResult::new(output, NextStep::Finished, 0))
+            .map_err(Into::into);
+        let step = self.complete_step(ctx, result)?;
+        self.core.release_owned();
+        Ok(step)
+    }
+
+    fn build_wait(&self) -> Option<WaitFact> {
+        let observable = self.dep.observable();
+        let observed_generation = observable.generation();
+        if self.core.is_build_loaded() || self.state.is_partition_ready(self.partition) {
+            return None;
+        }
+        Some(WaitFact {
+            reason: WaitReason::Dependency,
+            observable,
+            observed_generation,
+            deadline: None,
+        })
+    }
+    fn complete_step(
+        &mut self,
+        ctx: &StepContext<'_>,
+        result: ExecutionResult<StepResult>,
+    ) -> ExecutionResult<StepResult> {
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+            self.core.release_owned();
+        }
+        result
+    }
     fn init_profile_if_needed(&mut self) {
         if self.profile_initialized {
             return;
@@ -390,83 +323,28 @@ fn parse_join_node_id_from_dep_key(dep_key: &str) -> i32 {
     node_id_str.parse::<i32>().unwrap_or(-1)
 }
 
-impl PartitionedJoinProbeProcessorOperator {
-    fn join_probe_chunks_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
-        let arena = &self.evaluation_arena;
-        let factory = &self.construction;
-        let control = &self.evaluation_control;
-        self.core.join_probe_chunks_evaluated(
-            chunks,
-            factory
-                .as_deref()
-                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
-            &mut |expr, input| {
-                let owner = factory
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
-                    .begin_input_construction(input)?;
-                let control = control
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
-                    .eval(expr, input)
-            },
-        )
-    }
-
-    fn finish_core_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
-        let arena = &self.evaluation_arena;
-        let factory = &self.construction;
-        let control = &self.evaluation_control;
-        self.core.finish_evaluated(
-            chunks,
-            None,
-            factory
-                .as_deref()
-                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
-            &mut |expr, input| {
-                let owner = factory
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
-                    .begin_input_construction(input)?;
-                let control = control
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
-                    .eval(expr, input)
-            },
-        )
-    }
-
-    fn process_one(&mut self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
-        let probe_chunks = self.collect_probe_chunks(Some(chunk), false);
-        self.join_probe_chunks_created(probe_chunks)
-    }
-
-    fn finish_one(&mut self) -> ExecutionResult<Option<Chunk>> {
-        if !self.core.is_build_loaded() {
-            self.load_build_side()?;
-        }
-        let probe_chunks = self.collect_probe_chunks(None, true);
-        let out = self.finish_core_created(probe_chunks)?;
+impl PartitionedJoinProbeProcessorKernel {
+    fn finish_one(&mut self) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+        self.load_build_side()?;
+        let output = self.core.finish_from_probe_output(None, None, true)?;
         self.log_stats();
-        Ok(out)
+        Ok(output)
     }
 
-    fn load_build_side(&mut self) -> Result<(), String> {
+    fn load_build_side(&mut self) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if self.core.is_build_loaded() {
             return Ok(());
         }
         if self.partition >= self.state.partition_count() {
-            return Err("join probe partition out of bounds".to_string());
+            return Err(super::build_state::build_contract(
+                "join probe partition out of bounds",
+            ));
         }
 
-        let Some(artifact) = self
-            .state
-            .take_build_partition(self.partition)
-            .map_err(|e| e.to_string())?
-        else {
-            return Err("partitioned join build not ready".to_string());
+        let Some(artifact) = self.state.take_build_partition(self.partition)? else {
+            return Err(super::build_state::build_contract(
+                "partitioned join build not ready",
+            ));
         };
 
         let global_rows = self.state.global_build_row_count();
@@ -503,88 +381,11 @@ impl PartitionedJoinProbeProcessorOperator {
             self.core.residual_group_rows_total()
         );
     }
-
-    fn join_buffered(&mut self, drain_all: bool) -> ExecutionResult<Option<Chunk>> {
-        let probe_chunks = self.collect_probe_chunks(None, drain_all);
-        self.join_probe_chunks_created(probe_chunks)
-    }
-
-    fn collect_probe_chunks(&mut self, chunk: Option<Chunk>, drain_all: bool) -> Vec<Chunk> {
-        let mut probe_chunks = Vec::new();
-        if let Some(chunk) = chunk {
-            if !chunk.is_empty() {
-                self.buffered_rows = self.buffered_rows.saturating_add(chunk.len() as u64);
-                self.buffered.push_back(chunk);
-            }
-            if let Some(buffered) = self.buffered.pop_front()
-                && !buffered.is_empty()
-            {
-                self.buffered_rows = self.buffered_rows.saturating_sub(buffered.len() as u64);
-                probe_chunks.push(buffered);
-            }
-        } else if drain_all {
-            while let Some(buffered) = self.buffered.pop_front() {
-                if !buffered.is_empty() {
-                    self.buffered_rows = self.buffered_rows.saturating_sub(buffered.len() as u64);
-                    probe_chunks.push(buffered);
-                }
-            }
-        } else if let Some(buffered) = self.buffered.pop_front()
-            && !buffered.is_empty()
-        {
-            self.buffered_rows = self.buffered_rows.saturating_sub(buffered.len() as u64);
-            probe_chunks.push(buffered);
-        }
-        probe_chunks
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    fn partition_declared_keys(
-        input: &Chunk,
-        expressions: &[crate::exec::expr::ExprId],
-        arena: &ExprArena,
-        partitions: usize,
-        crc: bool,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
-        let runtime = RuntimeState::default();
-        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            crate::runtime::mem_tracker::MemTracker::new_root("join fixture partition evaluation"),
-            runtime.error_state(),
-        ).unwrap();
-        let owner = factory.begin_input_construction(input)?;
-        let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
-            runtime.error_state(),
-        );
-        let evaluation =
-            crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), &control);
-        crate::exec::operators::data_stream_sink::partition_chunk_by_hash_created(
-            input,
-            expressions,
-            &evaluation,
-            partitions,
-            crc,
-            factory.as_ref(),
-            &control,
-        )
-    }
-
-    fn install_evaluation_runtime(
-        operator: &mut dyn crate::exec::pipeline::operator::Operator,
-        runtime: &RuntimeState,
-    ) {
-        operator.set_construction_factory(
-            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-                crate::runtime::mem_tracker::MemTracker::new_root("hash probe evaluation construction"),
-                runtime.error_state(),
-            ).unwrap(),
-        );
-        operator.bind_runtime_state(runtime).unwrap();
-    }
-
+    use crate::exec::pipeline::operator::Operator;
     use std::sync::Arc;
 
     use arrow::array::{Array, Int32Array};
@@ -599,8 +400,14 @@ mod tests {
     use crate::exec::operators::hashjoin::build_state::JoinBuildSinkState;
     use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSharedState;
     use crate::exec::pipeline::dependency::DependencyManager;
-    use crate::exec::pipeline::operator::ProcessorOperator;
+
     use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::exec::pipeline::{
+        input::{PreparedInput, RawInput},
+        shape::{Transform, TransformKernel},
+        step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
+        step_context::StepContext,
+    };
     use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
 
@@ -675,25 +482,71 @@ mod tests {
         .expect("actual declared join fixture schema")
     }
 
-    fn push_expect_consumed(op: &mut dyn ProcessorOperator, rt: &RuntimeState, chunk: Chunk) {
-        match op.push_chunk(rt, chunk) {
-            Ok(()) => {}
-            Err(err) => panic!("unexpected error: {:?}", err),
+    fn accept_probe_input(op: &mut dyn Operator, rt: &RuntimeState, chunk: Chunk) {
+        match op.try_push_for_test(rt, crate::exec::pipeline::input::RawInput::for_test(chunk)) {
+            crate::exec::pipeline::step::InputResult::Accepted(result) => {
+                assert!(result.expect("accepted input").output.is_none())
+            }
+            _ => panic!("fixture probe input is admissible"),
         }
+    }
+    fn drain_probe_work(
+        op: &mut dyn Operator,
+        rt: &RuntimeState,
+        mut visit: impl FnMut(Chunk),
+    ) -> NextStep {
+        let control = rt.error_state();
+        let mut turn =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        for _ in 0..100_000 {
+            let step = op
+                .drive(&mut StepContext::new(&control, &mut turn))
+                .expect("finite join fixture step");
+            if let Some(output) = step.output {
+                visit(output);
+            }
+            match step.next {
+                next @ (NextStep::NeedInput | NextStep::Finished) => return next,
+                NextStep::Yield => turn.begin_turn(64).unwrap(),
+                NextStep::Runnable => {}
+                NextStep::Wait(wait) => {
+                    panic!("the fixture built every partition before probing: {wait:?}")
+                }
+            }
+        }
+        panic!("finite join fixture exceeded its step bound");
+    }
+    fn push_build_input(op: &mut dyn Operator, rt: &RuntimeState, chunk: Chunk) {
+        accept_probe_input(op, rt, chunk);
+        assert!(matches!(
+            drain_probe_work(op, rt, |_| panic!("build has no output edge")),
+            NextStep::NeedInput
+        ));
+    }
+    fn finish_build(op: &mut dyn Operator, rt: &RuntimeState) {
+        op.finish_for_test(rt).expect("build EOS");
+        assert!(matches!(
+            drain_probe_work(op, rt, |_| panic!("build has no output edge")),
+            NextStep::Finished
+        ));
     }
 
     fn chunk_of(values: &[i32], k_slot_id: SlotId) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        crate::exec::chunk::typed_fixture::chunk(
-            batch,
-            &[k_slot_id],
-            &[novarocks_type_contract::FunctionValueType::new(
-                DataType::Int32,
-                false,
-            )],
-        )
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[k_slot_id],
+            )
+            .expect("chunk schema");
+            super::super::probe_step_test_support::int32_source(Chunk::new_with_chunk_schema(
+                batch,
+                chunk_schema,
+            ))
+        }
     }
 
     fn chunk_of_two(
@@ -711,14 +564,18 @@ mod tests {
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        crate::exec::chunk::typed_fixture::chunk(
-            batch,
-            &[k_slot_id, v_slot_id],
-            &[
-                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-            ],
-        )
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[k_slot_id, v_slot_id],
+            )
+            .expect("chunk schema");
+            super::super::probe_step_test_support::int32_source(Chunk::new_with_chunk_schema(
+                batch,
+                chunk_schema,
+            ))
+        }
     }
 
     fn chunk_of_two_nullable(
@@ -736,14 +593,18 @@ mod tests {
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        crate::exec::chunk::typed_fixture::chunk(
-            batch,
-            &[k_slot_id, v_slot_id],
-            &[
-                novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
-                novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
-            ],
-        )
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[k_slot_id, v_slot_id],
+            )
+            .expect("chunk schema");
+            super::super::probe_step_test_support::int32_source(Chunk::new_with_chunk_schema(
+                batch,
+                chunk_schema,
+            ))
+        }
     }
 
     fn append_quads(chunk: Chunk, out: &mut Vec<(i32, i32, i32, i32)>) {
@@ -876,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_join_buffers_probe_chunks_until_build_ready() {
+    fn partitioned_join_defers_original_probe_until_build_ready() {
         let rt = RuntimeState::default();
         let mut arena = ExprArena::default();
         let build_key = arena.push_typed(ExprNode::SlotId(RIGHT_K_SLOT_ID), DataType::Int32);
@@ -914,55 +775,93 @@ mod tests {
             None,
             true,
             true,
-            chunk_schema_of(&left_schema, &LEFT_K_SLOT_IDS),
-            chunk_schema_of(&right_schema, &RIGHT_K_SLOT_IDS),
-            chunk_schema_of(&join_scope_schema, &JOIN_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&left_schema, &LEFT_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&right_schema, &RIGHT_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(
+                &join_scope_schema,
+                &JOIN_K_SLOT_IDS,
+            ),
             Arc::clone(&join_state),
-        )
-        .with_max_buffered_probe_chunks(2);
+        );
 
         let mut build = build_factory.create(1, 0);
-        install_evaluation_runtime(build.as_mut(), &rt);
+        super::super::probe_step_test_support::install(build.as_mut(), &rt);
         let mut probe = probe_factory.create(1, 0);
-        install_evaluation_runtime(probe.as_mut(), &rt);
-
-        let probe_proc = probe.as_processor_mut().expect("probe processor");
-        assert!(probe_proc.need_input());
-        let dep = probe_proc
-            .precondition_dependency()
-            .expect("build dependency");
-        let probe_chunk_1 = chunk_of(&[1, 2], LEFT_K_SLOT_ID);
-        let probe_chunk_2 = chunk_of(&[3, 4], LEFT_K_SLOT_ID);
-
-        assert!(!dep.is_ready());
-        assert!(probe_proc.need_input());
-        push_expect_consumed(probe_proc, &rt, probe_chunk_1);
-        push_expect_consumed(probe_proc, &rt, probe_chunk_2);
-
-        push_expect_consumed(
-            build.as_processor_mut().expect("build processor"),
+        let tracker = super::super::probe_step_test_support::install(probe.as_mut(), &rt);
+        use crate::exec::pipeline::{input::RawInput, step::InputResult, step_context::TurnWork};
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut work);
+        let step = probe.as_mut();
+        let first = chunk_of(&[1, 2], LEFT_K_SLOT_ID);
+        let original = first.columns()[0].clone();
+        let before = tracker.allocated();
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(wait),
+        } = step.try_push(&mut ctx, RawInput::for_test(first))
+        else {
+            panic!("unpublished partition must retain raw input at its edge");
+        };
+        assert!(Arc::ptr_eq(
+            &input.original_for_test().columns()[0],
+            &original
+        ));
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(same),
+        } = step.try_push(&mut ctx, input)
+        else {
+            panic!("same generation must keep waiting");
+        };
+        assert_eq!(same.observed_generation, wait.observed_generation);
+        assert!(Arc::ptr_eq(&same.observable, &wait.observable));
+        assert_eq!(tracker.allocated(), before, "no preparation while waiting");
+        push_build_input(
+            build.as_mut(),
             &rt,
             chunk_of(&[1, 2, 3, 4], RIGHT_K_SLOT_ID),
         );
-        build
-            .as_processor_mut()
-            .expect("build processor")
-            .set_finishing(&rt)
-            .expect("build finishing");
-
-        assert!(dep.is_ready());
-        probe_proc.set_finishing(&rt).expect("probe finishing");
-
-        let mut out_rows = 0usize;
-        loop {
-            match probe_proc.pull_chunk(&rt) {
-                Ok(Some(chunk)) => out_rows = out_rows.saturating_add(chunk.len()),
-                Ok(None) => break,
-                Err(e) => panic!("unexpected probe pull error: {e:?}"),
-            }
-        }
-
-        assert_eq!(out_rows, 4);
+        finish_build(build.as_mut(), &rt);
+        assert_ne!(wait.observable.generation(), wait.observed_generation);
+        assert!(matches!(
+            step.try_push(&mut ctx, input),
+            InputResult::Accepted(Ok(_))
+        ));
+        assert!(step.drive(&mut ctx).unwrap().output.is_none());
+        let first = step.drive(&mut ctx).unwrap();
+        assert!(matches!(first.next, NextStep::NeedInput));
+        let mut keys = first.output.unwrap().columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert!(matches!(
+            step.try_push(
+                &mut ctx,
+                RawInput::for_test(chunk_of(&[3, 4], LEFT_K_SLOT_ID))
+            ),
+            InputResult::Accepted(Ok(_))
+        ));
+        assert!(step.drive(&mut ctx).unwrap().output.is_none());
+        step.finish(&mut ctx).unwrap();
+        let last = step.drive(&mut ctx).unwrap();
+        assert!(matches!(last.next, NextStep::Runnable));
+        keys.extend_from_slice(
+            last.output.unwrap().columns()[0]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+        );
+        assert!(matches!(
+            step.drive(&mut ctx).unwrap().next,
+            NextStep::Finished
+        ));
+        assert!(step.drive(&mut ctx).unwrap().output.is_none());
+        assert_eq!(keys, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -1004,74 +903,80 @@ mod tests {
             None,
             true,
             true,
-            chunk_schema_of(&left_schema, &LEFT_K_SLOT_IDS),
-            chunk_schema_of(&right_schema, &RIGHT_K_SLOT_IDS),
-            chunk_schema_of(&join_scope_schema, &JOIN_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&left_schema, &LEFT_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&right_schema, &RIGHT_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(
+                &join_scope_schema,
+                &JOIN_K_SLOT_IDS,
+            ),
             Arc::clone(&join_state),
         );
 
         let row_count = 20_000usize;
         let values = (0..row_count as i32).collect::<Vec<_>>();
         let mut build = build_factory.create(1, 0);
-        install_evaluation_runtime(build.as_mut(), &rt);
+        super::super::probe_step_test_support::install(build.as_mut(), &rt);
         let mut probe = probe_factory.create(1, 0);
-        install_evaluation_runtime(probe.as_mut(), &rt);
-
-        {
-            let probe_proc = probe.as_processor_mut().expect("probe processor");
-            push_expect_consumed(probe_proc, &rt, chunk_of(&values, LEFT_K_SLOT_ID));
-        }
-
-        push_expect_consumed(
-            build.as_processor_mut().expect("build processor"),
-            &rt,
-            chunk_of(&values, RIGHT_K_SLOT_ID),
-        );
-        build
-            .as_processor_mut()
-            .expect("build processor")
-            .set_finishing(&rt)
-            .expect("build finishing");
-
-        let first_rows = {
-            let probe_proc = probe.as_processor_mut().expect("probe processor");
-            probe_proc.set_finishing(&rt).expect("probe finishing");
-            probe_proc
-                .pull_chunk(&rt)
-                .expect("first pull")
-                .expect("first output")
-                .len()
-        };
-        assert!(
-            first_rows < row_count,
-            "test must exercise core pending output batches"
-        );
-        assert!(
-            !probe.is_finished(),
-            "probe must not finish while core still has pending output"
-        );
-
-        let mut out_rows = first_rows;
-        loop {
-            let has_output = probe
-                .as_processor_ref()
-                .expect("probe processor")
-                .has_output();
-            if !has_output {
-                break;
-            }
-            if let Some(chunk) = probe
-                .as_processor_mut()
-                .expect("probe processor")
-                .pull_chunk(&rt)
-                .expect("probe pull")
-            {
-                out_rows = out_rows.saturating_add(chunk.len());
-            }
-        }
-
-        assert!(probe.is_finished());
-        assert_eq!(out_rows, row_count);
+        let tracker = super::super::probe_step_test_support::install(probe.as_mut(), &rt);
+        push_build_input(build.as_mut(), &rt, chunk_of(&values, RIGHT_K_SLOT_ID));
+        finish_build(build.as_mut(), &rt);
+        use crate::exec::pipeline::{input::RawInput, step::InputResult, step_context::TurnWork};
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
+        let mut ctx = StepContext::new(&control, &mut work);
+        let step = probe.as_mut();
+        assert!(matches!(
+            step.try_push(
+                &mut ctx,
+                RawInput::for_test(chunk_of(&values, LEFT_K_SLOT_ID))
+            ),
+            InputResult::Accepted(Ok(_))
+        ));
+        assert!(step.drive(&mut ctx).unwrap().output.is_none());
+        step.finish(&mut ctx).unwrap();
+        let before = tracker.allocated();
+        assert!(matches!(
+            step.drive(&mut ctx).unwrap().next,
+            NextStep::Yield
+        ));
+        assert_eq!(tracker.allocated(), before);
+        drop(ctx);
+        work.begin_turn(1).unwrap();
+        let mut ctx = StepContext::new(&control, &mut work);
+        let first = step.drive(&mut ctx).unwrap();
+        assert!(matches!(first.next, NextStep::Runnable));
+        let first = first.output.unwrap();
+        assert!(first.len() < row_count);
+        let before = tracker.allocated();
+        let yielded = step.drive(&mut ctx).unwrap();
+        assert!(yielded.output.is_none());
+        assert!(matches!(yielded.next, NextStep::Yield));
+        assert_eq!(tracker.allocated(), before);
+        drop(ctx);
+        work.begin_turn(1).unwrap();
+        let mut ctx = StepContext::new(&control, &mut work);
+        let last = step.drive(&mut ctx).unwrap();
+        assert!(matches!(last.next, NextStep::Runnable));
+        let last = last.output.unwrap();
+        assert_eq!(first.len() + last.len(), row_count);
+        let keys = [&first, &last]
+            .into_iter()
+            .flat_map(|chunk| {
+                chunk.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, values);
+        assert!(matches!(
+            step.drive(&mut ctx).unwrap().next,
+            NextStep::Finished
+        ));
+        assert!(step.drive(&mut ctx).unwrap().output.is_none());
     }
 
     #[test]
@@ -1113,32 +1018,46 @@ mod tests {
             None,
             true,
             true,
-            chunk_schema_of(&left_schema, &LEFT_K_SLOT_IDS),
-            chunk_schema_of(&right_schema, &RIGHT_K_SLOT_IDS),
-            chunk_schema_of(&join_scope_schema, &JOIN_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&left_schema, &LEFT_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&right_schema, &RIGHT_K_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(
+                &join_scope_schema,
+                &JOIN_K_SLOT_IDS,
+            ),
             Arc::clone(&join_state),
         );
 
         let build = chunk_of(&[1, 2, 4], RIGHT_K_SLOT_ID);
         let probe = chunk_of(&[2, 3, 4], LEFT_K_SLOT_ID);
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         // Build per partition.
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            if let Some(sink) = op.as_processor_mut() {
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            {
+                let sink = op.as_mut();
                 let c = build_part.clone();
                 if !c.is_empty() {
-                    push_expect_consumed(sink, &rt, c);
+                    push_build_input(sink, &rt, c);
                 }
-                sink.set_finishing(&rt).expect("build finish");
-            } else {
-                panic!("build operator missing processor");
+                finish_build(sink, &rt);
             }
         }
 
@@ -1146,57 +1065,51 @@ mod tests {
         let mut pairs = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
 
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    let left_arr = out
-                        .columns()
-                        .first()
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap();
-                    let right_arr = out
-                        .columns()
-                        .get(1)
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap();
-                    for i in 0..out.len() {
-                        pairs.push((left_arr.value(i), right_arr.value(i)));
-                    }
+            let proc = op.as_mut();
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                let left_arr = out
+                    .columns()
+                    .first()
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let right_arr = out
+                    .columns()
+                    .get(1)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                for i in 0..out.len() {
+                    pairs.push((left_arr.value(i), right_arr.value(i)));
                 }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    let left_arr = out
-                        .columns()
-                        .first()
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap();
-                    let right_arr = out
-                        .columns()
-                        .get(1)
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap();
-                    for i in 0..out.len() {
-                        pairs.push((left_arr.value(i), right_arr.value(i)));
-                    }
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                let left_arr = out
+                    .columns()
+                    .first()
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let right_arr = out
+                    .columns()
+                    .get(1)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                for i in 0..out.len() {
+                    pairs.push((left_arr.value(i), right_arr.value(i)));
                 }
-            }
+            });
         }
 
         pairs.sort();
@@ -1247,9 +1160,12 @@ mod tests {
             Some(residual),
             true,
             true,
-            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
-            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
-            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&left_schema, &LEFT_KV_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(&right_schema, &RIGHT_KV_SLOT_IDS),
+            super::super::probe_step_test_support::int32_schema(
+                &join_scope_schema,
+                &JOIN_KV_SLOT_IDS,
+            ),
             Arc::clone(&join_state),
         );
 
@@ -1262,46 +1178,50 @@ mod tests {
         );
         let probe = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[3, 9], LEFT_V_SLOT_ID, "v");
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_quads(out, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_quads(out, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_quads(out, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_quads(out, &mut rows);
+            });
         }
 
         rows.sort();
@@ -1369,46 +1289,50 @@ mod tests {
             "v",
         );
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
         }
 
         rows.sort();
@@ -1470,46 +1394,50 @@ mod tests {
             "v",
         );
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
         }
 
         rows.sort();
@@ -1565,46 +1493,50 @@ mod tests {
         let build = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 20], LEFT_V_SLOT_ID, "l");
         let probe = chunk_of_two(&[2, 3], RIGHT_K_SLOT_ID, &[200, 300], RIGHT_W_SLOT_ID, "r");
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_columns(out, 2, 3, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_columns(out, 2, 3, &mut rows);
+            });
         }
 
         rows.sort();
@@ -1659,45 +1591,49 @@ mod tests {
         let build = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 20], LEFT_V_SLOT_ID, "l");
         let probe = chunk_of_two(&[2, 3], RIGHT_K_SLOT_ID, &[200, 300], RIGHT_W_SLOT_ID, "r");
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, probe_part.clone());
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_slot_quad_rows(out, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_slot_quad_rows(out, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, probe_part.clone());
+            drain_probe_work(proc, &rt, |out| {
+                append_slot_quad_rows(out, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_slot_quad_rows(out, &mut rows);
+            });
         }
 
         rows.sort();
@@ -1768,46 +1704,50 @@ mod tests {
             "v",
         );
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_columns(out, 2, 3, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_columns(out, 2, 3, &mut rows);
+            });
         }
 
         rows.sort();
@@ -1867,46 +1807,50 @@ mod tests {
         let build = chunk_of_two(&[1, 1], RIGHT_K_SLOT_ID, &[5, 20], RIGHT_W_SLOT_ID, "w");
         let probe = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 7], LEFT_V_SLOT_ID, "v");
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
+            });
         }
 
         rows.sort();
@@ -1972,46 +1916,50 @@ mod tests {
             "v",
         );
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
+            });
         }
 
         rows.sort();
@@ -2067,46 +2015,50 @@ mod tests {
         let build = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 20], LEFT_V_SLOT_ID, "l");
         let probe = chunk_of_two(&[2, 3], RIGHT_K_SLOT_ID, &[200, 300], RIGHT_W_SLOT_ID, "r");
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_slots(out, RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_slots(out, RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_slots(out, RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pair_slots(out, RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID, &mut rows);
+            });
         }
 
         rows.sort();
@@ -2167,46 +2119,50 @@ mod tests {
             "v",
         );
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
         }
 
         // Only k=1 matches; NULL key should never match.
@@ -2280,46 +2236,50 @@ mod tests {
             "v",
         );
 
-        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
-            .expect("partition build");
-        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
-            .expect("partition probe");
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
-            let Some(sink) = op.as_processor_mut() else {
-                panic!("build operator missing processor");
-            };
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
+            let sink = op.as_mut();
             let c = build_part.clone();
             if !c.is_empty() {
-                push_expect_consumed(sink, &rt, c);
+                push_build_input(sink, &rt, c);
             }
-            sink.set_finishing(&rt).expect("build finish");
+            finish_build(sink, &rt);
         }
 
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            install_evaluation_runtime(op.as_mut(), &rt);
+            super::super::probe_step_test_support::install(op.as_mut(), &rt);
             let c = probe_part.clone();
-            let Some(proc) = op.as_processor_mut() else {
-                panic!("probe operator missing processor");
-            };
+            let proc = op.as_mut();
 
-            assert!(proc.need_input());
-            push_expect_consumed(proc, &rt, c);
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
-            proc.set_finishing(&rt).expect("probe finish");
-            while proc.has_output() {
-                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
-                }
-            }
+            assert!(matches!(proc.initial_step(), NextStep::NeedInput));
+            accept_probe_input(proc, &rt, c);
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
+            proc.finish_for_test(&rt).expect("probe finish");
+            drain_probe_work(proc, &rt, |out| {
+                append_pairs(out, &mut rows);
+            });
         }
 
         // Only the v=3 row satisfies v<w (3<5). NULL residual row is filtered out.

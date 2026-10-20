@@ -105,7 +105,7 @@ fn join_probe_owned_actual_sql_compiler_every_callback_preserves_three_causes() 
             let mut events = self.events.lock().unwrap();
             let at = events.len();
             events.push((phase, units));
-            if let Some((stop, cause)) = self.refusal {
+            if let Some((stop, cause)) = self.refusal.clone() {
                 if at == stop {
                     return Err(cause);
                 }
@@ -150,7 +150,7 @@ fn join_probe_owned_actual_sql_compiler_every_callback_preserves_three_causes() 
         ] {
             let control = Trace {
                 events: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(run(&control),Err(novarocks_local_compiler::FragmentCompileError::Control(actual)) if actual == cause)

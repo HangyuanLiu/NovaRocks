@@ -60,7 +60,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.fail {
+        match self.fail.clone() {
             Some((refusal, cause)) if at == refusal => Err(cause),
             _ => Ok(()),
         }
@@ -116,7 +116,7 @@ fn assert_prefixes(
 ) {
     for at in positions {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(verify_single_field_schema_message(bytes, expected, limits, options, &control), Err(TypeCodecError::Control(actual)) if actual == cause)
             );

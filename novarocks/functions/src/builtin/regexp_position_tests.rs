@@ -142,14 +142,20 @@ fn regexp_position_shared_legacy_keeps_raw_int32_null_and_full_error() {
         Regex::new(&long).unwrap_err()
     );
     assert!(expected.len() > 512);
-    assert_eq!(evaluate_legacy(&arrays, 1).unwrap_err(), expected);
+    let failure = evaluate_required(&arrays, 1).unwrap_err();
+    let original = super::super::string_failure::original_source::<regex::Error>(&failure);
+    assert_eq!(
+        format!("Invalid regex expression: {long}. Detail message: {original}"),
+        expected
+    );
+    assert!(failure.to_string().len() <= crate::MAX_ROW_ERROR_MESSAGE_BYTES);
     let arrays = vec![
         arrays[0].clone(),
         arrays[1].clone(),
         Arc::new(Int32Array::from(vec![-1])),
     ];
     assert_eq!(
-        evaluate_legacy(&arrays, 1).unwrap().to_data(),
+        evaluate_required(&arrays, 1).unwrap().to_data(),
         Int32Array::from(vec![-1]).to_data()
     );
 }

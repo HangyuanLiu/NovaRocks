@@ -26,7 +26,6 @@ use novarocks_type_contract::{
     ExpressionUseId, FunctionKind, FunctionValueType, PureCompileControl,
 };
 
-use crate::aggregate_kernel::finish_lifecycle;
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::{
     EvaluationCheckpoints, logical_is_null, validate_argument_observed, validate_type_observed,
@@ -417,8 +416,9 @@ impl<'evaluator, 'contract, 'input> LambdaBodyInvocation<'evaluator, 'contract, 
         } else {
             self.evaluator.evaluate(input, control)
         };
-        let result = finish_lifecycle(result, self.validate_metadata());
-        let output = finish_lifecycle(result, control.checkpoint(0))?;
+        let output = result?;
+        self.validate_metadata()?;
+        control.checkpoint(0)?;
         validate_body_output(input, &output, control)?;
         Ok(LambdaBodyOutput {
             contract: Arc::clone(&self.contract),

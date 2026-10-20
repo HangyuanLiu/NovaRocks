@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ fn eval_locate_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     haystack_arg: usize,
     start_arg: Option<usize>,
     fn_name: &str,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let haystack_arr = arena.eval(args[haystack_arg], chunk)?;
     let needle_arr = arena.eval(args[needle_arg], chunk)?;
     let start_raw = match start_arg {
@@ -37,11 +38,11 @@ fn eval_locate_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let haystack_arr = haystack_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("{fn_name} expects string"))?;
+        .ok_or_else(|| expression_contract(format_args!("{fn_name} expects string")))?;
     let needle_arr = needle_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("{fn_name} expects string"))?;
+        .ok_or_else(|| expression_contract(format_args!("{fn_name} expects string")))?;
     let start_arr = start_raw
         .as_ref()
         .map(|arr| super::common::downcast_int_arg_array(arr, fn_name))
@@ -53,28 +54,25 @@ fn eval_locate_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     }
 
     if haystack_arr.len() != 1 && haystack_arr.len() != rows {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "{fn_name} haystack length mismatch: {} vs {rows}",
             haystack_arr.len()
-        ))
-        .into());
+        )));
     }
     if needle_arr.len() != 1 && needle_arr.len() != rows {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "{fn_name} needle length mismatch: {} vs {rows}",
             needle_arr.len()
-        ))
-        .into());
+        )));
     }
     if let Some(start) = &start_arr
         && start.len() != 1
         && start.len() != rows
     {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "{fn_name} start position length mismatch: {} vs {rows}",
             start.len()
-        ))
-        .into());
+        )));
     }
 
     let mut out: Vec<Option<i32>> = Vec::with_capacity(rows);
@@ -141,11 +139,14 @@ pub fn eval_locate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     match args.len() {
-        2 => Ok((eval_locate_impl(arena, args, chunk, 0, 1, None, "locate"))?),
-        3 => Ok((eval_locate_impl(arena, args, chunk, 0, 1, Some(2), "locate"))?),
-        _ => Err((format!("locate expects 2 or 3 arguments, got {}", args.len())).into()),
+        2 => eval_locate_impl(arena, args, chunk, 0, 1, None, "locate"),
+        3 => eval_locate_impl(arena, args, chunk, 0, 1, Some(2), "locate"),
+        _ => Err(expression_contract(format_args!(
+            "locate expects 2 or 3 arguments, got {}",
+            args.len()
+        ))),
     }
 }
 
@@ -154,20 +155,30 @@ pub fn eval_instr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() != 2 {
-        return Err((format!("instr expects 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "instr expects 2 arguments, got {}",
+            args.len()
+        )));
     }
-    Ok((eval_locate_impl(arena, args, chunk, 1, 0, None, "instr"))?)
+    eval_locate_impl(arena, args, chunk, 1, 0, None, "instr")
 }
 
-fn resolve_row_index(len: usize, rows: usize, row: usize, arg_name: &str) -> Result<usize, String> {
+fn resolve_row_index(
+    len: usize,
+    rows: usize,
+    row: usize,
+    arg_name: &str,
+) -> ExecutionResult<usize> {
     if len == 1 {
         Ok(0)
     } else if len == rows {
         Ok(row)
     } else {
-        Err(format!("{arg_name} length mismatch: {len} vs {rows}"))
+        Err(expression_contract(format_args!(
+            "{arg_name} length mismatch: {len} vs {rows}"
+        )))
     }
 }
 
@@ -191,8 +202,10 @@ fn strpos_impl(haystack: &str, needle: &str, instance: i64) -> i64 {
             if found == instance {
                 return (pos + 1) as i64;
             }
-            // Match StarRocks: advance by 1 byte to allow overlapping matches.
-            from_index = pos + 1;
+            // Match starts are UTF-8 boundaries. Advance one scalar so an
+            // overlapping valid needle remains searchable without slicing
+            // the next iteration inside a multibyte scalar.
+            from_index = next_search_boundary(haystack, pos);
             if from_index > haystack.len() {
                 break;
             }
@@ -200,7 +213,11 @@ fn strpos_impl(haystack: &str, needle: &str, instance: i64) -> i64 {
         return 0;
     }
 
-    let target_from_end = (-instance) as usize;
+    let target = instance.unsigned_abs();
+    if target > haystack.len() as u64 {
+        return 0;
+    }
+    let target_from_end = target as usize;
     let mut positions = Vec::new();
     let mut from_index = 0_usize;
     while from_index <= haystack.len() {
@@ -209,7 +226,7 @@ fn strpos_impl(haystack: &str, needle: &str, instance: i64) -> i64 {
         };
         let pos = from_index + pos_rel;
         positions.push(pos);
-        from_index = pos + 1;
+        from_index = next_search_boundary(haystack, pos);
     }
     if target_from_end == 0 || target_from_end > positions.len() {
         return 0;
@@ -222,9 +239,12 @@ pub fn eval_strpos<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() != 2 && args.len() != 3 {
-        return Err((format!("strpos expects 2 or 3 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "strpos expects 2 or 3 arguments, got {}",
+            args.len()
+        )));
     }
 
     let haystack_arr = arena.eval(args[0], chunk)?;
@@ -238,11 +258,11 @@ pub fn eval_strpos<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let haystack_arr = haystack_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "strpos expects string".to_string())?;
+        .ok_or_else(|| expression_contract("strpos expects string"))?;
     let needle_arr = needle_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "strpos expects string".to_string())?;
+        .ok_or_else(|| expression_contract("strpos expects string"))?;
     let instance_arr = instance_raw
         .as_ref()
         .map(|arr| super::common::downcast_int_arg_array(arr, "strpos"))
@@ -286,4 +306,30 @@ pub fn eval_strpos<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         out.push(Some(strpos_impl(haystack, needle, instance) as i32));
     }
     Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
+}
+
+fn next_search_boundary(haystack: &str, match_start: usize) -> usize {
+    match_start
+        + haystack[match_start..]
+            .chars()
+            .next()
+            .expect("nonempty needle matched a scalar")
+            .len_utf8()
+}
+#[cfg(test)]
+mod source_properties {
+    use super::*;
+    #[test]
+    fn overlapping_unicode_matches_keep_byte_positions_without_invalid_slices() {
+        assert_eq!(strpos_impl("ééé", "éé", 1), 1);
+        assert_eq!(strpos_impl("ééé", "éé", 2), 3);
+        assert_eq!(strpos_impl("ééé", "éé", -1), 3);
+        assert_eq!(strpos_impl("ééé", "éé", -2), 1);
+        assert_eq!(strpos_impl("ééé", "éé", -3), 0);
+        assert_eq!(strpos_impl("aaa", "aa", 2), 2);
+        assert_eq!(strpos_impl("abc", "a", i64::MIN), 0);
+        assert_eq!(strpos_impl("abc", "", i64::MIN), 1);
+        assert_eq!(locate_utf8("ééa", "a", 1), 3);
+        assert_eq!(locate_utf8("", "", 1), 1);
+    }
 }

@@ -259,25 +259,10 @@ fn prepare_frozen_writer_aggregate_core<H>(
         work.flush()?;
         Ok(token)
     })();
-    if matches!(
-        &result,
-        Err(CheckedCallPreparationFailure::Binding(
-            crate::FunctionBindingCreationFailure::Creator(_)
-                | crate::FunctionBindingCreationFailure::Resource(_)
-                | crate::FunctionBindingCreationFailure::Binding(
-                    crate::FunctionBindingError::Control(_),
-                )
-        )) | Err(CheckedCallPreparationFailure::Preparation(
-            crate::CheckedOwnerFailure::Original(
-                FunctionSpecializationFailure::Control(_)
-                    | FunctionSpecializationFailure::Kernel(
-                        crate::KernelFailure::Cancelled
-                            | crate::KernelFailure::DeadlineExceeded
-                            | crate::KernelFailure::ResourceExhausted
-                    ),
-            )
-        ))
-    ) {
+    if result
+        .as_ref()
+        .is_err_and(CheckedCallPreparationFailure::is_interruption)
+    {
         return result;
     }
     work.finish()?;

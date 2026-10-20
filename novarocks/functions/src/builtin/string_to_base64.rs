@@ -94,10 +94,7 @@ pub(super) fn evaluate_string_to_base64<'a>(
                     Observation::OpaqueBoundary => work.flush(),
                 }
             })
-            .map_err(|error| match error {
-                super::md5_shared::CoreError::Kernel(failure) => failure,
-                _ => internal("to_base64 exact Utf8 reader admission failed"),
-            })?;
+            .map_err(|source| super::md5_shared::into_kernel(source, "to_base64"))?;
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
         work.flush()?;
@@ -182,12 +179,7 @@ pub(super) fn evaluate_string_to_base64<'a>(
             || work.step(),
         )
     })();
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
+    if result.as_ref().is_err_and(KernelFailure::is_interruption) {
         return result;
     }
     work.finish()?;

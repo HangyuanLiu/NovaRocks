@@ -49,12 +49,12 @@ fn setup(a: ArrayRef) -> (ExprArena, ExprId, Chunk) {
     let id = arena.push_typed(ExprNode::SlotId(slot), ty);
     (arena, id, chunk)
 }
-fn raw(a: ArrayRef, target: Option<DataType>, extra: bool) -> Result<ArrayRef, String> {
+fn raw(
+    a: ArrayRef,
+    target: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, id, chunk) = setup(a);
-    let mut args = vec![id];
-    if extra {
-        args.push(ExprId(usize::MAX));
-    }
+    let args = vec![id];
     let expr = target.map_or(ExprId(usize::MAX), |t| {
         arena.push_typed(
             ExprNode::FunctionCall {
@@ -95,7 +95,7 @@ fn legacy_reverse_original_unicode_scalar_order_slice_null_empty_and_ignored_tar
         Some(DataType::Null),
     ] {
         assert_eq!(
-            values(raw(a.clone(), target, true).unwrap()),
+            values(raw(a.clone(), target).unwrap()),
             vec![
                 Some("中éa".into()),
                 Some("\u{301}a".into()),
@@ -106,10 +106,10 @@ fn legacy_reverse_original_unicode_scalar_order_slice_null_empty_and_ignored_tar
             ]
         );
     }
-    assert!(raw(strings(vec![]), None, true).unwrap().is_empty());
+    assert!(raw(strings(vec![]), None).unwrap().is_empty());
 }
 #[test]
-fn legacy_reverse_original_exact_reader_errors_precede_null_and_ignored_extra_arguments() {
+fn reverse_prepared_arity_and_reader_contracts_precede_null_masking() {
     for a in [
         Arc::new(NullArray::new(1)) as ArrayRef,
         Arc::new(LargeStringArray::from(vec![None::<&str>])),
@@ -117,38 +117,35 @@ fn legacy_reverse_original_exact_reader_errors_precede_null_and_ignored_extra_ar
         Arc::new(Int64Array::from(vec![None::<i64>])),
     ] {
         assert_eq!(
-            raw(a.clone(), None, true).unwrap_err(),
+            (raw(a.clone(), None).unwrap_err()).to_string(),
             "reverse expects string or array"
         );
         assert_eq!(
-            raw(a, Some(DataType::Utf8), false).unwrap_err(),
+            (raw(a, Some(DataType::Utf8)).unwrap_err()).to_string(),
             "reverse expects string or array"
         );
     }
     let (arena, id, chunk) = setup(strings(vec![None]));
+    for args in [vec![], vec![ExprId(usize::MAX), id]] {
+        let failure =
+            eval_string_function("reverse", &arena, ExprId(usize::MAX), &args, &chunk).unwrap_err();
+        assert_reverse_contract(&failure);
+        assert_eq!(
+            failure.detail(),
+            "reverse requires exactly one prepared argument"
+        );
+    }
+    let missing = eval_string_function(
+        "reverse",
+        &arena,
+        ExprId(usize::MAX),
+        &[ExprId(usize::MAX)],
+        &chunk,
+    )
+    .unwrap_err();
+    assert_eq!(missing.detail(), "invalid ExprId");
     assert_eq!(
-        eval_string_function(
-            "reverse",
-            &arena,
-            ExprId(usize::MAX),
-            &[ExprId(usize::MAX), id],
-            &chunk
-        )
-        .unwrap_err(),
-        "invalid ExprId"
-    );
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| eval_string_function(
-            "reverse",
-            &arena,
-            ExprId(usize::MAX),
-            &[],
-            &chunk
-        )))
-        .is_err()
-    );
-    assert_eq!(
-        values(raw(strings(vec![Some("x"), None]), None, true).unwrap()),
+        values(raw(strings(vec![Some("x"), None]), None).unwrap()),
         vec![Some("x".into()), None]
     );
 }
@@ -160,8 +157,7 @@ fn legacy_reverse_original_unicode_boundaries_and_long_scalar_rendering() {
                 strings(vec![Some(
                     "\u{0}\u{7f}\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{ffff}\u{10000}\u{10ffff}"
                 )]),
-                None,
-                false
+                None
             )
             .unwrap()
         ),
@@ -172,7 +168,7 @@ fn legacy_reverse_original_unicode_boundaries_and_long_scalar_rendering() {
     let a = "aé中\0".repeat(600);
     let expected = "\0中éa".repeat(600);
     assert_eq!(
-        values(raw(strings(vec![Some(a.as_str())]), None, false).unwrap()),
+        values(raw(strings(vec![Some(a.as_str())]), None).unwrap()),
         vec![Some(expected)]
     );
 }
@@ -188,7 +184,7 @@ fn legacy_reverse_original_unregistered_list_helper_keeps_field_and_item_cast() 
             std::collections::HashMap::from([("source".into(), "original".into())]),
         ),
     );
-    let out = raw(a.clone(), Some(DataType::List(field.clone())), true).unwrap();
+    let out = raw(a.clone(), Some(DataType::List(field.clone()))).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     assert_eq!(list.data_type(), &DataType::List(field));
     assert_eq!(
@@ -202,7 +198,8 @@ fn legacy_reverse_original_unregistered_list_helper_keeps_field_and_item_cast() 
     );
     assert!(list.is_null(1));
     assert_eq!(list.value_length(2), 0);
-    let out = raw(a.clone(), Some(DataType::Utf8), true).unwrap();
+    assert_reverse_contract(&raw(a.clone(), Some(DataType::Utf8)).unwrap_err());
+    let out = raw(a.clone(), None).unwrap();
     assert_eq!(out.data_type(), a.data_type());
     assert_eq!(
         out.as_any()
@@ -215,5 +212,16 @@ fn legacy_reverse_original_unregistered_list_helper_keeps_field_and_item_cast() 
             .iter()
             .collect::<Vec<_>>(),
         vec![Some(3), None, Some(1)]
+    );
+}
+
+fn assert_reverse_contract(error: &crate::runtime::fragment::ExecutionFailure) {
+    use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
+    assert_eq!(
+        error.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::ExpressionContract.reason()
+        )
     );
 }

@@ -103,7 +103,8 @@ pub(super) fn evaluate_selected<'a>(
                 observe_bytes(replacement, &mut work)?;
                 work.flush()?;
                 // The original library owns compilation and replacement semantics.
-                let compiled = patterns.get_or_compile(pattern, Regex::new);
+                let compiled = patterns
+                    .get_or_compile(pattern, |pattern| Regex::new(pattern).map_err(Arc::new));
                 work.flush()?;
                 match compiled {
                     Ok(re) => {
@@ -128,14 +129,18 @@ pub(super) fn evaluate_selected<'a>(
                     }
                     Err(error) => {
                         work.flush()?;
-                        let message = error.to_string();
+                        let source = super::string_failure::regex_syntax(error)?;
+                        let message = source.to_string();
                         work.flush()?;
                         observe_bytes(&message, &mut work)?;
                         // Legacy captures the raw first error and fails immediately.
                         // Only the owner boundary truncates row-error diagnostics.
                         if let Some(boundary) = input.error_boundary {
                             work.flush()?;
-                            boundary(&message)?;
+                            boundary(
+                                ordinal,
+                                super::string_failure::StringDataError::Regex(&source),
+                            )?;
                             work.flush()?;
                         }
                         work.flush()?;
@@ -266,7 +271,7 @@ mod tests {
         ];
         let arguments = arrays.each_ref().map(EvaluatedArgument::Column);
         let message = std::cell::RefCell::new(None);
-        let boundary = |raw: &str| {
+        let boundary = |_: usize, raw: super::super::string_failure::StringDataError<'_>| {
             *message.borrow_mut() = Some(raw.to_string());
             Err(KernelFailure::InstanceFailed)
         };

@@ -34,7 +34,7 @@ use novarocks_types::value::bitmap::encode_bitmap_aggregate as encode_bitmap;
 use super::super::*;
 use super::AggregateFunction;
 use crate::exec::node::aggregate::AggFunction;
-use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
+use crate::runtime::mem_tracker::MemTracker;
 
 pub(super) struct BitmapUnionIntAgg;
 
@@ -53,10 +53,87 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
     }
 }
 
-fn legacy_state_error(error: novarocks_functions::aggregate_scalar::ScalarStateError) -> String {
-    match error {
-        novarocks_functions::aggregate_scalar::ScalarStateError::Legacy(message) => message,
-        _ => unreachable!("the original bitmap allocator authors only its legacy rejection"),
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use novarocks_functions::bitmap_aggregate_core::{
+    BitmapAggregatePort, BitmapInputFailure, InputFailure, StateMutation,
+};
+use novarocks_functions::bitmap_value::{BitmapDecodePort, BitmapOutputTally, BitmapValueFailure};
+
+#[derive(Debug)]
+enum NativeBitmapFailure {
+    Data(BitmapValueFailure),
+    Input(BitmapInputFailure),
+    Kernel(novarocks_functions::KernelFailure),
+}
+impl std::fmt::Display for NativeBitmapFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Data(e) => e.fmt(f),
+            Self::Input(e) => e.fmt(f),
+            Self::Kernel(e) => e.fmt(f),
+        }
+    }
+}
+impl From<NativeBitmapFailure> for ExecutionFailure {
+    fn from(source: NativeBitmapFailure) -> Self {
+        match source {
+            NativeBitmapFailure::Data(source) => Self::from_domain(source),
+            NativeBitmapFailure::Input(source) => Self::from_domain(source),
+            NativeBitmapFailure::Kernel(source) => source.into(),
+        }
+    }
+}
+struct NativeBitmapRows<W> {
+    writer: W,
+}
+impl<W> NativeBitmapRows<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+}
+impl<W: FnMut(usize, StateMutation) -> Result<(), novarocks_functions::KernelFailure>>
+    BitmapDecodePort for NativeBitmapRows<W>
+{
+    type Error = NativeBitmapFailure;
+    fn failure(&mut self, source: BitmapValueFailure) -> Self::Error {
+        NativeBitmapFailure::Data(source)
+    }
+    fn is_data(source: &Self::Error) -> bool {
+        matches!(source, NativeBitmapFailure::Data(source) if source.is_data())
+    }
+    fn step(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn boundary(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn before_render(&mut self, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn before_tree_insert(&mut self, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn before_tree_collection(&mut self, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn before_roaring(&mut self, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn before_u32_collection(&mut self, _: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+impl<W: FnMut(usize, StateMutation) -> Result<(), novarocks_functions::KernelFailure>>
+    BitmapAggregatePort for NativeBitmapRows<W>
+{
+    fn input_failure(&mut self, source: InputFailure<'_>) -> Self::Error {
+        NativeBitmapFailure::Input(source.into_failure())
+    }
+    fn observe(&mut self, ordinal: usize) -> Result<(), Self::Error> {
+        (self.writer)(ordinal, StateMutation::Observe).map_err(NativeBitmapFailure::Kernel)
+    }
+    fn insert(&mut self, ordinal: usize, value: u64) -> Result<(), Self::Error> {
+        (self.writer)(ordinal, StateMutation::Insert(value)).map_err(NativeBitmapFailure::Kernel)
     }
 }
 
@@ -70,12 +147,19 @@ impl AggregateFunction for BitmapUnionIntAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let kind = kind_from_name(func.name.as_str())
-            .ok_or_else(|| format!("unsupported bitmap aggregate function: {}", func.name))?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let kind = kind_from_name(func.name.as_str()).ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "unsupported bitmap aggregate function: {}",
+                func.name
+            ))
+        })?;
         if !input_is_intermediate {
-            let dt =
-                input_type.ok_or_else(|| "bitmap_union_int requires 1 argument".to_string())?;
+            let dt = input_type.ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "bitmap_union_int requires 1 argument",
+                )
+            })?;
             if !matches!(
                 dt,
                 DataType::Boolean
@@ -92,10 +176,12 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     | DataType::Binary
                     | DataType::LargeBinary
             ) {
-                return Err(format!(
-                    "bitmap aggregate expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got {:?}",
-                    dt
-                ));
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "bitmap aggregate expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got {:?}",
+                        dt
+                    )),
+                );
             }
         }
         Ok(AggSpec {
@@ -125,10 +211,12 @@ impl AggregateFunction for BitmapUnionIntAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "bitmap_union_int input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "bitmap_union_int input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -136,24 +224,22 @@ impl AggregateFunction for BitmapUnionIntAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "bitmap_union_int intermediate input missing".to_string())?;
-        let binary = arr
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "bitmap_union_int intermediate input missing",
+            )
+        })?;
+        let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "failed to downcast to BinaryArray",
+            )
+        })?;
         Ok(AggInputView::Binary(binary))
     }
 
-    fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
-        unsafe {
-            ptr.cast::<BitmapState>()
-                .write(BitmapState::new(AggregateAllocator::new(
-                    process_mem_tracker(),
-                )))
-        };
+    fn init_state(&self, _spec: &AggSpec, _ptr: *mut u8) {
+        panic!("allocation-tracked bitmap state requires tracker-aware initialization");
     }
 
     fn init_state_with_tracker(
@@ -161,9 +247,11 @@ impl AggregateFunction for BitmapUnionIntAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked bitmap state requires a memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked bitmap state requires a memory tracker",
+            )
         })?;
         unsafe {
             ptr.cast::<BitmapState>()
@@ -190,18 +278,18 @@ impl AggregateFunction for BitmapUnionIntAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("bitmap_union_int batch input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "bitmap_union_int batch input type mismatch",
+            ));
         };
-        use novarocks_functions::bitmap_aggregate_core::{
-            BitmapOperation, LegacyRows, StateMutation,
-        };
+        use novarocks_functions::bitmap_aggregate_core::BitmapOperation;
         let operation = match spec.kind {
             AggKind::BitmapUnionInt => BitmapOperation::Count,
             _ => BitmapOperation::BitmapProjection,
         };
-        let mut port = LegacyRows::new(|ordinal, mutation| {
+        let mut port = NativeBitmapRows::new(|ordinal, mutation| {
             let ptr = unsafe { (state_ptrs[ordinal] as *mut u8).add(offset) };
             let state = unsafe { &mut *ptr.cast::<BitmapState>() };
             match mutation {
@@ -209,7 +297,7 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     state.observe();
                     Ok(())
                 }
-                StateMutation::Insert(value) => state.insert(value).map_err(legacy_state_error),
+                StateMutation::Insert(value) => state.insert(value),
             }
         });
         novarocks_functions::bitmap_aggregate_core::update(
@@ -218,6 +306,7 @@ impl AggregateFunction for BitmapUnionIntAgg {
             0..state_ptrs.len(),
             &mut port,
         )
+        .map_err(ExecutionFailure::from)
     }
 
     fn merge_batch(
@@ -226,12 +315,14 @@ impl AggregateFunction for BitmapUnionIntAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Binary(array) = input else {
-            return Err("bitmap_union_int merge input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "bitmap_union_int merge input type mismatch",
+            ));
         };
-        use novarocks_functions::bitmap_aggregate_core::{LegacyRows, StateMutation};
-        let mut port = LegacyRows::new(|ordinal, mutation| {
+
+        let mut port = NativeBitmapRows::new(|ordinal, mutation| {
             let ptr = unsafe { (state_ptrs[ordinal] as *mut u8).add(offset) };
             let state = unsafe { &mut *ptr.cast::<BitmapState>() };
             match mutation {
@@ -239,10 +330,11 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     state.observe();
                     Ok(())
                 }
-                StateMutation::Insert(value) => state.insert(value).map_err(legacy_state_error),
+                StateMutation::Insert(value) => state.insert(value),
             }
         });
         novarocks_functions::bitmap_aggregate_core::merge(array, 0..state_ptrs.len(), &mut port)
+            .map_err(ExecutionFailure::from)
     }
 
     fn build_array(
@@ -251,7 +343,22 @@ impl AggregateFunction for BitmapUnionIntAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+        if output_intermediate || matches!(spec.kind, AggKind::BitmapAgg) {
+            let mut extent = BitmapOutputTally::default();
+            for &base in group_states {
+                let ptr = unsafe { (base as *mut u8).add(offset) };
+                if let Some(state) = unsafe { get_state(ptr) }
+                    && state.has_value
+                {
+                    extent.append(
+                        state
+                            .aggregate_encoded_size()
+                            .map_err(ExecutionFailure::from_domain)?,
+                    )?;
+                }
+            }
+        }
         if output_intermediate {
             // For both BitmapAgg and BitmapUnionInt the intermediate stage must
             // emit NULL when no non-null input was observed, so the final
@@ -261,9 +368,10 @@ impl AggregateFunction for BitmapUnionIntAgg {
             for &base in group_states {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
                 match unsafe { get_state(ptr) } {
-                    Some(state) if state.has_value => {
-                        builder.append_value(encode_bitmap(&state.encoded_values())?)
-                    }
+                    Some(state) if state.has_value => builder.append_value(
+                        encode_bitmap(&state.encoded_values())
+                            .map_err(ExecutionFailure::from_domain)?,
+                    ),
                     _ => builder.append_null(),
                 }
             }
@@ -279,7 +387,7 @@ impl AggregateFunction for BitmapUnionIntAgg {
                         Some(state) if state.has_value => {
                             let value = state
                                 .cardinality()
-                                .map_err(|failure| failure.to_string())?
+                                .map_err(ExecutionFailure::from_domain)?
                                 .expect("original has_value branch");
                             builder.append_value(value);
                         }
@@ -295,21 +403,26 @@ impl AggregateFunction for BitmapUnionIntAgg {
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     match unsafe { get_state(ptr) } {
-                        Some(state) if state.has_value => {
-                            builder.append_value(encode_bitmap(&state.encoded_values())?)
-                        }
+                        Some(state) if state.has_value => builder.append_value(
+                            encode_bitmap(&state.encoded_values())
+                                .map_err(ExecutionFailure::from_domain)?,
+                        ),
                         _ => builder.append_null(),
                     }
                 }
                 Ok(Arc::new(builder.finish()))
             }
-            other => Err(format!("unexpected bitmap aggregate kind: {:?}", other)),
+            other => Err(super::aggregate_binding_contract(format_args!(
+                "unexpected bitmap aggregate kind: {:?}",
+                other
+            ))),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{AggregateAllocator, BitmapState, MemTracker};
     use std::collections::BTreeSet;
     use std::mem::MaybeUninit;
     use std::sync::Arc;
@@ -334,9 +447,41 @@ mod tests {
             .build_spec_from_type(&function, Some(&DataType::FixedSizeBinary(16)), false)
             .expect_err("LARGEINT must not be accepted as a bitmap aggregate input");
 
-        assert!(error.contains("bitmap aggregate expects"), "{error}");
+        assert!(
+            error.detail().contains("bitmap aggregate expects"),
+            "{error}"
+        );
     }
 
+    #[test]
+    fn actual_bitmap_update_preserves_container_refusal_without_panicking_or_retaining_owner() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let tracker = MemTracker::new_root("bitmap original container refusal");
+        tracker.install_limit_once(1).unwrap();
+        let weak = Arc::downgrade(&tracker);
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut state = BitmapState::new(allocator.clone());
+        let pointer = (&mut state as *mut BitmapState) as AggStatePtr;
+        let input: ArrayRef = Arc::new(Int64Array::from(vec![7]));
+        let error = BitmapUnionIntAgg
+            .update_batch(
+                &spec_bitmap_union_int(),
+                0,
+                &[pointer],
+                &AggInputView::Any(&input),
+            )
+            .unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().code(), 169);
+        assert!(state.encoded_values().is_empty());
+        assert_eq!(tracker.current(), 0);
+        drop(state);
+        drop(allocator);
+        drop(tracker);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(error.failure_fact(), fact);
+    }
     #[test]
     fn bitmap_union_int_encodes_single32() {
         let values = BTreeSet::from([7_u64]);
@@ -363,9 +508,12 @@ mod tests {
         let agg = BitmapUnionIntAgg;
         let mut backing = MaybeUninit::<super::BitmapState>::uninit();
         let ptr = backing.as_mut_ptr().cast::<u8>();
-        agg.init_state(spec, ptr);
+        let tracker = MemTracker::new_root("bitmap native component state");
+        agg.init_state_with_tracker(spec, ptr, Some(tracker.clone()))
+            .unwrap();
         let out = f(&agg, ptr, spec);
         agg.drop_state(spec, ptr);
+        assert_eq!(tracker.current(), 0);
         out
     }
 

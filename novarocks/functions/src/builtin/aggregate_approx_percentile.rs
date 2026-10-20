@@ -20,7 +20,7 @@
 //! published only after the actual host-backed diagnostic has been built.
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, ScalarWork};
 use crate::approx_percentile_aggregate_core::{
     self as core, ApproxPercentileDiagnostic as Diagnostic,
 };
@@ -109,7 +109,11 @@ struct FailureSink<'a, 'host> {
     control: &'a dyn KernelEvaluationControl,
 }
 impl FailureSink<'_, '_> {
-    fn diagnostic<T: std::fmt::Display + ?Sized>(&mut self, original: &T) -> EvaluationFailure {
+    fn diagnostic<T: std::fmt::Display + ?Sized>(
+        &mut self,
+        original: &T,
+        reason: crate::DataFailureReason,
+    ) -> EvaluationFailure {
         use crate::aggregate_format::AggregateFailureStage;
         let stage = match &self.domain {
             FailureDomain::Mutation {
@@ -148,18 +152,23 @@ impl FailureSink<'_, '_> {
                     phase,
                     selection,
                     mapping,
-                } => InvocationData::prepare_aggregate(
+                } => InvocationData::prepare_aggregate_with_reason(
                     self.allocator,
                     Arc::clone(contract),
                     *phase,
                     *selection,
                     mapping,
                     text,
+                    reason,
                     &mut work,
                 ),
-                FailureDomain::Emission(context) => {
-                    InvocationData::prepare_emission(self.allocator, context, text, &mut work)
-                }
+                FailureDomain::Emission(context) => InvocationData::prepare_emission_with_reason(
+                    self.allocator,
+                    context,
+                    text,
+                    reason,
+                    &mut work,
+                ),
             }
         })();
         match result {
@@ -169,23 +178,6 @@ impl FailureSink<'_, '_> {
     }
 }
 
-impl FailureSink<'_, '_> {
-    fn original(&mut self, error: String, allocator: &HostAggregateAllocator) -> EvaluationFailure {
-        // Only an actual recorded host refusal may replace its temporary
-        // original String carrier. Never classify error text as a resource.
-        match allocator.take_recorded_failure() {
-            Some(cause) => cause.into(),
-            None => self.diagnostic(&error),
-        }
-    }
-    fn scalar(&mut self, error: ScalarStateError) -> EvaluationFailure {
-        match error {
-            ScalarStateError::Kernel(cause) => cause.into(),
-            ScalarStateError::OutputAllocation(_) => KernelFailure::ResourceExhausted.into(),
-            ScalarStateError::Legacy(message) => self.diagnostic(&message),
-        }
-    }
-}
 // The observer/sink borrows the actual phase receipt and actual allocators.
 // It never classifies a diagnostic string as a Kernel cause.
 struct ObservedFailureSink<'a, 'host, 'control> {
@@ -201,16 +193,46 @@ impl crate::approx_percentile_failure::ApproxPercentileFailureSink
         &mut self,
         recipe: crate::approx_percentile_failure::ApproxPercentileDataRecipe<'_>,
     ) -> EvaluationFailure {
-        self.failure.diagnostic(&recipe)
+        self.failure
+            .diagnostic(&recipe, crate::DataFailureReason::InvalidValue)
     }
-    fn allocation(
+    fn encoding(
         &mut self,
-        _recipe: crate::approx_percentile_failure::ApproxPercentileDataRecipe<'_>,
+        recipe: crate::approx_percentile_failure::ApproxPercentileDataRecipe<'_>,
+    ) -> EvaluationFailure {
+        self.failure
+            .diagnostic(&recipe, crate::DataFailureReason::InvalidEncoding)
+    }
+    fn kernel(&mut self, source: KernelFailure) -> EvaluationFailure {
+        source.into()
+    }
+    fn json(&mut self, source: serde_json::Error) -> EvaluationFailure {
+        match self
+            .failure
+            .diagnostic(&source, crate::DataFailureReason::InvalidEncoding)
+        {
+            EvaluationFailure::InvocationData(data) => {
+                EvaluationFailure::InvocationData(data.with_whole_value_source(
+                    crate::approx_percentile_failure::json_failure(source),
+                ))
+            }
+            failure => failure,
+        }
+    }
+    fn allocation<E: crate::allocation_failure::AllocationRefusalSource>(
+        &mut self,
+        recipe: crate::approx_percentile_failure::ApproxPercentileDataRecipe<'_>,
+        source: E,
     ) -> EvaluationFailure {
         self.state_allocator
             .take_recorded_failure()
             .or_else(|| self.failure.allocator.take_recorded_failure())
-            .unwrap_or(KernelFailure::ResourceExhausted)
+            .unwrap_or_else(|| {
+                KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                    &recipe.to_string(),
+                    source,
+                ))
+            })
             .into()
     }
     fn observe(
@@ -477,19 +499,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                     {
                         let channels =
                             core::UnweightedInput::try_new(structure, self.operation.update())
-                                .map_err(|original| {
-                                    FailureSink {
-                                        allocator: &allocator,
-                                        domain: FailureDomain::Mutation {
-                                            contract: &self.contract,
-                                            phase: AggregateInvocationPhase::Update,
-                                            selection: input.selection(),
-                                            mapping: &mapping,
-                                        },
-                                        control,
-                                    }
-                                    .diagnostic(&original)
-                                })?;
+                                .map_err(EvaluationFailure::from)?;
                         UpdateChannels::Unweighted(channels)
                     } else {
                         UpdateChannels::Payload(array.clone())
@@ -690,7 +700,8 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
         observed(control, |work| {
             let expected = states.len();
             self.check_emit(context, expected)?;
-            let mut builder = BinaryBuilder::new();
+            let mut builder = scalar::BinaryResultBuilder::new();
+            let mut output_offset = 0;
             let mut count = 0;
             for state in states {
                 if state.failed {
@@ -704,6 +715,10 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 }
                 work.step()?;
                 work.flush()?;
+                output_offset = scalar::checked_binary_output_offset(
+                    output_offset,
+                    digest::encoded_size(&state.core)?,
+                )?;
                 let encoded =
                     digest::encode_state_observed(
                         &state.core,
@@ -714,7 +729,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                         },
                     )?;
                 work.flush()?;
-                builder.append_value(encoded);
+                builder.append_value(encoded)?;
                 work.flush()?;
                 count += 1;
             }
@@ -724,7 +739,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 )
                 .into());
             }
-            let array = Arc::new(builder.finish()) as ArrayRef;
+            let array = Arc::new(builder.finish()?) as ArrayRef;
             work.flush()?;
             Ok(array)
         })
@@ -782,15 +797,20 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 }
                 work.step()?;
                 work.flush()?;
-                let original = core::scalar_output_with_policy(
+                let value = core::scalar_output_with_sink(
                     &state.core,
                     output_kind,
-                    &mut digest::FallibleClone,
-                );
-                let value = match original {
-                    Ok(value) => value,
-                    Err(error) => return Err(sink.original(error, &state.core.allocator())),
-                };
+                    &mut digest::TrackedTDigestClone,
+                    &mut ObservedFailureSink {
+                        failure: FailureSink {
+                            allocator: &host,
+                            domain: FailureDomain::Emission(context),
+                            control,
+                        },
+                        state_allocator: state.core.allocator(),
+                        work,
+                    },
+                )?;
                 work.flush()?;
                 output.push(value);
                 work.flush()?;
@@ -803,7 +823,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
             }
             let mut scalar_work = ScalarWork::new(Some(work));
             scalar::build_scalar_array(self.output_type(), output, &mut scalar_work)
-                .map_err(|error| sink.scalar(error))
+                .map_err(EvaluationFailure::from)
         })
     }
 }

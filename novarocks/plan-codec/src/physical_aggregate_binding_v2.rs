@@ -443,7 +443,7 @@ pub fn encode_aggregate_bindings<'loan, 'source>(
         &mut work,
     );
     if let Err(BindingCodecError::Control(cause)) = &result {
-        return Err(BindingCodecError::Control(*cause));
+        return Err(BindingCodecError::Control(cause.clone()));
     }
     work.finish()?;
     let (definitions, facts) = result?;

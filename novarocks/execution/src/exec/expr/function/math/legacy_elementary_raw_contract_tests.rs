@@ -63,7 +63,7 @@ fn evaluate(
     name: &'static str,
     inputs: Vec<ArrayRef>,
     output: Option<DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = inputs.first().map_or(3, |v| v.len());
     let (mut arena, args, chunk) = fixture(inputs, rows);
     let expr = output.map_or(ExprId(usize::MAX), |ty| {
@@ -115,9 +115,11 @@ fn legacy_elementary_raw_sign_keeps_int64_source_and_exact_text_projection() {
     // Freeze the full error using an independent Arrow cast of the original
     // Int64 carrier; replacing that source with Float64 changes this oracle.
     let target = DataType::Struct(vec![Arc::new(Field::new("item", DataType::Int64, true))].into());
-    let error = arrow::compute::cast(&raw, &target).unwrap_err();
+    let error = arrow::compute::cast(&raw, &target).unwrap_err().to_string();
     assert_eq!(
-        evaluate("sign", vec![values], Some(target)).unwrap_err(),
+        evaluate("sign", vec![values], Some(target))
+            .unwrap_err()
+            .to_string(),
         format!("math: failed to cast output: {error}")
     );
 }
@@ -148,7 +150,9 @@ fn legacy_elementary_raw_unsupported_carriers_keep_full_errors() {
     for (values, error) in cases {
         for name in ["log", "sign"] {
             assert_eq!(
-                evaluate(name, vec![values.clone()], Some(DataType::Float64)).unwrap_err(),
+                evaluate(name, vec![values.clone()], Some(DataType::Float64))
+                    .unwrap_err()
+                    .to_string(),
                 error
             );
         }
@@ -159,11 +163,14 @@ fn legacy_elementary_raw_unsupported_carriers_keep_full_errors() {
                 vec![numeric.clone(), values.clone()],
                 Some(DataType::Float64)
             )
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
             error
         );
         assert_eq!(
-            evaluate("log", vec![values, numeric], Some(DataType::Float64)).unwrap_err(),
+            evaluate("log", vec![values, numeric], Some(DataType::Float64))
+                .unwrap_err()
+                .to_string(),
             error
         );
     }

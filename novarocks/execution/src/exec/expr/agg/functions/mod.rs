@@ -203,13 +203,22 @@ use sum::SumAgg;
 use sum_map::SumMapAgg;
 use variance::VarStdAgg;
 
+/// Native aggregate binding guards describe the frozen expression contract.
+fn aggregate_binding_contract(
+    detail: impl std::fmt::Display,
+) -> crate::runtime::fragment::ExecutionFailure {
+    use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
+    let detail = novarocks_failure_contract::BoundedDetail::truncating_display(detail);
+    ExecPlanBuildError::new(ExecPlanInvariant::Expression, detail.as_str()).into()
+}
+
 pub(super) trait AggregateFunction: Send + Sync {
     fn build_spec_from_type(
         &self,
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String>;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec>;
 
     fn state_layout_for(&self, kind: &AggKind) -> (usize, usize);
 
@@ -217,13 +226,13 @@ pub(super) trait AggregateFunction: Send + Sync {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String>;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>>;
 
     fn build_merge_view<'a>(
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String>;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>>;
 
     fn init_state(&self, spec: &AggSpec, ptr: *mut u8);
     fn init_state_with_tracker(
@@ -231,14 +240,15 @@ pub(super) trait AggregateFunction: Send + Sync {
         spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if matches!(
             self.retained_memory_policy(spec),
             RetainedMemoryPolicy::AllocationTracked
         ) {
             return Err(
-                "allocation-tracked aggregate must implement tracker-aware state initialization"
-                    .to_string(),
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "allocation-tracked aggregate must implement tracker-aware state initialization",
+                ),
             );
         }
         let _ = tracker;
@@ -263,7 +273,7 @@ pub(super) trait AggregateFunction: Send + Sync {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String>;
+    ) -> crate::runtime::fragment::ExecutionResult<()>;
 
     fn merge_batch(
         &self,
@@ -271,7 +281,7 @@ pub(super) trait AggregateFunction: Send + Sync {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String>;
+    ) -> crate::runtime::fragment::ExecutionResult<()>;
 
     fn build_array(
         &self,
@@ -279,7 +289,7 @@ pub(super) trait AggregateFunction: Send + Sync {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String>;
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef>;
 }
 
 static COUNT: CountAgg = CountAgg;
@@ -367,7 +377,9 @@ static HLL_RAW: HllRawAgg = HllRawAgg;
 static MIN_MAX_N: MinMaxNAgg = MinMaxNAgg;
 
 #[cfg(test)]
-fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction, String> {
+fn resolve_by_func(
+    func: &AggFunction,
+) -> crate::runtime::fragment::ExecutionResult<&'static dyn AggregateFunction> {
     resolve_by_name(func.name.as_str())
 }
 
@@ -504,13 +516,19 @@ static BUILTIN_AGGREGATE_IMPLEMENTATIONS: &[BuiltinAggregateImplementation] = &[
 ];
 
 #[cfg(test)]
-fn resolve_by_name(name: &str) -> Result<&'static dyn AggregateFunction, String> {
+fn resolve_by_name(
+    name: &str,
+) -> crate::runtime::fragment::ExecutionResult<&'static dyn AggregateFunction> {
     let canonical_name = canonical_agg_name(name);
     BUILTIN_AGGREGATE_IMPLEMENTATIONS
         .iter()
         .find(|implementation| implementation.canonical_name == canonical_name)
         .map(|implementation| implementation.function)
-        .ok_or_else(|| format!("unsupported agg function: {canonical_name}"))
+        .ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "unsupported agg function: {canonical_name}"
+            ))
+        })
 }
 
 /// Installs the implementation-side aggregate manifest. Both overload and
@@ -640,7 +658,7 @@ pub(super) fn build_spec_from_type(
     func: &AggFunction,
     input_type: Option<&DataType>,
     input_is_intermediate: bool,
-) -> Result<AggSpec, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     resolve_by_func(func)?.build_spec_from_type(func, input_type, input_is_intermediate)
 }
 
@@ -656,7 +674,7 @@ pub(in crate::exec::expr::agg) fn state_layout_for_kind(kind: &AggKind) -> (usiz
 pub(in crate::exec::expr::agg) fn build_input_view<'a>(
     spec: &AggSpec,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
     resolve_by_kind(&spec.kind).build_input_view(spec, array)
 }
 
@@ -664,7 +682,7 @@ pub(in crate::exec::expr::agg) fn build_input_view<'a>(
 pub(in crate::exec::expr::agg) fn build_merge_view<'a>(
     spec: &AggSpec,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
     resolve_by_kind(&spec.kind).build_merge_view(spec, array)
 }
 
@@ -684,7 +702,7 @@ pub(in crate::exec::expr::agg) fn update_batch(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     resolve_by_kind(&spec.kind).update_batch(spec, offset, state_ptrs, input)
 }
 
@@ -694,7 +712,7 @@ pub(in crate::exec::expr::agg) fn merge_batch(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     resolve_by_kind(&spec.kind).merge_batch(spec, offset, state_ptrs, input)
 }
 
@@ -704,7 +722,7 @@ pub(in crate::exec::expr::agg) fn build_array(
     offset: usize,
     group_states: &[AggStatePtr],
     output_intermediate: bool,
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     resolve_by_kind(&spec.kind).build_array(spec, offset, group_states, output_intermediate)
 }
 

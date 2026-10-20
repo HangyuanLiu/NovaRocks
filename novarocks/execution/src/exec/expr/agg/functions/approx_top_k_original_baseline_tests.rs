@@ -67,11 +67,11 @@ impl Original {
     fn state(&self) -> &ApproxTopKState {
         unsafe { self.raw.assume_init_ref() }
     }
-    fn update(&mut self, a: ArrayRef) -> Result<(), String> {
+    fn update(&mut self, a: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let ps = vec![self.ptr(); a.len()];
         ApproxTopKAgg.update_batch(&self.spec, 0, &ps, &AggInputView::Any(&a))
     }
-    fn args(&mut self, a: Vec<ArrayRef>) -> Result<(), String> {
+    fn args(&mut self, a: Vec<ArrayRef>) -> crate::runtime::fragment::ExecutionResult<()> {
         if a.len() == 1 {
             return self.update(a[0].clone());
         }
@@ -82,7 +82,10 @@ impl Original {
             .collect::<Vec<_>>();
         self.update(Arc::new(StructArray::new(Fields::from(fields), a, None)))
     }
-    fn output(&mut self, intermediate: bool) -> Result<ArrayRef, String> {
+    fn output(
+        &mut self,
+        intermediate: bool,
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let p = self.ptr();
         ApproxTopKAgg.build_array(&self.spec, 0, &[p], intermediate)
     }
@@ -94,7 +97,7 @@ impl Original {
             .value(0)
             .to_vec()
     }
-    fn merge(&mut self, a: ArrayRef) -> Result<(), String> {
+    fn merge(&mut self, a: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let ps = vec![self.ptr(); a.len()];
         let a = Some(a);
         let view = ApproxTopKAgg.build_merge_view(&self.spec, &a)?;
@@ -186,8 +189,9 @@ fn original_approx_top_k_parameter_reader_clamps_invalid_and_per_row_update_orde
     assert_eq!(s.pairs().len(), 1);
     let mut s = Original::new(DataType::Int32);
     assert_eq!(
-        s.args(vec![ints(vec![None]), Arc::new(UInt32Array::from(vec![1]))])
-            .unwrap_err(),
+        (s.args(vec![ints(vec![None]), Arc::new(UInt32Array::from(vec![1]))])
+            .unwrap_err())
+        .to_string(),
         "unsupported scalar type: UInt32"
     );
 }
@@ -227,7 +231,7 @@ fn original_approx_top_k_tracked_counter_eviction_saturation_and_drop_keep_origi
     assert_eq!(s.counts.len(), 2);
     assert!(s.counts.values().any(|v| v.count == 2));
     s.counter_num = 1;
-    enforce_counter_limit(&mut s);
+    enforce_counter_limit(&mut s).expect("original counter eviction");
     assert_eq!(s.counts.len(), 1);
     let a = ints(vec![Some(7)]);
     let value = tracked_scalar_from_array(&a, 0, &s.allocator).unwrap();
@@ -258,7 +262,7 @@ fn original_approx_top_k_merge_full_codec_errors_and_null_mask_are_exact() {
                 1_u32.to_le_bytes(),
             ]
             .concat(),
-            "approx_top_k decode entry len failed".to_string(),
+            "approx_top_k decode entries: buffer too short".to_string(),
         ),
         (
             payload(&[1, 255], 1),
@@ -270,14 +274,14 @@ fn original_approx_top_k_merge_full_codec_errors_and_null_mask_are_exact() {
         ),
     ] {
         let mut s = Original::new(DataType::Int32);
-        assert_eq!(s.merge(binary(&bytes)).unwrap_err(), message);
+        assert_eq!((s.merge(binary(&bytes)).unwrap_err()).to_string(), message);
     }
     let mut s = Original::new(DataType::Int32);
     s.merge(Arc::new(BinaryArray::from(vec![None::<&[u8]>])))
         .unwrap();
     assert!(s.pairs().is_empty());
     assert_eq!(
-        s.merge(ints(vec![Some(1)])).unwrap_err(),
+        (s.merge(ints(vec![Some(1)])).unwrap_err()).to_string(),
         "approx_top_k merge input must be BinaryArray"
     );
 }
@@ -382,7 +386,7 @@ fn original_approx_top_k_first_struct_single_argument_is_original_argument_pack_
     let mut s = Original::new(ty);
     s.update(a).unwrap();
     assert_eq!(
-        s.output(false).unwrap_err(),
+        (s.output(false).unwrap_err()).to_string(),
         "scalar output type mismatch for Struct"
     );
 }
@@ -418,7 +422,7 @@ fn original_approx_top_k_hidden_root_null_masks_tracked_value_but_not_parameter_
     )) as ArrayRef;
     let mut s = Original::new(DataType::Int32);
     assert_eq!(
-        s.update(packed).unwrap_err(),
+        (s.update(packed).unwrap_err()).to_string(),
         "unsupported scalar type: UInt32"
     );
 }
@@ -427,13 +431,13 @@ fn original_approx_top_k_output_contract_and_tracker_refusal_errors_are_exact() 
     let mut s = Original::new(DataType::Int32);
     s.spec.output_type = DataType::Int64;
     assert_eq!(
-        s.output(false).unwrap_err(),
+        (s.output(false).unwrap_err()).to_string(),
         "approx_top_k output type must be LIST<STRUCT>, got Int64"
     );
     let mut s = Original::new(DataType::Int32);
     s.spec.output_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     assert_eq!(
-        s.output(false).unwrap_err(),
+        (s.output(false).unwrap_err()).to_string(),
         "approx_top_k list element type must be STRUCT, got Int64"
     );
     let mut s = Original::new(DataType::Int32);
@@ -443,14 +447,14 @@ fn original_approx_top_k_output_contract_and_tracker_refusal_errors_are_exact() 
         true,
     )));
     assert_eq!(
-        s.output(false).unwrap_err(),
+        (s.output(false).unwrap_err()).to_string(),
         "approx_top_k output struct must have at least 2 fields"
     );
     let mut raw = MaybeUninit::<ApproxTopKState>::uninit();
-    assert_eq!(
-        ApproxTopKAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(ApproxTopKAgg
             .init_state_with_tracker(&s.spec, raw.as_mut_ptr().cast(), None)
-            .unwrap_err(),
-        "allocation-tracked approx_top_k requires an aggregate memory tracker"
+            .unwrap_err()),
+        &"allocation-tracked approx_top_k requires an aggregate memory tracker",
     );
 }

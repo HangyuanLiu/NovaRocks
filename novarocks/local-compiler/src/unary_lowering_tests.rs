@@ -960,7 +960,7 @@ impl PureCompileControl for RefusingControl {
         trace.push((phase, units));
         if trace.len() == self.stop_at {
             *refused = true;
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -991,7 +991,7 @@ fn unary_if_compilation_preserves_every_original_control_refusal_without_later_c
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = RefusingControl::new(cause, index);
+            let control = RefusingControl::new(cause.clone(), index);
             assert!(matches!(compile(source.clone(), &functions, &control),
                 Err(FragmentCompileError::Control(actual)) if actual == cause));
             assert_eq!(*control.trace.lock().unwrap(), trace[..index]);

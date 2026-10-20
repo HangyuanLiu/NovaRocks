@@ -422,7 +422,7 @@ mod tests {
         fn checkpoint(&self, _: CompilePhase, completed: u32) -> Result<(), CompileControlError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push(completed);
-            if let Some((index, cause)) = self.fail
+            if let Some((index, cause)) = self.fail.clone()
                 && index == calls.len() - 1
             {
                 return Err(cause);
@@ -530,7 +530,7 @@ mod tests {
         ] {
             let c = Trace {
                 calls: Mutex::new(Vec::new()),
-                fail: Some((1, cause)),
+                fail: Some((1, cause.clone())),
             };
             let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
             let error = (0..320)

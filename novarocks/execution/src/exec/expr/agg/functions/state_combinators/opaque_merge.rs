@@ -30,7 +30,7 @@ use super::super::{
     AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction, RetainedMemoryPolicy,
 };
 
-type StateUnionFn = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+type StateUnionFn = fn(&[u8], &[u8]) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure>;
 
 pub(in crate::exec::expr::agg::functions) struct OpaqueStateMergeAgg {
     name: &'static str,
@@ -69,13 +69,20 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let input_type = input_type.ok_or_else(|| format!("{} input type missing", self.name))?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "{} input type missing",
+                self.name
+            ))
+        })?;
         if input_type != &DataType::Binary {
-            return Err(format!(
-                "{} input must be Binary, got {:?}",
-                self.name, input_type
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "{} input must be Binary, got {:?}",
+                    self.name, input_type
+                )),
+            );
         }
 
         Ok(AggSpec {
@@ -101,7 +108,7 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_binary_state_view(self.name, array)
     }
 
@@ -109,7 +116,7 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_binary_state_view(self.name, array)
     }
 
@@ -127,12 +134,12 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
                 "allocation-tracked {} state requires a memory tracker",
                 self.name
-            )
+            ))
         })?;
         unsafe {
             ptr.cast::<OpaqueStateMergeState>()
@@ -161,7 +168,7 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         self.merge_binary_states(spec, offset, state_ptrs, input)
     }
 
@@ -171,7 +178,7 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         self.merge_binary_states(spec, offset, state_ptrs, input)
     }
 
@@ -181,13 +188,17 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         if !same_kind(&spec.kind, &self.kind) {
-            return Err(format!("{} build array kind mismatch", self.name));
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{} build array kind mismatch", self.name),
+            ));
         }
         let mut builder = BinaryBuilder::new();
+        let mut extent = super::failure::BinaryOutput::default();
         for &base in group_states {
             let state = unsafe { &*state_slot(base, offset) };
+            extent.append(state.state.len())?;
             builder.append_value(&state.state);
         }
         Ok(Arc::new(builder.finish()))
@@ -201,12 +212,16 @@ impl OpaqueStateMergeAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if !same_kind(&spec.kind, &self.kind) {
-            return Err(format!("{} merge kind mismatch", self.name));
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{} merge kind mismatch", self.name),
+            ));
         }
         let AggInputView::Binary(array) = input else {
-            return Err(format!("{} merge input type mismatch", self.name));
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{} merge input type mismatch", self.name),
+            ));
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             if array.is_null(row) {
@@ -215,11 +230,13 @@ impl OpaqueStateMergeAgg {
             let state = unsafe { &mut *state_slot(base, offset) };
             let merged = (self.union)(&state.state, array.value(row))?;
             let mut replacement = AggregateVec::new_in(state.allocator.clone());
-            replacement.try_reserve_exact(merged.len()).map_err(|_| {
-                state
-                    .allocator
-                    .allocation_error("reserve merged opaque state")
-            })?;
+            replacement
+                .try_reserve_exact(merged.len())
+                .map_err(|source| {
+                    state
+                        .allocator
+                        .allocation_error("reserve merged opaque state", source)
+                })?;
             replacement.extend_from_slice(&merged);
             state.state = replacement;
         }
@@ -230,14 +247,15 @@ impl OpaqueStateMergeAgg {
 fn build_binary_state_view<'a>(
     name: &str,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
-    let arr = array
-        .as_ref()
-        .ok_or_else(|| format!("{name} input missing"))?;
-    let binary = arr
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| format!("{name} input must be BinaryArray"))?;
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+    let arr = array.as_ref().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format!("{name} input missing"))
+    })?;
+    let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format!(
+            "{name} input must be BinaryArray"
+        ))
+    })?;
     Ok(AggInputView::Binary(binary))
 }
 

@@ -41,7 +41,7 @@ impl PureCompileControl for OwnerControl {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -80,7 +80,7 @@ fn assert_causes(run: impl Fn(&OwnerControl) -> Result<(), FrozenPruningError>) 
     for at in 0..baseline.len() {
         for cause in CAUSES {
             let c = OwnerControl {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..OwnerControl::default()
             };
             assert_eq!(run(&c), Err(FrozenPruningError::Control(cause)));
@@ -209,7 +209,7 @@ fn pruning_borrowed_original_witness_failures_keep_categories_and_all_control_pr
         let table = pruning_table(&package, vec![bad.clone()]);
         assert_eq!(
             table.validate_package(&package, &Control::default()),
-            Err(FrozenPruningError::Structure(expected))
+            Err(FrozenPruningError::Structure(expected.clone()))
         );
         assert_eq!(
             run_validate(&table, &package, &OwnerControl::default()),

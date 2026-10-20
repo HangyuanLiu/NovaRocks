@@ -484,7 +484,7 @@ mod tests {
         )
         .expect_err("invalid repeated channel enum");
 
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidEnum);
+        assert_eq!(error.kind(), &ProtocolErrorKind::InvalidEnum);
         assert_eq!(
             error.path().to_string(),
             "query_terminal_profile_contribution.channels[0].install_state"
@@ -544,7 +544,7 @@ mod tests {
         let absent = novarocks::QueryTerminalProfileContributionTelemetry { telemetry: None };
         let error = QueryTerminalProfileContributionTelemetry::parse(absent)
             .expect_err("an absent telemetry oneof is not an empty contribution");
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
             "query_terminal_profile_contribution_telemetry.telemetry"
@@ -564,7 +564,7 @@ mod tests {
             QueryTerminalProfileContributionTelemetry::parse(blank_stage)
                 .expect_err("a blank stage is not a reason")
                 .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let available = novarocks::QueryTerminalProfileContributionTelemetry {

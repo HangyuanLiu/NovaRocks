@@ -85,8 +85,8 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
 }
-pub(super) fn evaluate_date_format<'a>(
-    input: super::calendar_extended_shared::CalendarInput<'_, 'a>,
+pub(super) fn evaluate_date_format<'a, E>(
+    input: super::calendar_extended_shared::CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;

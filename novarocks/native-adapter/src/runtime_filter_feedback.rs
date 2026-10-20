@@ -313,6 +313,7 @@ mod tests {
             Arc::new(TaskStatusSource::new()),
             Arc::new(ProcessMonotonicClock::new()),
             METRIC_PUBLISH_MIN_INTERVAL,
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
         ));
         owner.release_to_observers();
         (Arc::clone(&owner), TaskStatusReporter::new(owner))

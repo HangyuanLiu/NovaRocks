@@ -57,6 +57,17 @@ pub(crate) fn test_receiver_creation_factory() -> Arc<dyn InputConstructionFacto
 /// compiled ExchangeSource layout, and it binds wire columns by position:
 /// compiled sender and receiver slot ids are allocated per fragment and are
 /// never comparable.
+fn compiled_exchange_binding_refusal(
+    target: crate::exec::fragment::error::FragmentBindingTarget,
+    kind: crate::exec::fragment::error::FragmentBindingErrorKind,
+    detail: impl Into<String>,
+) -> ConstructionFailure {
+    crate::runtime::fragment::ExecutionFailure::from(
+        crate::exec::fragment::error::FragmentBindingError::new(target, kind, detail),
+    )
+    .into()
+}
+
 pub(crate) fn materialize_compiled_exchange_receivers(
     program: &novarocks_local_program::LocalProgram,
     fragment_instance_id: UniqueId,
@@ -70,37 +81,55 @@ pub(crate) fn materialize_compiled_exchange_receivers(
     let mut bindings = ExchangeBindings::default();
     for (id, input) in program.exchange_inputs() {
         let node = nodes.get(id.index()).ok_or_else(|| {
-            format!(
-                "compiled exchange input names missing local node {}",
-                id.index()
+            compiled_exchange_binding_refusal(
+                crate::exec::fragment::error::FragmentBindingTarget::Program,
+                crate::exec::fragment::error::FragmentBindingErrorKind::MissingAssignment,
+                format!(
+                    "compiled exchange input names missing local node {}",
+                    id.index()
+                ),
             )
         })?;
         if !matches!(
             node.kind(),
             novarocks_local_program::ProgramNodeKind::ExchangeSource { .. }
         ) {
-            return Err(format!(
-                "compiled exchange input at local node {} is not an exchange source",
-                id.index()
-            )
-            .into());
+            return Err(compiled_exchange_binding_refusal(
+                crate::exec::fragment::error::FragmentBindingTarget::Program,
+                crate::exec::fragment::error::FragmentBindingErrorKind::WrongAssignmentKind,
+                format!(
+                    "compiled exchange input at local node {} is not an exchange source",
+                    id.index()
+                ),
+            ));
         }
         let receiver = i32::try_from(input.receiver_node).map_err(|_| {
-            format!(
-                "compiled exchange receiver node {} exceeds i32",
-                input.receiver_node
+            compiled_exchange_binding_refusal(
+                crate::exec::fragment::error::FragmentBindingTarget::Program,
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled exchange receiver node {} exceeds i32",
+                    input.receiver_node
+                ),
             )
         })?;
         if !receivers.insert(receiver) {
-            return Err(format!(
-                "compiled exchange receiver node {receiver} is addressed by more than one source"
-            )
-            .into());
+            return Err(compiled_exchange_binding_refusal(
+                crate::exec::fragment::error::FragmentBindingTarget::ExchangeNode(receiver),
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled exchange receiver node {receiver} is addressed by more than one source"
+                ),
+            ));
         }
         let assignment = assignments
             .get(&FragmentNodeId::new(receiver))
             .ok_or_else(|| {
-                format!("missing exchange assignment for compiled receiver node {receiver}")
+                compiled_exchange_binding_refusal(
+                    crate::exec::fragment::error::FragmentBindingTarget::ExchangeNode(receiver),
+                    crate::exec::fragment::error::FragmentBindingErrorKind::MissingAssignment,
+                    format!("missing exchange assignment for compiled receiver node {receiver}"),
+                )
             })?;
         let expected_senders = assignment.sender_count().get();
         let key = ExchangeReceiverKey {
@@ -133,11 +162,14 @@ pub(crate) fn materialize_compiled_exchange_receivers(
         .iter()
         .find(|(node_id, _)| !receivers.contains(&node_id.get()))
     {
-        return Err(format!(
-            "exchange assignment for node {} has no compiled exchange source",
-            extra.get()
-        )
-        .into());
+        return Err(compiled_exchange_binding_refusal(
+            crate::exec::fragment::error::FragmentBindingTarget::ExchangeNode(extra.get()),
+            crate::exec::fragment::error::FragmentBindingErrorKind::ExtraAssignment,
+            format!(
+                "exchange assignment for node {} has no compiled exchange source",
+                extra.get()
+            ),
+        ));
     }
     Ok(CompiledExchangeReceivers {
         registrations,

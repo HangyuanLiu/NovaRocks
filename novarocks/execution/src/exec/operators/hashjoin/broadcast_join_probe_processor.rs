@@ -27,6 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::sync::Arc;
@@ -37,8 +38,14 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
 use crate::exec::pipeline::dependency::DependencyHandle;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputConstructionFactory, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    shape::{Transform, TransformKernel},
+    step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
+    step_context::StepContext,
+};
 use crate::runtime::runtime_state::RuntimeState;
 use tracing::debug;
 
@@ -130,16 +137,11 @@ impl OperatorFactory for BroadcastJoinProbeProcessorFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(BroadcastJoinProbeProcessorOperator {
+        Box::new(Transform::hydrating(BroadcastJoinProbeProcessorKernel {
             name: self.name.clone(),
             state: Arc::clone(&self.state),
             driver_id,
             dep: self.state.dep(),
-            buffered: Vec::new(),
-            pending_output: None,
-            finishing: false,
-            finishing_done: false,
-            finished: false,
             core: HashJoinProbeCore::new_native(
                 Arc::clone(&self.arena),
                 self.join_type,
@@ -155,50 +157,27 @@ impl OperatorFactory for BroadcastJoinProbeProcessorFactory {
             input_chunks: 0,
             buffered_rows: 0,
             profile_initialized: false,
+            finalizing: false,
             profiles: None,
-            evaluation_arena: Arc::clone(&self.arena),
-            construction: None,
-            evaluation_control: None,
-        })
+        }))
     }
 }
 
-struct BroadcastJoinProbeProcessorOperator {
-    evaluation_arena: Arc<ExprArena>,
-    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
-    evaluation_control: Option<super::super::compiled_expression::RuntimeKernelControl>,
+struct BroadcastJoinProbeProcessorKernel {
     name: String,
     state: Arc<BroadcastJoinSharedState>,
     driver_id: i32,
     dep: DependencyHandle,
-    buffered: Vec<Chunk>,
-    pending_output: Option<Chunk>,
-    finishing: bool,
-    finishing_done: bool,
-    finished: bool,
     core: HashJoinProbeCore,
     input_rows: usize,
     input_chunks: usize,
     buffered_rows: usize,
     profile_initialized: bool,
+    finalizing: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
 }
 
-impl Operator for BroadcastJoinProbeProcessorOperator {
-    fn creates_typed_storage(&self) -> bool {
-        true
-    }
-    fn set_construction_factory(
-        &mut self,
-        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-    ) {
-        self.construction = Some(factory);
-    }
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        self.evaluation_control =
-            Some(super::super::compiled_expression::RuntimeKernelControl::new(state.error_state()));
-        Ok(())
-    }
+impl OperatorLifecycle for BroadcastJoinProbeProcessorKernel {
     fn name(&self) -> &str {
         &self.name
     }
@@ -207,109 +186,109 @@ impl Operator for BroadcastJoinProbeProcessorOperator {
         self.profiles = Some(profiles);
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn creates_typed_storage(&self) -> bool {
+        true
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.core.set_construction_factory(factory);
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.core.release_owned();
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
+    }
+    fn cancel(&mut self) {
+        self.core.release_owned();
+    }
+    fn on_driver_failure(&mut self) {
+        self.core.release_owned();
     }
 }
-
-impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
-    fn need_input(&self) -> bool {
-        if self.finishing
-            || self.finished
-            || self.pending_output.is_some()
-            || self.core.has_pending_output()
-        {
-            return false;
-        }
-        self.core.is_build_loaded() || self.state.has_build()
-    }
-
-    fn has_output(&self) -> bool {
-        if self.pending_output.is_some() {
-            return true;
-        }
-        if self.core.has_pending_output() {
-            return true;
-        }
-        self.finishing
-            && !self.finishing_done
-            && (self.core.is_build_loaded() || self.state.has_build())
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.init_profile_if_needed();
-        if self.finishing {
-            return Err("broadcast join probe received input after set_finishing"
-                .to_string()
-                .into());
-        }
-        if self.pending_output.is_some() {
-            return Err(
-                "broadcast join probe received input while output buffer is full"
-                    .to_string()
-                    .into(),
-            );
-        }
-        if !self.core.is_build_loaded() {
-            self.load_build_side()?;
-        }
-        let out = self.process_one(chunk)?;
-        self.pending_output = out;
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.pending_output.is_none() && self.core.has_pending_output() {
-            self.pending_output = self.core.pop_pending_output()?;
-        }
-        if self.pending_output.is_none() && self.finishing && !self.finishing_done {
-            let out = self.finish_one()?;
-            self.pending_output = out;
-            self.finishing_done = true;
-        }
-        let out = self.pending_output.take();
-        if self.finishing
-            && self.finishing_done
-            && self.pending_output.is_none()
-            && !self.core.has_pending_output()
-        {
-            self.finished = true;
-        }
-        Ok(out)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.init_profile_if_needed();
-        self.finishing = true;
-        Ok(())
-    }
-
-    fn precondition_dependency(
+impl InputEncodingPolicy for BroadcastJoinProbeProcessorKernel {}
+impl TransformKernel for BroadcastJoinProbeProcessorKernel {
+    fn admission(
         &self,
-    ) -> Option<crate::exec::pipeline::dependency::DependencyHandle> {
-        if self.core.is_build_loaded() || self.state.has_build() {
-            None
-        } else {
-            Some(self.dep.clone())
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        Ok(self.build_wait().map(AdmissionNext::Wait))
+    }
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        self.init_profile_if_needed();
+        let result = (|| {
+            self.load_build_side()?;
+            if !chunk.is_empty() {
+                self.input_rows = self.input_rows.saturating_add(chunk.len());
+                self.input_chunks = self.input_chunks.saturating_add(1);
+            }
+            self.core.accept_probe(ctx, chunk)
+        })();
+        self.complete_step(ctx, result)
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.finalizing {
+            return self.advance_finalization(ctx);
         }
+        let result = self.core.drive_probe(ctx);
+        if result.is_err() {
+            self.core.release_owned();
+        }
+        result
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        self.finalizing = true;
+        self.advance_finalization(ctx)
     }
 }
 
-impl BroadcastJoinProbeProcessorOperator {
+impl BroadcastJoinProbeProcessorKernel {
+    // EOS is signalled once by the shape. Build readiness can arrive later;
+    // that wake must resume this same finalization instead of requesting input.
+    fn advance_finalization(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(wait) = self.build_wait() {
+            return Ok(StepResult::new(None, NextStep::Wait(wait), 0));
+        }
+        self.init_profile_if_needed();
+        let result = self
+            .finish_one()
+            .map(|output| StepResult::new(output, NextStep::Finished, 0))
+            .map_err(Into::into);
+        let step = self.complete_step(ctx, result)?;
+        self.core.release_owned();
+        Ok(step)
+    }
+
+    fn build_wait(&self) -> Option<WaitFact> {
+        let observable = self.dep.observable();
+        let observed_generation = observable.generation();
+        if self.core.is_build_loaded() || self.state.has_build() {
+            return None;
+        }
+        Some(WaitFact {
+            reason: WaitReason::Dependency,
+            observable,
+            observed_generation,
+            deadline: None,
+        })
+    }
+    fn complete_step(
+        &mut self,
+        ctx: &StepContext<'_>,
+        result: ExecutionResult<StepResult>,
+    ) -> ExecutionResult<StepResult> {
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+            self.core.release_owned();
+        }
+        result
+    }
     fn init_profile_if_needed(&mut self) {
         if self.profile_initialized {
             return;
@@ -329,97 +308,25 @@ impl BroadcastJoinProbeProcessorOperator {
         }
     }
 
-    fn join_probe_chunks_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
-        let arena = &self.evaluation_arena;
-        let factory = &self.construction;
-        let control = &self.evaluation_control;
-        self.core.join_probe_chunks_evaluated(
-            chunks,
-            factory
-                .as_deref()
-                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
-            &mut |expr, input| {
-                let owner = factory
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
-                    .begin_input_construction(input)?;
-                let control = control
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
-                    .eval(expr, input)
-            },
-        )
-    }
-
-    fn finish_core_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
-        let arena = &self.evaluation_arena;
-        let factory = &self.construction;
-        let control = &self.evaluation_control;
-        self.core.finish_evaluated(
-            chunks,
-            None,
-            factory
-                .as_deref()
-                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
-            &mut |expr, input| {
-                let owner = factory
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
-                    .begin_input_construction(input)?;
-                let control = control
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
-                    .eval(expr, input)
-            },
-        )
-    }
-
-    fn process_one(&mut self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
-        if !chunk.is_empty() {
-            self.input_rows = self.input_rows.saturating_add(chunk.len());
-            self.input_chunks = self.input_chunks.saturating_add(1);
-        }
-        let probe_chunks = self.collect_probe_chunks(Some(chunk));
-        self.join_probe_chunks_created(probe_chunks)
-    }
-
-    fn finish_one(&mut self) -> ExecutionResult<Option<Chunk>> {
-        if !self.core.is_build_loaded() {
-            self.load_build_side()?;
-        }
-        let probe_chunks = self.collect_probe_chunks(None);
+    fn finish_one(&mut self) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+        self.load_build_side()?;
         let join_type = self.core.join_type();
-        let emits_build_side_output =
-            matches!(join_type, JoinType::FullOuter | JoinType::RightOuter)
-                || (self.core.probe_is_left()
-                    && matches!(join_type, JoinType::RightAnti | JoinType::RightSemi));
-        let out = if emits_build_side_output {
-            let probe_out = self.join_probe_chunks_created(probe_chunks)?;
-            let local_flags = self.core.take_build_matched().unwrap_or_default();
-            match self.state.merge_build_matched(local_flags)? {
-                Some(merged) => self.core.finish_from_probe_output_evaluated(
-                    probe_out,
-                    Some(merged),
-                    false,
-                    self.construction.as_deref().ok_or(
-                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                    )?,
-                )?,
-                None if self.core.probe_is_left()
-                    && matches!(join_type, JoinType::RightAnti | JoinType::RightSemi) =>
-                {
-                    None
-                }
-                None => probe_out,
+        let emits_build = matches!(join_type, JoinType::FullOuter | JoinType::RightOuter)
+            || (self.core.probe_is_left()
+                && matches!(join_type, JoinType::RightAnti | JoinType::RightSemi));
+        let output = if emits_build {
+            let flags = self.core.take_build_matched().unwrap_or_default();
+            match self.state.merge_build_matched(flags)? {
+                Some(merged) => self
+                    .core
+                    .finish_from_probe_output(None, Some(merged), false)?,
+                None => None,
             }
         } else {
-            self.finish_core_created(probe_chunks)?
+            self.core.finish_from_probe_output(None, None, true)?
         };
-
         self.log_stats();
-        Ok(out)
+        Ok(output)
     }
 
     fn log_stats(&self) {
@@ -437,12 +344,14 @@ impl BroadcastJoinProbeProcessorOperator {
         );
     }
 
-    fn load_build_side(&mut self) -> Result<(), String> {
+    fn load_build_side(&mut self) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if self.core.is_build_loaded() {
             return Ok(());
         }
         let Some(artifact) = self.state.get_build() else {
-            return Err("broadcast join build not ready".to_string());
+            return Err(super::build_state::build_contract(
+                "broadcast join build not ready",
+            ));
         };
         let global_rows = artifact.build_row_count;
         let global_has_null = artifact.build_has_null_key;
@@ -450,39 +359,11 @@ impl BroadcastJoinProbeProcessorOperator {
             .set_build_artifact(artifact, global_rows, global_has_null)?;
         Ok(())
     }
-
-    fn collect_probe_chunks(&mut self, chunk: Option<Chunk>) -> Vec<Chunk> {
-        let mut probe_chunks = Vec::new();
-        for buffered in self.buffered.drain(..) {
-            if !buffered.is_empty() {
-                probe_chunks.push(buffered);
-            }
-        }
-        if let Some(chunk) = chunk
-            && !chunk.is_empty()
-        {
-            probe_chunks.push(chunk);
-        }
-        probe_chunks
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    fn install_evaluation_runtime(
-        operator: &mut dyn crate::exec::pipeline::operator::Operator,
-        runtime: &RuntimeState,
-    ) {
-        operator.set_construction_factory(
-            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-                crate::runtime::mem_tracker::MemTracker::new_root("hash probe evaluation construction"),
-                runtime.error_state(),
-            ).unwrap(),
-        );
-        operator.bind_runtime_state(runtime).unwrap();
-    }
-
+    use crate::exec::pipeline::test_driver::TestDriver;
     use std::sync::Arc;
 
     use arrow::array::Int32Array;
@@ -498,6 +379,12 @@ mod tests {
     use crate::exec::operators::hashjoin::build_state::JoinBuildSinkState;
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::exec::pipeline::{
+        input::{PreparedInput, RawInput},
+        shape::{Transform, TransformKernel},
+        step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
+        step_context::StepContext,
+    };
     use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
 
@@ -507,14 +394,18 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        crate::exec::chunk::typed_fixture::chunk(
-            batch,
-            &[slot_id],
-            &[novarocks_type_contract::FunctionValueType::new(
-                DataType::Int32,
-                false,
-            )],
-        )
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[slot_id],
+            )
+            .expect("chunk schema");
+            super::super::probe_step_test_support::int32_source(Chunk::new_with_chunk_schema(
+                batch,
+                chunk_schema,
+            ))
+        }
     }
 
     fn chunk_of_two(
@@ -532,14 +423,18 @@ mod tests {
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        crate::exec::chunk::typed_fixture::chunk(
-            batch,
-            &[k_slot_id, v_slot_id],
-            &[
-                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-            ],
-        )
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[k_slot_id, v_slot_id],
+            )
+            .expect("chunk schema");
+            super::super::probe_step_test_support::int32_source(Chunk::new_with_chunk_schema(
+                batch,
+                chunk_schema,
+            ))
+        }
     }
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
@@ -651,9 +546,12 @@ mod tests {
             None,
             true,
             true,
-            chunk_schema_of(&left_schema, &[SlotId::new(1)]),
-            chunk_schema_of(&right_schema, &[SlotId::new(2)]),
-            chunk_schema_of(&join_scope_schema, &[SlotId::new(1), SlotId::new(2)]),
+            super::super::probe_step_test_support::int32_schema(&left_schema, &[SlotId::new(1)]),
+            super::super::probe_step_test_support::int32_schema(&right_schema, &[SlotId::new(2)]),
+            super::super::probe_step_test_support::int32_schema(
+                &join_scope_schema,
+                &[SlotId::new(1), SlotId::new(2)],
+            ),
             Arc::clone(&join_state),
         );
 
@@ -662,55 +560,83 @@ mod tests {
         let probe_right = chunk_of(SlotId::new(1), &[4]);
 
         let mut probe_op_left = probe_factory.create(2, 0);
-        install_evaluation_runtime(probe_op_left.as_mut(), &rt);
-        let Some(proc_left) = probe_op_left.as_processor_mut() else {
-            panic!("probe operator missing processor");
+        super::super::probe_step_test_support::install(probe_op_left.as_mut(), &rt);
+        use crate::exec::pipeline::{input::RawInput, step::InputResult, step_context::TurnWork};
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut work);
+        let original = probe_left.columns()[0].clone();
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(wait),
+        } = probe_op_left
+            .as_mut()
+            .try_push(&mut ctx, RawInput::for_test(probe_left))
+        else {
+            panic!("build must defer raw probe input");
         };
-        assert!(!proc_left.need_input());
-        let dep = proc_left
-            .precondition_dependency()
-            .expect("build dependency");
+        assert!(Arc::ptr_eq(
+            &input.original_for_test().columns()[0],
+            &original
+        ));
 
         let mut build_op = build_factory.create(1, 0);
-        install_evaluation_runtime(build_op.as_mut(), &rt);
-        let Some(sink) = build_op.as_processor_mut() else {
-            panic!("build operator missing processor");
-        };
-        sink.push_chunk(&rt, build).expect("build push");
-        sink.set_finishing(&rt).expect("build finish");
-        assert!(dep.is_ready());
-
+        super::super::probe_step_test_support::install(build_op.as_mut(), &rt);
+        let mut sink = TestDriver::new(build_op.as_mut(), &rt);
+        sink.input_without_output(build).expect("build push");
+        sink.signal_eos().expect("build EOS");
+        assert!(sink.collect_until_finished().unwrap().is_empty());
+        assert_ne!(wait.observable.generation(), wait.observed_generation);
+        let step = probe_op_left.as_mut();
+        assert!(matches!(
+            step.try_push(&mut ctx, input),
+            InputResult::Accepted(Ok(_))
+        ));
+        assert!(step.drive(&mut ctx).unwrap().output.is_none());
+        let mut proc_left = TestDriver::new(probe_op_left.as_mut(), &rt);
         let mut pairs = Vec::new();
-        assert!(proc_left.need_input());
-        proc_left.push_chunk(&rt, probe_left).expect("probe push");
-        while proc_left.has_output() {
-            if let Some(out) = proc_left.pull_chunk(&rt).expect("probe pull") {
+        while matches!(proc_left.next(), NextStep::Runnable | NextStep::Yield) {
+            if let Some(out) = proc_left
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .expect("probe pull")
+            {
                 append_pairs(out, &mut pairs);
             }
         }
-        proc_left.set_finishing(&rt).expect("probe finish");
-        while proc_left.has_output() {
-            if let Some(out) = proc_left.pull_chunk(&rt).expect("probe pull") {
+        proc_left.signal_eos().expect("probe finish");
+        while matches!(proc_left.next(), NextStep::Runnable | NextStep::Yield) {
+            if let Some(out) = proc_left
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .expect("probe pull")
+            {
                 append_pairs(out, &mut pairs);
             }
         }
 
         let mut probe_op_right = probe_factory.create(2, 1);
-        install_evaluation_runtime(probe_op_right.as_mut(), &rt);
-        let Some(proc_right) = probe_op_right.as_processor_mut() else {
-            panic!("probe operator missing processor");
-        };
+        super::super::probe_step_test_support::install(probe_op_right.as_mut(), &rt);
+        let mut proc_right = TestDriver::new(probe_op_right.as_mut(), &rt);
         proc_right
-            .push_chunk(&rt, probe_right)
+            .accept_without_output(probe_right)
             .expect("probe process");
-        while proc_right.has_output() {
-            if let Some(out) = proc_right.pull_chunk(&rt).expect("probe pull") {
+        while matches!(proc_right.next(), NextStep::Runnable | NextStep::Yield) {
+            if let Some(out) = proc_right
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .expect("probe pull")
+            {
                 append_pairs(out, &mut pairs);
             }
         }
-        proc_right.set_finishing(&rt).expect("probe finish");
-        while proc_right.has_output() {
-            if let Some(out) = proc_right.pull_chunk(&rt).expect("probe pull") {
+        proc_right.signal_eos().expect("probe finish");
+        while matches!(proc_right.next(), NextStep::Runnable | NextStep::Yield) {
+            if let Some(out) = proc_right
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .expect("probe pull")
+            {
                 append_pairs(out, &mut pairs);
             }
         }
@@ -780,34 +706,48 @@ mod tests {
         );
 
         let mut probe_op = probe_factory.create(1, 0);
-        install_evaluation_runtime(probe_op.as_mut(), &rt);
-        let Some(proc) = probe_op.as_processor_mut() else {
-            panic!("probe operator missing processor");
+        super::super::probe_step_test_support::install(probe_op.as_mut(), &rt);
+        use crate::exec::pipeline::{input::RawInput, step::InputResult, step_context::TurnWork};
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut work);
+        let step = probe_op.as_mut();
+        let original = probe.columns()[0].clone();
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(wait),
+        } = step.try_push(&mut ctx, RawInput::for_test(probe))
+        else {
+            panic!("build dependency leaves the raw probe on its edge");
         };
-        assert!(!proc.need_input());
-        let dep = proc.precondition_dependency().expect("build dependency");
-
+        assert!(Arc::ptr_eq(
+            &input.original_for_test().columns()[0],
+            &original
+        ));
         let mut build_op = build_factory.create(1, 0);
-        install_evaluation_runtime(build_op.as_mut(), &rt);
-        let Some(sink) = build_op.as_processor_mut() else {
-            panic!("build operator missing processor");
-        };
-        sink.push_chunk(&rt, build).expect("build push");
-        sink.set_finishing(&rt).expect("build finish");
-        assert!(dep.is_ready());
-
+        super::super::probe_step_test_support::install(build_op.as_mut(), &rt);
+        let mut sink = TestDriver::new(build_op.as_mut(), &rt);
+        sink.input_without_output(build).unwrap();
+        sink.signal_eos().unwrap();
+        assert!(sink.collect_until_finished().unwrap().is_empty());
+        assert_ne!(wait.observable.generation(), wait.observed_generation);
+        assert!(matches!(
+            step.try_push(&mut ctx, input),
+            InputResult::Accepted(Ok(_))
+        ));
+        let computed = step.drive(&mut ctx).unwrap();
         let mut rows = Vec::new();
-        assert!(proc.need_input());
-        proc.push_chunk(&rt, probe).expect("probe push");
-        while proc.has_output() {
-            if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
+        if let Some(out) = computed.output {
+            append_pairs(out, &mut rows);
+        }
+        step.finish(&mut ctx).unwrap();
+        loop {
+            let next = step.drive(&mut ctx).unwrap();
+            if let Some(out) = next.output {
                 append_pairs(out, &mut rows);
             }
-        }
-        proc.set_finishing(&rt).expect("probe finish");
-        while proc.has_output() {
-            if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                append_pairs(out, &mut rows);
+            if matches!(next.next, NextStep::Finished) {
+                break;
             }
         }
 
@@ -887,34 +827,48 @@ mod tests {
         );
 
         let mut probe_op = probe_factory.create(1, 0);
-        install_evaluation_runtime(probe_op.as_mut(), &rt);
-        let Some(proc) = probe_op.as_processor_mut() else {
-            panic!("probe operator missing processor");
+        super::super::probe_step_test_support::install(probe_op.as_mut(), &rt);
+        use crate::exec::pipeline::{input::RawInput, step::InputResult, step_context::TurnWork};
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut work);
+        let step = probe_op.as_mut();
+        let original = probe.columns()[0].clone();
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(wait),
+        } = step.try_push(&mut ctx, RawInput::for_test(probe))
+        else {
+            panic!("build dependency leaves the raw probe on its edge");
         };
-        assert!(!proc.need_input());
-        let dep = proc.precondition_dependency().expect("build dependency");
-
+        assert!(Arc::ptr_eq(
+            &input.original_for_test().columns()[0],
+            &original
+        ));
         let mut build_op = build_factory.create(1, 0);
-        install_evaluation_runtime(build_op.as_mut(), &rt);
-        let Some(sink) = build_op.as_processor_mut() else {
-            panic!("build operator missing processor");
-        };
-        sink.push_chunk(&rt, build).expect("build push");
-        sink.set_finishing(&rt).expect("build finish");
-        assert!(dep.is_ready());
-
+        super::super::probe_step_test_support::install(build_op.as_mut(), &rt);
+        let mut sink = TestDriver::new(build_op.as_mut(), &rt);
+        sink.input_without_output(build).unwrap();
+        sink.signal_eos().unwrap();
+        assert!(sink.collect_until_finished().unwrap().is_empty());
+        assert_ne!(wait.observable.generation(), wait.observed_generation);
+        assert!(matches!(
+            step.try_push(&mut ctx, input),
+            InputResult::Accepted(Ok(_))
+        ));
+        let computed = step.drive(&mut ctx).unwrap();
         let mut rows = Vec::new();
-        assert!(proc.need_input());
-        proc.push_chunk(&rt, probe).expect("probe push");
-        while proc.has_output() {
-            if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
+        if let Some(out) = computed.output {
+            append_pair_columns(out, 2, 3, &mut rows);
+        }
+        step.finish(&mut ctx).unwrap();
+        loop {
+            let next = step.drive(&mut ctx).unwrap();
+            if let Some(out) = next.output {
                 append_pair_columns(out, 2, 3, &mut rows);
             }
-        }
-        proc.set_finishing(&rt).expect("probe finish");
-        while proc.has_output() {
-            if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                append_pair_columns(out, 2, 3, &mut rows);
+            if matches!(next.next, NextStep::Finished) {
+                break;
             }
         }
 

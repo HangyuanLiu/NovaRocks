@@ -20,8 +20,9 @@
 use super::*;
 use crate::iceberg::spec::{PrimitiveType, Type};
 use novarocks_connector_contract::{
-    ConnectorReadExecutionSchema, ConnectorSourceFieldFacts, ConnectorSourceInitialDefault,
-    ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape, MAX_CONNECTOR_RECIPE_COLUMNS,
+    ConnectorErrorKind, ConnectorReadExecutionSchema, ConnectorSourceFieldFacts,
+    ConnectorSourceInitialDefault, ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape,
+    MAX_CONNECTOR_RECIPE_COLUMNS,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
 use std::{alloc::Layout, collections::HashMap};

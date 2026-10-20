@@ -17,6 +17,7 @@
 //! Original IN state assembly and signed comparison. Scheduling stays outside
 //! this module; every input has already been evaluated by its original shell.
 //! Observation grants no memory. Raw entrypoints preserve complete data errors.
+use crate::KernelFailure;
 use arrow_array::builder::BooleanBuilder;
 use arrow_array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow_schema::DataType;
@@ -28,7 +29,7 @@ pub enum InObservation {
 }
 #[derive(Debug)]
 pub enum InError<E> {
-    Data(String),
+    Operation(KernelFailure),
     Host(E),
 }
 fn observe<E>(
@@ -41,10 +42,10 @@ fn raw<T>(
     f: impl FnOnce(
         &mut dyn FnMut(InObservation) -> Result<(), Infallible>,
     ) -> Result<T, InError<Infallible>>,
-) -> Result<T, String> {
+) -> Result<T, KernelFailure> {
     match f(&mut |_| Ok(())) {
         Ok(value) => Ok(value),
-        Err(InError::Data(message)) => Err(message),
+        Err(InError::Operation(message)) => Err(message),
         Err(InError::Host(never)) => match never {},
     }
 }
@@ -55,8 +56,8 @@ pub struct InRows {
     matched: Vec<bool>,
 }
 impl InRows {
-    pub fn legacy(input: &ArrayRef) -> Self {
-        raw(|observe| Self::begin_observed(input, observe)).unwrap()
+    pub fn begin_required(input: &ArrayRef) -> Result<Self, KernelFailure> {
+        raw(|observe| Self::begin_observed(input, observe))
     }
     pub fn begin_observed<E>(
         input: &ArrayRef,
@@ -72,8 +73,20 @@ impl InRows {
         }
         observe(observer, InObservation::OpaqueBoundary)?;
         // Original two independent std allocations; no new memory wallet.
-        let has_null = vec![false; len];
-        let matched = vec![false; len];
+        let mut has_null = Vec::new();
+        has_null.try_reserve_exact(len).map_err(|source| {
+            InError::Operation(KernelFailure::from_domain(
+                crate::allocation_failure::AllocationRefusal::new("IN null state", source),
+            ))
+        })?;
+        has_null.resize(len, false);
+        let mut matched = Vec::new();
+        matched.try_reserve_exact(len).map_err(|source| {
+            InError::Operation(KernelFailure::from_domain(
+                crate::allocation_failure::AllocationRefusal::new("IN match state", source),
+            ))
+        })?;
+        matched.resize(len, false);
         observe(observer, InObservation::OpaqueBoundary)?;
         Ok(Self {
             len,
@@ -84,7 +97,7 @@ impl InRows {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
-    pub fn candidate_nulls_legacy(&mut self, candidate: &ArrayRef) -> Result<(), String> {
+    pub fn candidate_nulls_required(&mut self, candidate: &ArrayRef) -> Result<(), KernelFailure> {
         raw(|observe| self.candidate_nulls_observed(candidate, observe))
     }
     pub fn candidate_nulls_observed<E>(
@@ -116,22 +129,27 @@ impl InRows {
         observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
     ) -> Result<(), InError<E>> {
         if candidate.len() != 1 && candidate.len() != len {
-            return Err(InError::Data(format!(
+            return Err(InError::Operation(contract(format_args!(
                 "IN predicate value length mismatch: input has {}, value has {}",
                 len,
                 candidate.len()
-            )));
+            ))));
         }
         for row in 0..len {
             observe(observer, InObservation::Step)?;
+            if parent(row) >= self.len {
+                return Err(InError::Operation(contract(
+                    "IN parent ordinal is outside its state",
+                )));
+            }
             if candidate.is_null(row_index(row, candidate.len())) {
                 self.has_null[parent(row)] = true;
             }
         }
         Ok(())
     }
-    pub fn equalities_legacy(&mut self, equalities: &BooleanArray) {
-        raw(|observe| self.equalities_observed(equalities, observe)).unwrap();
+    pub fn equalities_required(&mut self, equalities: &BooleanArray) -> Result<(), KernelFailure> {
+        raw(|observe| self.equalities_observed(equalities, observe))
     }
     pub fn equalities_observed<E>(
         &mut self,
@@ -155,9 +173,19 @@ impl InRows {
         parent: impl Fn(usize) -> usize,
         observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
     ) -> Result<(), InError<E>> {
+        if equalities.len() != len {
+            return Err(InError::Operation(contract(
+                "IN equality length differs from its selected rows",
+            )));
+        }
         for row in 0..len {
             observe(observer, InObservation::Step)?;
             let parent = parent(row);
+            if parent >= self.len {
+                return Err(InError::Operation(contract(
+                    "IN equality parent is outside its state",
+                )));
+            }
             if equalities.is_null(row) {
                 self.has_null[parent] = true;
             } else if equalities.value(row) {
@@ -166,8 +194,12 @@ impl InRows {
         }
         Ok(())
     }
-    pub fn finish_legacy(self, input: &ArrayRef, negated: bool) -> BooleanArray {
-        raw(|observe| self.finish_observed(input, negated, observe)).unwrap()
+    pub fn finish_required(
+        self,
+        input: &ArrayRef,
+        negated: bool,
+    ) -> Result<BooleanArray, KernelFailure> {
+        raw(|observe| self.finish_observed(input, negated, observe))
     }
     pub fn finish_observed<E>(
         self,
@@ -195,6 +227,14 @@ impl InRows {
         failed_rows: &[usize],
         observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
     ) -> Result<BooleanArray, InError<E>> {
+        if input.len() != self.len
+            || failed_rows.iter().any(|row| *row >= self.len)
+            || failed_rows.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(InError::Operation(contract(
+                "IN finish input or failure ordinals differ from its state",
+            )));
+        }
         if self.len == 0 {
             return Ok(BooleanArray::from(Vec::<bool>::new()));
         }
@@ -248,37 +288,39 @@ fn is_signed_integer_type(data_type: &DataType) -> bool {
     )
 }
 
-fn signed_integer_value(array: &ArrayRef, row: usize) -> Result<i64, String> {
+fn signed_integer_value(array: &ArrayRef, row: usize) -> Result<i64, KernelFailure> {
     match array.data_type() {
         DataType::Int8 => Ok(array
             .as_any()
             .downcast_ref::<Int8Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int8Array".to_string())?
+            .ok_or_else(|| contract("failed to downcast signed IN value to Int8Array"))?
             .value(row) as i64),
         DataType::Int16 => Ok(array
             .as_any()
             .downcast_ref::<Int16Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int16Array".to_string())?
+            .ok_or_else(|| contract("failed to downcast signed IN value to Int16Array"))?
             .value(row) as i64),
         DataType::Int32 => Ok(array
             .as_any()
             .downcast_ref::<Int32Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int32Array".to_string())?
+            .ok_or_else(|| contract("failed to downcast signed IN value to Int32Array"))?
             .value(row) as i64),
         DataType::Int64 => Ok(array
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int64Array".to_string())?
+            .ok_or_else(|| contract("failed to downcast signed IN value to Int64Array"))?
             .value(row)),
-        other => Err(format!("unsupported signed IN value type: {other:?}")),
+        other => Err(contract(format_args!(
+            "unsupported signed IN value type: {other:?}"
+        ))),
     }
 }
 
 /// A supported signed pair only; None preserves the original next dispatch.
-pub fn signed_equality_legacy(
+pub fn signed_equality_required(
     input: &ArrayRef,
     candidate: &ArrayRef,
-) -> Result<Option<BooleanArray>, String> {
+) -> Result<Option<BooleanArray>, KernelFailure> {
     raw(|observe| signed_equality_observed(input, candidate, observe))
 }
 pub fn signed_equality_observed<E>(
@@ -299,7 +341,7 @@ pub fn signed_equality_observed<E>(
             &array.as_ref() as &dyn arrow_array::Datum,
             &candidate.as_ref() as &dyn arrow_array::Datum,
         )
-        .map_err(|error| InError::Data(error.to_string()))?;
+        .map_err(|error| InError::Operation(arrow_failure(error)))?;
         observe(observer, InObservation::OpaqueBoundary)?;
         return Ok(Some(result));
     }
@@ -314,8 +356,8 @@ pub fn signed_equality_observed<E>(
             continue;
         }
         builder.append_value(
-            signed_integer_value(array, row).map_err(InError::Data)?
-                == signed_integer_value(candidate, candidate_row).map_err(InError::Data)?,
+            signed_integer_value(array, row).map_err(InError::Operation)?
+                == signed_integer_value(candidate, candidate_row).map_err(InError::Operation)?,
         );
     }
     observe(observer, InObservation::OpaqueBoundary)?;
@@ -600,3 +642,48 @@ fn inlist_own_effects(
 #[cfg(test)]
 #[path = "native_inlist_tests.rs"]
 mod tests;
+
+#[derive(Debug)]
+enum InOperationFailure {
+    Contract(novarocks_failure_contract::BoundedDetail),
+    Arrow(arrow_schema::ArrowError),
+}
+impl std::fmt::Display for InOperationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contract(detail) => detail.fmt(f),
+            Self::Arrow(source) => source.fmt(f),
+        }
+    }
+}
+impl std::error::Error for InOperationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Arrow(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for InOperationFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self {
+            Self::Contract(_) => (FailureClass::Invariant, 381),
+            Self::Arrow(arrow_schema::ArrowError::MemoryError(_)) => (FailureClass::Resource, 382),
+            Self::Arrow(_) => (FailureClass::Invariant, 383),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+pub fn contract(detail: impl std::fmt::Display) -> KernelFailure {
+    KernelFailure::from_domain(InOperationFailure::Contract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+pub fn arrow_failure(source: arrow_schema::ArrowError) -> KernelFailure {
+    KernelFailure::from_domain(InOperationFailure::Arrow(source))
+}
+impl novarocks_failure_contract::OuterFailureProjection for InOperationFailure {}

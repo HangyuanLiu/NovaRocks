@@ -19,6 +19,7 @@
 //! Pending retains only its unexecuted continuation, never an active writer.
 
 use super::{
+    fragment::{ExecutionFailure, ExecutionResult},
     kernel_memory::{KernelMemoryAdmission, KernelMemoryJournal, request_complete_operation},
     query_memory::QueryMemoryBinding,
 };
@@ -31,13 +32,31 @@ pub enum PreparationMemoryStop {
     Cancel(CancelReason),
     Abort(AbortCause),
 }
+impl std::fmt::Display for PreparationMemoryStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancel(reason) => write!(f, "preparation observed cancellation: {reason}"),
+            Self::Abort(cause) => write!(f, "preparation observed abort: {cause}"),
+        }
+    }
+}
+impl std::error::Error for PreparationMemoryStop {}
+impl novarocks_failure_contract::FailureProjection for PreparationMemoryStop {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::stop_observation(
+            crate::runtime::fragment::ExecutionReason::PreparationStopped.reason(),
+        )
+    }
+}
+/// The control author supplies the actual failure. An accepted Task failure
+/// is not reconstructed as a cancellation/abort command at this boundary.
 pub trait SynchronousPreparationControl {
-    fn checkpoint(&self) -> Result<(), PreparationMemoryStop>;
-    fn wait(&self) -> Result<(), PreparationMemoryStop>;
+    fn checkpoint(&self) -> ExecutionResult<()>;
+    fn wait(&self) -> ExecutionResult<()>;
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparationMemoryRefusal {
-    Stopped(PreparationMemoryStop),
+    Interrupted(ExecutionFailure),
     MissingQueryMemory,
     SharedShortage(ShortageReceipt),
     Capacity(CapacityError),
@@ -45,7 +64,7 @@ pub enum PreparationMemoryRefusal {
 impl std::fmt::Display for PreparationMemoryRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Stopped(stop) => write!(f, "metadata preparation stopped: {stop:?}"),
+            Self::Interrupted(stop) => write!(f, "metadata preparation interrupted: {stop}"),
             Self::MissingQueryMemory => f.write_str("metadata preparation requires query memory"),
             Self::SharedShortage(receipt) => {
                 write!(f, "metadata preparation shared shortage: {receipt:?}")
@@ -54,7 +73,15 @@ impl std::fmt::Display for PreparationMemoryRefusal {
         }
     }
 }
-impl std::error::Error for PreparationMemoryRefusal {}
+impl std::error::Error for PreparationMemoryRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Interrupted(source) => Some(source),
+            Self::Capacity(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum SynchronousPreparationFailure<E> {
@@ -144,7 +171,7 @@ impl<'a> SynchronousPreparationMemory<'a> {
         *self.journal.workset_bytes = Some(peak);
         loop {
             self.control.checkpoint().map_err(|stop| {
-                SynchronousPreparationFailure::Host(PreparationMemoryRefusal::Stopped(stop))
+                SynchronousPreparationFailure::Host(PreparationMemoryRefusal::Interrupted(stop))
             })?;
             let admission = match self.binding {
                 Some(binding) => request(binding, peak),
@@ -155,7 +182,9 @@ impl<'a> SynchronousPreparationMemory<'a> {
                     // A stop may win during admission. Dropping unused Ready
                     // returns its original rights without executing the body.
                     self.control.checkpoint().map_err(|stop| {
-                        SynchronousPreparationFailure::Host(PreparationMemoryRefusal::Stopped(stop))
+                        SynchronousPreparationFailure::Host(PreparationMemoryRefusal::Interrupted(
+                            stop,
+                        ))
                     })?;
                     let result = ready.run(self.journal.body, body).map_err(|cause| {
                         SynchronousPreparationFailure::Host(self.capacity(cause))
@@ -182,7 +211,9 @@ impl<'a> SynchronousPreparationMemory<'a> {
                 KernelMemoryAdmission::SettlementPending(receipt) => {
                     *self.journal.pending = Some(receipt);
                     self.control.wait().map_err(|stop| {
-                        SynchronousPreparationFailure::Host(PreparationMemoryRefusal::Stopped(stop))
+                        SynchronousPreparationFailure::Host(PreparationMemoryRefusal::Interrupted(
+                            stop,
+                        ))
                     })?;
                 }
                 KernelMemoryAdmission::SharedShortage(receipt) => {
@@ -207,3 +238,23 @@ impl<'a> SynchronousPreparationMemory<'a> {
 #[cfg(test)]
 #[path = "preparation_memory_tests.rs"]
 mod tests;
+
+impl novarocks_failure_contract::FailureProjection for PreparationMemoryRefusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        match self {
+            Self::MissingQueryMemory => FailureFact::new(
+                FailureClass::Invariant,
+                ExecutionReason::PreparationMissingQueryMemory.reason(),
+            ),
+            Self::Interrupted(source) => source.failure_fact(),
+            Self::SharedShortage(cause) => {
+                novarocks_memory_failure::ShortageFailureProjection::new(cause).failure_fact()
+            }
+            Self::Capacity(cause) => {
+                novarocks_memory_failure::CapacityFailureProjection::new(cause).failure_fact()
+            }
+        }
+    }
+}

@@ -34,7 +34,7 @@ impl PureCompileControl for Compile {
         let mut t = self.trace.lock().unwrap();
         let at = t.len();
         t.push(n);
-        if let Some((target, cause)) = self.refusal
+        if let Some((target, cause)) = self.refusal.clone()
             && at == target
         {
             Err(cause)
@@ -282,10 +282,10 @@ fn float_arithmetic_recipe_three_compile_and_seven_runtime_causes_have_no_tail()
     ] {
         for at in 0..trace.len() {
             let c = Compile {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Compile::default()
             };
-            assert_eq!(make(&c).unwrap_err().control_error(), Some(cause));
+            assert_eq!(make(&c).unwrap_err().control_error(), Some(cause.clone()));
             assert_eq!(*c.trace.lock().unwrap(), trace[..=at]);
         }
     }
@@ -360,7 +360,7 @@ fn canonical_float_target_actual_factory_precedes_construction_and_survives_last
                 );
             }
             trace.push((phase, units));
-            match self.1 {
+            match self.1.clone() {
                 Some((stop, cause)) if at == stop => Err(cause),
                 _ => Ok(()),
             }
@@ -440,8 +440,10 @@ fn canonical_float_target_actual_factory_precedes_construction_and_survives_last
     let source = FunctionValueType::new(DataType::Float32, false);
     let right = FunctionValueType::new(DataType::Int64, false);
     let output = FunctionValueType::new(DataType::Float64, true);
-    let run = |fail, control_fail, expected_trace: &[(CompilePhase, u32)]| {
-        let control = Compile(Mutex::new(Vec::new()), control_fail);
+    let run = |fail,
+               control_fail: Option<(usize, CompileControlError)>,
+               expected_trace: &[(CompilePhase, u32)]| {
+        let control = Compile(Mutex::new(Vec::new()), control_fail.clone());
         let live = Arc::new(AtomicUsize::new(0));
         let factory = Factory {
             control: &control,
@@ -525,7 +527,7 @@ fn canonical_float_target_actual_factory_precedes_construction_and_survives_last
         CompileControlError::ResourceExhausted,
     ] {
         for stop in 0..trace.len() {
-            run(None, Some((stop, cause)), &trace);
+            run(None, Some((stop, cause.clone())), &trace);
         }
     }
     let control = Compile(Mutex::new(Vec::new()), None);

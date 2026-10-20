@@ -22,6 +22,7 @@ use arrow::array::{
     NullArray, StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::datatypes::Field;
+use novarocks_failure_contract::FailureProjection;
 use novarocks_functions::{ConstantPolicy, ConstantPool, ConstantValue};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
@@ -107,7 +108,7 @@ fn run(
     input: Vec<Option<i64>>,
     partitions: &[(usize, usize)],
     window: Option<&WindowFrame>,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut arena = ExprArena::default();
     let input_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
     let parameter_id = parameter(&mut arena, parameter_value);
@@ -299,22 +300,30 @@ fn selected_null_is_rejected_by_required_integer_callers() {
     }
 }
 
+fn assert_parameter_failure(error: ExecutionFailure, detail: &'static str) {
+    assert_eq!(
+        error.failure_fact(),
+        analytic_failure::parameter(detail).failure_fact()
+    );
+    assert_eq!(error.to_string(), detail);
+}
+
 #[test]
 fn constant_parameters_keep_original_range_validation() {
     for parameter in integer_parameters(0)
         .into_iter()
         .chain(integer_parameters(-1))
     {
-        assert_eq!(
+        assert_parameter_failure(
             run(
                 WindowFunctionKind::Ntile,
                 parameter,
                 vec![Some(1); 3],
                 &[(0, 3)],
-                None
+                None,
             )
             .unwrap_err(),
-            "ntile buckets must be positive"
+            "ntile buckets must be positive",
         );
     }
     for parameter in integer_parameters(-1) {
@@ -326,9 +335,9 @@ fn constant_parameters_keep_original_range_validation() {
                 ignore_nulls: false,
             },
         ] {
-            assert_eq!(
+            assert_parameter_failure(
                 run(kind, parameter.clone(), vec![Some(1); 3], &[(0, 3)], None).unwrap_err(),
-                "lead/lag offset must be non-negative"
+                "lead/lag offset must be non-negative",
             );
         }
     }

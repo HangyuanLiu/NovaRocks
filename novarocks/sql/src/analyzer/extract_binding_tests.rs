@@ -362,10 +362,28 @@ fn extract_binding_keeps_lexical_policy_null_sources_and_explicit_constant_admis
         "SELECT year('2024-02-29')",
     ] {
         let error = analyze(sql, &catalog, policy).unwrap_err();
+        assert!(error.control_error().is_none());
+        let source = error
+            .source_failure()
+            .expect("retain the actual constant author");
+        assert!(matches!(
+            source.downcast_ref::<novarocks_functions::FunctionBindingError>(),
+            Some(novarocks_functions::FunctionBindingError::Constant(
+                novarocks_constant_contract::ConstantError::Limit(
+                    "constant factory row limit exceeded"
+                )
+            ))
+        ));
+        use novarocks_failure_contract::FailureProjection;
         assert_eq!(
-            error.control_error(),
-            Some(CompileControlError::ResourceExhausted)
+            source.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Resource
         );
+        assert_eq!(
+            source.failure_fact().reason().domain(),
+            novarocks_failure_contract::domain::CONSTANT.get()
+        );
+        assert_eq!(source.failure_fact().reason().code(), 2);
     }
 }
 
@@ -379,7 +397,7 @@ impl PureCompileControl for Trace {
         let mut callbacks = self.callbacks.lock().unwrap();
         let ordinal = callbacks.len();
         callbacks.push((phase, units));
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && at == ordinal
         {
             return Err(cause);
@@ -425,7 +443,7 @@ fn extract_binding_sole_canonical_helper_preserves_every_original_control_prefix
             ] {
                 let control = Trace {
                     callbacks: Mutex::new(Vec::new()),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = match super::resolve_expr::bind_scalar_function_call_with_catalog(
                     crate::functions::builtin_sql_function_catalog(),
@@ -438,7 +456,7 @@ fn extract_binding_sole_canonical_helper_preserves_every_original_control_prefix
                     Ok(_) => panic!("refused binder"),
                     Err(error) => error,
                 };
-                assert_eq!(error.control_error(), Some(cause));
+                assert_eq!(error.control_error(), Some(cause.clone()));
                 assert_eq!(
                     error
                         .at_type_mismatch(novarocks_parser::Span::new(7, 23))

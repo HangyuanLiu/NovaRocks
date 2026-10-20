@@ -16,9 +16,9 @@
 // under the License.
 
 //! First-non-NULL state and its original recursive scalar storage.
+use crate::KernelFailure;
 use crate::aggregate_scalar::{
-    self as scalar, AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork,
-    TrackedAggScalarValue,
+    self as scalar, AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
 };
 use arrow_array::ArrayRef;
 
@@ -57,7 +57,7 @@ impl<A: ScalarStateAllocator> AnyValueState<A> {
         array: &ArrayRef,
         row: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), KernelFailure> {
         if self.has_value {
             return Ok(());
         }
@@ -73,7 +73,7 @@ impl<A: ScalarStateAllocator> AnyValueState<A> {
     pub fn output(
         &self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<AggScalarValue>, ScalarStateError> {
+    ) -> Result<Option<AggScalarValue>, KernelFailure> {
         if self.has_value {
             self.value
                 .as_ref()

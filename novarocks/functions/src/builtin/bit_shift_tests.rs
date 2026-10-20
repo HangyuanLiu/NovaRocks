@@ -604,7 +604,7 @@ fn strict_null_cannot_hide_wrong_shape_carrier_or_selected_nonnull_violation() {
         );
         assert!(matches!(
             kernel.evaluate(Selection::all(2), &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         assert_eq!(
             kernel
@@ -624,7 +624,7 @@ fn strict_null_cannot_hide_wrong_shape_carrier_or_selected_nonnull_violation() {
     );
     assert!(matches!(
         kernel.evaluate(Selection::all(2), &args, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -646,12 +646,12 @@ fn compact_selection_mismatch_and_argument_cardinality_are_outer_errors() {
     let mut kernel = instance(NAMES[0], &types);
     assert!(matches!(
         kernel.evaluate(selection, &args, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let mut kernel = instance(NAMES[0], &types);
     assert!(matches!(
         kernel.evaluate(Selection::all(1), &args[..1], &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     assert!(Selection::try_sparse(1, &[1]).is_err());
     assert!(Selection::try_sparse(2, &[1, 1]).is_err());
@@ -817,7 +817,7 @@ fn controller_must_resolve_child_row_errors_before_even_empty_or_null_demand() {
     );
     assert!(matches!(
         kernel.evaluate(selection, &args, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     assert_eq!(
         kernel

@@ -47,7 +47,11 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &'static str, columns: Vec<ArrayRef>, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &'static str,
+    columns: Vec<ArrayRef>,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -181,7 +185,7 @@ fn legacy_calendar_convert_tz_baseline_named_dst_gap_and_ambiguous_earliest_are_
 fn legacy_calendar_convert_tz_baseline_datetime_type_error_precedes_timezone_type_error() {
     let boolean: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
     assert_eq!(
-        eval(
+        (eval(
             "convert_tz",
             vec![
                 Arc::clone(&boolean),
@@ -190,11 +194,12 @@ fn legacy_calendar_convert_tz_baseline_datetime_type_error_precedes_timezone_typ
             ],
             micro_type()
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "unsupported datetime input type: Boolean"
     );
     assert_eq!(
-        eval(
+        (eval(
             "convert_tz",
             vec![
                 timestamps(vec![None]),
@@ -203,48 +208,56 @@ fn legacy_calendar_convert_tz_baseline_datetime_type_error_precedes_timezone_typ
             ],
             micro_type()
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "convert_tz expects string"
     );
     assert_eq!(
-        eval(
+        (eval(
             "convert_tz",
             vec![timestamps(vec![None]), text(vec![Some("UTC")]), boolean],
             micro_type()
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "convert_tz expects string"
     );
 }
 
 #[test]
-fn legacy_calendar_convert_tz_baseline_raw_temporal_and_requested_carrier_projection() {
+fn legacy_calendar_convert_tz_requires_the_frozen_normalized_result() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
     for source in [
         dates(vec![Some(0)]),
         text(vec![Some("1970-01-01")]),
         timestamps(vec![Some("1970-01-01 00:00:00")]),
     ] {
+        let arguments = || {
+            vec![
+                source.clone(),
+                text(vec![Some("UTC")]),
+                text(vec![Some("+01:00")]),
+            ]
+        };
         assert_micros(
-            eval(
-                "convert_tz",
-                vec![
-                    Arc::clone(&source),
-                    text(vec![Some("UTC")]),
-                    text(vec![Some("+01:00")]),
-                ],
-                DataType::Timestamp(TimeUnit::Second, None),
-            )
-            .unwrap(),
-            vec![Some(3600)],
+            eval("convert_tz", arguments(), micro_type()).unwrap(),
+            vec![Some(3_600_000_000)],
         );
-        assert_micros(
-            eval(
-                "convert_tz",
-                vec![source, text(vec![Some("UTC")]), text(vec![Some("+01:00")])],
-                DataType::Date32,
-            )
-            .unwrap(),
-            vec![None],
-        );
+        for result in [
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Date32,
+        ] {
+            let error = eval("convert_tz", arguments(), result.clone()).unwrap_err();
+            let fact = error.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Invariant);
+            assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+            assert_eq!(fact.reason().code(), 274);
+            assert_eq!(
+                error.detail(),
+                format!(
+                    "calendar operation requires normalized result carrier Timestamp(Microsecond, None), got {result:?}"
+                )
+            );
+        }
     }
 }

@@ -32,12 +32,12 @@ use novarocks_type_contract::ValueTypeStorageLifetime;
 
 #[derive(Debug)]
 pub(crate) enum JoinGatherError {
-    Source(String),
+    Source(ExecutionFailure),
     Construction(ConstructionFailure),
     Kernel(novarocks_functions::KernelFailure),
 }
-impl From<String> for JoinGatherError {
-    fn from(value: String) -> Self {
+impl From<ExecutionFailure> for JoinGatherError {
+    fn from(value: ExecutionFailure) -> Self {
         Self::Source(value)
     }
 }
@@ -61,12 +61,128 @@ impl JoinGatherError {
             Self::Kernel(cause) => cause.into(),
         }
     }
-    fn into_legacy(self) -> String {
-        match self {
-            Self::Source(message) => message,
-            Self::Construction(cause) => cause.to_string(),
-            Self::Kernel(cause) => cause.to_string(),
+}
+
+#[derive(Debug)]
+struct JoinGatherContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinGatherContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinGatherContract {}
+impl novarocks_failure_contract::FailureProjection for JoinGatherContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinGatherContract.reason(),
+        )
+    }
+}
+fn gather_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinGatherContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+#[derive(Debug)]
+pub(in crate::exec::operators::hashjoin) struct GatherKernelFailure(
+    pub(in crate::exec::operators::hashjoin) arrow::error::ArrowError,
+);
+impl std::fmt::Display for GatherKernelFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "join gather kernel: {}", self.0)
+    }
+}
+impl std::error::Error for GatherKernelFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for GatherKernelFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use arrow::error::ArrowError;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match self.0 {
+            ArrowError::MemoryError(_) | ArrowError::ArithmeticOverflow(_) => (
+                FailureClass::Resource,
+                ExecutionReason::JoinGatherAllocation,
+            ),
+            ArrowError::OffsetOverflowError(_) => (
+                FailureClass::Representation,
+                ExecutionReason::JoinGatherOffset,
+            ),
+            ArrowError::IoError(..) => (
+                FailureClass::Unexpected,
+                ExecutionReason::JoinGatherUnexpected,
+            ),
+            _ => (FailureClass::Invariant, ExecutionReason::JoinGatherArrow),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        if matches!(self.0, ArrowError::OffsetOverflowError(_)) {
+            use novarocks_failure_contract::{
+                RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
+            };
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(27).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
         }
+    }
+}
+fn gather_kernel(cause: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(GatherKernelFailure(cause))
+}
+fn copy_failure(cause: novarocks_functions::selected_copy::CopyError) -> JoinGatherError {
+    JoinGatherError::Kernel(cause.into_kernel())
+}
+impl From<crate::exec::chunk::ChunkConstructionFailure> for JoinGatherError {
+    fn from(cause: crate::exec::chunk::ChunkConstructionFailure) -> Self {
+        Self::Source(cause.into())
+    }
+}
+impl From<JoinGatherError> for ExecutionFailure {
+    fn from(cause: JoinGatherError) -> Self {
+        cause.into_execution()
+    }
+}
+
+#[derive(Debug)]
+struct JoinIndexAdoptionExtent;
+impl std::fmt::Display for JoinIndexAdoptionExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("join index adoption exceeds its representation")
+    }
+}
+impl std::error::Error for JoinIndexAdoptionExtent {}
+impl novarocks_failure_contract::FailureProjection for JoinIndexAdoptionExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        FailureFact::new(
+            FailureClass::Representation,
+            crate::runtime::fragment::ExecutionReason::JoinIndexAdoptionExtent.reason(),
+        )
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: domain::EXECUTION,
+                code: std::num::NonZeroU16::new(28).unwrap(),
+            },
+            required: None,
+            extent_limit: None,
+            representable_prefix: None,
+        })
     }
 }
 
@@ -95,8 +211,8 @@ impl TypedJoinBatch {
         let storage = owner
             .storage_lifetime()
             .retaining_observed(&self.storage, |layout| owner.request(layout))?;
-        let batch = arrow::compute::filter_record_batch(&self.batch, mask)
-            .map_err(|cause| cause.to_string())?;
+        let batch =
+            arrow::compute::filter_record_batch(&self.batch, mask).map_err(gather_kernel)?;
         Ok(Self {
             batch,
             schema: self.schema,
@@ -171,7 +287,8 @@ fn strict_record_batch(
         columns,
         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
     )
-    .map_err(|cause| JoinGatherError::Source(cause.to_string()))
+    .map_err(|cause| crate::exec::chunk::ChunkConstructionFailure::record_batch(cause).into())
+    .map_err(JoinGatherError::Source)
 }
 fn validate_projection(
     source: &ChunkSchema,
@@ -179,11 +296,10 @@ fn validate_projection(
     owner: &dyn InputConstructionOwner,
 ) -> Result<(), JoinGatherError> {
     if !source.is_typed() || !target.is_typed() || source.slots().len() != target.slots().len() {
-        return Err(
-            "typed join projection has no exact complete channel declaration"
-                .to_owned()
-                .into(),
-        );
+        return Err(gather_contract(
+            "typed join projection has no exact complete channel declaration",
+        )
+        .into());
     }
     for (source, target) in source.slots().iter().zip(target.slots()) {
         work(owner, 1)?;
@@ -196,9 +312,10 @@ fn validate_projection(
                     || work(owner, 1),
                 )?
         {
-            return Err("typed join projection changes its complete value binding"
-                .to_owned()
-                .into());
+            return Err(gather_contract(
+                "typed join projection changes its complete value binding",
+            )
+            .into());
         }
     }
     Ok(())
@@ -225,9 +342,9 @@ fn validate_source(
             .checked_add(source.chunk_schema().slots().len())
             .is_none_or(|end| end > target.slots().len())
     {
-        return Err("typed join source has no complete declared channel range"
-            .to_owned()
-            .into());
+        return Err(
+            gather_contract("typed join source has no complete declared channel range").into(),
+        );
     }
     for (source, target) in source
         .chunk_schema()
@@ -246,9 +363,9 @@ fn validate_source(
                     || work(owner, 1),
                 )?
         {
-            return Err("typed join source differs from its complete declaration"
-                .to_owned()
-                .into());
+            return Err(
+                gather_contract("typed join source differs from its complete declaration").into(),
+            );
         }
     }
     Ok(())
@@ -288,17 +405,17 @@ pub(crate) fn filter_probe_typed(
     owner: &dyn InputConstructionOwner,
 ) -> Result<TypedJoinBatch, JoinGatherError> {
     if probe.record_batch().num_columns() != schema.slots().len() {
-        return Err("typed join filter channel count differs from declaration"
-            .to_owned()
-            .into());
+        return Err(
+            gather_contract("typed join filter channel count differs from declaration").into(),
+        );
     }
     validate_source(probe, &schema, 0, JoinSourceRole::CanonicalOutput, owner)?;
     let storage = probe.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
         owner.request(layout)
     })?;
     preflight_filter_columns(owner, probe.record_batch().num_columns())?;
-    let batch = arrow::compute::filter_record_batch(probe.record_batch(), mask)
-        .map_err(|cause| cause.to_string())?;
+    let batch =
+        arrow::compute::filter_record_batch(probe.record_batch(), mask).map_err(gather_kernel)?;
     let (_, columns, rows) = batch.into_parts();
     let batch = strict_record_batch(&schema, columns, rows)?;
     Ok(TypedJoinBatch {
@@ -373,7 +490,7 @@ impl GatherAuthor for TypedGather<'_> {
             CopyConstructionError::Copy(CopyError::Control(cause)) => {
                 JoinGatherError::Kernel(cause)
             }
-            CopyConstructionError::Copy(other) => JoinGatherError::Source(other.to_string()),
+            CopyConstructionError::Copy(other) => copy_failure(other),
         })?;
         self.scratch.request(
             novarocks_type_contract::owned_resources::layout::arc_layout(
@@ -433,13 +550,13 @@ fn normalize_columns_to_schema(
     output_schema: &SchemaRef,
     columns: Vec<ArrayRef>,
     context: &str,
-) -> Result<Vec<ArrayRef>, String> {
+) -> Result<Vec<ArrayRef>, ExecutionFailure> {
     if output_schema.fields().len() != columns.len() {
-        return Err(format!(
+        return Err(gather_contract(format_args!(
             "{context} column count mismatch: schema_fields={} arrays={}",
             output_schema.fields().len(),
             columns.len()
-        ));
+        )));
     }
 
     let mut normalized = Vec::with_capacity(columns.len());
@@ -450,20 +567,8 @@ fn normalize_columns_to_schema(
             continue;
         }
 
-        let actual = column.data_type().clone();
-        if let Err(_mismatch) = check_exact(descriptor, &actual) {
-            return Err(format!(
-                "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
-                descriptor, actual,
-            ));
-        }
-
-        let column = retag_column(&column, descriptor).map_err(|mismatch| {
-            format!(
-                "{context} type retag failed at column {idx}: descriptor={:?} actual={:?} mismatch={:?}",
-                descriptor, actual, mismatch
-            )
-        })?;
+        check_exact(descriptor, column.data_type()).map_err(ExecutionFailure::from_domain)?;
+        let column = retag_column(&column, descriptor).map_err(ExecutionFailure::from_domain)?;
         normalized.push(column);
     }
     Ok(normalized)
@@ -473,10 +578,11 @@ fn build_output_record_batch(
     output_schema: &SchemaRef,
     columns: Vec<ArrayRef>,
     context: &str,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, ExecutionFailure> {
     let columns = normalize_columns_to_schema(output_schema, columns, context)?;
     let schema = output_schema_for_columns(output_schema, &columns);
-    RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
+    RecordBatch::try_new(schema, columns)
+        .map_err(|cause| crate::exec::chunk::ChunkConstructionFailure::record_batch(cause).into())
 }
 
 fn output_schema_for_columns(output_schema: &SchemaRef, columns: &[ArrayRef]) -> SchemaRef {
@@ -509,7 +615,7 @@ pub(crate) fn gather_join_batch(
     left_indices: &[u32],
     right_indices: &[u32],
     output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>, String> {
+) -> Result<Option<RecordBatch>, ExecutionFailure> {
     gather_join_batch_in(
         left,
         right,
@@ -517,7 +623,7 @@ pub(crate) fn gather_join_batch(
         right_indices,
         &LegacyGather(output_schema),
     )
-    .map_err(JoinGatherError::into_legacy)
+    .map_err(JoinGatherError::into_execution)
 }
 
 fn gather_join_batch_in<A: GatherAuthor>(
@@ -528,11 +634,11 @@ fn gather_join_batch_in<A: GatherAuthor>(
     author: &A,
 ) -> Result<Option<A::Batch>, JoinGatherError> {
     if left_indices.len() != right_indices.len() {
-        return Err(format!(
+        return Err(gather_contract(format_args!(
             "join index length mismatch: left={} right={}",
             left_indices.len(),
             right_indices.len()
-        )
+        ))
         .into());
     }
     if left_indices.is_empty() || right_indices.is_empty() {
@@ -544,11 +650,11 @@ fn gather_join_batch_in<A: GatherAuthor>(
     author.columns(count)?;
     let mut columns = Vec::with_capacity(count);
     for col in left.record_batch().columns() {
-        let taken = take(col.as_ref(), &left_idx_ref, None).map_err(|e| e.to_string())?;
+        let taken = take(col.as_ref(), &left_idx_ref, None).map_err(gather_kernel)?;
         columns.push(taken);
     }
     for col in right.record_batch().columns() {
-        let taken = take(col.as_ref(), &right_idx_ref, None).map_err(|e| e.to_string())?;
+        let taken = take(col.as_ref(), &right_idx_ref, None).map_err(gather_kernel)?;
         columns.push(taken);
     }
 
@@ -566,13 +672,13 @@ pub(crate) fn gather_join_batches(
     left_indices: &[u32],
     right_indices: &[u32],
     output_schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>, String> {
+) -> Result<Vec<RecordBatch>, ExecutionFailure> {
     if left_indices.len() != right_indices.len() {
-        return Err(format!(
+        return Err(gather_contract(format_args!(
             "join index length mismatch: left={} right={}",
             left_indices.len(),
             right_indices.len()
-        ));
+        )));
     }
     if left_indices.is_empty() {
         return Ok(Vec::new());
@@ -604,7 +710,7 @@ pub(crate) fn gather_probe_build_batches(
     output_schema: &SchemaRef,
     probe_is_left: bool,
     all_match_one: bool,
-) -> Result<GatherBatches, String> {
+) -> Result<GatherBatches, ExecutionFailure> {
     gather_probe_build_batches_in(
         probe,
         build,
@@ -614,7 +720,7 @@ pub(crate) fn gather_probe_build_batches(
         all_match_one,
         &LegacyGather(output_schema),
     )
-    .map_err(JoinGatherError::into_legacy)
+    .map_err(JoinGatherError::into_execution)
 }
 
 fn gather_probe_build_batches_in<A: GatherAuthor>(
@@ -627,11 +733,11 @@ fn gather_probe_build_batches_in<A: GatherAuthor>(
     author: &A,
 ) -> Result<GatherBatches<A::Batch>, JoinGatherError> {
     if probe_indices.len() != build_indices.len() {
-        return Err(format!(
+        return Err(gather_contract(format_args!(
             "join index length mismatch: probe={} build={}",
             probe_indices.len(),
             build_indices.len()
-        )
+        ))
         .into());
     }
     if probe_indices.is_empty() {
@@ -644,10 +750,10 @@ fn gather_probe_build_batches_in<A: GatherAuthor>(
     if all_match_one {
         for (row, probe_row) in probe_indices.iter().enumerate() {
             if *probe_row != row as u32 {
-                return Err(format!(
+                return Err(gather_contract(format_args!(
                     "ALL_MATCH_ONE probe index mismatch: row={} probe_row={}",
                     row, probe_row
-                )
+                ))
                 .into());
             }
         }
@@ -680,9 +786,8 @@ fn gather_probe_build_batches_in<A: GatherAuthor>(
                 if probe.record_batch().num_columns() > 0 {
                     let start = std::time::Instant::now();
                     for col in probe.record_batch().columns() {
-                        columns.push(
-                            take(col.as_ref(), &probe_idx_ref, None).map_err(|e| e.to_string())?,
-                        );
+                        columns
+                            .push(take(col.as_ref(), &probe_idx_ref, None).map_err(gather_kernel)?);
                     }
                     timings.add_probe(start);
                 }
@@ -695,8 +800,7 @@ fn gather_probe_build_batches_in<A: GatherAuthor>(
             if build.record_batch().num_columns() > 0 {
                 let start = std::time::Instant::now();
                 for col in build.record_batch().columns() {
-                    columns
-                        .push(take(col.as_ref(), &build_idx_ref, None).map_err(|e| e.to_string())?);
+                    columns.push(take(col.as_ref(), &build_idx_ref, None).map_err(gather_kernel)?);
                 }
                 timings.add_build(start);
             }
@@ -721,14 +825,14 @@ pub(crate) fn gather_left_with_null_right(
     left_indices: &[u32],
     right_schema: &SchemaRef,
     output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>, String> {
+) -> Result<Option<RecordBatch>, ExecutionFailure> {
     gather_left_with_null_right_in(
         left,
         left_indices,
         right_schema,
         &LegacyGather(output_schema),
     )
-    .map_err(JoinGatherError::into_legacy)
+    .map_err(JoinGatherError::into_execution)
 }
 
 fn gather_left_with_null_right_in<A: GatherAuthor>(
@@ -746,7 +850,7 @@ fn gather_left_with_null_right_in<A: GatherAuthor>(
     author.columns(count)?;
     let mut columns = Vec::with_capacity(count);
     for col in left.record_batch().columns() {
-        let taken = take(col.as_ref(), &left_idx_ref, None).map_err(|e| e.to_string())?;
+        let taken = take(col.as_ref(), &left_idx_ref, None).map_err(gather_kernel)?;
         columns.push(taken);
     }
     for field in right_schema.fields().iter() {
@@ -768,9 +872,9 @@ fn typed_pair_author<'a>(
     if left.record_batch().num_columns() + right.record_batch().num_columns()
         != schema.slots().len()
     {
-        return Err("typed join pair channel count differs from declaration"
-            .to_owned()
-            .into());
+        return Err(
+            gather_contract("typed join pair channel count differs from declaration").into(),
+        );
     }
     validate_source(left, schema, 0, JoinSourceRole::Scope, owner)?;
     validate_source(
@@ -849,9 +953,9 @@ pub(crate) fn gather_left_with_null_right_typed(
     if left.record_batch().num_columns() + right.slots().len() != schema.slots().len()
         || !right.is_typed()
     {
-        return Err("typed outer join channel count differs from declaration"
-            .to_owned()
-            .into());
+        return Err(
+            gather_contract("typed outer join channel count differs from declaration").into(),
+        );
     }
     validate_source(left, schema, 0, JoinSourceRole::CanonicalOutput, owner)?;
     for (source, target) in right
@@ -871,11 +975,10 @@ pub(crate) fn gather_left_with_null_right_typed(
                     || work(owner, 1),
                 )?
         {
-            return Err(
-                "typed outer join NULL extension differs from its complete declaration"
-                    .to_owned()
-                    .into(),
-            );
+            return Err(gather_contract(
+                "typed outer join NULL extension differs from its complete declaration",
+            )
+            .into());
         }
     }
     let storage = left.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
@@ -900,7 +1003,7 @@ pub(crate) fn gather_null_left_with_right(
     right_indices: &[u32],
     left_schema: &SchemaRef,
     output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>, String> {
+) -> Result<Option<RecordBatch>, ExecutionFailure> {
     if right_indices.is_empty() {
         return Ok(None);
     }
@@ -914,7 +1017,7 @@ pub(crate) fn gather_null_left_with_right(
         columns.push(new_null_array(field.data_type(), len));
     }
     for col in right.record_batch().columns() {
-        let taken = take(col.as_ref(), &right_idx_ref, None).map_err(|e| e.to_string())?;
+        let taken = take(col.as_ref(), &right_idx_ref, None).map_err(gather_kernel)?;
         columns.push(taken);
     }
 
@@ -924,6 +1027,7 @@ pub(crate) fn gather_null_left_with_right(
 
 #[cfg(test)]
 mod tests {
+    use novarocks_failure_contract::FailureProjection;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1000,6 +1104,53 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn gather_kernel_preserves_actual_arrow_source() {
+        use std::error::Error;
+        let values = arrow::array::Int32Array::from(vec![7]);
+        let indexes = arrow::array::UInt32Array::from(vec![3]);
+        let cause = arrow::compute::take(
+            &values,
+            &indexes,
+            Some(arrow::compute::TakeOptions { check_bounds: true }),
+        )
+        .unwrap_err();
+        let wrapped = super::GatherKernelFailure(cause);
+        assert!(
+            wrapped
+                .source()
+                .unwrap()
+                .downcast_ref::<arrow::error::ArrowError>()
+                .is_some()
+        );
+        let fact = wrapped.failure_fact();
+        assert_eq!(
+            fact.class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
+        let error = crate::runtime::fragment::ExecutionFailure::from_domain(wrapped);
+        assert_eq!(error.failure_fact(), fact);
+    }
+
+    #[test]
+    fn gather_projection_uses_arrow_variant_and_keeps_unknown_extents() {
+        use novarocks_failure_contract::FailureClass;
+        let allocation = super::GatherKernelFailure(arrow::error::ArrowError::MemoryError(
+            "cancelled; invalid input".into(),
+        ));
+        assert_eq!(allocation.failure_fact().class(), FailureClass::Resource);
+        let offset = super::GatherKernelFailure(arrow::error::ArrowError::OffsetOverflowError(0));
+        let fact = offset.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        let representation = fact.representation().unwrap();
+        assert_eq!(representation.required, None);
+        assert_eq!(representation.extent_limit, None);
+        let invalid = super::GatherKernelFailure(arrow::error::ArrowError::InvalidArgumentError(
+            "out of memory".into(),
+        ));
+        assert_eq!(invalid.failure_fact().class(), FailureClass::Invariant);
     }
 
     #[test]
@@ -1127,11 +1278,11 @@ mod tests {
             .expect_err("join output must reject actual-widen decimal");
 
         assert!(
-            err.contains("join output type mismatch at column 0"),
+            err.failure_fact().class() == novarocks_failure_contract::FailureClass::Invariant,
             "err={err}"
         );
-        assert!(err.contains("Decimal128(10, 2)"), "err={err}");
-        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+        assert!(err.detail().contains("Decimal128(10, 2)"), "err={err}");
+        assert!(err.detail().contains("Decimal128(38, 2)"), "err={err}");
     }
 
     #[test]

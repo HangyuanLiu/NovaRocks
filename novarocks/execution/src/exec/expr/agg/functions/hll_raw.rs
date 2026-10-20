@@ -37,8 +37,11 @@ fn update_state_register_from_hash(state: &mut HllRawState, hash_value: u64) {
     core::update_state_register_from_hash(state, hash_value, &mut HllWork::new(None))
         .expect("no-control legacy register allocation is infallible");
 }
-fn merge_hll_bytes(state: &mut HllRawState, bytes: &[u8]) -> Result<(), String> {
-    core::merge_hll_bytes(state, bytes, &mut HllWork::new(None)).map_err(|error| error.to_string())
+fn merge_hll_bytes(
+    state: &mut HllRawState,
+    bytes: &[u8],
+) -> crate::runtime::fragment::ExecutionResult<()> {
+    core::merge_hll_bytes(state, bytes, &mut HllWork::new(None)).map_err(Into::into)
 }
 fn serialize_hll_state(state: &HllRawState) -> Option<Vec<u8>> {
     core::serialize_hll_state(state, &mut HllWork::new(None))
@@ -54,17 +57,20 @@ fn estimate_cardinality(state: &HllRawState) -> i64 {
     core::estimate_cardinality(state, &mut HllWork::new(None))
         .expect("no-control legacy estimate is infallible")
 }
-pub fn cardinality_from_serialized_hll(bytes: &[u8]) -> Result<i64, String> {
-    core::cardinality_from_serialized_hll(bytes, &mut HllWork::new(None))
-        .map_err(|error| error.to_string())
+pub fn cardinality_from_serialized_hll(
+    bytes: &[u8],
+) -> crate::runtime::fragment::ExecutionResult<i64> {
+    core::cardinality_from_serialized_hll(bytes, &mut HllWork::new(None)).map_err(Into::into)
 }
 pub fn estimate_cardinality_from_registers(registers: &[u8; HLL_REGISTERS_COUNT]) -> i64 {
     core::estimate_cardinality_from_registers_observed(registers, &mut HllWork::new(None))
         .expect("no-control legacy estimate is infallible")
 }
-pub fn hash_array_value_for_hll(array: &ArrayRef, row: usize) -> Result<Option<u64>, String> {
-    core::hash_array_value_for_hll_observed(array, row, &mut HllWork::new(None))
-        .map_err(|error| error.to_string())
+pub fn hash_array_value_for_hll(
+    array: &ArrayRef,
+    row: usize,
+) -> crate::runtime::fragment::ExecutionResult<Option<u64>> {
+    core::hash_array_value_for_hll_observed(array, row, &mut HllWork::new(None)).map_err(Into::into)
 }
 #[cfg(test)]
 fn ensure_registers(state: &mut HllRawState) -> &mut [u8; HLL_REGISTERS_COUNT] {
@@ -127,8 +133,8 @@ fn merge_input_array(
     array: &ArrayRef,
     offset: usize,
     state_ptrs: &[AggStatePtr],
-) -> Result<(), String> {
-    let input = core::HllPayloadInput::try_new(array).map_err(|failure| failure.to_string())?;
+) -> crate::runtime::fragment::ExecutionResult<()> {
+    let input = core::HllPayloadInput::try_new(array).map_err(|failure| failure.into_kernel())?;
     core::merge_payload_rows(&input, 0..state_ptrs.len(), |row, bytes| {
         let ptr = unsafe { (state_ptrs[row] as *mut u8).add(offset) };
         let state = unsafe { get_or_init_state(ptr) };
@@ -140,7 +146,7 @@ fn hash_update_input_array(
     array: &ArrayRef,
     offset: usize,
     state_ptrs: &[AggStatePtr],
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     for (row, &base) in state_ptrs.iter().enumerate() {
         let Some(hash) = hash_array_value_for_hll(array, row)? else {
             continue;
@@ -158,9 +164,13 @@ impl AggregateFunction for HllRawAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         let Some(_input_type) = input_type else {
-            return Err("hll_raw expects exactly one argument".to_string());
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "hll_raw expects exactly one argument",
+                ),
+            );
         };
 
         let (kind, output_type) = match canonical_agg_name(func.name.as_str()) {
@@ -172,7 +182,14 @@ impl AggregateFunction for HllRawAgg {
             }
             "ds_hll_count_distinct_union" => (AggKind::HllRawMerge, DataType::Binary),
             "ds_hll_count_distinct_merge" => (AggKind::HllUnionCount, DataType::Int64),
-            other => return Err(format!("unsupported hll aggregate function: {}", other)),
+            other => {
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "unsupported hll aggregate function: {}",
+                        other
+                    )),
+                );
+            }
         };
 
         Ok(AggSpec {
@@ -198,10 +215,10 @@ impl AggregateFunction for HllRawAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "hll_raw input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("hll_raw input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -209,10 +226,10 @@ impl AggregateFunction for HllRawAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "hll_raw merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("hll_raw merge input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -256,16 +273,23 @@ impl AggregateFunction for HllRawAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("hll_raw input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "hll_raw input type mismatch",
+            ));
         };
         match spec.kind {
             AggKind::HllRawHash => hash_update_input_array(array, offset, state_ptrs),
             AggKind::HllRawMerge | AggKind::HllUnionCount => {
                 merge_input_array(array, offset, state_ptrs)
             }
-            _ => Err(format!("unexpected hll aggregate kind: {:?}", spec.kind)),
+            _ => Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "unexpected hll aggregate kind: {:?}",
+                    spec.kind
+                )),
+            ),
         }
     }
 
@@ -275,9 +299,11 @@ impl AggregateFunction for HllRawAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("hll_raw merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "hll_raw merge input type mismatch",
+            ));
         };
         merge_input_array(array, offset, state_ptrs)
     }
@@ -288,7 +314,7 @@ impl AggregateFunction for HllRawAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let output_type = if output_intermediate {
             &spec.intermediate_type
         } else {
@@ -328,10 +354,12 @@ impl AggregateFunction for HllRawAgg {
                 }
                 Ok(std::sync::Arc::new(builder.finish()) as ArrayRef)
             }
-            other => Err(format!(
-                "hll_raw output type must be Binary or Int64, got {:?}",
-                other
-            )),
+            other => Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "hll_raw output type must be Binary or Int64, got {:?}",
+                    other
+                )),
+            ),
         }
     }
 }
@@ -787,3 +815,12 @@ mod legacy_ndv_hll_baseline_tests;
 #[cfg(test)]
 #[path = "hll_payload_aggregate_original_tests.rs"]
 mod original_payload_aggregate_tests;
+
+impl From<core::HllError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(source: core::HllError) -> Self {
+        match source {
+            core::HllError::Kernel(source) => source.into(),
+            other => Self::from_domain(other),
+        }
+    }
+}

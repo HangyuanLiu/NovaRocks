@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-failure-contract.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = ["docs/testing/mem-1-m07/profile-v1.json"]

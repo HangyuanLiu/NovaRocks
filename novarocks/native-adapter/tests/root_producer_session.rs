@@ -32,7 +32,8 @@ use arrow_buffer::i256;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use novarocks_execution::runtime::fragment::io::{
     ResultAbort, ResultWriteAdmission, RootInputAdmission, RootInputAuthority, RootInputPermit,
-    RootProducerState, RootResultSession, RootResultWriteSpec,
+    RootInputReservationAdmission, RootProducerState, RootResultSession, RootResultWriteSpec,
+    RootWorkExitProgress,
 };
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_execution_contract::root_lifetime::RootRetentionClose;
@@ -86,17 +87,21 @@ struct Fixture {
     budget: Arc<ResultRetainedBudget>,
     channel: Arc<RootResultChannel>,
     session: Arc<NativeRootResultSession>,
+    health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
 }
 
 impl Fixture {
     fn new(output: FrozenRootOutput) -> Self {
         let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
         let budget = ResultRetainedBudget::new(limits.per_process());
+        let health =
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new());
         let pool = RootProducerPool::try_new(
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(8).unwrap(),
             1 << 20,
             Arc::clone(&budget),
+            Arc::clone(&health),
         )
         .unwrap();
         let channel = RootResultChannel::try_open(
@@ -106,15 +111,19 @@ impl Fixture {
             },
             Arc::clone(&budget),
             limits,
+            Arc::clone(&health),
         )
         .unwrap();
         channel.mark_context_owned().unwrap();
-        let session = NativeRootResultSession::try_open(Arc::clone(&channel), &pool).unwrap();
+        let session =
+            NativeRootResultSession::try_open_for_local_encoding(Arc::clone(&channel), &pool)
+                .unwrap();
         Self {
             pool,
             budget,
             channel,
             session,
+            health,
         }
     }
 }
@@ -130,7 +139,7 @@ impl Drop for Fixture {
     }
 }
 
-async fn shutdown(pool: &Arc<RootProducerPool>) {
+async fn shutdown_result(pool: &Arc<RootProducerPool>) -> Result<(), String> {
     let pool = Arc::clone(pool);
     let (sent, received) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
@@ -140,7 +149,110 @@ async fn shutdown(pool: &Arc<RootProducerPool>) {
         .await
         .expect("root pool shutdown exceeded deadline")
         .expect("shutdown owner exited without its result")
+}
+
+async fn shutdown(pool: &Arc<RootProducerPool>) {
+    shutdown_result(pool)
+        .await
         .expect("root pool shutdown failed");
+}
+
+async fn await_whole_exit(session: &NativeRootResultSession) {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            match session.producer_exit_progress() {
+                RootWorkExitProgress::Pending => tokio::time::sleep(Duration::from_millis(1)).await,
+                RootWorkExitProgress::Exited => return,
+                RootWorkExitProgress::Unresolved => {
+                    panic!("normal Root job exit became unresolved")
+                }
+            }
+        }
+    })
+    .await
+    .expect("root whole-job exit exceeded deadline");
+}
+
+async fn shutdown_with_issuer_notification_unknown(fixture: &Fixture) {
+    use novarocks_execution::runtime::execution_health::ExecutionExitOrigin;
+    use novarocks_execution_contract::failure::{FailureClass, FailureReason, domain};
+    shutdown_result(&fixture.pool)
+        .await
+        .expect("the actual pool CPU work joins independently of its issuer notification owner");
+    assert!(fixture.pool.poll_failure().is_none());
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Unresolved,
+        "the original issuer proof still participates after actual pool exit"
+    );
+    let original = fixture
+        .health
+        .failure()
+        .expect("actual issuer notification fault");
+    assert_eq!(
+        original.origin(),
+        ExecutionExitOrigin::Task {
+            identity: fixture.channel.spec().task,
+            phase: novarocks_execution_contract::TaskFailurePhase::Execution
+        }
+    );
+    assert_eq!(original.fact().class(), FailureClass::Unexpected);
+    assert_eq!(
+        original.fact().reason(),
+        FailureReason::new(domain::EXECUTION, std::num::NonZeroU16::new(611).unwrap())
+    );
+    fixture.session.abort(ResultAbort::Cancelled(
+        "late issuer failure observation".into(),
+    ));
+    assert_eq!(fixture.health.failure(), Some(original));
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Unresolved
+    );
+    assert!(fixture.session.try_acquire_input().is_err());
+}
+
+async fn shutdown_with_channel_metadata_unknown(fixture: &Fixture, metadata_before_fault: usize) {
+    use novarocks_execution::runtime::execution_health::ExecutionExitOrigin;
+    use novarocks_execution_contract::failure::{FailureClass, FailureReason, domain};
+    shutdown_result(&fixture.pool)
+        .await
+        .expect("the actual pool exits after channel-local notification catch");
+    assert!(fixture.pool.poll_failure().is_none());
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Exited,
+        "both original pool and issuer proofs have actually exited"
+    );
+    let original = fixture
+        .health
+        .failure()
+        .expect("actual channel metadata fault");
+    assert_eq!(
+        original.origin(),
+        ExecutionExitOrigin::Task {
+            identity: fixture.channel.spec().task,
+            phase: novarocks_execution_contract::TaskFailurePhase::Execution
+        }
+    );
+    assert_eq!(original.fact().class(), FailureClass::Unexpected);
+    assert_eq!(
+        original.fact().reason(),
+        FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(163).unwrap())
+    );
+    let snapshot = fixture.channel.try_ownership_snapshot().unwrap().unwrap();
+    assert!(snapshot.metadata_holders > 0);
+    assert!(snapshot.metadata_holders > metadata_before_fault);
+    assert!(!fixture.channel.physical_idle());
+    fixture.session.abort(ResultAbort::Cancelled(
+        "late channel failure observation".into(),
+    ));
+    assert_eq!(fixture.health.failure(), Some(original));
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Exited
+    );
+    assert!(!fixture.channel.physical_idle());
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -279,16 +391,22 @@ async fn client_dictionary_repeated_occurrences_and_null_have_independent_exact_
     )
     .unwrap();
     assert!(matches!(dictionary.data_type(), DataType::Dictionary(_, _)));
-    fixture
-        .session
-        .submit_input(
-            owned_chunk(Arc::new(dictionary)),
-            input(&fixture.session).await,
-        )
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_chunk(Arc::new(dictionary)),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     fixture.session.finish_input().unwrap();
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
-    assert!(fixture.session.producer_exited());
+    await_whole_exit(&fixture.session).await;
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
     assert_eq!(fixture.channel.snapshot().offered_through, 0);
     let first = read(&fixture.channel, Some(1), 0).await;
@@ -320,13 +438,22 @@ async fn count_only_accepts_decimal256_without_client_cell_rendering() {
     ])
     .with_precision_and_scale(76, 0)
     .unwrap();
-    fixture
-        .session
-        .submit_input(owned_chunk(Arc::new(array)), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_chunk(Arc::new(array)),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     fixture.session.finish_input().unwrap();
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
-    assert!(fixture.session.producer_exited());
+    await_whole_exit(&fixture.session).await;
     assert_eq!(fixture.channel.snapshot().data_positions, 0);
     assert_eq!(fixture.channel.snapshot().produced_through, 1);
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
@@ -346,7 +473,11 @@ async fn one_original_input_position_and_same_task_foreign_issuer_are_distinct()
         fixture.session.try_acquire_input().unwrap(),
         RootInputAdmission::Blocked
     ));
-    let foreign = RootInputAuthority::new(fixture.session.spec());
+    let foreign = RootInputAuthority::new(fixture.session.spec(), Arc::clone(&fixture.health));
+    let RootInputReservationAdmission::Granted(mut reservation) = foreign.try_reserve().unwrap()
+    else {
+        panic!("foreign issuer reservation")
+    };
     let ResultWriteAdmission::Granted(credit) = fixture
         .channel
         .try_reserve(foreign.required_bytes())
@@ -354,14 +485,42 @@ async fn one_original_input_position_and_same_task_foreign_issuer_are_distinct()
     else {
         panic!("foreign issuer uses the same existing retained budget");
     };
-    let RootInputAdmission::Granted(foreign_permit) = foreign.try_acquire(credit).unwrap() else {
+    let mut credit = Some(credit);
+    let RootInputAdmission::Granted(foreign_permit) = reservation.try_bind(&mut credit).unwrap()
+    else {
         panic!("foreign issuer has a free position");
     };
-    let error = fixture
-        .session
-        .submit_input(strings(vec![Some("foreign")]), foreign_permit)
-        .unwrap_err();
+    let error = {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                strings(vec![Some("foreign")]),
+                foreign_permit,
+            ),
+        );
+        let original_array =
+            Arc::as_ptr(submitted.as_ref().unwrap().chunk().record_batch().column(0));
+        let generation = submitted.as_ref().unwrap().permit().generation();
+        let error = fixture.session.submit_input(&mut submitted).unwrap_err();
+        let returned = submitted
+            .as_ref()
+            .expect("preaccept refusal returns the original caller slot");
+        assert!(std::ptr::eq(
+            original_array,
+            Arc::as_ptr(returned.chunk().record_batch().column(0))
+        ));
+        assert_eq!(returned.permit().generation(), generation);
+        let (chunk, permit) = submitted.take().unwrap().into_cleanup_parts();
+        drop(chunk);
+        drop(permit);
+        error
+    };
     assert!(error.to_string().contains("different issuer or generation"));
+    use novarocks_execution_contract::failure::FailureProjection;
+    assert_eq!(
+        error.failure_fact().reason().domain(),
+        novarocks_execution_contract::failure::domain::NATIVE.get()
+    );
+    assert_eq!(error.failure_fact().reason().code(), 513);
     assert!(foreign.is_available());
     assert!(matches!(
         fixture.session.try_acquire_input().unwrap(),
@@ -379,10 +538,19 @@ async fn one_original_input_position_and_same_task_foreign_issuer_are_distinct()
 #[tokio::test]
 async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
     let fixture = Fixture::new(client(1));
-    fixture
-        .session
-        .submit_input(strings(vec![Some("a")]), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                strings(vec![Some("a")]),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     wait_until(|| fixture.channel.snapshot().produced_through == 1).await;
     assert_eq!(
         fixture.session.producer_state(),
@@ -391,15 +559,24 @@ async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
     let first = read(&fixture.channel, Some(1), 0).await;
     assert_eq!(body(&first), [2, 0, 0, 0, 1, b'a']);
     drop(first);
-    fixture
-        .session
-        .submit_input(strings(vec![Some("b")]), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                strings(vec![Some("b")]),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     wait_until(|| fixture.channel.snapshot().produced_through == 2).await;
     assert_eq!(fixture.channel.snapshot().data_positions, 2);
     fixture.session.finish_input().unwrap();
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
-    assert!(fixture.session.producer_exited());
+    await_whole_exit(&fixture.session).await;
     let second = read(&fixture.channel, Some(2), 0).await;
     assert_eq!(body(&second), [2, 0, 0, 0, 1, b'b']);
     drop(second);
@@ -413,13 +590,22 @@ async fn client_single_row_has_an_exact_one_byte_continuation_before_end() {
     use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor, RootProfileV1};
     let fixture = Fixture::new(client(1));
     let value = "x".repeat(RootProfileV1::SEGMENT_BYTES - 7);
-    fixture
-        .session
-        .submit_input(strings(vec![Some(&value)]), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                strings(vec![Some(&value)]),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     fixture.session.finish_input().unwrap();
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
-    wait_until(|| fixture.session.producer_exited()).await;
+    await_whole_exit(&fixture.session).await;
     let profile = ClientRowProfile::try_new(
         RootProfileV1::SEGMENT_BYTES,
         RootProfileV1::ROW_PAYLOAD_BYTES,
@@ -462,7 +648,7 @@ async fn empty_finish_has_end_without_a_prior_input_or_data_item() {
         let fixture = Fixture::new(output);
         fixture.session.finish_input().unwrap();
         wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
-        assert!(fixture.session.producer_exited());
+        await_whole_exit(&fixture.session).await;
         assert!(fixture.session.try_acquire_input().is_err());
         assert_eq!(fixture.channel.snapshot().data_positions, 0);
         assert_end(&read(&fixture.channel, Some(1), 0).await, 1, 0);
@@ -485,16 +671,36 @@ async fn ordinary_upstream_output_beyond_the_input_allowance_fails_after_pull() 
         None,
     )
     .unwrap();
-    let error = fixture
-        .session
-        .submit_input(owned_chunk(Arc::new(array)), input(&fixture.session).await)
-        .unwrap_err();
-    assert!(
+    let error = {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_chunk(Arc::new(array)),
+                input(&fixture.session).await,
+            ),
+        );
+        let original_array =
+            Arc::as_ptr(submitted.as_ref().unwrap().chunk().record_batch().column(0));
+        let generation = submitted.as_ref().unwrap().permit().generation();
+        let error = fixture.session.submit_input(&mut submitted).unwrap_err();
+        let returned = submitted
+            .as_ref()
+            .expect("preaccept refusal returns the original caller slot");
+        assert!(std::ptr::eq(
+            original_array,
+            Arc::as_ptr(returned.chunk().record_batch().column(0))
+        ));
+        assert_eq!(returned.permit().generation(), generation);
+        let (chunk, permit) = submitted.take().unwrap().into_cleanup_parts();
+        drop(chunk);
+        drop(permit);
         error
-            .to_string()
-            .contains("root input backing exceeds its frozen capacity"),
-        "unexpected refusal: {error}"
+    };
+    assert_original_root_storage_cause(
+        &error,
+        novarocks_execution::exec::chunk::RootArrayStorageError::CapacityExceeded,
     );
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Resource);
     // The refused input exits with its position; nothing was published.
     drop(input(&fixture.session).await);
     assert_eq!(fixture.channel.snapshot().produced_through, 0);
@@ -537,16 +743,43 @@ async fn unknown_actual_schema_refuses_before_producer_and_drops_chunk_before_cr
             actual_dropped.store(weak.upgrade().is_none(), Ordering::SeqCst);
             observed.fetch_add(1, Ordering::SeqCst);
         }));
-    let error = fixture.session.submit_input(unknown, permit).unwrap_err();
-    assert!(
+    let error = {
+        let mut submitted =
+            Some(novarocks_execution::runtime::fragment::io::RootResultInput::new(unknown, permit));
+        let original_array =
+            Arc::as_ptr(submitted.as_ref().unwrap().chunk().record_batch().column(0));
+        let generation = submitted.as_ref().unwrap().permit().generation();
+        let error = fixture.session.submit_input(&mut submitted).unwrap_err();
+        let returned = submitted
+            .as_ref()
+            .expect("preaccept refusal returns the original caller slot");
+        assert!(std::ptr::eq(
+            original_array,
+            Arc::as_ptr(returned.chunk().record_batch().column(0))
+        ));
+        assert_eq!(returned.permit().generation(), generation);
+        assert_eq!(
+            callbacks.load(Ordering::SeqCst),
+            0,
+            "refusal retains the caller input and credit"
+        );
+        let (chunk, permit) = submitted.take().unwrap().into_cleanup_parts();
+        drop(chunk);
+        drop(permit);
         error
-            .to_string()
-            .contains("root input actual schema differs from its metadata owner"),
-        "unexpected refusal: {error}"
+    };
+    assert_original_root_storage_cause(
+        &error,
+        novarocks_execution::exec::chunk::RootArrayStorageError::UnknownMetadataOwner,
     );
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
     assert!(callbacks.load(Ordering::SeqCst) > 0);
     assert!(dropped_before_wake.load(Ordering::SeqCst));
-    assert!(fixture.session.producer_exited());
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Pending
+    );
     assert_eq!(fixture.channel.snapshot().produced_through, 0);
     assert_eq!(
         fixture.session.producer_state(),
@@ -562,14 +795,26 @@ async fn full_window_suspends_original_input_and_abort_exits_with_response_alias
     let value = "q".repeat(3 << 20);
     let array: ArrayRef = Arc::new(StringArray::from(vec![value.as_str()]));
     let weak = Arc::downgrade(&array);
-    fixture
-        .session
-        .submit_input(owned_chunk(array), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_chunk(array),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     wait_until(|| fixture.channel.snapshot().data_positions == 2).await;
     assert_eq!(fixture.channel.snapshot().produced_through, 2);
     assert!(weak.upgrade().is_some());
-    assert!(!fixture.session.producer_exited());
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Pending
+    );
     assert!(matches!(
         fixture.session.try_acquire_input().unwrap(),
         RootInputAdmission::Blocked
@@ -583,7 +828,7 @@ async fn full_window_suspends_original_input_and_abort_exits_with_response_alias
     fixture
         .session
         .abort(ResultAbort::Cancelled("test cancellation".into()));
-    wait_until(|| fixture.session.producer_exited()).await;
+    await_whole_exit(&fixture.session).await;
     assert!(weak.upgrade().is_none());
     assert!(matches!(
         fixture.session.producer_state(),
@@ -609,15 +854,27 @@ async fn pool_shutdown_drains_an_active_blocked_session_without_consumer_ack() {
     let value = "x".repeat(3 << 20);
     let array: ArrayRef = Arc::new(StringArray::from(vec![value.as_str()]));
     let weak = Arc::downgrade(&array);
-    fixture
-        .session
-        .submit_input(owned_chunk(array), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_chunk(array),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     wait_until(|| fixture.channel.snapshot().data_positions == 2).await;
-    assert!(!fixture.session.producer_exited());
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Pending
+    );
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
     shutdown(&fixture.pool).await;
-    assert!(fixture.session.producer_exited());
+    await_whole_exit(&fixture.session).await;
     assert!(weak.upgrade().is_none());
     assert!(matches!(
         fixture.session.producer_state(),
@@ -625,21 +882,35 @@ async fn pool_shutdown_drains_an_active_blocked_session_without_consumer_ack() {
     ));
     assert!(fixture.session.try_acquire_input().is_err());
     assert!(
-        NativeRootResultSession::try_open(Arc::clone(&fixture.channel), &fixture.pool).is_err()
+        NativeRootResultSession::try_open_for_local_encoding(
+            Arc::clone(&fixture.channel),
+            &fixture.pool
+        )
+        .is_err()
     );
     fixture.channel.close(RootRetentionClose::ContextReleased);
 }
 
 #[tokio::test]
-async fn repeated_cancel_observer_panics_cannot_defer_original_input_exit() {
+async fn repeated_cancel_issuer_observer_panics_keep_notification_unknown_after_original_input_exit()
+ {
     let fixture = Fixture::new(client(1));
     let value = "x".repeat(3 << 20);
     let array: ArrayRef = Arc::new(StringArray::from(vec![value.as_str()]));
     let weak = Arc::downgrade(&array);
-    fixture
-        .session
-        .submit_input(owned_chunk(array), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_chunk(array),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     wait_until(|| fixture.channel.snapshot().data_positions == 2).await;
     let observed = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&observed);
@@ -658,11 +929,10 @@ async fn repeated_cancel_observer_panics_cannot_defer_original_input_exit() {
                 }
             }
         }));
-    shutdown(&fixture.pool).await;
-    assert!(fixture.session.producer_exited());
+    shutdown_with_issuer_notification_unknown(&fixture).await;
     assert!(weak.upgrade().is_none());
     assert!(
-        observed.load(Ordering::SeqCst) < 64,
+        observed.load(Ordering::SeqCst) > 0 && observed.load(Ordering::SeqCst) < 64,
         "original input exit depended on exhausting the observer's panic budget"
     );
     assert!(matches!(
@@ -680,7 +950,7 @@ async fn repeated_cancel_observer_panics_cannot_defer_original_input_exit() {
 }
 
 #[tokio::test]
-async fn count_only_panicking_input_credit_observer_cannot_strand_shutdown_or_grant() {
+async fn count_only_panicking_issuer_observer_keeps_unknown_after_cpu_and_grant_exit() {
     let fixture = Fixture::new(FrozenRootOutput::CountOnly);
     let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
     let weak = Arc::downgrade(&array);
@@ -695,15 +965,23 @@ async fn count_only_panicking_input_credit_observer_cannot_strand_shutdown_or_gr
                 panic!("injected one-time writable observer failure");
             }
         }));
-    // CountOnly drops Input inside the producer turn. The first release
-    // notification unwinds through that turn's state lock and poisons it.
-    fixture
-        .session
-        .submit_input(owned_chunk(array), permit)
-        .unwrap();
+    // CountOnly retires the real input in the producer turn. The issuer
+    // catches this notification fault independently of its exact grant receipt.
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_chunk(array),
+                permit,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     wait_until(|| fired.load(Ordering::SeqCst)).await;
-    shutdown(&fixture.pool).await;
-    assert!(fixture.session.producer_exited());
+    shutdown_with_issuer_notification_unknown(&fixture).await;
     assert!(weak.upgrade().is_none());
     assert!(matches!(
         fixture.session.producer_state(),
@@ -727,7 +1005,7 @@ async fn cancel_after_a_normal_end_keeps_the_completed_terminal() {
     let fixture = Fixture::new(client(1));
     fixture.session.finish_input().unwrap();
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
-    wait_until(|| fixture.session.producer_exited()).await;
+    await_whole_exit(&fixture.session).await;
     // A pool shutdown can still reach a job whose slot it has not yet
     // removed; cancelling a completed producer must not rewrite its End.
     fixture
@@ -742,8 +1020,14 @@ async fn cancel_after_a_normal_end_keeps_the_completed_terminal() {
 }
 
 #[tokio::test]
-async fn exit_hook_notification_panic_cannot_hide_completed_producer_exit() {
+async fn encoder_handoff_notification_panic_keeps_contextheld_and_channel_metadata_unknown() {
     let fixture = Fixture::new(client(1));
+    let metadata_before_fault = fixture
+        .channel
+        .try_ownership_snapshot()
+        .unwrap()
+        .unwrap()
+        .metadata_holders;
     let fired = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&fired);
     let channel = Arc::downgrade(&fixture.channel);
@@ -756,16 +1040,15 @@ async fn exit_hook_notification_panic_cannot_hide_completed_producer_exit() {
                 && !observed.swap(true, Ordering::SeqCst)
             {
                 // End has been published and the real producer guard has
-                // handed off to its context. Its exit notification can unwind
-                // before the ordinary final exited.store would execute.
+                // handed off to its context. This notification still precedes
+                // whole-pool-job proof. The channel's original finite metadata
+                // owner catches it without invalidating the CPU job's exit.
                 panic!("injected one-time completed producer exit notification failure");
             }
         }));
     fixture.session.finish_input().unwrap();
     wait_until(|| fired.load(Ordering::SeqCst)).await;
-    wait_until(|| fixture.session.producer_exited()).await;
-    shutdown(&fixture.pool).await;
-    assert!(fixture.session.producer_exited());
+    shutdown_with_channel_metadata_unknown(&fixture, metadata_before_fault).await;
     assert_eq!(
         fixture.session.producer_state(),
         RootProducerState::ContextHeld
@@ -781,11 +1064,13 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
     // pool shutdown may hide which owner keeps the metadata grant alive.
     let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
     let budget = ResultRetainedBudget::new(limits.per_process());
+    let health = Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new());
     let pool = RootProducerPool::try_new(
         NonZeroUsize::new(1).unwrap(),
         NonZeroUsize::new(8).unwrap(),
         1 << 20,
         Arc::clone(&budget),
+        Arc::clone(&health),
     )
     .unwrap();
     let channel = RootResultChannel::try_open(
@@ -798,11 +1083,18 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         },
         budget,
         limits,
+        Arc::clone(&health),
     )
     .unwrap();
     channel.mark_context_owned().unwrap();
-    let session = NativeRootResultSession::try_open(Arc::clone(&channel), &pool).unwrap();
-    assert!(session.producer_exited());
+    let session =
+        NativeRootResultSession::try_open_for_local_encoding(Arc::clone(&channel), &pool).unwrap();
+    assert_eq!(
+        session.producer_exit_progress(),
+        RootWorkExitProgress::Pending
+    );
+    session.finish_input().unwrap();
+    await_whole_exit(&session).await;
     let weak_session = Arc::downgrade(&session);
     let first = Arc::new(AtomicBool::new(true));
     let first_notification = Arc::clone(&first);
@@ -811,6 +1103,15 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let entered = std::sync::Mutex::new(Some(entered));
     let (release, release_rx) = std::sync::mpsc::channel();
+    struct ReleaseNotification(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseNotification {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let mut release = ReleaseNotification(Some(release));
     let release_rx = std::sync::Mutex::new(release_rx);
     let _subscription = session.writable_observable().subscribe(Arc::new(move || {
         if first_notification.swap(false, Ordering::SeqCst) {
@@ -857,7 +1158,7 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
             .is_err(),
         "the blocked callback snapshot still retains fixed metadata"
     );
-    release.send(()).unwrap();
+    release.0.take().unwrap().send(()).unwrap();
     tokio::time::timeout(DEADLINE, joined_rx)
         .await
         .expect("notification join exceeded deadline")
@@ -1016,10 +1317,19 @@ async fn statistics_domain_emits_exact_opaque_records_across_two_original_inputs
         InternalResultDomain::StatisticsArtifactV1,
     ));
     let (chunk, weak) = statistics_chunk(&[9, 7], "é", &[0, 255, 65]);
-    fixture
-        .session
-        .submit_input(chunk, input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                chunk,
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     let second_permit = input(&fixture.session).await;
     assert!(weak.upgrade().is_none());
     let first = read(&fixture.channel, Some(1), 0).await;
@@ -1032,9 +1342,18 @@ async fn statistics_domain_emits_exact_opaque_records_across_two_original_inputs
     );
     drop(first);
     let (chunk, _) = statistics_chunk(&[3], "x", &[]);
-    fixture.session.submit_input(chunk, second_permit).unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, second_permit),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_exited()).await;
+    await_whole_exit(&fixture.session).await;
     let second = read(&fixture.channel, Some(2), 1).await;
     assert_eq!(
         body(&second),
@@ -1056,12 +1375,24 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
     ));
     let body_bytes = vec![0xf3; 3 << 20];
     let (chunk, weak) = statistics_chunk(&[1], "theta", &body_bytes);
-    fixture
-        .session
-        .submit_input(chunk, input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                chunk,
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     wait_until(|| fixture.channel.snapshot().data_positions == 2).await;
-    assert!(!fixture.session.producer_exited());
+    assert_eq!(
+        fixture.session.producer_exit_progress(),
+        RootWorkExitProgress::Pending
+    );
     assert!(weak.upgrade().is_some());
     let first = read(&fixture.channel, Some(1), 0).await;
     assert_eq!(&body(&first)[..4], b"STA1");
@@ -1070,7 +1401,7 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
     fixture.session.abort(ResultAbort::Cancelled(
         "cancel statistics continuation".into(),
     ));
-    wait_until(|| fixture.session.producer_exited()).await;
+    await_whole_exit(&fixture.session).await;
     assert!(weak.upgrade().is_none());
     assert!(matches!(
         fixture.session.producer_state(),
@@ -1149,17 +1480,32 @@ async fn write_commit_records_cross_inputs_and_end_after_their_summary() {
     let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
         InternalResultDomain::PreparedWriteCommitV1,
     ));
-    fixture
-        .session
-        .submit_input(
-            write_chunk(&[(0, b"a"), (1, b"bc")], None),
-            input(&fixture.session).await,
-        )
-        .unwrap();
-    fixture
-        .session
-        .submit_input(write_chunk(&[], Some(3)), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                write_chunk(&[(0, b"a"), (1, b"bc")], None),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                write_chunk(&[], Some(3)),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     fixture.session.finish_input().unwrap();
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
     let mut bytes = Vec::new();
@@ -1200,19 +1546,39 @@ async fn write_commit_without_summary_fails_instead_of_a_success_end() {
     let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
         InternalResultDomain::PreparedWriteCommitV1,
     ));
-    fixture
-        .session
-        .submit_input(
-            write_chunk(&[(0, b"a")], None),
-            input(&fixture.session).await,
-        )
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                write_chunk(&[(0, b"a")], None),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_exited()).await;
-    assert!(matches!(
-        fixture.session.producer_state(),
-        RootProducerState::Failed(ref message) if message.contains("SUMMARY")
-    ));
+    await_whole_exit(&fixture.session).await;
+    let RootProducerState::Failed(cause) = fixture.session.producer_state() else {
+        panic!("missing SUMMARY cannot publish normal End")
+    };
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        cause.failure_fact().reason().domain(),
+        novarocks_execution_contract::failure::domain::NATIVE.get()
+    );
+    assert_eq!(cause.failure_fact().reason().code(), 206);
+    let mut source = std::error::Error::source(&cause);
+    let mut original = None;
+    while let Some(cause) = source {
+        if let Some(cause) = cause.downcast_ref::<novarocks_native_adapter::root_write_commit_codec::WriteCommitCodecError>() { original = Some(*cause); break; }
+        source = cause.source();
+    }
+    assert_eq!(original, Some(novarocks_native_adapter::root_write_commit_codec::WriteCommitCodecError::MissingSummary));
+    assert_eq!(fixture.session.channel().snapshot().end_sequence, None);
     shutdown(&fixture.pool).await;
 }
 
@@ -1221,11 +1587,13 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
     use novarocks_result_contract::InternalResultDomain;
     let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
     let budget = ResultRetainedBudget::new(limits.per_process());
+    let health = Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new());
     let pool = RootProducerPool::try_new(
         NonZeroUsize::new(1).unwrap(),
         NonZeroUsize::new(8).unwrap(),
         1 << 20,
         Arc::clone(&budget),
+        Arc::clone(&health),
     )
     .unwrap();
     // A scalar domain identity without its typed schema has no channel.
@@ -1240,6 +1608,7 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
             },
             Arc::clone(&budget),
             limits,
+            Arc::clone(&health),
         )
         .is_err()
     );
@@ -1258,11 +1627,13 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
             },
             Arc::clone(&budget),
             limits,
+            Arc::clone(&health),
         )
         .unwrap();
         channel.mark_context_owned().unwrap();
-        let session = NativeRootResultSession::try_open(Arc::clone(&channel), &pool)
-            .unwrap_or_else(|error| panic!("{domain:?} producer is installed: {error}"));
+        let session =
+            NativeRootResultSession::try_open_for_local_encoding(Arc::clone(&channel), &pool)
+                .unwrap_or_else(|error| panic!("{domain:?} producer is installed: {error}"));
         session.abort(ResultAbort::Cancelled(String::new()));
         drop(session);
         channel.close(RootRetentionClose::ContextReleased);
@@ -1289,10 +1660,19 @@ async fn cow_selection_records_decode_back_to_their_batches() {
         .map(|chunk| chunk.record_batch().clone())
         .collect::<Vec<_>>();
     for chunk in inputs {
-        fixture
-            .session
-            .submit_input(chunk, input(&fixture.session).await)
-            .unwrap();
+        {
+            let mut submitted = Some(
+                novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                    chunk,
+                    input(&fixture.session).await,
+                ),
+            );
+            fixture.session.submit_input(&mut submitted).unwrap();
+            assert!(
+                submitted.is_none(),
+                "accepted input transfers its exact caller slot"
+            );
+        };
     }
     fixture.session.finish_input().unwrap();
     // Three records exceed the unacknowledged window: consume while reading.
@@ -1356,7 +1736,7 @@ fn longs(values: Vec<Option<i64>>) -> Chunk {
 }
 async fn scalar_record(fixture: &Fixture, schema: &ScalarSchema, rows: u64) -> ScalarRecord {
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
-    assert!(fixture.session.producer_exited());
+    await_whole_exit(&fixture.session).await;
     assert_eq!(fixture.channel.snapshot().data_positions, 1);
     let data = read(&fixture.channel, Some(1), 0).await;
     let record = ScalarRecord::decode_owned(schema, body(&data)).unwrap();
@@ -1370,10 +1750,19 @@ async fn scalar_value_is_published_once_at_sealed_end_after_empty_batches() {
     let (output, schema) = scalar(nullable_i64());
     let fixture = Fixture::new(output);
     for chunk in [longs(vec![]), longs(vec![Some(42)]), longs(vec![])] {
-        fixture
-            .session
-            .submit_input(chunk, input(&fixture.session).await)
-            .unwrap();
+        {
+            let mut submitted = Some(
+                novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                    chunk,
+                    input(&fixture.session).await,
+                ),
+            );
+            fixture.session.submit_input(&mut submitted).unwrap();
+            assert!(
+                submitted.is_none(),
+                "accepted input transfers its exact caller slot"
+            );
+        };
     }
     // The next permit proves every earlier input exited; the accepted row is
     // still unpublished until the sealed normal End.
@@ -1404,10 +1793,19 @@ async fn scalar_zero_rows_is_unique_no_rows_and_one_null_row_is_a_value() {
 
     let empty_batches = Fixture::new(output.clone());
     for _ in 0..2 {
-        empty_batches
-            .session
-            .submit_input(longs(vec![]), input(&empty_batches.session).await)
-            .unwrap();
+        {
+            let mut submitted = Some(
+                novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                    longs(vec![]),
+                    input(&empty_batches.session).await,
+                ),
+            );
+            empty_batches.session.submit_input(&mut submitted).unwrap();
+            assert!(
+                submitted.is_none(),
+                "accepted input transfers its exact caller slot"
+            );
+        };
     }
     empty_batches.session.finish_input().unwrap();
     assert_eq!(
@@ -1417,10 +1815,19 @@ async fn scalar_zero_rows_is_unique_no_rows_and_one_null_row_is_a_value() {
     shutdown(&empty_batches.pool).await;
 
     let null_row = Fixture::new(output);
-    null_row
-        .session
-        .submit_input(longs(vec![None]), input(&null_row.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                longs(vec![None]),
+                input(&null_row.session).await,
+            ),
+        );
+        null_row.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     null_row.session.finish_input().unwrap();
     assert_eq!(
         scalar_record(&null_row, &schema, 1).await,
@@ -1433,15 +1840,33 @@ async fn scalar_zero_rows_is_unique_no_rows_and_one_null_row_is_a_value() {
 async fn scalar_second_row_fails_before_any_record_is_published() {
     let (output, _) = scalar(nullable_i64());
     let across_batches = Fixture::new(output.clone());
-    across_batches
-        .session
-        .submit_input(longs(vec![Some(1)]), input(&across_batches.session).await)
-        .unwrap();
-    across_batches
-        .session
-        .submit_input(longs(vec![Some(2)]), input(&across_batches.session).await)
-        .unwrap();
-    wait_until(|| across_batches.session.producer_exited()).await;
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                longs(vec![Some(1)]),
+                input(&across_batches.session).await,
+            ),
+        );
+        across_batches.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                longs(vec![Some(2)]),
+                input(&across_batches.session).await,
+            ),
+        );
+        across_batches.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
+    await_whole_exit(&across_batches.session).await;
     assert!(matches!(
         across_batches.session.producer_state(),
         RootProducerState::Failed(_)
@@ -1451,14 +1876,20 @@ async fn scalar_second_row_fails_before_any_record_is_published() {
     shutdown(&across_batches.pool).await;
 
     let one_batch = Fixture::new(output);
-    one_batch
-        .session
-        .submit_input(
-            longs(vec![Some(1), Some(2)]),
-            input(&one_batch.session).await,
-        )
-        .unwrap();
-    wait_until(|| one_batch.session.producer_exited()).await;
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                longs(vec![Some(1), Some(2)]),
+                input(&one_batch.session).await,
+            ),
+        );
+        one_batch.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
+    await_whole_exit(&one_batch.session).await;
     assert!(matches!(
         one_batch.session.producer_state(),
         RootProducerState::Failed(_)
@@ -1471,16 +1902,25 @@ async fn scalar_second_row_fails_before_any_record_is_published() {
 async fn scalar_cancel_after_an_accepted_row_publishes_neither_value_nor_no_rows() {
     let (output, _) = scalar(nullable_i64());
     let fixture = Fixture::new(output);
-    fixture
-        .session
-        .submit_input(longs(vec![Some(7)]), input(&fixture.session).await)
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                longs(vec![Some(7)]),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     let held = input(&fixture.session).await;
     drop(held);
     fixture
         .session
         .abort(ResultAbort::Cancelled("cancel scalar root".into()));
-    wait_until(|| fixture.session.producer_exited()).await;
+    await_whole_exit(&fixture.session).await;
     assert!(matches!(
         fixture.session.producer_state(),
         RootProducerState::Failed(_)
@@ -1510,13 +1950,19 @@ async fn scalar_nested_list_record_is_published_whole() {
         None,
     )
     .unwrap();
-    fixture
-        .session
-        .submit_input(
-            owned_nested_chunk(Arc::new(list), vec![item]),
-            input(&fixture.session).await,
-        )
-        .unwrap();
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                owned_nested_chunk(Arc::new(list), vec![item]),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
     fixture.session.finish_input().unwrap();
     assert_eq!(
         scalar_record(&fixture, &schema, 1).await,
@@ -1536,15 +1982,46 @@ async fn scalar_type_mismatch_fails_without_a_record() {
         value_type: ScalarValueType::SignedInteger(32),
     });
     let fixture = Fixture::new(output);
-    fixture
-        .session
-        .submit_input(longs(vec![Some(1)]), input(&fixture.session).await)
-        .unwrap();
-    wait_until(|| fixture.session.producer_exited()).await;
+    {
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                longs(vec![Some(1)]),
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(
+            submitted.is_none(),
+            "accepted input transfers its exact caller slot"
+        );
+    };
+    await_whole_exit(&fixture.session).await;
     assert!(matches!(
         fixture.session.producer_state(),
         RootProducerState::Failed(_)
     ));
     assert_eq!(fixture.channel.snapshot().produced_through, 0);
     shutdown(&fixture.pool).await;
+}
+
+// The input fixtures independently establish the violated storage contract.
+// Root session and IO must preserve that exact author, not restate its text.
+fn assert_original_root_storage_cause(
+    error: &novarocks_execution::runtime::fragment::io::FragmentIoError,
+    expected: novarocks_execution::exec::chunk::RootArrayStorageError,
+) {
+    use novarocks_execution_contract::failure::FailureProjection;
+    assert_eq!(error.failure_fact(), expected.failure_fact());
+    let mut source = std::error::Error::source(error);
+    let mut original = None;
+    while let Some(cause) = source {
+        if let Some(cause) =
+            cause.downcast_ref::<novarocks_execution::exec::chunk::RootArrayStorageError>()
+        {
+            original = Some(*cause);
+            break;
+        }
+        source = cause.source();
+    }
+    assert_eq!(original, Some(expected));
 }

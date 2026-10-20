@@ -16,7 +16,8 @@
 // under the License.
 
 //! The original clock-free UTC epoch conversion and selected NTZ projection.
-use super::{calendar_extended::timestamp_value_for_type, calendar_extended_shared::CalendarInput};
+use super::calendar_extended_shared::CalendarInput;
+use super::calendar_timestamp::timestamp_value;
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, SelectedValues,
     kernel_control::{internal, invalid},
@@ -47,8 +48,8 @@ pub(super) fn split_epoch_value(value: i64, scale: i64) -> Option<(i64, u32)> {
 pub(super) fn epoch_utc_datetime(seconds: i64, micros: u32) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(seconds, micros * 1_000)
 }
-pub(super) fn evaluate_epoch_ntz<'a>(
-    input: CalendarInput<'_, 'a>,
+pub(super) fn evaluate_epoch_ntz<'a, E>(
+    input: CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
@@ -135,9 +136,7 @@ pub(super) fn evaluate_epoch_ntz<'a>(
                 work.flush()?;
                 let result = split_epoch_value(value, scale)
                     .and_then(|(seconds, micros)| epoch_utc_datetime(seconds, micros))
-                    .and_then(|date| {
-                        timestamp_value_for_type(date.naive_utc(), target.data_type()).ok()
-                    });
+                    .and_then(|date| timestamp_value(date.naive_utc(), TimeUnit::Microsecond).ok());
                 work.flush()?;
                 result
             };

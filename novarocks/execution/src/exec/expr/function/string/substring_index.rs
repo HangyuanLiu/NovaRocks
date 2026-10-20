@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, StringArray};
 use novarocks_functions::builtin::string_substring_index_core::{
     ForwardMatchAccess, forward_match_indices, substring_index_span,
@@ -29,7 +30,7 @@ pub fn eval_substring_index<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let delim_arr = arena.eval(args[1], chunk)?;
@@ -37,11 +38,11 @@ pub fn eval_substring_index<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "substring_index expects string".to_string())?;
+        .ok_or_else(|| expression_contract("substring_index expects string"))?;
     let d_arr = delim_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "substring_index expects string".to_string())?;
+        .ok_or_else(|| expression_contract("substring_index expects string"))?;
     let c_arr = downcast_int_arg_array(&count_arr, "substring_index")?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);

@@ -687,7 +687,7 @@ impl PureCompileControl for Trace {
         events.push((phase, units));
         if self.at == Some(at) {
             self.refused.store(true, Ordering::SeqCst);
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -724,7 +724,7 @@ fn assert_rows_complete_compiler_preserves_every_small_control_prefix_and_ordina
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..expected.len() {
-                let control = Trace::new(Some(at), cause);
+                let control = Trace::new(Some(at), cause.clone());
                 assert!(
                     matches!(invoke(&control), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );
@@ -778,7 +778,7 @@ fn assert_rows_wide_real_keys_and_multibyte_label_copy_cross_quantum_without_rep
         CompileControlError::ResourceExhausted,
     ] {
         for at in [0, quantum, expected.len() - 1] {
-            let control = Trace::new(Some(at), cause);
+            let control = Trace::new(Some(at), cause.clone());
             assert!(
                 matches!(compile(&source, &functions, &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
             );
@@ -823,7 +823,7 @@ fn assert_rows_leaf_ordinary_shape_tail_and_unrepresentable_reservation_keep_ori
         CompileControlError::ResourceExhausted,
     ] {
         for at in 0..expected.len() {
-            let trace = Trace::new(Some(at), cause);
+            let trace = Trace::new(Some(at), cause.clone());
             assert!(
                 matches!(invoke(&trace), Err(FragmentCompileError::Control(actual)) if actual == cause)
             );

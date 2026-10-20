@@ -58,10 +58,7 @@ impl std::ops::DerefMut for MinMaxNState {
 }
 struct LegacyNBuffer(Vec<u8>);
 impl novarocks_functions::builtin::aggregate_by_core::ByEncodeBuffer for LegacyNBuffer {
-    fn push(
-        &mut self,
-        byte: u8,
-    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+    fn push(&mut self, byte: u8) -> Result<(), novarocks_functions::KernelFailure> {
         self.0.push(byte);
         Ok(())
     }
@@ -69,7 +66,7 @@ impl novarocks_functions::builtin::aggregate_by_core::ByEncodeBuffer for LegacyN
         &mut self,
         bytes: &[u8],
         _work: &mut novarocks_functions::aggregate_scalar::ScalarWork<'_, '_>,
-    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+    ) -> Result<(), novarocks_functions::KernelFailure> {
         self.0.extend_from_slice(bytes);
         Ok(())
     }
@@ -80,40 +77,63 @@ impl AggregateFunction for MinMaxNAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let input_type = input_type.ok_or_else(|| "min_n/max_n input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "min_n/max_n input type missing",
+            )
+        })?;
         let kind = match canonical_agg_name(func.name.as_str()) {
             "min_n" => AggKind::MinN,
             "max_n" => AggKind::MaxN,
-            other => return Err(format!("unsupported min/max_n function: {}", other)),
+            other => {
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "unsupported min/max_n function: {}",
+                        other
+                    )),
+                );
+            }
         };
 
         let output_type = func
             .types
             .as_ref()
             .and_then(|sig| sig.output_type.clone())
-            .unwrap_or_else(|| default_output_type(input_type, input_is_intermediate));
+            .ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "min_n/max_n frozen output type is missing",
+                )
+            })?;
         let intermediate_type = func
             .types
             .as_ref()
             .and_then(|sig| sig.intermediate_type.clone())
-            .unwrap_or(DataType::Binary);
+            .ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "min_n/max_n frozen intermediate type is missing",
+                )
+            })?;
 
         if input_is_intermediate {
             if !matches!(
                 input_type,
                 DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8
             ) {
-                return Err(format!(
-                    "min_n/max_n merge input must be binary-like, got {:?}",
-                    input_type
-                ));
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "min_n/max_n merge input must be binary-like, got {:?}",
+                        input_type
+                    )),
+                );
             }
         } else if !matches!(input_type, DataType::Struct(fields) if fields.len() >= 2) {
-            return Err(format!(
-                "min_n/max_n expects packed STRUCT(value, n), got {:?}",
-                input_type
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "min_n/max_n expects packed STRUCT(value, n), got {:?}",
+                    input_type
+                )),
+            );
         }
 
         Ok(AggSpec {
@@ -142,10 +162,10 @@ impl AggregateFunction for MinMaxNAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "min_n/max_n input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("min_n/max_n input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -153,10 +173,12 @@ impl AggregateFunction for MinMaxNAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "min_n/max_n merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "min_n/max_n merge input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -174,9 +196,11 @@ impl AggregateFunction for MinMaxNAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked min_n/max_n requires a memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked min_n/max_n requires a memory tracker",
+            )
         })?;
         unsafe { ptr.cast::<MinMaxNState>().write(MinMaxNState::new(tracker)) };
         Ok(())
@@ -202,18 +226,26 @@ impl AggregateFunction for MinMaxNAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("min_n/max_n input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "min_n/max_n input type mismatch",
+            ));
         };
         let struct_array = array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "min_n/max_n input must be StructArray".to_string())?;
+            .ok_or_else(|| {
+                crate::exec::expr::agg::views::aggregate_input_contract(
+                    "min_n/max_n input must be StructArray",
+                )
+            })?;
         if struct_array.num_columns() < 2 {
-            return Err(format!(
-                "min_n/max_n input expects at least 2 fields, got {}",
-                struct_array.num_columns()
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "min_n/max_n input expects at least 2 fields, got {}",
+                    struct_array.num_columns()
+                ),
             ));
         }
         let values = struct_array.column(0).clone();
@@ -231,7 +263,7 @@ impl AggregateFunction for MinMaxNAgg {
                     keep_smallest,
                     &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         }
         Ok(())
     }
@@ -242,9 +274,11 @@ impl AggregateFunction for MinMaxNAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("min_n/max_n merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "min_n/max_n merge input type mismatch",
+            ));
         };
         let keep_smallest = matches!(spec.kind, AggKind::MinN);
         for (row, &base) in state_ptrs.iter().enumerate() {
@@ -256,7 +290,7 @@ impl AggregateFunction for MinMaxNAgg {
                     keep_smallest,
                     &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         }
         Ok(())
     }
@@ -267,7 +301,7 @@ impl AggregateFunction for MinMaxNAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let target_type = if output_intermediate {
             &spec.intermediate_type
         } else {
@@ -276,7 +310,7 @@ impl AggregateFunction for MinMaxNAgg {
 
         match target_type {
             DataType::Binary => {
-                let mut builder = BinaryBuilder::new();
+                let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
                 for &base in group_states {
                     let state = unsafe { &*((base as *mut u8).add(offset) as *const MinMaxNState) };
                     let mut bytes = LegacyNBuffer(Vec::new());
@@ -285,10 +319,10 @@ impl AggregateFunction for MinMaxNAgg {
                             &mut bytes,
                             &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
                         )
-                        .map_err(|error| error.to_string())?;
-                    builder.append_value(bytes.0);
+                        .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
+                    builder.append_value(bytes.0)?;
                 }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
+                Ok(Arc::new(builder.finish()?) as ArrayRef)
             }
             DataType::List(_) => {
                 let mut values = Vec::with_capacity(group_states.len());
@@ -299,14 +333,16 @@ impl AggregateFunction for MinMaxNAgg {
                             .output(&mut novarocks_functions::aggregate_scalar::ScalarWork::new(
                                 None,
                             ))
-                            .map_err(|error| error.to_string())?,
+                            .map_err(crate::runtime::fragment::ExecutionFailure::from)?,
                     ));
                 }
                 build_scalar_array(target_type, values)
             }
-            other => Err(format!(
-                "min_n/max_n output type must be Binary or List, got {:?}",
-                other
+            other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "min_n/max_n output type must be Binary or List, got {:?}",
+                    other
+                ),
             )),
         }
     }
@@ -314,22 +350,6 @@ impl AggregateFunction for MinMaxNAgg {
 
 fn canonical_agg_name(name: &str) -> &str {
     name.split_once('|').map(|(base, _)| base).unwrap_or(name)
-}
-
-fn default_output_type(input_type: &DataType, input_is_intermediate: bool) -> DataType {
-    if input_is_intermediate {
-        return DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-    }
-    if let DataType::Struct(fields) = input_type
-        && let Some(first) = fields.first()
-    {
-        return DataType::List(Arc::new(Field::new(
-            "item",
-            first.data_type().clone(),
-            true,
-        )));
-    }
-    DataType::List(Arc::new(Field::new("item", input_type.clone(), true)))
 }
 
 #[cfg(test)]
@@ -385,3 +405,39 @@ mod retained_bytes_tests {
 #[cfg(test)]
 #[path = "minmax_n_baseline_tests.rs"]
 mod minmax_n_baseline_tests;
+
+#[cfg(test)]
+mod binding_contract_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn binary_n_state_never_guesses_a_missing_frozen_result_or_intermediate_type() {
+        for (output, intermediate) in [
+            (None, Some(DataType::Binary)),
+            (
+                Some(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Int64,
+                    true,
+                )))),
+                None,
+            ),
+        ] {
+            let function = AggFunction {
+                name: "min_n".into(),
+                types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                    input_arg_type: Some(DataType::Int64),
+                    output_type: output,
+                    intermediate_type: intermediate,
+                }),
+                ..Default::default()
+            };
+            let error =
+                match MinMaxNAgg.build_spec_from_type(&function, Some(&DataType::Binary), true) {
+                    Err(error) => error,
+                    Ok(_) => panic!("a frozen type cannot be inferred from opaque state bytes"),
+                };
+            assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        }
+    }
+}

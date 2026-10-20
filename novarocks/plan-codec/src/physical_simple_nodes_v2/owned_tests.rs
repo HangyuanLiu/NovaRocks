@@ -151,7 +151,7 @@ fn caller_owned_known_header_and_emit_requests_precede_late_control_and_foreign_
             .unwrap();
         for receiving in [false, true] {
             for late in CAUSES {
-                c.arm(Some((1, late)));
+                c.arm(Some((1, late.clone())));
                 let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
                 for _ in 0..255 {
                     work.step().unwrap();
@@ -283,7 +283,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             let result=invoke(receiving,ordinary,None); assert_eq!(result.is_err(),ordinary); let baseline=c.trace();
             assert!(!baseline.is_empty());
             for at in 0..baseline.len() {for cause in CAUSES {
-                assert!(matches!(invoke(receiving,ordinary,Some((at,cause))),Err(Error::Control(actual)) if actual==cause));
+                assert!(matches!(invoke(receiving,ordinary,Some((at,cause.clone()))),Err(Error::Control(actual)) if actual==cause));
                 assert_eq!(c.trace(),baseline[..=at]);
             }}
         }}
@@ -323,7 +323,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             };
             run(None).unwrap();let baseline=c.trace();let quantum=baseline.iter().position(|(_,n)|*n==256).expect("actual wide source reaches original quantum");
             for at in [0,quantum,baseline.len()-1] {for cause in CAUSES {
-                assert!(matches!(run(Some((at,cause))),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),baseline[..=at]);
+                assert!(matches!(run(Some((at,cause.clone()))),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),baseline[..=at]);
             }}
         }
     });

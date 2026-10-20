@@ -20,16 +20,21 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryBuilder, Int64Builder};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use crate::exec::mv::state_codec::{MultisetEntry, decode_multiset_self_describing};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
-pub fn count_distinct_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn count_distinct_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     super::min_max::min_state_union(a, b)
 }
 
-pub fn count_distinct_state_visible(s: &[u8]) -> Result<i64, String> {
+pub fn count_distinct_state_visible(
+    s: &[u8],
+) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
     let (_, entries) = decode_multiset_self_describing(s)?;
     positive_entry_count(&entries)
 }
@@ -39,17 +44,16 @@ pub fn eval_count_distinct_state_union<__Eval: crate::exec::expr::ExprEvaluation
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!(
+        return Err(super::failure::contract(format_args!(
             "count_distinct_state_union expects 2 arguments, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_count_distinct_state_union_arrays(&lhs, &rhs))?)
+    eval_count_distinct_state_union_arrays(&lhs, &rhs)
 }
 
 pub fn eval_count_distinct_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -57,24 +61,24 @@ pub fn eval_count_distinct_state_visible<__Eval: crate::exec::expr::ExprEvaluati
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 1 {
-        return Err((format!(
+        return Err(super::failure::contract(format_args!(
             "count_distinct_state_visible expects 1 argument, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
-    Ok((eval_count_distinct_state_visible_array(&input))?)
+    eval_count_distinct_state_visible_array(&input)
 }
 
 fn eval_count_distinct_state_union_arrays(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count("count_distinct_state_union", lhs.len(), rhs.len())?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::StateOutputTally::default();
     for row in 0..rows {
         let left = binary_value_or_empty(
             lhs,
@@ -88,12 +92,16 @@ fn eval_count_distinct_state_union_arrays(
             "count_distinct_state_union",
             1,
         )?;
-        builder.append_value(count_distinct_state_union(left, right)?);
+        let state = count_distinct_state_union(left, right)?;
+        extent.append(state.len())?;
+        builder.append_value(state);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn eval_count_distinct_state_visible_array(input: &ArrayRef) -> Result<ArrayRef, String> {
+fn eval_count_distinct_state_visible_array(
+    input: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = Int64Builder::new();
     for row in 0..input.len() {
         let state = binary_value_or_empty(input, row, "count_distinct_state_visible", 0)?;
@@ -102,13 +110,15 @@ fn eval_count_distinct_state_visible_array(input: &ArrayRef) -> Result<ArrayRef,
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn positive_entry_count(entries: &[MultisetEntry]) -> Result<i64, String> {
+fn positive_entry_count(
+    entries: &[MultisetEntry],
+) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
     entries
         .iter()
         .filter(|entry| entry.count > 0)
         .count()
         .try_into()
-        .map_err(|_| "count_distinct_state_visible count overflow".to_string())
+        .map_err(super::failure::numeric_conversion)
 }
 
 #[cfg(test)]

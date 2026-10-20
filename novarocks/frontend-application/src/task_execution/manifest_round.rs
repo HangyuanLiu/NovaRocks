@@ -21,12 +21,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_query_application::api::{
-    NativeAttemptConvergence, NativeAttemptPreparationFailure, NativeAttemptTerminal,
-    NativeContextConvergence, QueryExecutionError, QueryExecutionErrorKind,
+    NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
+    NativeAttemptPreparationFailure, NativeAttemptTerminal, StatementNativeHealthFailure,
 };
 use novarocks_query_application::coordination::{
-    AcceptedRootStatusSource, AttemptFailureClass, NativeAttemptDrive,
-    ReplacementWorkerAdmissionEvidence,
+    AcceptedRootStatusSource, NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
 };
 use novarocks_query_application::coordination::{DispatchBudget, OperationDispatchResult};
 use novarocks_task_codec::TransportBudget;
@@ -34,6 +33,10 @@ use novarocks_workload_control::{CancellationReason, CancellationView};
 
 use super::abort_effect::NativeAbortEffectIntake;
 use super::actor_gate::{ActorGateOwner, ActorGatedTaskOperationSink};
+use super::attempt_convergence::{
+    NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, NativeAttemptConvergenceTarget,
+    advance_task_round,
+};
 use super::clock::{ProcessMonotonicClock, TaskProtocolClock};
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::QueryTaskExecution;
@@ -43,7 +46,6 @@ use super::round::{AcknowledgementObserver, TaskRound, TurnPump};
 use super::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use super::split_transport::SplitDeliveryBridge;
 use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
-use super::termination::render_termination_detail;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::task_transport::{
     AttemptWireFacts, CoveredTaskStatusSubscriber, NativeTaskOperationSink, TaskAckIntake,
@@ -53,9 +55,7 @@ use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::query_execution::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
 };
-use novarocks_query_application::api::{
-    BackendProcessObservation, BackendProcessObservationService,
-};
+use novarocks_query_application::api::BackendProcessObservationService;
 
 const STATUS_INTAKE_CAPACITY: usize = 4096;
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
@@ -73,25 +73,15 @@ pub(crate) struct ManifestAttemptTransport {
     pub(crate) convergence_source: BackendProcessObservationService,
 }
 
-#[derive(Clone, Debug)]
-struct ManifestConvergenceTarget {
-    context: novarocks_execution_contract::QueryContextRef,
-    process: novarocks_types::BackendProcessId,
-    endpoint: novarocks_execution::runtime::endpoint::RuntimeEndpoint,
-}
-
 /// One active Task protocol owner assembled without a scheduling capability.
 pub(crate) struct ManifestAssembledRound {
     pub(crate) round: TaskRound,
     pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
     pub(crate) actor_gate: ActorGateOwner,
-    convergence_source: BackendProcessObservationService,
-    convergence_targets: Box<[ManifestConvergenceTarget]>,
+    convergence: NativeAttemptConvergenceOwner,
     notify: Arc<tokio::sync::Notify>,
     terminal: Option<NativeAttemptTerminal>,
     pending_terminal: Option<NativeAttemptTerminal>,
-    convergence_started: bool,
-    convergence_cleanup_started: bool,
 }
 
 /// The completion fact this Task owner must wait for before it reports the
@@ -138,11 +128,10 @@ pub(crate) fn assemble_manifest_round(
             backend.process_id(),
             backend.target().descriptor().preparing_positions(),
         );
-        convergence_targets.push(ManifestConvergenceTarget {
-            context: context.context(),
-            process: backend.process_id(),
-            endpoint: backend.endpoint().clone(),
-        });
+        convergence_targets.push(NativeAttemptConvergenceTarget::new(
+            context.context(),
+            backend.endpoint().clone(),
+        ));
         if admission_epochs
             .insert(backend.process_id(), backend.admission_epoch_capability())
             .is_some()
@@ -163,7 +152,7 @@ pub(crate) fn assemble_manifest_round(
             acks.handle(),
             transport.data_runtime.clone(),
         )
-        .map_err(TaskExecutionError::Schedule)?,
+        .map_err(TaskExecutionError::NativeTransport)?,
     ) as Arc<dyn TaskOperationSink>;
     let (actor_sink, actor_gate, actor_observer) = ActorGatedTaskOperationSink::pair(
         native,
@@ -191,7 +180,7 @@ pub(crate) fn assemble_manifest_round(
             transport.data_runtime,
             transport.subscription_scope,
         )
-        .map_err(TaskExecutionError::Schedule)?,
+        .map_err(TaskExecutionError::NativeTransport)?,
     );
     let mut execution = QueryTaskExecution::new(
         graph,
@@ -217,21 +206,30 @@ pub(crate) fn assemble_manifest_round(
     .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
     .observing(actor_observer)
     .with_connector_blocking_io(connector_blocking_io);
+    let convergence =
+        NativeAttemptConvergenceOwner::new(&round, convergence_source, convergence_targets)?;
     Ok(ManifestAssembledRound {
         round,
         split_delivery,
         actor_gate,
-        convergence_source,
-        convergence_targets: convergence_targets.into_boxed_slice(),
+        convergence,
         notify,
         terminal: None,
         pending_terminal: None,
-        convergence_started: false,
-        convergence_cleanup_started: false,
     })
 }
 
 impl ManifestAssembledRound {
+    /// Read only the terminal selected by this original attempt owner.
+    pub(crate) fn observed_failure(
+        &self,
+    ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
+        match self.terminal.as_ref() {
+            Some(NativeAttemptTerminal::Failed(failure)) => Some(failure.input().clone()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn install_split_assignment(
         &mut self,
         execution: novarocks_types::QueryExecutionId,
@@ -279,23 +277,7 @@ impl ManifestAssembledRound {
     /// the round first, so actor settlement precedes authorization of the next
     /// batch while Task state remains single-owner.
     async fn advance(&mut self, drive: &NativeAttemptDrive) -> Result<bool, TaskExecutionError> {
-        for pending in self.split_delivery.take_pending() {
-            let delivery = pending.delivery();
-            let task = pending.task();
-            let admitted = self
-                .round
-                .execution_mut()
-                .enqueue_task_update(task, pending.into_update());
-            let reported = match &admitted {
-                Ok(admission) => Ok(*admission),
-                Err(error) => Err(error),
-            };
-            self.split_delivery
-                .admit(delivery, reported)
-                .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
-            admitted?;
-        }
-        let report = self.round.turn();
+        let report = advance_task_round(&mut self.round, &self.split_delivery);
         // ACK observers run inside TaskRound before a state-machine error is
         // returned. Settle all observed ACKs before publishing that error,
         // without authorizing another batch for the terminal attempt.
@@ -370,24 +352,24 @@ impl ManifestAssembledRound {
                 self.terminal = Some(terminal.clone());
                 return terminal;
             }
-            if !success_sealed && let Some(detail) = self.round.failure_cause() {
-                // Derived peer failure is a placeholder. The same TaskRound
-                // remains live until the originating Worker publishes the
-                // authoritative cause, so recovery classification never fixes
-                // an incomplete failure fact.
-                if !detail.is_derived() {
-                    let terminal = NativeAttemptTerminal::Failed(task_termination_failure(detail));
-                    if self.actor_gate.prepare_convergence() {
-                        self.terminal = Some(terminal.clone());
-                        return terminal;
-                    }
+            if !success_sealed
+                && let Some(input) = self.round.execution().selected_task_failure().and_then(novarocks_query_application::execution_error::ExecutionFailureInput::from_selected_task)
+            {
+                // Peer placeholders still wait for their original author.
+                // Task/control inputs retain their real identity and phase.
+                let terminal=NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(input));
+                if self.actor_gate.prepare_convergence() {
+                    self.terminal=Some(terminal.clone());
+                    return terminal;
                 }
             }
             let completed = match completion {
                 ManifestAttemptCompletion::AcceptedRootSuccessSeal => {
                     self.round.accepted_root_success_sealed()
                 }
-                ManifestAttemptCompletion::AttemptDrained => self.round.attempt_drained(),
+                ManifestAttemptCompletion::AttemptDrained => {
+                    self.round.attempt_drained() && self.round.execution().worker_contexts_stopped()
+                }
             };
             if completed && self.actor_gate.prepare_convergence() {
                 let terminal = NativeAttemptTerminal::Completed;
@@ -419,284 +401,150 @@ impl ManifestAssembledRound {
         }
     }
 
-    /// Continues the same Task owner until every exact context has a positive
-    /// closure fact. A Worker release proves local stop. Exact process
-    /// replacement closes residual responsibility without claiming resource
-    /// release. Cancellation and unobservability are never closure evidence.
+    /// Keeps the original local pumps until their real close/join exits. The
+    /// original remote deadline only ends remote tracking; it never supplies a
+    /// Worker stop fact or substitutes for a local pump exit.
     pub(crate) async fn converge(
         &mut self,
-        cancellation: CancellationView,
-    ) -> NativeAttemptConvergence {
-        if !self.convergence_started {
-            begin_convergence(
+        request: NativeActiveConvergenceRequest,
+    ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
+        let mode = if matches!(self.terminal, Some(NativeAttemptTerminal::Completed)) {
+            NativeAttemptConvergenceMode::Normal
+        } else {
+            NativeAttemptConvergenceMode::Cleanup
+        };
+        self.convergence
+            .drive(
                 &mut self.round,
                 &self.split_delivery,
-                self.terminal.as_ref(),
-            );
-            self.convergence_cleanup_started =
-                !matches!(self.terminal, Some(NativeAttemptTerminal::Completed));
-            self.convergence_started = true;
-        }
-        loop {
-            if !self.convergence_cleanup_started
-                && (cancellation.reason().is_some() || self.round.failure_cause().is_some())
-            {
-                tracing::warn!(
-                    terminal = ?self.terminal,
-                    cancellation = ?cancellation.reason(),
-                    failure = ?self.round.failure_cause(),
-                    "Native convergence entered terminal cleanup after a late cancellation or Task failure"
-                );
-                begin_terminal_cleanup(&mut self.round, &self.split_delivery);
-                self.convergence_cleanup_started = true;
-            }
-            if self.round.attempt_drained() {
-                return NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced();
-            }
-            if let Some(convergence) = self.context_convergence() {
-                return NativeAttemptConvergence::contexts(convergence);
-            }
-            let notify = Arc::clone(&self.notify);
-            let notified = notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let moved = match self.round.turn() {
-                Ok(report) => !report.is_idle(),
-                Err(error) => {
-                    if !self.convergence_cleanup_started {
-                        tracing::warn!(
-                            terminal = ?self.terminal,
-                            error = %error,
-                            "Native convergence Task turn failed before cleanup"
-                        );
-                    }
-                    if !self.convergence_cleanup_started {
-                        begin_terminal_cleanup(&mut self.round, &self.split_delivery);
-                        self.convergence_cleanup_started = true;
-                    }
-                    false
-                }
-            };
-            if moved {
-                continue;
-            }
-            tokio::select! {
-                _ = notified => {}
-                _ = tokio::time::sleep(IDLE_RECHECK) => {}
-            }
-        }
+                mode,
+                request,
+                &self.notify,
+            )
+            .await
     }
 
-    fn context_convergence(&self) -> Option<Box<[NativeContextConvergence]>> {
-        let mut convergence = Vec::with_capacity(self.convergence_targets.len());
-        for target in &self.convergence_targets {
-            if self.round.execution().context_released(target.context) {
-                convergence.push(NativeContextConvergence::worker_stopped_and_context_fenced(
-                    target.context,
-                ));
-                continue;
-            }
-            if self
-                .round
-                .execution()
-                .context_never_established(target.context)
-            {
-                // Establish is the only operation that can create this
-                // Worker context. A context whose Establish was never minted
-                // could not have hosted any of its planned Tasks, even if a
-                // queued admission or Create request is still settling.
-                convergence.push(NativeContextConvergence::never_established(target.context));
-                continue;
-            }
-            match self
-                .convergence_source
-                .observe_process_at_endpoint(target.process, &target.endpoint)
-            {
-                Ok(BackendProcessObservation::Replaced { .. }) => {
-                    convergence.push(NativeContextConvergence::worker_process_replaced(
-                        target.context,
-                    ));
-                }
-                Ok(
-                    BackendProcessObservation::Current | BackendProcessObservation::Unobservable,
-                )
-                | Err(_) => return None,
-            }
-        }
-        Some(convergence.into_boxed_slice())
+    #[cfg(test)]
+    fn context_convergence(
+        &self,
+    ) -> Option<Box<[novarocks_query_application::api::NativeContextConvergence]>> {
+        self.convergence.observed_contexts(&self.round)
     }
 }
 
-/// Successful root sealing fixes the client-visible result before upstream
-/// tasks necessarily stop. Keep their status streams and context lifecycle
-/// live until the exact terminal statuses can authorize Release.
+// The original raw TaskRound fixture still starts its normal drain here.
+// Production convergence is owned by NativeAttemptConvergenceOwner.
+#[cfg(test)]
 pub(super) fn begin_convergence(
     round: &mut TaskRound,
     split_delivery: &SplitDeliveryBridge,
     terminal: Option<&NativeAttemptTerminal>,
 ) {
-    if matches!(terminal, Some(NativeAttemptTerminal::Completed)) {
-        round.begin_normal_drain();
-        split_delivery.abandon("Native attempt entered normal drain");
+    let mode = if matches!(terminal, Some(NativeAttemptTerminal::Completed)) {
+        NativeAttemptConvergenceMode::Normal
     } else {
-        begin_terminal_cleanup(round, split_delivery);
-    }
-}
-
-fn begin_terminal_cleanup(round: &mut TaskRound, split_delivery: &SplitDeliveryBridge) {
-    round.begin_terminal_cleanup();
-    split_delivery.abandon("Native attempt entered convergence");
-}
-
-fn task_termination_failure(
-    detail: &novarocks_execution_contract::TerminationDetail,
-) -> NativeAttemptPreparationFailure {
-    use novarocks_execution_contract::{TaskFailureCategory, TerminationDetail};
-    let message = format!(
-        "Native Task attempt terminated: {}",
-        render_termination_detail(Some(detail))
-    );
-    let (class, message) = if matches!(detail,
-        TerminationDetail::Failed(failure) if failure.category() == TaskFailureCategory::Unsupported)
-    {
-        (
-            AttemptFailureClass::Unsupported,
-            novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
-                message,
-            )
-            .to_bracketed_user_message(),
-        )
-    } else {
-        (AttemptFailureClass::ExecutionFailure, message)
+        NativeAttemptConvergenceMode::Cleanup
     };
-    NativeAttemptPreparationFailure::new(
-        class,
-        QueryExecutionError::new(QueryExecutionErrorKind::Failed, message),
-    )
+    super::attempt_convergence::begin_convergence(round, split_delivery, mode);
 }
 
 fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
-    let topology_requirement = match &error {
-        TaskExecutionError::ParticipantUnobservable {
-            backend,
-            state: ParticipantObservationFailure::Transport(_),
-        }
-        | TaskExecutionError::PreReadyEstablishTransportUnknown { backend }
-        | TaskExecutionError::PreReadyEstablishRejected {
-            backend,
-            outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
-        } => novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
-            *backend,
-        ),
-        _ => novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot,
-    };
-    let (class, kind) = match &error {
-        TaskExecutionError::Capacity(_) => (
-            AttemptFailureClass::ResourceGovernance,
-            QueryExecutionErrorKind::Rejected,
-        ),
-        TaskExecutionError::DispatchRejected {
-            result: OperationDispatchResult::IngressRejected(_),
-            ..
-        } => (
-            AttemptFailureClass::ResourceGovernance,
-            QueryExecutionErrorKind::Rejected,
-        ),
-        TaskExecutionError::DispatchRejected {
-            result: OperationDispatchResult::NonWorkerRejected,
-            ..
-        } => (
-            AttemptFailureClass::ContractViolation,
-            QueryExecutionErrorKind::InvalidRequest,
-        ),
-        TaskExecutionError::ParticipantUnobservable {
-            state: ParticipantObservationFailure::IdentityViolation(_),
-            ..
-        } => (
-            AttemptFailureClass::ContractViolation,
-            QueryExecutionErrorKind::InvalidRequest,
-        ),
-        TaskExecutionError::ParticipantUnobservable { .. }
-        | TaskExecutionError::QueueResidenceExpired { .. }
-        | TaskExecutionError::PreReadyEstablishTransportUnknown { .. }
-        | TaskExecutionError::PreReadyEstablishRejected { .. }
-        | TaskExecutionError::ResultStream(_) => (
-            AttemptFailureClass::RecoverableInfrastructure,
-            QueryExecutionErrorKind::Failed,
-        ),
-        TaskExecutionError::OperationFailed { .. }
-        | TaskExecutionError::IllegalTaskTransition { .. } => (
-            AttemptFailureClass::ExecutionFailure,
-            QueryExecutionErrorKind::Failed,
-        ),
-        _ => (
-            AttemptFailureClass::ContractViolation,
-            QueryExecutionErrorKind::InvalidRequest,
-        ),
-    };
-    NativeAttemptTerminal::Failed(
-        NativeAttemptPreparationFailure::new(
-            class,
-            QueryExecutionError::new(kind, format!("Native Task protocol failed: {error}")),
-        )
-        .with_topology_requirement(topology_requirement),
-    )
+    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+        error.preparation_input(),
+    ))
 }
 
 fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
-    let (class, kind) = match reason {
-        CancellationReason::DeadlineExceeded
-        | CancellationReason::FrontendDrainDeadlineExceeded => (
-            AttemptFailureClass::DeadlineExceeded,
-            QueryExecutionErrorKind::DeadlineExceeded,
-        ),
-        _ => (
-            AttemptFailureClass::Cancelled,
-            QueryExecutionErrorKind::Cancelled,
-        ),
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    use novarocks_query_application::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
     };
-    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-        class,
-        QueryExecutionError::new(kind, format!("Native Task attempt cancelled: {reason:?}")),
+    let fact = match reason {
+        CancellationReason::DeadlineExceeded
+        | CancellationReason::FrontendDrainDeadlineExceeded => QueryFailureReason::DeadlineExceeded,
+        _ => QueryFailureReason::Cancelled,
+    }
+    .failure_fact();
+    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+        ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating(&format!("Native Task attempt cancelled: {reason:?}")),
+            ExecutionFailureSite::Coordinator,
+        ),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_query_application::api::BackendProcessObservation;
+    use novarocks_query_application::{
+        api::QueryExecutionErrorKind, coordination::AttemptFailureClass,
+    };
+
+    fn protocol_context(
+        backend: novarocks_types::BackendProcessId,
+    ) -> novarocks_execution_contract::QueryContextRef {
+        use novarocks_types::{AttemptId, FrontendProcessId, QueryExecutionId, QueryId};
+        novarocks_execution_contract::QueryContextRef::new(
+            QueryExecutionId::new(QueryId::new(31, 32), AttemptId::new(1).unwrap()).unwrap(),
+            FrontendProcessId::new_v7(),
+            backend,
+        )
+    }
 
     #[test]
     fn preparation_task_capability_uses_the_same_client_identity_as_result_observation() {
-        use novarocks_execution_contract::{
-            SafeDetail, TaskFailure, TaskFailureCategory, TaskFailurePhase, TerminationDetail,
-        };
-        for category in [
-            TaskFailureCategory::Unsupported,
-            TaskFailureCategory::Protocol,
+        use novarocks_failure_contract::FailureProjection;
+        let backend = novarocks_types::BackendProcessId::new_v7();
+        let query = novarocks_types::QueryExecutionId::new(
+            novarocks_types::QueryId::new(31, 32),
+            novarocks_types::AttemptId::new(1).unwrap(),
+        )
+        .unwrap();
+        let identity = novarocks_execution_contract::TaskIdentity::new(
+            query,
+            novarocks_types::StageId::new(1).unwrap(),
+            novarocks_types::TaskId::new(1).unwrap(),
+            backend,
+        );
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "FULL OUTER hash join".into(),
+            ),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("FULL OUTER hash join".into()),
         ] {
-            let detail = TerminationDetail::Failed(TaskFailure::new_in_phase(
-                category,
-                SafeDetail::truncating("FULL OUTER hash join"),
-                TaskFailurePhase::Preparation,
-            ));
-            let failure = task_termination_failure(&detail);
-            if category == TaskFailureCategory::Unsupported {
-                assert_eq!(failure.class(), AttemptFailureClass::Unsupported);
-                assert!(
-                    failure
-                        .error()
-                        .message()
-                        .starts_with("[UnsupportedCompiledShape] ")
+            let fact = original.failure_fact();
+            let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
+                identity.clone(),
+                novarocks_execution_contract::TerminationDetail::Failed(
+                    novarocks_execution_contract::TaskFailure::new_in_phase(
+                        fact,
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "FULL OUTER hash join",
+                        ),
+                        novarocks_execution_contract::TaskFailurePhase::Preparation,
+                    ),
+                ),
+            );
+            let input = novarocks_query_application::execution_error::ExecutionFailureInput::from_selected_task(&selected).unwrap();
+            assert_eq!(input.fact(), fact);
+            assert_eq!(
+                input.site(),
+                novarocks_query_application::execution_error::ExecutionFailureSite::Task {
+                    identity: identity.clone(),
+                    phase: novarocks_execution_contract::TaskFailurePhase::Preparation
+                }
+            );
+            let failure = NativeAttemptPreparationFailure::from_input(input.clone());
+            assert_eq!(failure.input(), &input);
+            let observed =
+                novarocks_query_application::coordination::RootResultFetchFailure::from_input(
+                    input.clone(),
                 );
-            } else {
-                assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
-                assert!(
-                    !failure
-                        .error()
-                        .message()
-                        .starts_with("[UnsupportedCompiledShape]")
-                );
-            }
+            assert_eq!(failure.class(), observed.class());
+            assert_eq!(failure.error().execution_failure(), Some(&input));
+            assert_eq!(observed.input().descriptor(), input.descriptor());
             assert!(failure.error().message().contains("FULL OUTER hash join"));
         }
     }
@@ -803,6 +651,352 @@ mod tests {
         }
     }
 
+    #[test]
+    fn abort_closure_is_not_worker_exit_and_only_the_original_receipt_closes_resources() {
+        use super::super::status_intake::{ObservationFrame, ObservationIntakeEntry};
+        use novarocks_execution_contract::{
+            QueryContextConvergenceReceipt, QueryContextConvergenceState,
+            QueryContextConvergenceVersion,
+        };
+        use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
+        struct CurrentProcess;
+        impl novarocks_query_application::api::BackendProcessObservationPort for CurrentProcess {
+            fn observe_process_at_endpoint(
+                &self,
+                _: novarocks_types::BackendProcessId,
+                _: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+            ) -> Result<
+                BackendProcessObservation,
+                novarocks_query_application::api::BackendTopologyError,
+            > {
+                Ok(BackendProcessObservation::Current)
+            }
+        }
+        let (round, _) = super::super::tests::manifest_terminal_regression_fixture();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+        let (_, actor_gate, _) = ActorGatedTaskOperationSink::pair(
+            Arc::new(BackpressuredGateTransport),
+            Arc::new(super::super::status_intake::CountingWake::default()),
+            novarocks_types::NativeCompatibilityId::new([0x41; 32]),
+        );
+        let convergence = NativeAttemptConvergenceOwner::new(
+            &round,
+            Arc::new(CurrentProcess),
+            vec![NativeAttemptConvergenceTarget::new(
+                context,
+                novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let mut assembled = ManifestAssembledRound {
+            round,
+            split_delivery,
+            actor_gate,
+            convergence,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            terminal: None,
+            pending_terminal: None,
+        };
+        assembled.convergence.begin(
+            &mut assembled.round,
+            &assembled.split_delivery,
+            NativeAttemptConvergenceMode::Cleanup,
+        );
+        assembled
+            .round
+            .execution_mut()
+            .observe_actor_abort_context_closed(context)
+            .unwrap();
+        assert!(
+            assembled
+                .round
+                .execution()
+                .owner(context)
+                .unwrap()
+                .is_released()
+        );
+        assert!(assembled.context_convergence().is_none());
+        assert!(!assembled.round.execution().worker_contexts_stopped());
+        let receipt = QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        );
+        assembled
+            .round
+            .execution_mut()
+            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(
+                ObservationFrame::Covered {
+                    context,
+                    generation: 1,
+                    event: CoveredStatusStreamEvent {
+                        fact: CoveredStatusStreamFact::ContextConvergence(receipt),
+                        source_revision: None,
+                    },
+                },
+            )])
+            .unwrap();
+        assert_eq!(
+            assembled
+                .round
+                .execution()
+                .context_convergence_receipt(context),
+            Some(receipt)
+        );
+        assert!(assembled.round.execution().worker_contexts_stopped());
+        assert_eq!(assembled.context_convergence().unwrap().len(), 1);
+    }
+
+    #[derive(Clone)]
+    struct ReleaseJoinObservation(BackendProcessObservation);
+
+    impl novarocks_query_application::api::BackendProcessObservationPort for ReleaseJoinObservation {
+        fn observe_process_at_endpoint(
+            &self,
+            _: novarocks_types::BackendProcessId,
+            _: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+        ) -> Result<BackendProcessObservation, novarocks_query_application::api::BackendTopologyError>
+        {
+            Ok(self.0)
+        }
+    }
+
+    fn release_join_round(
+        round: TaskRound,
+        observation: BackendProcessObservation,
+    ) -> ManifestAssembledRound {
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+        let (_, actor_gate, _) = ActorGatedTaskOperationSink::pair(
+            Arc::new(BackpressuredGateTransport),
+            Arc::new(super::super::status_intake::CountingWake::default()),
+            novarocks_types::NativeCompatibilityId::new([0x41; 32]),
+        );
+        let convergence = NativeAttemptConvergenceOwner::new(
+            &round,
+            Arc::new(ReleaseJoinObservation(observation)),
+            vec![NativeAttemptConvergenceTarget::new(
+                context,
+                novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let mut assembled = ManifestAssembledRound {
+            round,
+            split_delivery,
+            actor_gate,
+            convergence,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            terminal: Some(NativeAttemptTerminal::Completed),
+            pending_terminal: None,
+        };
+        assembled.convergence.begin(
+            &mut assembled.round,
+            &assembled.split_delivery,
+            NativeAttemptConvergenceMode::Normal,
+        );
+        assembled
+    }
+
+    fn publish_release_join_exit(assembled: &mut ManifestAssembledRound) {
+        use super::super::status_intake::{ObservationFrame, ObservationIntakeEntry};
+        use novarocks_execution_contract::{
+            QueryContextConvergenceReceipt, QueryContextConvergenceState,
+            QueryContextConvergenceVersion,
+        };
+        use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
+        let context = *assembled
+            .round
+            .execution()
+            .graph()
+            .contexts()
+            .next()
+            .unwrap();
+        let receipt = QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        );
+        assembled
+            .round
+            .execution_mut()
+            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(
+                ObservationFrame::Covered {
+                    context,
+                    generation: 1,
+                    event: CoveredStatusStreamEvent {
+                        fact: CoveredStatusStreamFact::ContextConvergence(receipt),
+                        source_revision: None,
+                    },
+                },
+            )])
+            .unwrap();
+    }
+
+    #[test]
+    fn completed_convergence_joins_covered_exit_and_original_release_in_both_orders() {
+        use super::super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+        use novarocks_execution_contract::{
+            OperationKind, OperationOutcome, QueryContextReceipt, QueryContextState, ReleaseOutcome,
+        };
+        let expected = super::super::tests::fixture_runtime_filter_contribution();
+        let mut outcomes = Vec::new();
+        for covered_first in [true, false] {
+            let (round, acks, release) =
+                super::super::tests::manifest_normal_release_ack_regression_fixture();
+            let mut assembled = release_join_round(round, BackendProcessObservation::Current);
+            let context = *assembled
+                .round
+                .execution()
+                .graph()
+                .contexts()
+                .next()
+                .unwrap();
+            let OperationIntent::ReleaseQueryContext(request) = &release else {
+                unreachable!()
+            };
+            let ack = OperationAcknowledgement::new(
+                release.operation_id(),
+                OperationKind::ReleaseQueryContext,
+                OperationOutcome::Accepted,
+                AckPayload::Release {
+                    receipt: QueryContextReceipt::new(
+                        request.context(),
+                        QueryContextState::TerminalRetained,
+                    ),
+                    outcome: ReleaseOutcome::Released,
+                    runtime_filter: Some(expected.clone()),
+                },
+            );
+            assert!(assembled.context_convergence().is_none());
+            if covered_first {
+                publish_release_join_exit(&mut assembled);
+                assert!(assembled.round.execution().worker_contexts_stopped());
+                assert!(
+                    !assembled
+                        .round
+                        .execution()
+                        .owner(context)
+                        .unwrap()
+                        .is_released()
+                );
+                assert!(
+                    assembled.context_convergence().is_none(),
+                    "physical exit must not discard the pending Release acknowledgement"
+                );
+                acks.publish(ack);
+                assembled.round.turn().unwrap();
+            } else {
+                acks.publish(ack);
+                assembled.round.turn().unwrap();
+                assert!(
+                    assembled
+                        .round
+                        .execution()
+                        .owner(context)
+                        .unwrap()
+                        .is_released()
+                );
+                assert!(!assembled.round.execution().worker_contexts_stopped());
+                assert!(
+                    assembled.context_convergence().is_none(),
+                    "Release acknowledgement is not physical exit evidence"
+                );
+                publish_release_join_exit(&mut assembled);
+            }
+            assert_eq!(assembled.context_convergence().unwrap().len(), 1);
+            let contributions = assembled
+                .round
+                .execution()
+                .released_runtime_filter_contributions();
+            assert!(contributions.is_complete());
+            assert_eq!(contributions.contexts(), 1);
+            assert_eq!(
+                contributions.contributions(),
+                &[(context.backend_process_id(), expected.clone())]
+            );
+            outcomes.push(
+                contributions
+                    .contributions()
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "arrival order cannot change the sealed contribution"
+        );
+    }
+
+    #[test]
+    fn cleanup_convergence_keeps_physical_exit_without_requiring_normal_release() {
+        let (round, _acks, _release) =
+            super::super::tests::manifest_normal_release_ack_regression_fixture();
+        let mut assembled = release_join_round(round, BackendProcessObservation::Current);
+        let context = *assembled
+            .round
+            .execution()
+            .graph()
+            .contexts()
+            .next()
+            .unwrap();
+        assembled.convergence.begin(
+            &mut assembled.round,
+            &assembled.split_delivery,
+            NativeAttemptConvergenceMode::Cleanup,
+        );
+        publish_release_join_exit(&mut assembled);
+        assert!(
+            !assembled
+                .round
+                .execution()
+                .owner(context)
+                .unwrap()
+                .is_released()
+        );
+        assert_eq!(assembled.context_convergence().unwrap().len(), 1);
+        let contributions = assembled
+            .round
+            .execution()
+            .released_runtime_filter_contributions();
+        assert!(!contributions.is_complete());
+        assert!(contributions.contributions().is_empty());
+    }
+
+    #[test]
+    fn exact_process_replacement_does_not_wait_for_release_or_invent_a_contribution() {
+        use novarocks_query_application::api::NativeContextConvergenceKind;
+        for covered_first in [false, true] {
+            let (round, _acks, _release) =
+                super::super::tests::manifest_normal_release_ack_regression_fixture();
+            let mut assembled = release_join_round(
+                round,
+                BackendProcessObservation::Replaced {
+                    current_process: novarocks_types::BackendProcessId::new_v7(),
+                },
+            );
+            if covered_first {
+                publish_release_join_exit(&mut assembled);
+            }
+            let convergence = assembled.context_convergence().unwrap();
+            assert_eq!(convergence.len(), 1);
+            assert_eq!(
+                convergence[0].kind(),
+                NativeContextConvergenceKind::WorkerProcessReplaced
+            );
+            let contributions = assembled
+                .round
+                .execution()
+                .released_runtime_filter_contributions();
+            assert!(!contributions.is_complete());
+            assert!(contributions.contributions().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn accepted_root_seal_wins_residual_native_advance_error_before_reply_consumption() {
         use super::super::intent::OperationAcknowledgement;
@@ -878,17 +1072,34 @@ mod tests {
                 None
             };
             let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+            let convergence = NativeAttemptConvergenceOwner::new(
+                &round,
+                Arc::new(UnusedConvergenceSource),
+                round
+                    .execution()
+                    .graph()
+                    .contexts()
+                    .map(|&context| {
+                        NativeAttemptConvergenceTarget::new(
+                            context,
+                            novarocks_execution::runtime::endpoint::RuntimeEndpoint::new(
+                                "127.0.0.1",
+                                1,
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
             let mut assembled = ManifestAssembledRound {
                 round,
                 split_delivery,
                 actor_gate,
-                convergence_source: Arc::new(UnusedConvergenceSource),
-                convergence_targets: Box::new([]),
+                convergence,
                 notify: Arc::new(tokio::sync::Notify::new()),
                 terminal: None,
                 pending_terminal: None,
-                convergence_started: false,
-                convergence_cleanup_started: false,
             };
             let terminal = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -949,14 +1160,11 @@ mod tests {
             panic!("task protocol refusal must fail the attempt");
         };
         assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
-        assert_eq!(
-            failure.error().kind(),
-            QueryExecutionErrorKind::InvalidRequest
-        );
+        assert_eq!(failure.error().kind(), QueryExecutionErrorKind::Failed);
     }
 
     #[test]
-    fn pre_ready_establish_unknown_preserves_whole_attempt_recovery() {
+    fn pre_ready_establish_unknown_is_observation_loss_without_backend_loss_evidence() {
         let backend = novarocks_types::identity::BackendProcessId::new_v7();
         let terminal =
             task_protocol_failure(TaskExecutionError::PreReadyEstablishTransportUnknown {
@@ -965,54 +1173,55 @@ mod tests {
         let NativeAttemptTerminal::Failed(failure) = terminal else {
             panic!("transport uncertainty must terminate the old attempt");
         };
-        assert_eq!(
-            failure.class(),
-            AttemptFailureClass::RecoverableInfrastructure
-        );
+        assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
         assert_eq!(failure.error().kind(), QueryExecutionErrorKind::Failed);
         assert_eq!(
             failure.topology_requirement(),
-            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
-                backend
-            )
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
         );
     }
 
     #[test]
-    fn pre_ready_establish_rejection_preserves_whole_attempt_recovery() {
+    fn pre_ready_establish_rejection_retains_its_protocol_fact() {
         let terminal = task_protocol_failure(TaskExecutionError::PreReadyEstablishRejected {
-            backend: novarocks_types::identity::BackendProcessId::new_v7(),
-            outcome: novarocks_execution::task_execution::OperationOutcome::InvalidStateOrRequest,
+            context: protocol_context(novarocks_types::identity::BackendProcessId::new_v7()),
+            operation_id: novarocks_execution_contract::TaskOperationId::new_v7(),
+            rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
+                outcome:
+                    novarocks_execution::task_execution::OperationOutcome::InvalidStateOrRequest,
+                detail: None,
+                acknowledgement: None,
+            },
         });
         let NativeAttemptTerminal::Failed(failure) = terminal else {
             panic!("pre-ready Establish rejection must terminate the old attempt");
         };
-        assert_eq!(
-            failure.class(),
-            AttemptFailureClass::RecoverableInfrastructure
-        );
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
         assert_eq!(failure.error().kind(), QueryExecutionErrorKind::Failed);
     }
     #[test]
-    fn pre_ready_identity_mismatch_excludes_the_failed_process() {
+    fn pre_ready_identity_mismatch_is_an_operation_fact_without_process_loss() {
         let backend = novarocks_types::identity::BackendProcessId::new_v7();
         let NativeAttemptTerminal::Failed(failure) =
             task_protocol_failure(TaskExecutionError::PreReadyEstablishRejected {
-                backend,
-                outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
+                context: protocol_context(backend),
+                operation_id: novarocks_execution_contract::TaskOperationId::new_v7(),
+                rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
+                    outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
+                    detail: None,
+                    acknowledgement: None,
+                },
             })
         else {
             panic!("identity mismatch must fail the attempt");
         };
         assert_eq!(
             failure.topology_requirement(),
-            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
-                backend
-            )
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
         );
     }
     #[test]
-    fn lost_status_transport_preserves_failed_process_for_replacement() {
+    fn lost_status_transport_does_not_manufacture_failed_process_evidence() {
         let backend = novarocks_types::identity::BackendProcessId::new_v7();
         let NativeAttemptTerminal::Failed(failure) =
             task_protocol_failure(TaskExecutionError::ParticipantUnobservable {
@@ -1022,15 +1231,10 @@ mod tests {
         else {
             panic!("lost participant must fail the attempt");
         };
-        assert_eq!(
-            failure.class(),
-            AttemptFailureClass::RecoverableInfrastructure
-        );
+        assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
         assert_eq!(
             failure.topology_requirement(),
-            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
-                backend
-            )
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
         );
     }
 }

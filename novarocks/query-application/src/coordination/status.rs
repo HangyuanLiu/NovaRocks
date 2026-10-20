@@ -48,6 +48,7 @@ pub enum StatusObservation {
     IdentityMismatch(IdentityMismatch),
     TerminalOverwrite,
     InstallationRegression,
+    ConclusionOverwrite,
 }
 
 impl StatusObservation {
@@ -58,6 +59,7 @@ impl StatusObservation {
                 | Self::IdentityMismatch(_)
                 | Self::TerminalOverwrite
                 | Self::InstallationRegression
+                | Self::ConclusionOverwrite
         )
     }
 }
@@ -88,6 +90,24 @@ pub fn classify_observation(
     }
     if held.is_some_and(TaskStatus::is_terminal) {
         return StatusObservation::TerminalOverwrite;
+    }
+    // A catch-up snapshot may skip lifecycle states, but cannot skip the
+    // already accepted cause. This semantic check is independent of adjacent
+    // version shape validation. Only a derived peer placeholder may refine.
+    if let Some(existing) = held.and_then(TaskStatus::termination) {
+        if observed.termination() != Some(existing) {
+            use novarocks_execution_contract::{
+                ConclusionDecision, TaskConclusion, decide_conclusion,
+            };
+            let current = TaskConclusion::Terminated(existing.clone());
+            let proposed = observed
+                .termination()
+                .cloned()
+                .map_or(TaskConclusion::Succeeded, TaskConclusion::Terminated);
+            if decide_conclusion(Some(&current), &proposed) != ConclusionDecision::RefineDerived {
+                return StatusObservation::ConclusionOverwrite;
+            }
+        }
     }
     StatusObservation::Accept
 }
@@ -198,11 +218,10 @@ pub fn classify_observed_task_transition(
             to,
             TaskState::Finished | TaskState::Canceling | TaskState::Aborting | TaskState::Failing
         ),
-        TaskState::Canceling => matches!(
-            to,
-            TaskState::Canceled | TaskState::Aborting | TaskState::Failing
-        ),
-        TaskState::Aborting => matches!(to, TaskState::Aborted),
+        TaskState::Canceling => matches!(to, TaskState::Canceled),
+        // The observation's accepted-cause check separately requires derived
+        // refinement. A shape transition never authorizes a new first cause.
+        TaskState::Aborting => matches!(to, TaskState::Aborted | TaskState::Failing),
         TaskState::Failing => matches!(to, TaskState::Failed),
         TaskState::Finished | TaskState::Canceled | TaskState::Aborted | TaskState::Failed => false,
     };
@@ -239,6 +258,155 @@ mod tests {
         assert_eq!(
             classify_observed_task_transition(TaskState::Flushing, TaskState::Running),
             ObservedTaskTransition::Illegal
+        );
+    }
+}
+
+#[cfg(test)]
+mod accepted_cause_observation_tests {
+    use super::*;
+    use novarocks_execution_contract::{
+        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskOutputFacts, TaskState,
+        TerminationDetail,
+    };
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    fn identity() -> TaskIdentity {
+        TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(3903, 1), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        )
+    }
+    fn snapshot(
+        identity: TaskIdentity,
+        version: u64,
+        cause: Option<TerminationDetail>,
+        terminal: bool,
+    ) -> TaskStatus {
+        let state = match (&cause, terminal) {
+            (Some(TerminationDetail::Canceled(_)), false) => TaskState::Canceling,
+            (Some(TerminationDetail::Canceled(_)), true) => TaskState::Canceled,
+            (Some(TerminationDetail::Aborted(_)), false) => TaskState::Aborting,
+            (Some(TerminationDetail::Aborted(_)), true) => TaskState::Aborted,
+            (Some(TerminationDetail::Failed(_)), false) => TaskState::Failing,
+            (Some(TerminationDetail::Failed(_)), true) => TaskState::Failed,
+            (None, false) => TaskState::Running,
+            (None, true) => TaskState::Finished,
+        };
+        TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(version).unwrap(),
+            state,
+            cause,
+            TaskOutputFacts::new(terminal),
+        )
+        .unwrap()
+    }
+    fn failure(detail: &str) -> TerminationDetail {
+        TerminationDetail::Failed(TaskFailure::new(
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
+            SafeDetail::new(detail).unwrap(),
+        ))
+    }
+    #[test]
+    fn accepted_cancellation_and_original_causes_survive_adjacent_and_coalesced_observations() {
+        let identity = identity();
+        for first in [
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            TerminationDetail::Aborted(AbortCause::LeaseExpired),
+            failure("original"),
+        ] {
+            let held = snapshot(identity, 2, Some(first.clone()), false);
+            let cursor = TaskStatusCursor::at(identity, held.version());
+            for version in [3, 9] {
+                for terminal in [false, true] {
+                    let same = snapshot(identity, version, Some(first.clone()), terminal);
+                    assert_eq!(
+                        classify_observation(cursor, Some(&held), &same),
+                        StatusObservation::Accept
+                    );
+                    for later in [
+                        None,
+                        Some(TerminationDetail::Canceled(
+                            CancelReason::UpstreamNoLongerNeeded,
+                        )),
+                        Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+                        Some(failure("different failure")),
+                    ] {
+                        if later == Some(first.clone()) {
+                            continue;
+                        }
+                        let observed = snapshot(identity, version, later, terminal);
+                        let rejected = classify_observation(cursor, Some(&held), &observed);
+                        assert_eq!(rejected, StatusObservation::ConclusionOverwrite);
+                        assert!(rejected.is_fatal());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn derived_peer_placeholder_refines_only_to_originating_failure_across_a_gap() {
+        let identity = identity();
+        let held = snapshot(
+            identity,
+            2,
+            Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+            false,
+        );
+        let cursor = TaskStatusCursor::at(identity, held.version());
+        for version in [3, 9] {
+            for terminal in [false, true] {
+                let original = snapshot(
+                    identity,
+                    version,
+                    Some(failure("original producer")),
+                    terminal,
+                );
+                assert_eq!(
+                    classify_observation(cursor, Some(&held), &original),
+                    StatusObservation::Accept
+                );
+                for later in [
+                    Some(TerminationDetail::Canceled(
+                        CancelReason::UpstreamNoLongerNeeded,
+                    )),
+                    Some(TerminationDetail::Aborted(AbortCause::LeaseExpired)),
+                    None,
+                ] {
+                    assert_eq!(
+                        classify_observation(
+                            cursor,
+                            Some(&held),
+                            &snapshot(identity, version, later, terminal)
+                        ),
+                        StatusObservation::ConclusionOverwrite
+                    );
+                }
+            }
+        }
+        let failure = snapshot(identity, 3, Some(failure("original producer")), false);
+        assert_eq!(
+            classify_observed_task_transition(held.state(), failure.state()),
+            ObservedTaskTransition::Advance
+        );
+        let accepted_terminal = snapshot(identity, 3, held.termination().cloned(), true);
+        assert_eq!(
+            classify_observation(
+                TaskStatusCursor::at(identity, accepted_terminal.version()),
+                Some(&accepted_terminal),
+                &snapshot(identity, 9, failure.termination().cloned(), true)
+            ),
+            StatusObservation::TerminalOverwrite
         );
     }
 }

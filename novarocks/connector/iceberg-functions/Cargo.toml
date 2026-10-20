@@ -33,6 +33,7 @@ arrow-buffer.workspace = true
 arrow-schema.workspace = true
 datasketches = { workspace = true, features = ["theta"] }
 novarocks-functions.workspace = true
+novarocks-failure-contract.workspace = true
 novarocks-type-contract.workspace = true
 
 [package.metadata.novarocks.test]

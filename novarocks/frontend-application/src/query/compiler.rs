@@ -121,6 +121,7 @@ impl FrontendQueryPurpose {
 pub(crate) enum FrontendQueryCompilerError {
     Engine(String),
     Analyze(AnalyzeError),
+    Source(novarocks_failure_contract::SharedFailureCause),
     Control(novarocks_type_contract::CompileControlError),
 }
 
@@ -140,16 +141,14 @@ impl FrontendQueryCompilerError {
             SqlCompileError::ResourceExhausted => {
                 Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
             }
+            SqlCompileError::CompilationSource(source) => Self::Source(source),
             error => Self::Engine(error.to_string()),
         }
     }
     fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
         match error {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
-            novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => Self::Engine(error),
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
-                Self::Engine(novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(message).to_bracketed_user_message())
-            }
+            other => Self::Source(novarocks_failure_contract::SharedFailureCause::new(other)),
         }
     }
     fn from_completion(
@@ -1155,21 +1154,173 @@ mod compile_control_tests {
     use super::*;
     use novarocks_type_contract::CompileControlError;
 
+    fn service(
+        error: FrontendQueryCompilerError,
+    ) -> novarocks_query_application::session_error::QueryServiceError {
+        match super::super::governed_compiler_failure(error, "SELECT value") {
+            super::super::GovernedPreparationError::Service(error)
+            | super::super::GovernedPreparationError::Cancelled(error) => error,
+        }
+    }
+
+    #[test]
+    fn compilation_source_keeps_original_resource_fact_through_the_real_session_consumer() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::execution_error::ExecutionFailureSite;
+        let domain = novarocks_functions::ConstantError::arrow_validation(
+            arrow::error::ArrowError::MemoryError("provider-local allocation detail".into()),
+        );
+        let expected = domain.failure_fact();
+        let sql_error = SqlCompileError::from(domain);
+        let SqlCompileError::CompilationSource(source) = &sql_error else {
+            panic!("the constant author must retain its source")
+        };
+        let original = source.clone();
+        let error = FrontendQueryCompilerError::from_compile(sql_error);
+        assert!(
+            matches!(&error, FrontendQueryCompilerError::Source(actual) if actual == &original)
+        );
+        let routed = super::super::routed_compiler_failure(
+            FrontendQueryCompilerError::from_compile(SqlCompileError::CompilationSource(
+                original.clone(),
+            )),
+            "EXPLAIN SELECT value",
+        );
+        let super::super::RoutedExecutionError::Control(control) = routed else {
+            panic!("the EXPLAIN consumer must retain its nominal source")
+        };
+        assert_eq!(control, CompileControlError::Source(original.clone()));
+        let routed_service =
+            novarocks_query_application::session_error::QueryServiceError::from_compile_control(
+                control,
+            );
+        assert_eq!(routed_service.execution_failure().unwrap().fact(), expected);
+        assert_eq!(
+            routed_service
+                .execution_failure()
+                .unwrap()
+                .descriptor()
+                .errno,
+            1041
+        );
+        let service = service(error);
+        let input = service.execution_failure().unwrap();
+        assert_eq!(input.fact(), expected);
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            (input.descriptor().errno, input.descriptor().sqlstate),
+            (1041, "HY000")
+        );
+        assert_eq!(
+            service.compile_control_error(),
+            Some(CompileControlError::Source(original))
+        );
+        assert_eq!(
+            service.user_error().unwrap().phase(),
+            novarocks_user_error::ErrorPhase::Execution
+        );
+        assert_eq!(service.user_error().unwrap().location(), None);
+        assert!(!service.message().contains("provider-local"));
+    }
+
+    #[test]
+    fn real_checked_decimal_overflow_keeps_1690_through_compiler_and_session() {
+        use novarocks_failure_contract::FailureProjection;
+        let domain = novarocks_functions::legacy_decimal::pow10_i128(39).unwrap_err();
+        let expected = domain.failure_fact();
+        let domain = novarocks_functions::ConstantError::from_domain(domain);
+        let sql_error = SqlCompileError::from(domain);
+        let service = service(FrontendQueryCompilerError::from_compile(sql_error));
+        let input = service.execution_failure().unwrap();
+        assert_eq!(input.fact(), expected);
+        assert_eq!(
+            (input.descriptor().errno, input.descriptor().sqlstate),
+            (1690, "22003")
+        );
+        let Some(CompileControlError::Source(source)) = service.compile_control_error() else {
+            panic!("the original source must remain available locally")
+        };
+        assert!(
+            source
+                .downcast_ref::<novarocks_functions::ConstantError>()
+                .is_some()
+        );
+        assert_eq!(
+            service.user_error().unwrap().phase(),
+            novarocks_user_error::ErrorPhase::Execution
+        );
+        assert_eq!(service.user_error().unwrap().location(), None);
+    }
+
+    #[test]
+    fn ordinary_compile_strings_and_analyze_locations_keep_their_original_routes() {
+        let service = service(FrontendQueryCompilerError::from_compile(
+            SqlCompileError::Compilation("numeric overflow resource exhausted".into()),
+        ));
+        assert!(service.execution_failure().is_none());
+        assert!(service.user_error().is_none());
+
+        let sql = "SELECT missing";
+        let error =
+            AnalyzeError::unknown_column("unknown column", novarocks_parser::Span::new(7, 14));
+        let expected = error.to_user_error(Some(sql));
+        let super::super::GovernedPreparationError::Service(service) =
+            super::super::governed_compiler_failure(
+                FrontendQueryCompilerError::from_compile(SqlCompileError::Analyze(error)),
+                sql,
+            )
+        else {
+            panic!("analysis is not a cancellation observation")
+        };
+        assert_eq!(service.user_error(), Some(&expected));
+        assert!(service.execution_failure().is_none());
+        assert!(service.user_error().unwrap().location().is_some());
+    }
+
     #[test]
     fn encode_capability_refusal_preserves_the_client_engine_code() {
-        let error = FrontendQueryCompilerError::from_encode(
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for original in [
             novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
                 "CTE multicast".into(),
             ),
-        );
-        assert!(matches!(error, FrontendQueryCompilerError::Engine(message)
-            if message == "[UnsupportedCompiledShape] CTE multicast"));
-        let error = FrontendQueryCompilerError::from_encode(
-            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".to_owned()),
-        );
-        assert!(
-            matches!(error, FrontendQueryCompilerError::Engine(message) if message == "unsupported diagnostic")
-        );
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+        ] {
+            let expected = original.failure_fact();
+            let FrontendQueryCompilerError::Source(source) =
+                FrontendQueryCompilerError::from_encode(original)
+            else {
+                panic!("typed encode author must survive")
+            };
+            assert_eq!(source.failure_fact(), expected);
+            assert!(
+                source
+                    .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+                    .is_some()
+            );
+            assert_eq!(
+                expected.class(),
+                match source
+                    .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+                    .unwrap()
+                {
+                    novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(_) =>
+                        FailureClass::Unsupported,
+                    novarocks_plan_codec::PhysicalEncodeError::Invalid(_) =>
+                        FailureClass::Invariant,
+                    other => panic!("unexpected author: {other}"),
+                }
+            );
+            let super::super::GovernedPreparationError::Service(service) =
+                super::super::governed_compiler_failure(
+                    FrontendQueryCompilerError::Source(source),
+                    "SELECT 1",
+                )
+            else {
+                panic!("a source error is final")
+            };
+            assert_eq!(service.execution_failure().unwrap().fact(), expected);
+        }
     }
 
     #[test]
@@ -1180,12 +1331,12 @@ mod compile_control_tests {
             CompileControlError::ResourceExhausted,
         ] {
             let errors = [
-                FrontendQueryCompilerError::from_compile(control.into()),
+                FrontendQueryCompilerError::from_compile(control.clone().into()),
                 FrontendQueryCompilerError::from_encode(
-                    novarocks_plan_codec::PhysicalEncodeError::Control(control),
+                    novarocks_plan_codec::PhysicalEncodeError::Control(control.clone()),
                 ),
                 FrontendQueryCompilerError::from_compile(SqlCompileError::Analyze(
-                    AnalyzeError::control(control),
+                    AnalyzeError::control(control.clone()),
                 )),
             ];
             for error in errors {
@@ -1193,12 +1344,32 @@ mod compile_control_tests {
                     matches!(error, FrontendQueryCompilerError::Control(actual) if actual == control)
                 );
             }
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            let original = novarocks_plan_codec::PhysicalEncodeError::Invalid(control.to_string());
+            let expected = original.failure_fact();
+            let FrontendQueryCompilerError::Source(source) =
+                FrontendQueryCompilerError::from_encode(original)
+            else {
+                panic!("the original Invalid author must survive")
+            };
+            assert_eq!(source.failure_fact(), expected);
+            assert_eq!(expected.class(), FailureClass::Invariant);
+            assert_ne!(expected, control.failure_fact());
             assert!(matches!(
-                FrontendQueryCompilerError::from_encode(
-                    novarocks_plan_codec::PhysicalEncodeError::Invalid(control.to_string())
-                ),
-                FrontendQueryCompilerError::Engine(_)
+                source.downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>(),
+                Some(novarocks_plan_codec::PhysicalEncodeError::Invalid(detail))
+                    if detail == &control.to_string()
             ));
+            let service = service(FrontendQueryCompilerError::Source(source));
+            assert_eq!(service.execution_failure().unwrap().fact(), expected);
+            assert_ne!(
+                service.kind(),
+                novarocks_query_application::session_error::QueryServiceErrorKind::Interrupted
+            );
+            assert_ne!(
+                service.kind(),
+                novarocks_query_application::session_error::QueryServiceErrorKind::Timeout
+            );
         }
     }
 }

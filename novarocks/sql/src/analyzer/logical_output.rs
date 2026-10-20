@@ -63,7 +63,7 @@ impl AnalyzerContext<'_> {
             },
         );
         if let Err(OutputProjectionError::Control(error)) = &result {
-            return Err(AnalyzeError::control(*error));
+            return Err(AnalyzeError::control(error.clone()));
         }
         work.finish().map_err(AnalyzeError::control)?;
         match result {

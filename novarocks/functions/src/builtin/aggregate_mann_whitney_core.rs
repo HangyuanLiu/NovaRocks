@@ -16,9 +16,11 @@
 // under the License.
 //! The original Mann–Whitney state, sample transitions, codec and formatter.
 //! Callers supply storage; this module owns no execution context or tracker.
+pub use super::aggregate_mann_whitney_failure::{MannFailure, MannValueFailure};
+use super::aggregate_mann_whitney_failure::{contract, storage_count, wire_geometry};
 use crate::KernelFailure;
 use crate::aggregate_scalar::{
-    AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork, scalar_from_array,
+    AggScalarValue, ScalarStateAllocator, ScalarWork, scalar_from_array,
 };
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::{
@@ -110,7 +112,7 @@ fn static_error<O: MannResources>(
     treatment_replacement: bool,
     work: &mut ScalarWork<'_, '_>,
     resources: &mut O,
-) -> ScalarStateError {
+) -> MannFailure {
     match resources.before(
         MannResourceEvent::StaticDiagnostic {
             message,
@@ -118,11 +120,28 @@ fn static_error<O: MannResources>(
         },
         work,
     ) {
-        Ok(()) => message.to_string().into(),
+        Ok(()) => contract(message).into(),
         Err(cause) => cause.into(),
     }
 }
 
+fn value_error<O: MannResources>(
+    source: MannValueFailure,
+    message: &'static str,
+    work: &mut ScalarWork<'_, '_>,
+    resources: &mut O,
+) -> MannFailure {
+    match resources.before(
+        MannResourceEvent::StaticDiagnostic {
+            message,
+            treatment_replacement: false,
+        },
+        work,
+    ) {
+        Ok(()) => MannFailure::Value(source),
+        Err(cause) => cause.into(),
+    }
+}
 impl<A: ScalarStateAllocator> MannWhitneyState<A> {
     pub fn new(allocator: A) -> Self {
         Self {
@@ -158,18 +177,19 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         self.continuity_correction = continuity_correction;
     }
 
-    fn update(&mut self, value: f64, treatment: bool) -> Result<(), ScalarStateError> {
+    fn update(&mut self, value: f64, treatment: bool) -> Result<(), MannFailure> {
         let idx = if treatment { 1 } else { 0 };
-        self.stats[idx].try_reserve(1).map_err(|_| {
+        storage_count::<f64>(self.stats[idx].len() as u128 + 1)?;
+        self.stats[idx].try_reserve(1).map_err(|source| {
             self.allocator
-                .scalar_allocation_error("reserve Mann-Whitney sample")
+                .scalar_allocation_error("reserve Mann-Whitney sample", source)
         })?;
         self.stats[idx].push(value);
         self.sorted = false;
         Ok(())
     }
 
-    fn sort_if_needed(&mut self, work: &mut ScalarWork<'_, '_>) -> Result<(), ScalarStateError> {
+    fn sort_if_needed(&mut self, work: &mut ScalarWork<'_, '_>) -> Result<(), MannFailure> {
         if !self.sorted {
             for stats in &mut self.stats {
                 work.flush()?;
@@ -181,7 +201,7 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         Ok(())
     }
 
-    pub fn merge(&mut self, other: Self) -> Result<(), ScalarStateError> {
+    pub fn merge(&mut self, other: Self) -> Result<(), MannFailure> {
         self.merge_with_work(other, &mut ScalarWork::new(None))
     }
 
@@ -189,7 +209,7 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         &mut self,
         other: Self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), MannFailure> {
         self.merge_with_resources(other, work, &mut NoopMannResources)
     }
 
@@ -198,7 +218,7 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         mut other: Self,
         work: &mut ScalarWork<'_, '_>,
         resources: &mut O,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), MannFailure> {
         if self.is_uninitialized() {
             *self = other;
             return Ok(());
@@ -209,13 +229,17 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         if self.alternative != other.alternative
             || self.continuity_correction != other.continuity_correction
         {
-            return Err(static_error(
+            return Err(value_error(
+                MannValueFailure::StateParametersMismatch,
                 "mann_whitney_u_test state parameters mismatch",
-                false,
                 work,
                 resources,
             ));
         }
+        let capacities = [
+            storage_count::<f64>(self.stats[0].len() as u128 + other.stats[0].len() as u128)?,
+            storage_count::<f64>(self.stats[1].len() as u128 + other.stats[1].len() as u128)?,
+        ];
         resources.before(
             MannResourceEvent::MergeScratch {
                 left: self.extents(),
@@ -225,22 +249,11 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         )?;
         self.sort_if_needed(work)?;
         other.sort_if_needed(work)?;
-        for idx in 0..2 {
-            let capacity = self.stats[idx]
-                .len()
-                .checked_add(other.stats[idx].len())
-                .ok_or_else(|| {
-                    static_error(
-                        "mann_whitney_u_test sample count overflow",
-                        false,
-                        work,
-                        resources,
-                    )
-                })?;
+        for (idx, capacity) in capacities.into_iter().enumerate() {
             let mut merged = ScalarVec::new_in(self.allocator.clone());
-            merged.try_reserve_exact(capacity).map_err(|_| {
+            merged.try_reserve_exact(capacity).map_err(|source| {
                 self.allocator
-                    .scalar_allocation_error("reserve merged Mann-Whitney sample")
+                    .scalar_allocation_error("reserve merged Mann-Whitney sample", source)
             })?;
             let mut i = 0;
             let mut j = 0;
@@ -271,21 +284,25 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         Ok(())
     }
 
-    pub fn serialize(&mut self) -> Vec<u8> {
+    pub fn serialize(&mut self) -> Result<Vec<u8>, MannFailure> {
         self.serialize_with_work(&mut ScalarWork::new(None))
-            .expect("unobserved Mann-Whitney serialization cannot fail")
     }
 
     pub fn serialize_with_work(
         &mut self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Vec<u8>, ScalarStateError> {
+    ) -> Result<Vec<u8>, MannFailure> {
+        let ([len0, len1], bytes) = wire_geometry([self.stats[0].len(), self.stats[1].len()])?;
         self.sort_if_needed(work)?;
         let mut out = Vec::new();
+        out.try_reserve_exact(bytes).map_err(|source| {
+            KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                "reserve serialized Mann-Whitney state",
+                source,
+            ))
+        })?;
         out.push(self.alternative as u8);
         out.extend_from_slice(&self.continuity_correction.to_le_bytes());
-        let len0 = self.stats[0].len() as u32;
-        let len1 = self.stats[1].len() as u32;
         out.extend_from_slice(&len0.to_le_bytes());
         out.extend_from_slice(&len1.to_le_bytes());
         for v in &self.stats[0] {
@@ -300,7 +317,7 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         Ok(out)
     }
 
-    pub fn deserialize_in(data: &[u8], allocator: A) -> Result<Self, ScalarStateError> {
+    pub fn deserialize_in(data: &[u8], allocator: A) -> Result<Self, MannFailure> {
         Self::deserialize_in_with_work(data, allocator, &mut ScalarWork::new(None))
     }
 
@@ -308,7 +325,7 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         data: &[u8],
         allocator: A,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, MannFailure> {
         Self::deserialize_in_with_resources(data, allocator, work, &mut NoopMannResources)
     }
 
@@ -317,11 +334,11 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         allocator: A,
         work: &mut ScalarWork<'_, '_>,
         resources: &mut O,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, MannFailure> {
         if data.len() < 1 + 8 + 4 + 4 {
-            return Err(static_error(
+            return Err(value_error(
+                MannValueFailure::TruncatedState,
                 "mann_whitney_u_test deserialize: buffer too short",
-                false,
                 work,
                 resources,
             ));
@@ -345,15 +362,28 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         let len1 = u32::from_le_bytes(len_bytes) as usize;
         data = &data[4..];
 
+        // Validate the complete declared payload before either allocator call.
+        // Truncated input cannot force speculative allocation from its header.
+        let payload_bytes = 8 * (len0 as u128 + len1 as u128);
+        if payload_bytes > data.len() as u128 {
+            return Err(value_error(
+                MannValueFailure::TruncatedState,
+                "mann_whitney_u_test deserialize: buffer too short",
+                work,
+                resources,
+            ));
+        }
+        storage_count::<f64>(len0 as u128)?;
+        storage_count::<f64>(len1 as u128)?;
         let mut stats0 = ScalarVec::new_in(allocator.clone());
-        stats0.try_reserve_exact(len0).map_err(|_| {
-            allocator.scalar_allocation_error("reserve decoded Mann-Whitney control sample")
+        stats0.try_reserve_exact(len0).map_err(|source| {
+            allocator.scalar_allocation_error("reserve decoded Mann-Whitney control sample", source)
         })?;
         for _ in 0..len0 {
             if data.len() < 8 {
-                return Err(static_error(
+                return Err(value_error(
+                    MannValueFailure::TruncatedState,
                     "mann_whitney_u_test deserialize: buffer too short",
-                    false,
                     work,
                     resources,
                 ));
@@ -365,14 +395,15 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
             data = &data[8..];
         }
         let mut stats1 = ScalarVec::new_in(allocator.clone());
-        stats1.try_reserve_exact(len1).map_err(|_| {
-            allocator.scalar_allocation_error("reserve decoded Mann-Whitney treatment sample")
+        stats1.try_reserve_exact(len1).map_err(|source| {
+            allocator
+                .scalar_allocation_error("reserve decoded Mann-Whitney treatment sample", source)
         })?;
         for _ in 0..len1 {
             if data.len() < 8 {
-                return Err(static_error(
+                return Err(value_error(
+                    MannValueFailure::TruncatedState,
                     "mann_whitney_u_test deserialize: buffer too short",
-                    false,
                     work,
                     resources,
                 ));
@@ -394,10 +425,7 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         })
     }
 
-    fn format_number(
-        value: f64,
-        work: &mut ScalarWork<'_, '_>,
-    ) -> Result<String, ScalarStateError> {
+    fn format_number(value: f64, work: &mut ScalarWork<'_, '_>) -> Result<String, MannFailure> {
         work.flush()?;
         let out = if let Some(num) = serde_json::Number::from_f64(value) {
             let mut out = num.to_string();
@@ -412,15 +440,14 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         Ok(out)
     }
 
-    pub fn build_result(&mut self) -> String {
+    pub fn build_result(&mut self) -> Result<String, MannFailure> {
         self.build_result_with_work(&mut ScalarWork::new(None))
-            .expect("unobserved Mann-Whitney result construction cannot fail")
     }
 
     pub fn build_result_with_work(
         &mut self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<String, ScalarStateError> {
+    ) -> Result<String, MannFailure> {
         if self.is_uninitialized() {
             work.flush()?;
             let out = r#"{"Logical Error": "state not initialized."}"#.to_string();
@@ -438,7 +465,16 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
             return Ok(out);
         }
 
-        let mut combined = Vec::with_capacity(size as usize);
+        let count = storage_count::<(f64, usize)>(
+            self.stats[0].len() as u128 + self.stats[1].len() as u128,
+        )?;
+        let mut combined = Vec::new();
+        combined.try_reserve_exact(count).map_err(|source| {
+            KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                "reserve Mann-Whitney rank scratch",
+                source,
+            ))
+        })?;
         for v in &self.stats[0] {
             work.step()?;
             combined.push((*v, 0usize));
@@ -536,7 +572,7 @@ impl<'a> IntArrayView<'a> {
         treatment_replacement: bool,
         work: &mut ScalarWork<'_, '_>,
         resources: &mut O,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, MannFailure> {
         match array.data_type() {
             DataType::Int64 => array
                 .as_any()
@@ -594,7 +630,14 @@ impl<'a> IntArrayView<'a> {
                     },
                     work,
                 )?;
-                Err(format!("unsupported int input type: {:?}", other).into())
+                let error = if treatment_replacement {
+                    contract(format_args!(
+                        "mann_whitney_u_test expects boolean or integer treatment; got {other:?}"
+                    ))
+                } else {
+                    contract(format_args!("unsupported int input type: {other:?}"))
+                };
+                Err(error.into())
             }
         }
     }
@@ -619,7 +662,7 @@ impl<'a> TreatmentArrayView<'a> {
         array: &'a ArrayRef,
         work: &mut ScalarWork<'_, '_>,
         resources: &mut O,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, MannFailure> {
         if matches!(array.data_type(), DataType::Boolean) {
             let arr = array
                 .as_any()
@@ -629,20 +672,9 @@ impl<'a> TreatmentArrayView<'a> {
                 })?;
             return Ok(Self::Boolean(arr));
         }
-        Ok(Self::Int(
-            IntArrayView::new_with_resources(array, true, work, resources).map_err(|error| {
-                match error {
-                    // Only the original integer data error receives the original
-                    // replacement. An observer's typed refusal remains primary.
-                    ScalarStateError::Legacy(_) => {
-                        "mann_whitney_u_test expects boolean or integer treatment"
-                            .to_string()
-                            .into()
-                    }
-                    other => other,
-                }
-            })?,
-        ))
+        Ok(Self::Int(IntArrayView::new_with_resources(
+            array, true, work, resources,
+        )?))
     }
 
     fn value_at(&self, row: usize) -> Option<bool> {
@@ -675,24 +707,16 @@ pub struct MannWhitneyInput<'a> {
     continuity: Option<IntArrayView<'a>>,
 }
 impl<'a> MannWhitneyInput<'a> {
-    pub fn try_new(arguments: &'a [ArrayRef]) -> Result<Self, String> {
+    pub fn try_new(arguments: &'a [ArrayRef]) -> Result<Self, MannFailure> {
         let channels = std::array::from_fn(|index| arguments.get(index));
-        match Self::try_new_channels_with_work(
-            channels,
-            arguments.len(),
-            &mut ScalarWork::new(None),
-        ) {
-            Ok(input) => Ok(input),
-            Err(ScalarStateError::Legacy(message)) => Err(message),
-            Err(_) => unreachable!("unobserved Mann-Whitney input cannot fail control"),
-        }
+        Self::try_new_channels_with_work(channels, arguments.len(), &mut ScalarWork::new(None))
     }
 
     pub fn try_new_channels_with_work(
         channels: [Option<&'a ArrayRef>; 4],
         arity: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, MannFailure> {
         Self::try_new_channels_with_resources(channels, arity, work, &mut NoopMannResources)
     }
 
@@ -701,7 +725,7 @@ impl<'a> MannWhitneyInput<'a> {
         arity: usize,
         work: &mut ScalarWork<'_, '_>,
         resources: &mut O,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, MannFailure> {
         work.flush()?;
         if !(2..=4).contains(&arity) || channels[..arity.min(4)].iter().any(Option::is_none) {
             return Err(static_error(
@@ -758,7 +782,7 @@ impl<'a> MannWhitneyInput<'a> {
         state: &mut MannWhitneyState<A>,
         addresses: [usize; 4],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), MannFailure> {
         self.update_row_with_resources(state, addresses, work, &mut NoopMannResources)
     }
 
@@ -768,7 +792,7 @@ impl<'a> MannWhitneyInput<'a> {
         addresses: [usize; 4],
         work: &mut ScalarWork<'_, '_>,
         resources: &mut O,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), MannFailure> {
         work.step()?;
         if state.is_uninitialized() {
             let mut alternative = TestingAlternative::TwoSided;
@@ -787,7 +811,7 @@ impl<'a> MannWhitneyInput<'a> {
                 work.flush()?;
                 let parsed = TestingAlternative::from_str(&alt);
                 if parsed == TestingAlternative::Unknown {
-                    return Err(format!("Logical Error: invalid alternative `{}`.", alt).into());
+                    return Err(MannValueFailure::InvalidAlternative(alt).into());
                 }
                 alternative = parsed;
             }
@@ -795,9 +819,9 @@ impl<'a> MannWhitneyInput<'a> {
                 && let Some(v) = cont_arr.value_at(addresses[3])
             {
                 if v < 0 {
-                    return Err(static_error(
+                    return Err(value_error(
+                        MannValueFailure::NegativeContinuity,
                         "Logical Error: continuity_correction must be non-negative.",
-                        false,
                         work,
                         resources,
                     ));
@@ -817,18 +841,11 @@ impl<'a> MannWhitneyInput<'a> {
             },
             work,
         )?;
-        let Some(value) =
-            scalar_from_array(self.values, addresses[0], work).map_err(|error| match error {
-                ScalarStateError::Kernel(_) => error,
-                other => ScalarStateError::Legacy(other.to_string()),
-            })?
-        else {
+        let Some(value) = scalar_from_array(self.values, addresses[0], work)? else {
             return Ok(());
         };
         let Some(x) = mann_whitney_numeric_to_f64(&value) else {
-            return Err("mann_whitney_u_test expects numeric input"
-                .to_string()
-                .into());
+            return Err(contract("mann_whitney_u_test expects numeric input").into());
         };
         if x.is_nan() || x.is_infinite() {
             return Ok(());
@@ -862,8 +879,15 @@ mod tests {
         }
     }
     impl ScalarStateAllocator for Storage {
-        fn scalar_allocation_error(&self, operation: &str) -> ScalarStateError {
-            format!("test allocation rejected: {operation}").into()
+        fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+            &self,
+            operation: &str,
+            source: E,
+        ) -> crate::KernelFailure {
+            crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                operation, source,
+            ))
+            .into()
         }
     }
 
@@ -915,7 +939,7 @@ mod tests {
         Deserialize,
         Result,
     }
-    fn observe_operation(operation: Operation, control: &Control) -> Result<(), ScalarStateError> {
+    fn observe_operation(operation: Operation, control: &Control) -> Result<(), MannFailure> {
         let mut state = sample_state(440, 0);
         let mut checkpoints = crate::kernel_input::EvaluationCheckpoints::new(control);
         let mut work = ScalarWork::new(Some(&mut checkpoints));
@@ -943,14 +967,14 @@ mod tests {
                 let _ = state.serialize_with_work(&mut work)?;
             }
             Operation::Deserialize => {
-                let bytes = state.serialize();
+                let bytes = state.serialize().unwrap();
                 let _ = MannWhitneyState::deserialize_in_with_work(&bytes, Storage, &mut work)?;
             }
             Operation::Result => {
                 let _ = state.build_result_with_work(&mut work)?;
             }
         }
-        work.flush()
+        work.flush().map_err(Into::into)
     }
     #[test]
     fn mann_whitney_control_counts_actual_samples_and_final_false_tie_comparisons() {
@@ -998,7 +1022,7 @@ mod tests {
                         ..Default::default()
                     };
                     let actual = observe_operation(operation, &control).unwrap_err();
-                    assert!(matches!(actual, ScalarStateError::Kernel(actual) if actual == *cause));
+                    assert!(matches!(actual, MannFailure::Kernel(actual) if actual == *cause));
                     assert_eq!(control.units.lock().unwrap().len(), at + 1);
                 }
             }
@@ -1037,7 +1061,7 @@ mod tests {
                 .all(|capacity| capacity >= 1)
         );
         assert_eq!(
-            hex::encode(state.serialize()),
+            hex::encode(state.serialize().unwrap()),
             "02000000000000000001000000010000000000000000000040000000000000f03f"
         );
         assert!(state.extents().sorted);
@@ -1125,7 +1149,7 @@ mod tests {
             .update_row(&mut state, [0, 1, 0, 0], &mut work)
             .unwrap();
         assert_eq!(
-            hex::encode(state.serialize()),
+            hex::encode(state.serialize().unwrap()),
             "02000000000000000001000000010000000000000000000040000000000000f03f"
         );
     }

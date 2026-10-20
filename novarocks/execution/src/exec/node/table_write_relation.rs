@@ -43,6 +43,51 @@ use novarocks_spi::connector::write_stack::{
 use novarocks_types::SlotId;
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureFact, FailureProjection};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WriteRelationViolation {
+    Layout,
+    SlotBinding,
+    NotPrepared,
+    Column,
+}
+#[derive(Debug)]
+struct WriteRelationFailure {
+    violation: WriteRelationViolation,
+    detail: BoundedDetail,
+}
+impl std::fmt::Display for WriteRelationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.detail.fmt(f)
+    }
+}
+impl std::error::Error for WriteRelationFailure {}
+impl FailureProjection for WriteRelationFailure {
+    fn failure_fact(&self) -> FailureFact {
+        let reason = match self.violation {
+            WriteRelationViolation::Layout => ExecutionReason::WriteRelationLayout,
+            WriteRelationViolation::SlotBinding => ExecutionReason::WriteRelationBinding,
+            WriteRelationViolation::NotPrepared => ExecutionReason::WriteRelationNotPrepared,
+            WriteRelationViolation::Column => ExecutionReason::WriteRelationColumn,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+pub(crate) fn relation_failure(
+    violation: WriteRelationViolation,
+    detail: impl std::fmt::Display,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(WriteRelationFailure {
+        violation,
+        detail: BoundedDetail::truncating_display(detail),
+    })
+}
+fn relation_connector(source: ConnectorError) -> ExecutionFailure {
+    use crate::runtime::fragment::connector_failure::{ConnectorCallFailure, ConnectorOperation};
+    ConnectorCallFailure::new(ConnectorOperation::ValidateWriteRelation, source).into()
+}
 
 /// Exact ordinary-aggregate boundary inside the composite write dataflow.
 ///
@@ -116,20 +161,32 @@ impl WriterMultiplexRelationSchema {
     /// auxiliary channel is identified by its layout slot.
     pub(crate) fn try_from_compiled_layout(
         layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if !layout.is_typed() {
-            return Err("writer multiplex requires a complete typed layout".into());
+            return Err(relation_failure(
+                WriteRelationViolation::Layout,
+                "writer multiplex requires a complete typed layout",
+            ));
         }
         for ordinal in 0..WRITE_RELATION_COLUMN_COUNT {
-            let binding = layout
-                .value_binding_at(ordinal)
-                .ok_or("writer prefix binding is absent")?;
+            let binding = layout.value_binding_at(ordinal).ok_or_else(|| {
+                relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "writer prefix binding is absent",
+                )
+            })?;
             if !plain_relation_value(binding.value_type()) {
-                return Err("writer multiplex fixed prefix has a nominal domain".into());
+                return Err(relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "writer multiplex fixed prefix has a nominal domain",
+                ));
             }
         }
         if layout.slots().len() < WRITE_RELATION_FRAGMENT_INDEX + 1 {
-            return Err("compiled writer multiplex layout lacks fixed prefix".to_string());
+            return Err(relation_failure(
+                WriteRelationViolation::Layout,
+                "compiled writer multiplex layout lacks fixed prefix",
+            ));
         }
         let auxiliary = layout
             .slots()
@@ -139,22 +196,24 @@ impl WriterMultiplexRelationSchema {
             .skip(WRITE_RELATION_FRAGMENT_INDEX + 1)
             .map(|(ordinal, (slot, field))| {
                 let binding = layout.value_binding_at(ordinal).ok_or_else(|| {
-                    "writer auxiliary channel lacks its complete compiled binding".to_string()
+                    relation_failure(
+                        WriteRelationViolation::SlotBinding,
+                        "writer auxiliary channel lacks its complete compiled binding",
+                    )
                 })?;
                 let value_type =
                     novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                         binding.clone(),
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(ExecutionFailure::from_domain)?;
                 WriterAuxiliaryChannel::try_new(slot.0, field.name(), value_type)
-                    .map_err(|error| error.to_string())
+                    .map_err(relation_connector)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let contract =
-            WriterMultiplexSchema::try_new(auxiliary).map_err(|error| error.to_string())?;
+        let contract = WriterMultiplexSchema::try_new(auxiliary).map_err(relation_connector)?;
         contract
             .validate_exact_arrow_schema(layout.schema())
-            .map_err(|error| format!("compiled writer multiplex layout: {error}"))?;
+            .map_err(relation_connector)?;
         Ok(Self {
             contract,
             chunk_schema: ChunkSchema::from_compiled_layout(layout)?,
@@ -164,14 +223,19 @@ impl WriterMultiplexRelationSchema {
     /// Explicit pure relation author for FE declarations and direct fixtures.
     /// Runtime decode supplies its already created schema to the strict binding
     /// constructor below; this helper grants no runtime construction capacity.
-    pub fn try_new(contract: WriterMultiplexSchema) -> Result<Self, String> {
+    pub fn try_new(contract: WriterMultiplexSchema) -> ExecutionResult<Self> {
         use crate::exec::chunk::ChunkSlotSchema;
         let projection = contract.schema_projection();
         let mut slots = Vec::with_capacity(contract.arrow_schema().fields().len());
         for (ordinal, slot_id) in contract.slot_ids().into_iter().enumerate() {
             let (field, storage) = projection
                 .field(ordinal)
-                .ok_or_else(|| "writer field occurrence is absent".to_owned())?
+                .ok_or_else(|| {
+                    relation_failure(
+                        WriteRelationViolation::SlotBinding,
+                        "writer field occurrence is absent",
+                    )
+                })?
                 .into_parts();
             let value =
                 if ordinal < novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT {
@@ -207,13 +271,16 @@ impl WriterMultiplexRelationSchema {
     pub fn try_new_with_chunk_schema(
         contract: WriterMultiplexSchema,
         chunk_schema: ChunkSchemaRef,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if !chunk_schema.is_typed() {
-            return Err("writer multiplex requires a complete typed relation".into());
+            return Err(relation_failure(
+                WriteRelationViolation::Layout,
+                "writer multiplex requires a complete typed relation",
+            ));
         }
         contract
             .validate_exact_arrow_schema(chunk_schema.arrow_schema_ref().as_ref())
-            .map_err(|error| error.to_string())?;
+            .map_err(relation_connector)?;
         if (0..WRITE_RELATION_COLUMN_COUNT)
             .map(|ordinal| SlotId::new(write_relation_column_id(ordinal)))
             .chain(
@@ -224,7 +291,10 @@ impl WriterMultiplexRelationSchema {
             )
             .ne(chunk_schema.slot_ids().iter().copied())
         {
-            return Err("writer multiplex slot order differs from supplied relation".into());
+            return Err(relation_failure(
+                WriteRelationViolation::SlotBinding,
+                "writer multiplex slot order differs from supplied relation",
+            ));
         }
         for slot in chunk_schema
             .slots()
@@ -232,7 +302,10 @@ impl WriterMultiplexRelationSchema {
             .take(WRITE_RELATION_COLUMN_COUNT)
         {
             if !plain_relation_value(slot.field_schema().value_type()) {
-                return Err("writer multiplex fixed prefix has a nominal domain".into());
+                return Err(relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "writer multiplex fixed prefix has a nominal domain",
+                ));
             }
         }
         for (slot, channel) in chunk_schema
@@ -244,11 +317,12 @@ impl WriterMultiplexRelationSchema {
             let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 slot.typed_binding().clone(),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(ExecutionFailure::from_domain)?;
             if &actual != channel.value_type() {
-                return Err(
-                    "writer auxiliary channel differs from its complete declared binding".into(),
-                );
+                return Err(relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "writer auxiliary channel differs from its complete declared binding",
+                ));
             }
         }
         Ok(Self {
@@ -289,32 +363,47 @@ pub(crate) struct WriterMultiplexRelationTemplate {
     layout: novarocks_local_program::StaticLayout,
 }
 impl WriterMultiplexRelationTemplate {
-    pub(crate) fn try_new(layout: &novarocks_local_program::StaticLayout) -> Result<Self, String> {
+    pub(crate) fn try_new(layout: &novarocks_local_program::StaticLayout) -> ExecutionResult<Self> {
         if !layout.is_typed() {
-            return Err("compiled writer relation requires complete bindings".into());
+            return Err(relation_failure(
+                WriteRelationViolation::SlotBinding,
+                "compiled writer relation requires complete bindings",
+            ));
         }
         if layout.slots().len() < WRITE_RELATION_COLUMN_COUNT
             || layout.slots().len() - WRITE_RELATION_COLUMN_COUNT
                 > novarocks_spi::connector::write_stack::MAX_WRITER_AUXILIARY_CHANNELS
         {
-            return Err("writer relation column count exceeds its frozen contract".into());
+            return Err(relation_failure(
+                WriteRelationViolation::Layout,
+                "writer relation column count exceeds its frozen contract",
+            ));
         }
         novarocks_spi::connector::write_stack::relation::validate_writer_prefix_schema(
             layout.schema().fields(),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(relation_connector)?;
         for ordinal in 0..layout.slots().len() {
-            let binding = layout
-                .value_binding_at(ordinal)
-                .ok_or_else(|| "writer relation binding is absent".to_owned())?;
+            let binding = layout.value_binding_at(ordinal).ok_or_else(|| {
+                relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "writer relation binding is absent",
+                )
+            })?;
             if ordinal < WRITE_RELATION_COLUMN_COUNT {
                 if binding.value_type().domain().is_some() {
-                    return Err("writer fixed prefix has a nominal domain".into());
+                    return Err(relation_failure(
+                        WriteRelationViolation::SlotBinding,
+                        "writer fixed prefix has a nominal domain",
+                    ));
                 }
             } else if !binding.value_type().nullable()
                 || *binding.layout().data_type() == arrow::datatypes::DataType::Null
             {
-                return Err("writer auxiliary transport must admit sparse NULL padding and a concrete value".into());
+                return Err(relation_failure(
+                    WriteRelationViolation::Layout,
+                    "writer auxiliary transport must admit sparse NULL padding and a concrete value",
+                ));
             }
         }
         Ok(Self {
@@ -324,7 +413,7 @@ impl WriterMultiplexRelationTemplate {
     /// The local plan route retains the original reserved prefix slot law.
     pub(crate) fn try_new_reserved(
         layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let template = Self::try_new(layout)?;
         if layout.slots()[..WRITE_RELATION_COLUMN_COUNT]
             .iter()
@@ -332,7 +421,10 @@ impl WriterMultiplexRelationTemplate {
             .ne((0..WRITE_RELATION_COLUMN_COUNT)
                 .map(|ordinal| SlotId::new(write_relation_column_id(ordinal))))
         {
-            return Err("writer multiplex slot order differs from static layout".to_owned());
+            return Err(relation_failure(
+                WriteRelationViolation::SlotBinding,
+                "writer multiplex slot order differs from static layout",
+            ));
         }
         Ok(template)
     }
@@ -394,14 +486,18 @@ impl WriterMultiplexRelationTemplate {
                 novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::Arithmetic(_)=>novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
                 novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::SourceModel(_)=>novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
             }),
-            Failure::Contract(error)=>ConstructionFailure::InvalidSource(error.to_string()),
+            Failure::Contract(error)=>ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(error)),
         }
         };
         for slot in schema.slots().iter().skip(WRITE_RELATION_COLUMN_COUNT) {
             let value = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 slot.typed_binding().clone(),
             )
-            .map_err(|error| ConstructionFailure::InvalidSource(error.to_string()))?;
+            .map_err(|error| {
+                ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+                    error,
+                ))
+            })?;
             channels.push(
                 WriterAuxiliaryChannel::try_new_with_creator_work_in(
                     slot.slot_id().0,
@@ -421,7 +517,11 @@ impl WriterMultiplexRelationTemplate {
         .map_err(map)?;
         contract
             .validate_exact_arrow_schema(&schema.arrow_schema_ref())
-            .map_err(|error| ConstructionFailure::InvalidSource(error.to_string()))?;
+            .map_err(|error| {
+                ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+                    error,
+                ))
+            })?;
         if contract
             .auxiliary_channels()
             .iter()
@@ -470,7 +570,7 @@ impl WriterRelationPreparation {
             Self::Compiled { template, .. } => template.slots(),
         }
     }
-    pub(crate) fn schema(&self) -> Result<&WriterMultiplexRelationSchema, String> {
+    pub(crate) fn schema(&self) -> ExecutionResult<&WriterMultiplexRelationSchema> {
         match self {
             #[cfg(test)]
             Self::Existing(schema) => Ok(schema),
@@ -478,9 +578,10 @@ impl WriterRelationPreparation {
                 prepared: Some(schema),
                 ..
             } => Ok(schema),
-            Self::Compiled { prepared: None, .. } => {
-                Err("writer relation has not been prepared by its construction owner".into())
-            }
+            Self::Compiled { prepared: None, .. } => Err(relation_failure(
+                WriteRelationViolation::NotPrepared,
+                "writer relation has not been prepared by its construction owner",
+            )),
         }
     }
     pub(crate) fn prepare(
@@ -509,20 +610,29 @@ pub(crate) struct RootWriteResultRelationTemplate {
 }
 
 impl RootWriteResultRelationTemplate {
-    pub(crate) fn try_new(layout: &novarocks_local_program::StaticLayout) -> Result<Self, String> {
+    pub(crate) fn try_new(layout: &novarocks_local_program::StaticLayout) -> ExecutionResult<Self> {
         if !layout.is_typed() {
-            return Err("compiled root write result requires a complete typed layout".to_string());
+            return Err(relation_failure(
+                WriteRelationViolation::Layout,
+                "compiled root write result requires a complete typed layout",
+            ));
         }
         novarocks_spi::connector::write_stack::relation::validate_root_write_result_schema(
             layout.schema(),
         )
-        .map_err(|error| format!("compiled root write result layout: {error}"))?;
+        .map_err(relation_connector)?;
         for ordinal in 0..layout.slots().len() {
-            let binding = layout
-                .value_binding_at(ordinal)
-                .ok_or_else(|| "root write result complete binding is absent".to_owned())?;
+            let binding = layout.value_binding_at(ordinal).ok_or_else(|| {
+                relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "root write result complete binding is absent",
+                )
+            })?;
             if !plain_relation_value(binding.value_type()) {
-                return Err("root write result fixed purpose has a nominal domain".to_owned());
+                return Err(relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "root write result fixed purpose has a nominal domain",
+                ));
             }
         }
         Ok(Self {
@@ -533,7 +643,7 @@ impl RootWriteResultRelationTemplate {
     /// The local plan route retains the original reserved root slot law.
     pub(crate) fn try_new_reserved(
         layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let template = Self::try_new(layout)?;
         if RootWriteResultSchema::new()
             .slot_ids()
@@ -541,7 +651,10 @@ impl RootWriteResultRelationTemplate {
             .map(SlotId::new)
             .ne(layout.slots().iter().copied())
         {
-            return Err("root write result slot order differs from static layout".to_owned());
+            return Err(relation_failure(
+                WriteRelationViolation::SlotBinding,
+                "root write result slot order differs from static layout",
+            ));
         }
         Ok(template)
     }
@@ -554,21 +667,22 @@ impl RootWriteResultRelationTemplate {
     pub(crate) fn bind_created_schema(
         &self,
         schema: ChunkSchemaRef,
-    ) -> Result<RootWriteResultRelationSchema, String> {
+    ) -> ExecutionResult<RootWriteResultRelationSchema> {
         if !schema.is_typed()
             || schema.arrow_schema_ref().as_ref() != self.layout.schema().as_ref()
             || schema.slot_ids() != self.layout.slots()
         {
-            return Err(
-                "prepared root write result differs from its compiled template".to_string(),
-            );
+            return Err(relation_failure(
+                WriteRelationViolation::Layout,
+                "prepared root write result differs from its compiled template",
+            ));
         }
         for (ordinal, slot) in schema.slots().iter().enumerate() {
             if self.layout.value_binding_at(ordinal) != Some(slot.typed_binding()) {
-                return Err(
-                    "prepared root write result binding differs from its compiled template"
-                        .to_string(),
-                );
+                return Err(relation_failure(
+                    WriteRelationViolation::SlotBinding,
+                    "prepared root write result binding differs from its compiled template",
+                ));
             }
         }
         Ok(RootWriteResultRelationSchema {
@@ -591,24 +705,24 @@ impl RootWriteResultRelationSchema {
     #[cfg(test)]
     pub(crate) fn try_from_compiled_layout(
         layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let contract = RootWriteResultSchema::new();
         contract
             .validate_exact_arrow_schema(layout.schema())
-            .map_err(|error| format!("compiled root write result layout: {error}"))?;
+            .map_err(relation_connector)?;
         Ok(Self {
             contract,
             chunk_schema: ChunkSchema::from_compiled_layout(layout)?,
         })
     }
 
-    pub fn try_new(contract: RootWriteResultSchema) -> Result<Self, String> {
+    pub fn try_new(contract: RootWriteResultSchema) -> ExecutionResult<Self> {
         let slot_ids = contract.slot_ids().map(SlotId::new);
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             contract.arrow_schema().as_ref(),
             &slot_ids,
         )
-        .map_err(|error| format!("root write result chunk schema: {error}"))?;
+        .map_err(ExecutionFailure::from)?;
         debug_assert_eq!(slot_ids.len(), ROOT_WRITE_RESULT_COLUMN_COUNT);
         Self::try_new_with_chunk_schema(contract, chunk_schema)
     }
@@ -619,20 +733,26 @@ impl RootWriteResultRelationSchema {
     pub fn try_new_with_chunk_schema(
         contract: RootWriteResultSchema,
         chunk_schema: ChunkSchemaRef,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if chunk_schema.is_typed()
             && chunk_schema
                 .slots()
                 .iter()
                 .any(|slot| !plain_relation_value(slot.field_schema().value_type()))
         {
-            return Err("root write result fixed relation has a nominal domain".into());
+            return Err(relation_failure(
+                WriteRelationViolation::SlotBinding,
+                "root write result fixed relation has a nominal domain",
+            ));
         }
         contract
             .validate_exact_arrow_schema(chunk_schema.arrow_schema_ref().as_ref())
-            .map_err(|error| error.to_string())?;
+            .map_err(relation_connector)?;
         if contract.slot_ids().map(SlotId::new).as_slice() != chunk_schema.slot_ids() {
-            return Err("root write result slot order differs from supplied chunk schema".into());
+            return Err(relation_failure(
+                WriteRelationViolation::SlotBinding,
+                "root write result slot order differs from supplied chunk schema",
+            ));
         }
         Ok(Self {
             contract,

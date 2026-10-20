@@ -136,17 +136,17 @@ pub(super) fn evaluate<'a>(
                 .ok_or(KernelFailure::ResourceExhausted)?,
         )
         .map_err(|_| KernelFailure::ResourceExhausted)?;
-        let mut errors = reserve::<RowDataError>(selection.len(), &work)?;
         work.borrow_mut().flush()?;
+        let mut errors = reserve::<RowDataError>(selection.len(), &work)?;
         let nulls = RefCell::new(NullBufferBuilder::new(selection.len()));
         work.borrow_mut().flush()?;
         let mut observer = |e| match e {
             CollectionObservation::Step => work.borrow_mut().step(),
             CollectionObservation::OpaqueBoundary => work.borrow_mut().flush(),
         };
-        let mut row_error = |ordinal, text: String| {
+        let mut row_error = |ordinal, cause: super::map_projection_core::MapProjectionFailure| {
             work.borrow_mut().step()?;
-            errors.push(RowDataError::new(ordinal, &text));
+            errors.push(RowDataError::new(ordinal, &cause.to_string()));
             Ok(())
         };
         let values = project_observed(
@@ -194,8 +194,7 @@ pub(super) fn evaluate<'a>(
         )
         .map_err(|e| match e {
             ProjectionFailure::Control(cause) => cause,
-            ProjectionFailure::Data(text) => internal(&text),
-            ProjectionFailure::Take(text) => internal(&text),
+            ProjectionFailure::Domain(cause) => KernelFailure::from_domain(cause),
         })?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,

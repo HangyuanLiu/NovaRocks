@@ -25,8 +25,8 @@ use std::{future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
 
 use novarocks_execution_contract::root_result::RootResultRead;
 use novarocks_execution_contract::{
-    AbortCause, QueryContextRef, ResultPacketSequence, TaskFailureCategory, TaskIdentity,
-    TaskState, TaskStatus, TerminationDetail,
+    AbortCause, QueryContextRef, ResultPacketSequence, TaskIdentity, TaskState, TaskStatus,
+    TerminationDetail,
 };
 use novarocks_types::QueryExecutionId;
 use novarocks_workload_control::{CancellationReason, CancellationView, WorkError, WorkScope};
@@ -106,36 +106,25 @@ impl NativeAttemptTerminalSource {
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RootResultFetchFailure {
-    topology_requirement: NativeAttemptTopologyRequirement,
-    class: AttemptFailureClass,
     error: QueryExecutionError,
 }
-
 impl RootResultFetchFailure {
-    pub const fn with_topology_requirement(
-        mut self,
-        requirement: NativeAttemptTopologyRequirement,
-    ) -> Self {
-        self.topology_requirement = requirement;
-        self
-    }
-
-    pub fn new(class: AttemptFailureClass, error: QueryExecutionError) -> Self {
+    pub fn from_input(input: crate::execution_error::ExecutionFailureInput) -> Self {
         Self {
-            class,
-            error,
-            topology_requirement: NativeAttemptTopologyRequirement::LiveSnapshot,
+            error: QueryExecutionError::from_execution(input),
         }
     }
-
-    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.topology_requirement
+    pub fn input(&self) -> &crate::execution_error::ExecutionFailureInput {
+        self.error
+            .execution_failure()
+            .expect("typed constructor retains its original failure input")
     }
-
-    pub const fn class(&self) -> AttemptFailureClass {
-        self.class
+    pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.input().topology_requirement()
     }
-
+    pub fn class(&self) -> AttemptFailureClass {
+        self.input().attempt_class()
+    }
     pub const fn error(&self) -> &QueryExecutionError {
         &self.error
     }
@@ -235,7 +224,7 @@ struct AcceptedRootObservation {
 pub enum AcceptedAttemptFailure {
     None,
     DerivedPending,
-    Authoritative(TerminationDetail),
+    Authoritative(super::SelectedTaskTermination),
 }
 
 #[cfg(test)]
@@ -291,7 +280,8 @@ impl AcceptedRootStatusSender {
         attempt_failure: AcceptedAttemptFailure,
     ) -> Result<(), QueryExecutionError> {
         if let AcceptedAttemptFailure::Authoritative(authoritative) = &attempt_failure
-            && (authoritative.is_derived() || authoritative.is_success_compatible())
+            && (authoritative.detail().is_derived()
+                || authoritative.detail().is_success_compatible())
         {
             return Err(contract_error(
                 "authoritative attempt failure must be a non-derived failure cause",
@@ -311,7 +301,7 @@ impl AcceptedRootStatusSender {
     pub fn publish_with_attempt_failure(
         &self,
         status: TaskStatus,
-        authoritative_attempt_failure: TerminationDetail,
+        authoritative_attempt_failure: super::SelectedTaskTermination,
     ) -> Result<(), QueryExecutionError> {
         self.publish_attempt_observation(
             status,
@@ -326,6 +316,13 @@ impl AcceptedRootStatusSender {
         let status = &observation.status;
         if status.identity() != self.root {
             return Err(contract_error("accepted root status names another Task"));
+        }
+        if let AcceptedAttemptFailure::Authoritative(selected) = &observation.attempt_failure
+            && selected.identity().query_execution_id() != self.root.query_execution_id()
+        {
+            return Err(contract_error(
+                "accepted attempt failure names another query execution",
+            ));
         }
         if let Some(AcceptedRootProjection::Observation(held)) = self.sender.borrow().as_ref() {
             let cause_refinement = held.status == observation.status
@@ -468,24 +465,21 @@ pub enum ResultPumpFailure {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ResultPumpDecision {
-    topology_requirement: NativeAttemptTopologyRequirement,
     permit: RunningAttemptPermit,
     observer: Option<RootResultObserver>,
-    class: AttemptFailureClass,
-    error: QueryExecutionError,
+    failure: RootResultFetchFailure,
 }
 
 impl ResultPumpDecision {
-    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.topology_requirement
+    pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.failure.topology_requirement()
     }
 
-    pub const fn class(&self) -> AttemptFailureClass {
-        self.class
+    pub fn class(&self) -> AttemptFailureClass {
+        self.failure.class()
     }
-
     pub const fn error(&self) -> &QueryExecutionError {
-        &self.error
+        self.failure.error()
     }
 
     /// Installs the final typed failure before releasing the last root
@@ -496,7 +490,7 @@ impl ResultPumpDecision {
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
         let permit = self.permit;
         let result = actor
-            .fail_attempt_with_error(permit, self.error.clone())
+            .fail_attempt_with_error(permit, self.failure.error().clone())
             .await;
         drop(self.observer);
         result
@@ -510,18 +504,19 @@ impl ResultPumpDecision {
         replacement: QueryExecutionId,
         replacement_contexts: Vec<QueryContextRef>,
     ) -> Result<(ReplacementQualification, QueryExecutionError), LogicalExecutionActorError> {
+        let class = self.failure.class();
         let permit = self.permit;
         let qualification = actor
             .begin_replacement_with_error(
                 permit,
-                self.class,
-                self.error.clone(),
+                class,
+                self.failure.error().clone(),
                 replacement,
                 replacement_contexts,
             )
             .await?;
         drop(self.observer);
-        Ok((qualification, self.error))
+        Ok((qualification, self.failure.error))
     }
 }
 
@@ -531,8 +526,7 @@ impl ResultPumpDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConcludedResultPumpFailure {
     conclusion: LogicalConclusion,
-    class: AttemptFailureClass,
-    error: QueryExecutionError,
+    failure: RootResultFetchFailure,
 }
 
 impl ConcludedResultPumpFailure {
@@ -540,12 +534,12 @@ impl ConcludedResultPumpFailure {
         self.conclusion
     }
 
-    pub const fn class(&self) -> AttemptFailureClass {
-        self.class
+    pub fn class(&self) -> AttemptFailureClass {
+        self.failure.class()
     }
 
     pub const fn error(&self) -> &QueryExecutionError {
-        &self.error
+        self.failure.error()
     }
 }
 
@@ -604,13 +598,9 @@ impl PumpRuntime {
                 self.native_completed = true;
                 Ok(())
             }
-            Ok(NativeAttemptTerminal::Failed(failure)) => {
-                Err(PumpInterruption::Decision(RootResultFetchFailure {
-                    class: failure.class(),
-                    error: failure.error().clone(),
-                    topology_requirement: failure.topology_requirement(),
-                }))
-            }
+            Ok(NativeAttemptTerminal::Failed(failure)) => Err(PumpInterruption::Decision(
+                RootResultFetchFailure::from_input(failure.input().clone()),
+            )),
             Err(error) => Err(PumpInterruption::Decision(contract_failure(error))),
         }
     }
@@ -1105,13 +1095,20 @@ pub(crate) async fn run_root_relay(
                 ) {
                     Ok(request) => request,
                     Err(error) => {
-                        break RelayExit::Failure(contract_failure(contract_error(format!(
-                            "root relay read is invalid: {error}"
-                        ))));
+                        use novarocks_execution_contract::failure::FailureProjection;
+                        break RelayExit::Failure(RootResultFetchFailure::from_input(
+                            crate::execution_error::ExecutionFailureInput::new(
+                                error.failure_fact(),
+                                novarocks_execution_contract::SafeDetail::truncating(
+                                    "root relay read does not satisfy its frozen request contract",
+                                ),
+                                crate::execution_error::ExecutionFailureSite::RootRead { root },
+                            ),
+                        ));
                     }
                 };
                 frontier.sent(read);
-                reading = Some(port.read(request, window.clone()));
+                reading = Some(paced_root_read(port.as_ref(), request, window.clone()));
             }
             if delivering.is_none() && reading.is_none() {
                 break RelayExit::Failure(contract_failure(contract_error(
@@ -1142,9 +1139,7 @@ pub(crate) async fn run_root_relay(
                     }
                     resident.retire(sequence);
                     if let Err(error) = frontier.receipt(sequence) {
-                        break RelayExit::Failure(contract_failure(contract_error(
-                            error.to_string(),
-                        )));
+                        break RelayExit::Failure(relay_failure(root, error));
                     }
                 }
                 Ok(RelayEvent::Read(result)) => {
@@ -1158,12 +1153,10 @@ pub(crate) async fn run_root_relay(
                         crate::api::RootReplyView::Data { body, .. } => Some(body),
                         _ => None,
                     };
-                    let step = frontier.accept(reply.reply(), body);
+                    let step = frontier.accept(reply.response(), body);
                     match step {
                         Err(error) => {
-                            break RelayExit::Failure(contract_failure(contract_error(
-                                error.to_string(),
-                            )));
+                            break RelayExit::Failure(relay_failure(root, error));
                         }
                         Ok(super::RootRelayStep::Deliver { sequence, rows, .. }) => {
                             if !resident.publish(crate::api::ResidentRootSegment {
@@ -1178,10 +1171,15 @@ pub(crate) async fn run_root_relay(
                         Ok(super::RootRelayStep::AwaitTerminalControl) => {
                             break RelayExit::AwaitTerminalControl;
                         }
-                        Ok(super::RootRelayStep::NotReady) => {
-                            // A port that answers NotReady without its long
-                            // poll must not starve the delivery or the runtime.
-                            tokio::task::yield_now().await;
+                        Ok(super::RootRelayStep::NotReady | super::RootRelayStep::Deferred(_)) => {}
+                        Ok(super::RootRelayStep::Refused(refusal)) => {
+                            break RelayExit::Failure(RootResultFetchFailure::from_input(
+                                crate::execution_error::ExecutionFailureInput::new(
+                                    refusal.fact(),
+                                    refusal.detail().clone(),
+                                    crate::execution_error::ExecutionFailureSite::RootRead { root },
+                                ),
+                            ));
                         }
                         Ok(
                             super::RootRelayStep::EndKnown(_) | super::RootRelayStep::Acknowledged,
@@ -1271,16 +1269,37 @@ pub(crate) async fn run_root_relay(
     }
 }
 
+/// Preserve one read and its original window while an early normal deferral
+/// consumes the wait already requested from the backend. It grants no retry
+/// authority and never advances the cumulative delivery frontier.
+#[doc(hidden)]
+pub fn paced_root_read(
+    port: &dyn BoundedRootReadPort,
+    request: RootResultRead,
+    physical_guard: novarocks_workload_control::ResultWindowAlias,
+) -> Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>> {
+    let not_before = tokio::time::Instant::now() + request.max_wait();
+    let read = port.read(request, physical_guard);
+    Box::pin(async move {
+        let response = read.await?;
+        if matches!(
+            response.outcome(),
+            crate::api::RootReplyView::Deferred(_) | crate::api::RootReplyView::NotReady
+        ) {
+            tokio::time::sleep_until(not_before).await;
+        }
+        Ok(response)
+    })
+}
+
 fn pump_failure(
     permit: RunningAttemptPermit,
     failure: RootResultFetchFailure,
 ) -> ResultPumpFailure {
     ResultPumpFailure::DecisionPending(ResultPumpDecision {
-        topology_requirement: failure.topology_requirement,
         permit,
         observer: None,
-        class: failure.class,
-        error: failure.error,
+        failure,
     })
 }
 
@@ -1309,18 +1328,15 @@ async fn bound_pump_failure(
         .await
     {
         Ok(()) => ResultPumpFailure::DecisionPending(ResultPumpDecision {
-            topology_requirement: failure.topology_requirement,
             permit,
             observer: Some(observer.clone()),
-            class: failure.class,
-            error: failure.error,
+            failure,
         }),
         Err(LogicalExecutionActorError::ExecutionConcluded(conclusion)) => {
             drop(permit);
             ResultPumpFailure::Concluded(ConcludedResultPumpFailure {
                 conclusion,
-                class: failure.class,
-                error: failure.error,
+                failure,
             })
         }
         Err(error) => {
@@ -1362,8 +1378,7 @@ async fn bound_pump_interruption(
             drop(permit);
             ResultPumpFailure::Concluded(ConcludedResultPumpFailure {
                 conclusion,
-                class: failure.class,
-                error: failure.error,
+                failure,
             })
         }
     }
@@ -1399,8 +1414,7 @@ fn concluded_pump_failure(
 ) -> ResultPumpFailure {
     ResultPumpFailure::Concluded(ConcludedResultPumpFailure {
         conclusion,
-        class: failure.class,
-        error: failure.error,
+        failure,
     })
 }
 
@@ -1449,115 +1463,126 @@ fn contract_error(message: impl Into<Arc<str>>) -> QueryExecutionError {
     QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, message)
 }
 
-fn contract_failure(error: QueryExecutionError) -> RootResultFetchFailure {
-    RootResultFetchFailure::new(AttemptFailureClass::ContractViolation, error)
+fn query_failure(
+    reason: crate::execution_error::QueryFailureReason,
+    detail: &'static str,
+) -> RootResultFetchFailure {
+    use novarocks_execution_contract::failure::FailureProjection;
+    RootResultFetchFailure::from_input(crate::execution_error::ExecutionFailureInput::new(
+        reason.failure_fact(),
+        novarocks_execution_contract::SafeDetail::truncating(detail),
+        crate::execution_error::ExecutionFailureSite::Coordinator,
+    ))
+}
+fn relay_failure(root: TaskIdentity, error: super::RootRelayError) -> RootResultFetchFailure {
+    use novarocks_execution_contract::failure::FailureProjection;
+    RootResultFetchFailure::from_input(crate::execution_error::ExecutionFailureInput::new(
+        error.failure_fact(),
+        error.safe_detail(),
+        crate::execution_error::ExecutionFailureSite::RootRead { root },
+    ))
 }
 
+fn contract_failure(error: QueryExecutionError) -> RootResultFetchFailure {
+    if let Some(input) = error.execution_failure() {
+        return RootResultFetchFailure::from_input(input.clone());
+    }
+    tracing::debug!(error = %error, "local root result contract failure");
+    query_failure(
+        crate::execution_error::QueryFailureReason::ResultProtocol,
+        "root result protocol contract failed",
+    )
+}
 fn actor_failure(
     operation: &'static str,
     error: LogicalExecutionActorError,
 ) -> RootResultFetchFailure {
-    RootResultFetchFailure::new(
-        AttemptFailureClass::ContractViolation,
-        QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            format!("{operation} failed: {error}"),
-        ),
-    )
+    tracing::debug!(operation, error = %error, "root result actor operation failed");
+    use novarocks_execution_contract::failure::FailureProjection;
+    RootResultFetchFailure::from_input(crate::execution_error::ExecutionFailureInput::new(
+        error.failure_fact(),
+        error.safe_detail(),
+        crate::execution_error::ExecutionFailureSite::Coordinator,
+    ))
 }
-
 fn work_failure(error: WorkError) -> RootResultFetchFailure {
-    match error {
-        WorkError::Cancelled(reason) => cancellation_failure(reason),
-        WorkError::Capacity(_) | WorkError::CapacityWaitTimeout => RootResultFetchFailure::new(
-            AttemptFailureClass::ResourceGovernance,
-            QueryExecutionError::new(
-                QueryExecutionErrorKind::Rejected,
-                format!("result capacity is unavailable: {error}"),
-            ),
+    // The workload domain owns this projection; capacity wait expiry does not
+    // claim that the logical query deadline or a backend process expired.
+    use novarocks_execution_contract::failure::FailureProjection;
+    RootResultFetchFailure::from_input(crate::execution_error::ExecutionFailureInput::new(
+        error.failure_fact(),
+        novarocks_execution_contract::SafeDetail::truncating(
+            "result workload control refused the operation",
         ),
-        error => contract_failure(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            format!("result capacity contract failed: {error}"),
-        )),
-    }
+        crate::execution_error::ExecutionFailureSite::Coordinator,
+    ))
 }
-
 fn cancellation_failure(reason: CancellationReason) -> RootResultFetchFailure {
-    let (class, kind, message) = match reason {
+    use crate::execution_error::QueryFailureReason;
+    match reason {
         CancellationReason::DeadlineExceeded
-        | CancellationReason::FrontendDrainDeadlineExceeded => (
-            AttemptFailureClass::DeadlineExceeded,
-            QueryExecutionErrorKind::DeadlineExceeded,
+        | CancellationReason::FrontendDrainDeadlineExceeded => query_failure(
+            QueryFailureReason::DeadlineExceeded,
             "logical execution deadline expired while pumping results",
         ),
-        _ => (
-            AttemptFailureClass::Cancelled,
-            QueryExecutionErrorKind::Cancelled,
+        _ => query_failure(
+            QueryFailureReason::Cancelled,
             "logical execution was cancelled while pumping results",
         ),
-    };
-    RootResultFetchFailure::new(class, QueryExecutionError::new(kind, message))
+    }
 }
-
 fn classify_root_termination(
     status: &TaskStatus,
-    authoritative_attempt_failure: Option<&TerminationDetail>,
+    authoritative_attempt_failure: Option<&super::SelectedTaskTermination>,
 ) -> Option<RootResultFetchFailure> {
-    let detail = authoritative_attempt_failure.or_else(|| status.termination())?;
-    let (class, message) = match detail {
-        TerminationDetail::Canceled(reason) => (
-            AttemptFailureClass::ExecutionFailure,
-            format!("attempt ended without stable result success: CANCELED(reason={reason})"),
-        ),
-        TerminationDetail::Aborted(AbortCause::LeaseExpired) => (
-            AttemptFailureClass::RecoverableInfrastructure,
-            "attempt ended without stable result success: ABORTED(cause=LEASE_EXPIRED)".to_owned(),
-        ),
-        TerminationDetail::Aborted(AbortCause::PeerTaskFailed) => {
-            return Some(contract_failure(contract_error(
-                "derived root termination reached classification without an authoritative attempt failure",
-            )));
-        }
-        TerminationDetail::Aborted(cause) => (
-            AttemptFailureClass::ExecutionFailure,
-            format!("attempt ended without stable result success: ABORTED(cause={cause})"),
-        ),
-        TerminationDetail::Failed(failure) => {
-            let class = match failure.category() {
-                TaskFailureCategory::Unsupported => AttemptFailureClass::Unsupported,
-                TaskFailureCategory::ResourceExhausted => {
-                    AttemptFailureClass::RecoverableInfrastructure
-                }
-                TaskFailureCategory::Execution | TaskFailureCategory::Exchange => {
-                    AttemptFailureClass::ExecutionFailure
-                }
-                TaskFailureCategory::Protocol | TaskFailureCategory::Internal => {
-                    AttemptFailureClass::ContractViolation
-                }
-            };
-            let message = format!(
-                "attempt ended without stable result success: FAILED(category={}, detail={})",
-                failure.category(),
-                failure.detail()
+    let selected;
+    let original = match authoritative_attempt_failure {
+        Some(original) => original,
+        None => {
+            selected = super::SelectedTaskTermination::new(
+                status.identity(),
+                status.termination()?.clone(),
             );
-            let message = if class == AttemptFailureClass::Unsupported {
-                crate::engine_error::EngineError::unsupported_compiled_shape(message)
-                    .to_bracketed_user_message()
-            } else {
-                message
-            };
-            (class, message)
+            &selected
         }
     };
-    Some(RootResultFetchFailure::new(
-        class,
-        QueryExecutionError::new(QueryExecutionErrorKind::Failed, message),
-    ))
+    if original.detail().is_derived() {
+        return Some(contract_failure(contract_error(
+            "derived root termination lacks its authoritative Task cause",
+        )));
+    }
+    crate::execution_error::ExecutionFailureInput::from_selected_task(original)
+        .map(RootResultFetchFailure::from_input)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn actor_boundary_preserves_nested_fact_and_stopped_observation() {
+        use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+        let source = crate::coordination::EstablishIssueError::TicketExpired;
+        let error = LogicalExecutionActorError::Establish(source);
+        let projected = actor_failure("authorize Establish", error);
+        assert_eq!(projected.input().fact(), source.failure_fact());
+        assert_eq!(projected.input().detail(), &source.safe_detail());
+        assert_eq!(projected.class(), AttemptFailureClass::ExecutionFailure);
+        assert_eq!(
+            projected.topology_requirement(),
+            NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+
+        let projected = actor_failure(
+            "observe actor",
+            LogicalExecutionActorError::AlreadyConcluded,
+        );
+        assert_eq!(
+            projected.input().fact().evidence(),
+            FailureEvidence::StopObservation
+        );
+        assert_eq!(projected.error().kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(projected.class(), AttemptFailureClass::ExecutionFailure);
+    }
+
     use std::{
         collections::VecDeque,
         num::NonZeroUsize,
@@ -1683,17 +1708,35 @@ mod tests {
 
     #[test]
     fn unsupported_root_or_originating_failure_has_a_stable_nonretryable_identity() {
+        use crate::execution_error::{ExecutionFailureSite, QueryFailureReason};
+        use novarocks_execution_contract::{
+            TaskFailurePhase,
+            failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
+        };
+        use std::num::NonZeroU16;
         let root = root_task(execution(118));
-        let failure = TerminationDetail::Failed(TaskFailure::new(
-            TaskFailureCategory::Unsupported,
+        let origin = TaskIdentity::new(
+            root.query_execution_id(),
+            StageId::new(2).unwrap(),
+            TaskId::new(2).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let fact = FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::LOCAL_COMPILER, NonZeroU16::new(1).unwrap()),
+        );
+        let failure = TerminationDetail::Failed(TaskFailure::new_in_phase(
+            fact,
             SafeDetail::truncating("FULL OUTER hash join"),
+            TaskFailurePhase::Preparation,
         ));
-        let failed = TaskStatus::try_new(
+        let failed = TaskStatus::try_new_with_installed(
             root,
             TaskStatusVersion::new(3).unwrap(),
             TaskState::Failed,
             Some(failure.clone()),
             TaskOutputFacts::default(),
+            false,
         )
         .unwrap();
         let derived = TaskStatus::try_new(
@@ -1704,25 +1747,39 @@ mod tests {
             TaskOutputFacts::default(),
         )
         .unwrap();
-        for decision in [
-            classify_root_termination(&failed, None).unwrap(),
-            classify_root_termination(&derived, Some(&failure)).unwrap(),
+        let authoritative = super::super::SelectedTaskTermination::new(origin, failure);
+        for (decision, identity) in [
+            (classify_root_termination(&failed, None).unwrap(), root),
+            (
+                classify_root_termination(&derived, Some(&authoritative)).unwrap(),
+                origin,
+            ),
         ] {
             assert_eq!(decision.class(), AttemptFailureClass::Unsupported);
-            assert!(
-                decision
-                    .error()
-                    .message()
-                    .starts_with("[UnsupportedCompiledShape] ")
+            assert_eq!(decision.input().fact(), fact);
+            assert_eq!(
+                decision.input().site(),
+                ExecutionFailureSite::Task {
+                    identity,
+                    phase: TaskFailurePhase::Preparation,
+                },
             );
-            assert!(decision.error().message().contains("FULL OUTER hash join"));
+            let user = decision.input().user_error();
+            assert_eq!(user.code().as_str(), "UnsupportedCompiledShape");
+            assert_eq!(user.phase(), novarocks_user_error::ErrorPhase::Execution);
+            assert_eq!(user.retry(), novarocks_user_error::RetryClass::Never);
+            assert_eq!(user.location(), None);
+            assert_eq!(
+                crate::session_error::execution_public_message(decision.error()),
+                "[UnsupportedCompiledShape] FULL OUTER hash join",
+            );
         }
         let invalid = TaskStatus::try_new(
             root,
             TaskStatusVersion::new(3).unwrap(),
             TaskState::Failed,
             Some(TerminationDetail::Failed(TaskFailure::new(
-                TaskFailureCategory::Protocol,
+                QueryFailureReason::ResultProtocol.failure_fact(),
                 SafeDetail::truncating("unsupported diagnostic is not a capability"),
             ))),
             TaskOutputFacts::default(),
@@ -1730,10 +1787,12 @@ mod tests {
         .unwrap();
         let decision = classify_root_termination(&invalid, None).unwrap();
         assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
+        assert_ne!(
+            decision.input().user_error().code().as_str(),
+            "UnsupportedCompiledShape"
+        );
         assert!(
-            !decision
-                .error()
-                .message()
+            !crate::session_error::execution_public_message(decision.error())
                 .starts_with("[UnsupportedCompiledShape]")
         );
     }
@@ -1877,10 +1936,19 @@ mod tests {
         sender
             .publish_with_attempt_failure(
                 status,
-                TerminationDetail::Failed(TaskFailure::new(
-                    TaskFailureCategory::Exchange,
-                    SafeDetail::new("revoked root original cause").unwrap(),
-                )),
+                super::super::SelectedTaskTermination::new(
+                    root,
+                    TerminationDetail::Failed(TaskFailure::new(
+                        novarocks_execution_contract::failure::FailureFact::new(
+                            novarocks_execution_contract::failure::FailureClass::Dependency,
+                            novarocks_execution_contract::failure::FailureReason::new(
+                                std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                                std::num::NonZeroU16::new(2).unwrap(),
+                            ),
+                        ),
+                        SafeDetail::new("revoked root original cause").unwrap(),
+                    )),
+                ),
             )
             .unwrap();
         let error = tokio::time::timeout(Duration::from_secs(1), relay)
@@ -2014,14 +2082,26 @@ mod tests {
                 TaskStatusVersion::new(3).unwrap(),
                 TaskState::Failed,
                 Some(TerminationDetail::Failed(TaskFailure::new(
-                    TaskFailureCategory::Execution,
+                    novarocks_execution_contract::failure::FailureFact::new(
+                        novarocks_execution_contract::failure::FailureClass::Data,
+                        novarocks_execution_contract::failure::FailureReason::new(
+                            std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                            std::num::NonZeroU16::new(1).unwrap(),
+                        ),
+                    ),
                     SafeDetail::new("originating root failure").unwrap(),
                 ))),
                 TaskOutputFacts::new(false),
             )
             .unwrap();
             sender
-                .publish_with_attempt_failure(status.clone(), status.termination().unwrap().clone())
+                .publish_with_attempt_failure(
+                    status.clone(),
+                    super::super::SelectedTaskTermination::new(
+                        root,
+                        status.termination().unwrap().clone(),
+                    ),
+                )
                 .unwrap();
             let error = match tokio::time::timeout(Duration::from_secs(1), &mut relay).await {
                 Ok(result) => result.unwrap().unwrap_err(),
@@ -2125,10 +2205,19 @@ mod tests {
         sender
             .publish_with_attempt_failure(
                 pending,
-                TerminationDetail::Failed(TaskFailure::new(
-                    TaskFailureCategory::Exchange,
-                    SafeDetail::new("originating peer exchange failure").unwrap(),
-                )),
+                super::super::SelectedTaskTermination::new(
+                    root,
+                    TerminationDetail::Failed(TaskFailure::new(
+                        novarocks_execution_contract::failure::FailureFact::new(
+                            novarocks_execution_contract::failure::FailureClass::Dependency,
+                            novarocks_execution_contract::failure::FailureReason::new(
+                                std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                                std::num::NonZeroU16::new(2).unwrap(),
+                            ),
+                        ),
+                        SafeDetail::new("originating peer exchange failure").unwrap(),
+                    )),
+                ),
             )
             .unwrap();
         let error = tokio::time::timeout(Duration::from_secs(1), relay)
@@ -2172,9 +2261,16 @@ mod tests {
         let port = ScriptedRootPort::new(Vec::new());
         let (terminal_sender, terminal) = native_attempt_terminal_channel();
         terminal_sender.publish(NativeAttemptTerminal::Failed(
-            crate::api::NativeAttemptPreparationFailure::new(
-                AttemptFailureClass::RecoverableInfrastructure,
-                contract_error("exact backend process replaced"),
+            crate::api::NativeAttemptPreparationFailure::from_input(
+                crate::execution_error::ExecutionFailureInput::new(
+                    novarocks_execution_contract::failure::FailureProjection::failure_fact(
+                        &crate::execution_error::QueryFailureReason::BackendLost,
+                    ),
+                    SafeDetail::truncating("exact backend process replaced"),
+                    crate::execution_error::ExecutionFailureSite::Backend {
+                        process: root.backend_process_id(),
+                    },
+                ),
             ),
         ));
         let error = tokio::time::timeout(
@@ -2267,7 +2363,12 @@ mod tests {
                 if long_poll {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
-                RetainedRootReply::try_new(reply, physical_guard, 64 * 1024).map_err(|error| {
+                RetainedRootReply::try_new(
+                    novarocks_execution_contract::root_result::RootReadResponse::Reply(reply),
+                    physical_guard,
+                    64 * 1024,
+                )
+                .map_err(|error| {
                     contract_failure(contract_error(format!("retain root reply: {error}")))
                 })
             })
@@ -2716,6 +2817,36 @@ mod tests {
         drop((stream, actor, owner, window));
     }
 
+    fn assert_relay_failure_input(
+        error: &QueryExecutionError,
+        root: TaskIdentity,
+        expected: super::super::RootRelayError,
+    ) {
+        use crate::execution_error::{ExecutionFailureSite, QueryFailureReason};
+        use novarocks_execution_contract::failure::FailureProjection;
+        let input = error
+            .execution_failure()
+            .expect("relay preserves a canonical input");
+        assert_eq!(input.fact(), expected.failure_fact());
+        assert_eq!(input.detail(), &expected.safe_detail());
+        assert_eq!(input.site(), ExecutionFailureSite::RootRead { root });
+        assert_eq!(
+            input.topology_requirement(),
+            NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        assert_ne!(
+            input.fact().reason(),
+            QueryFailureReason::BackendLost.failure_fact().reason()
+        );
+        assert_eq!(input.fact().resource(), None);
+        assert_eq!(input.fact().representation(), None);
+        let class = match expected {
+            super::super::RootRelayError::Body(_) => AttemptFailureClass::ExecutionFailure,
+            _ => AttemptFailureClass::ContractViolation,
+        };
+        assert_eq!(input.attempt_class(), class);
+    }
+
     #[tokio::test]
     async fn relay_refuses_exact_prefix_only_and_complete_row_prefix_suffix_without_ack() {
         for (body, label) in [
@@ -2760,7 +2891,19 @@ mod tests {
             let ResultPumpFailure::DecisionPending(decision) = error else {
                 panic!("{label} must retain its failure decision");
             };
-            assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
+            assert_eq!(decision.class(), AttemptFailureClass::ExecutionFailure);
+            assert_eq!(
+                decision.topology_requirement(),
+                NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+            let expected_error = decision.error().clone();
+            assert_relay_failure_input(
+                &expected_error,
+                root,
+                super::super::RootRelayError::Body(
+                    novarocks_result_contract::ClientBodyError::PrefixWithoutPayload,
+                ),
+            );
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), decision.fail_logical(&actor))
                     .await
@@ -2770,13 +2913,15 @@ mod tests {
             );
             // Whole-body validation must reject the valid row too; the first
             // consumer observation is the failure, never a Segment delivery.
-            assert!(
-                tokio::time::timeout(Duration::from_secs(1), stream.next())
-                    .await
-                    .unwrap()
-                    .is_err(),
-                "{label} must not deliver any segment"
-            );
+            let delivered_error = match tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+            {
+                Err(error) => error,
+                Ok(_) => panic!("whole-body failure must precede every Segment"),
+            };
+            assert_eq!(delivered_error, expected_error, "{label}");
+            assert!(stream.next().await.unwrap().is_none());
             let requests = port.requests();
             assert_eq!(requests, vec![(Some(1), 0)], "{label}");
             assert!(
@@ -2789,24 +2934,39 @@ mod tests {
             // dropping it, the existing capacity oracle detects leaked relay
             // window aliases; this is not a physical-allocation exit oracle.
             assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
-            drop((stream, actor, owner, window, status_sender));
+            drop((stream, actor, window, status_sender));
+            owner
+                .into_residual_stand_down_supervisor()
+                .join()
+                .await
+                .unwrap();
             assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         }
     }
 
     #[tokio::test]
     async fn relay_refuses_malformed_rows_and_end_mismatch_before_delivery() {
-        for (outcomes, label) in [
+        use super::super::RootRelayError;
+        use novarocks_result_contract::ClientBodyError;
+        for (outcomes, expected, label) in [
             (
                 vec![rows_data(1, &[1, 0, 0, 0, b'a', 1, 0], None)],
+                RootRelayError::Body(ClientBodyError::PrefixWithoutPayload),
                 "prefix without payload",
             ),
             (
+                vec![rows_data(1, &[2, 0, 0, 0, b'a'], Some((2, 1)))],
+                RootRelayError::Body(ClientBodyError::EndInsideRow),
+                "End inside an unfinished row",
+            ),
+            (
                 vec![rows_data(1, &[1, 0, 0, 0, b'a'], Some((2, 3)))],
+                RootRelayError::EndMismatch,
                 "End row count",
             ),
             (
                 vec![rows_data(2, &[1, 0, 0, 0, b'a'], None)],
+                RootRelayError::Sequence,
                 "sequence gap",
             ),
         ] {
@@ -2822,6 +2982,7 @@ mod tests {
                 },
                 window,
             ) = relay_harness(32).await;
+            let capacity = scope.result_capacity().unwrap();
             let (status_sender, statuses) = accepted_root_status_projection(root);
             status_sender.publish(running(root)).unwrap();
             let port = ScriptedRootPort::new(outcomes);
@@ -2832,25 +2993,44 @@ mod tests {
                     permit,
                     root,
                     scope,
-                    relay_binding(root, port, &window),
+                    relay_binding(root, port.clone(), &window),
                     statuses,
                     terminal_source,
                 ),
             )
             .await
-            .unwrap();
-            assert!(result.is_err(), "{label} must fail the attempt");
-            // Nothing was handed to the consumer.
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), stream.next())
-                    .await
-                    .map_or(true, |next| !matches!(
-                        next,
-                        Ok(Some(ResultDelivery::Segment(_)))
-                    )),
-                "{label} must not deliver any segment"
+            .unwrap()
+            .unwrap_err();
+            let ResultPumpFailure::DecisionPending(decision) = result else {
+                panic!("{label} must retain its original failure decision");
+            };
+            let expected_error = decision.error().clone();
+            assert_relay_failure_input(&expected_error, root, expected);
+            assert_eq!(
+                decision.fail_logical(&actor).await.unwrap(),
+                LogicalConclusion::Failed,
             );
-            drop((stream, actor, owner, window, status_sender));
+            // Validation precedes frontier mutation, delivery, and ACK.
+            let delivered_error = match tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+            {
+                Err(error) => error,
+                Ok(_) => {
+                    panic!("malformed replies must deliver their original failure, never a Segment")
+                }
+            };
+            assert_eq!(delivered_error, expected_error, "{label}");
+            assert!(stream.next().await.unwrap().is_none());
+            assert_eq!(port.requests(), vec![(Some(1), 0)], "{label}");
+            assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+            drop((stream, actor, window, status_sender));
+            owner
+                .into_residual_stand_down_supervisor()
+                .join()
+                .await
+                .unwrap();
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         }
     }
 
@@ -2876,6 +3056,7 @@ mod tests {
             .unwrap(),
         )
         .await;
+        let capacity = scope.result_capacity().unwrap();
         // Keep the native root and admitted window valid; only the stream's
         // frozen consumer purpose conflicts with the ClientRows delivery.
         drop(window);
@@ -2894,7 +3075,7 @@ mod tests {
                 permit,
                 root,
                 scope,
-                relay_binding(root, port, &window),
+                relay_binding(root, port.clone(), &window),
                 statuses,
                 terminal_source,
             ),
@@ -2914,7 +3095,30 @@ mod tests {
             consumer.to_string().contains("row carrier"),
             "unexpected consumer error: {consumer}"
         );
-        drop((stream, actor, owner, window, status_sender));
+        use novarocks_execution_contract::failure::FailureProjection;
+        let input = consumer.execution_failure().unwrap();
+        assert_eq!(
+            input.fact(),
+            LogicalExecutionActorError::ResultProtocolViolation.failure_fact(),
+        );
+        assert_eq!(
+            input.site(),
+            crate::execution_error::ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(
+            (input.descriptor().errno, input.descriptor().sqlstate),
+            (1105, "HY000")
+        );
+        assert!(stream.next().await.unwrap().is_none());
+        assert!(!port.requests().is_empty());
+        assert!(port.requests().iter().all(|(_, consumed)| *consumed == 0));
+        drop((stream, actor, window, status_sender));
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[tokio::test]

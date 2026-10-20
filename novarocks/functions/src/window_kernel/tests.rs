@@ -54,7 +54,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
         self.work.lock().unwrap().push(units);
         if (!self.positive_only || units > 0)
-            && let Some(failure) = self.failure
+            && let Some(failure) = self.failure.clone()
         {
             Err(failure)
         } else {
@@ -834,7 +834,7 @@ fn wrong_output_shape_selection_type_null_error_and_capacity_latch_partition() {
             WindowEvaluationPartition::begin(kernel.clone(), input, &runtime).unwrap();
         assert!(matches!(
             partition.evaluate(selection, 2, &runtime),
-            Err(KernelFailure::Internal(_))
+            Err(ref cause) if crate::kernel_control::test_contract::output(cause)
         ));
         assert_eq!(
             partition.evaluate(selection, 2, &runtime).unwrap_err(),
@@ -860,7 +860,7 @@ fn wrong_output_shape_selection_type_null_error_and_capacity_latch_partition() {
             WindowEvaluationPartition::begin(kernel.clone(), input, &runtime).unwrap();
         assert!(matches!(
             partition.evaluate(selection, capacity, &runtime),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         assert_eq!(owner.counts.evaluate.load(Ordering::Relaxed), 0);
         assert_eq!(
@@ -967,6 +967,7 @@ fn retained_growth_and_metadata_drift_cover_success_error_and_finish_exits() {
             for failure in [
                 None,
                 Some(operational()),
+                Some(actual_lifecycle_source()),
                 Some(KernelFailure::Cancelled),
                 Some(KernelFailure::DeadlineExceeded),
                 Some(KernelFailure::ResourceExhausted),
@@ -999,12 +1000,9 @@ fn retained_growth_and_metadata_drift_cover_success_error_and_finish_exits() {
                         .evaluate(Selection::all(5), 5, &runtime)
                         .map(|_| ())
                 };
-                if let Some(
-                    error @ (KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted),
-                ) = failure
-                {
+                if let Some(error) = failure {
+                    // Accepted first-cause migration: actual source identity,
+                    // including an ordinary outer refusal, wins over late drift.
                     assert_eq!(result, Err(error));
                 } else {
                     assert!(matches!(result, Err(KernelFailure::Internal(_))));
@@ -1012,6 +1010,14 @@ fn retained_growth_and_metadata_drift_cover_success_error_and_finish_exits() {
                 assert_eq!(
                     partition.finish(&runtime),
                     Err(KernelFailure::InstanceFailed)
+                );
+                assert_eq!(
+                    owner.counts.evaluate.load(Ordering::Relaxed),
+                    usize::from(!finish)
+                );
+                assert_eq!(
+                    owner.counts.finish.load(Ordering::Relaxed),
+                    usize::from(finish)
                 );
                 drop(partition);
                 assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
@@ -1331,7 +1337,7 @@ fn compile_entry_and_positive_quantum_preserve_typed_controls_before_prepare() {
             );
             let input = owner.input();
             let control = CompileControl {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive_only,
                 ..CompileControl::default()
             };
@@ -1370,4 +1376,21 @@ fn compile_entry_and_positive_quantum_preserve_typed_controls_before_prepare() {
             }
         }
     }
+}
+
+fn actual_lifecycle_source() -> KernelFailure {
+    let source = crate::aggregate_scalar::build_scalar_array(
+        &DataType::Boolean,
+        vec![Some(crate::aggregate_scalar::AggScalarValue::Int64(1))],
+        &mut crate::aggregate_scalar::ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&source);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 315);
+    assert!(matches!(&source, KernelFailure::Source(_)));
+    source
 }

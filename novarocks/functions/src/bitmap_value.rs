@@ -19,6 +19,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
 use roaring::RoaringBitmap;
+#[path = "bitmap_failure.rs"]
+mod failure;
+pub(crate) use failure::TypedBitmapPort;
+use failure::bitmap_wire_count;
+pub use failure::{
+    BitmapDataFailure, BitmapOuterFailure, BitmapOutputTally, BitmapValueFailure,
+    ClassifiedBitmapFailure,
+};
 
 pub const BITMAP_TYPE_EMPTY: u8 = 0;
 pub const BITMAP_TYPE_SINGLE32: u8 = 1;
@@ -42,7 +50,12 @@ pub fn encode_varint_u64(mut value: u64, out: &mut Vec<u8>) {
 
 pub trait BitmapDecodePort {
     type Error: std::fmt::Display;
-    fn data(&mut self, message: std::fmt::Arguments<'_>) -> Self::Error;
+    fn failure(&mut self, source: BitmapValueFailure) -> Self::Error;
+    fn data(&mut self, message: std::fmt::Arguments<'_>) -> Self::Error {
+        self.failure(BitmapValueFailure::InvalidEncoding(
+            novarocks_failure_contract::BoundedDetail::truncating_display(message),
+        ))
+    }
     fn is_data(error: &Self::Error) -> bool;
     fn step(&mut self) -> Result<(), Self::Error>;
     fn boundary(&mut self) -> Result<(), Self::Error>;
@@ -52,51 +65,20 @@ pub trait BitmapDecodePort {
     fn before_roaring(&mut self, payload_bytes: usize) -> Result<(), Self::Error>;
     fn before_u32_collection(&mut self, entries: u64) -> Result<(), Self::Error>;
 }
-pub(crate) struct LegacyBitmapPort;
-impl BitmapDecodePort for LegacyBitmapPort {
-    type Error = String;
-    fn data(&mut self, message: std::fmt::Arguments<'_>) -> String {
-        std::fmt::format(message)
-    }
-    fn is_data(_: &String) -> bool {
-        true
-    }
-    fn step(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-    fn boundary(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-    fn before_render(&mut self, _: usize) -> Result<(), String> {
-        Ok(())
-    }
-    fn before_tree_insert(&mut self, _: usize) -> Result<(), String> {
-        Ok(())
-    }
-    fn before_tree_collection(&mut self, _: usize) -> Result<(), String> {
-        Ok(())
-    }
-    fn before_roaring(&mut self, _: usize) -> Result<(), String> {
-        Ok(())
-    }
-    fn before_u32_collection(&mut self, _: u64) -> Result<(), String> {
-        Ok(())
-    }
+pub fn decode_varint_u64(bytes: &[u8]) -> Result<(u64, usize), BitmapValueFailure> {
+    decode_varint_u64_with_port(bytes, &mut TypedBitmapPort)
 }
-pub fn decode_varint_u64(bytes: &[u8]) -> Result<(u64, usize), String> {
-    decode_varint_u64_with_port(bytes, &mut LegacyBitmapPort)
+pub fn parse_bitmap_string(text: &str) -> Result<BTreeSet<u64>, BitmapValueFailure> {
+    parse_bitmap_string_with_port(text, &mut TypedBitmapPort)
 }
-pub fn parse_bitmap_string(text: &str) -> Result<BTreeSet<u64>, String> {
-    parse_bitmap_string_with_port(text, &mut LegacyBitmapPort)
+pub fn decode_internal_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, BitmapValueFailure> {
+    decode_internal_bitmap_with_port(bytes, &mut TypedBitmapPort)
 }
-pub fn decode_internal_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
-    decode_internal_bitmap_with_port(bytes, &mut LegacyBitmapPort)
+pub fn decode_external_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, BitmapValueFailure> {
+    decode_external_bitmap_with_port(bytes, &mut TypedBitmapPort)
 }
-pub fn decode_external_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
-    decode_external_bitmap_with_port(bytes, &mut LegacyBitmapPort)
-}
-pub fn decode_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
-    decode_bitmap_with_port(bytes, &mut LegacyBitmapPort)
+pub fn decode_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, BitmapValueFailure> {
+    decode_bitmap_with_port(bytes, &mut TypedBitmapPort)
 }
 pub fn decode_varint_u64_with_port<P: BitmapDecodePort>(
     bytes: &[u8],
@@ -186,10 +168,11 @@ pub fn decode_internal_bitmap_with_port<P: BitmapDecodePort>(
                     bytes.len()
                 )));
             }
-            let value =
-                u32::from_le_bytes(bytes[1..5].try_into().map_err(|_| {
-                    port.data(format_args!("bitmap internal decode SINGLE32 failed"))
-                })?);
+            let value = u32::from_le_bytes(
+                bytes[1..5]
+                    .try_into()
+                    .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+            );
             {
                 port.before_tree_insert(0)?;
                 Ok(BTreeSet::from([u64::from(value)]))
@@ -202,10 +185,11 @@ pub fn decode_internal_bitmap_with_port<P: BitmapDecodePort>(
                     bytes.len()
                 )));
             }
-            let value =
-                u64::from_le_bytes(bytes[1..9].try_into().map_err(|_| {
-                    port.data(format_args!("bitmap internal decode SINGLE64 failed"))
-                })?);
+            let value = u64::from_le_bytes(
+                bytes[1..9]
+                    .try_into()
+                    .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+            );
             {
                 port.before_tree_insert(0)?;
                 Ok(BTreeSet::from([value]))
@@ -218,24 +202,16 @@ pub fn decode_internal_bitmap_with_port<P: BitmapDecodePort>(
                     bytes.len()
                 )));
             }
-            let count =
-                u32::from_le_bytes(bytes[1..5].try_into().map_err(|_| {
-                    port.data(format_args!("bitmap internal decode SET count failed"))
-                })?) as usize;
+            let count = u32::from_le_bytes(
+                bytes[1..5]
+                    .try_into()
+                    .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+            ) as usize;
             let mut offset = 5usize;
             let mut values = BTreeSet::new();
             for idx in 0..count {
                 port.step()?;
-                let (value, consumed) = decode_varint_u64_with_port(&bytes[offset..], port)
-                    .map_err(|e| {
-                        if !P::is_data(&e) {
-                            return e;
-                        }
-                        port.data(format_args!(
-                            "bitmap internal decode SET value failed at entry {}: {}",
-                            idx, e
-                        ))
-                    })?;
+                let (value, consumed) = decode_varint_u64_with_port(&bytes[offset..], port)?;
                 if consumed == 0 {
                     return Err(port.data(format_args!(
                         "bitmap internal decode SET consumed zero bytes at entry {}",
@@ -278,18 +254,11 @@ pub fn decode_roaring32_payload_with_port<P: BitmapDecodePort>(
     }
     let mut cursor = Cursor::new(bytes);
     port.before_roaring(bytes.len())?;
-    let bitmap = RoaringBitmap::deserialize_from(&mut cursor).map_err(|e| {
-        port.data(format_args!(
-            "bitmap decode roaring32 payload failed: {}",
-            e
-        ))
-    })?;
+    let bitmap = RoaringBitmap::deserialize_from(&mut cursor)
+        .map_err(|source| port.failure(BitmapValueFailure::DecodeIo(source)))?;
     port.boundary()?;
-    let consumed = usize::try_from(cursor.position()).map_err(|_| {
-        port.data(format_args!(
-            "bitmap decode roaring32 payload length overflow"
-        ))
-    })?;
+    let consumed = usize::try_from(cursor.position())
+        .map_err(|source| port.failure(BitmapValueFailure::Position(source)))?;
     if consumed == 0 || consumed > bytes.len() {
         return Err(port.data(format_args!(
             "bitmap decode roaring32 payload consumed invalid size: consumed={} len={}",
@@ -337,22 +306,13 @@ pub fn decode_external_bitmap64_with_port<P: BitmapDecodePort>(
                 bytes.len()
             )));
         }
-        let high = u32::from_le_bytes(bytes[offset..offset + 4].try_into().map_err(|_| {
-            port.data(format_args!(
-                "bitmap external BITMAP64 decode high bits failed"
-            ))
-        })?);
+        let high = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+        );
         offset += 4;
-        let (values, used) =
-            decode_roaring32_payload_with_port(&bytes[offset..], port).map_err(|e| {
-                if !P::is_data(&e) {
-                    return e;
-                }
-                port.data(format_args!(
-                    "bitmap external BITMAP64 decode roaring payload failed at entry {}: {}",
-                    idx, e
-                ))
-            })?;
+        let (values, used) = decode_roaring32_payload_with_port(&bytes[offset..], port)?;
         offset = offset.saturating_add(used);
         if offset > bytes.len() {
             return Err(port.data(format_args!(
@@ -387,10 +347,11 @@ pub fn decode_external_bitmap_with_port<P: BitmapDecodePort>(
                     bytes.len()
                 )));
             }
-            let value =
-                u32::from_le_bytes(bytes[1..5].try_into().map_err(|_| {
-                    port.data(format_args!("bitmap external decode SINGLE32 failed"))
-                })?);
+            let value = u32::from_le_bytes(
+                bytes[1..5]
+                    .try_into()
+                    .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+            );
             {
                 port.before_tree_insert(0)?;
                 Ok(BTreeSet::from([u64::from(value)]))
@@ -403,10 +364,11 @@ pub fn decode_external_bitmap_with_port<P: BitmapDecodePort>(
                     bytes.len()
                 )));
             }
-            let value =
-                u64::from_le_bytes(bytes[1..9].try_into().map_err(|_| {
-                    port.data(format_args!("bitmap external decode SINGLE64 failed"))
-                })?);
+            let value = u64::from_le_bytes(
+                bytes[1..9]
+                    .try_into()
+                    .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+            );
             {
                 port.before_tree_insert(0)?;
                 Ok(BTreeSet::from([value]))
@@ -419,10 +381,11 @@ pub fn decode_external_bitmap_with_port<P: BitmapDecodePort>(
                     bytes.len()
                 )));
             }
-            let count =
-                u32::from_le_bytes(bytes[1..5].try_into().map_err(|_| {
-                    port.data(format_args!("bitmap external decode SET count failed"))
-                })?) as usize;
+            let count = u32::from_le_bytes(
+                bytes[1..5]
+                    .try_into()
+                    .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+            ) as usize;
             let required = 5usize.saturating_add(count.saturating_mul(8));
             if bytes.len() < required {
                 return Err(port.data(format_args!(
@@ -435,10 +398,11 @@ pub fn decode_external_bitmap_with_port<P: BitmapDecodePort>(
             let mut offset = 5usize;
             for _ in 0..count {
                 port.step()?;
-                let value =
-                    u64::from_le_bytes(bytes[offset..offset + 8].try_into().map_err(|_| {
-                        port.data(format_args!("bitmap external decode SET value failed"))
-                    })?);
+                let value = u64::from_le_bytes(
+                    bytes[offset..offset + 8]
+                        .try_into()
+                        .map_err(|source| port.failure(BitmapValueFailure::Width(source)))?,
+                );
                 offset += 8;
                 port.before_tree_insert(out.len())?;
                 out.insert(value);
@@ -478,7 +442,7 @@ pub fn decode_bitmap_with_port<P: BitmapDecodePort>(
     parse_bitmap_text_with_port(bytes, port)
 }
 
-pub fn encode_internal_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
+pub fn encode_internal_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, BitmapValueFailure> {
     if values.is_empty() {
         return Ok(vec![BITMAP_TYPE_EMPTY]);
     }
@@ -486,7 +450,7 @@ pub fn encode_internal_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String>
         let value = values
             .first()
             .copied()
-            .ok_or_else(|| "bitmap internal encode missing singleton value".to_string())?;
+            .expect("a set of length one has a first element");
         if let Ok(v32) = u32::try_from(value) {
             let mut out = Vec::with_capacity(5);
             out.push(BITMAP_TYPE_SINGLE32);
@@ -499,8 +463,7 @@ pub fn encode_internal_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String>
         return Ok(out);
     }
 
-    let count = u32::try_from(values.len())
-        .map_err(|_| format!("bitmap internal value count overflow: {}", values.len()))?;
+    let count = bitmap_wire_count(values.len())?;
     let mut out = Vec::new();
     out.push(BITMAP_TYPE_SET);
     out.extend_from_slice(&count.to_le_bytes());
@@ -522,21 +485,35 @@ pub trait BitmapAggregateEncodePort: BitmapDecodePort {
     fn before_aggregate_buffer(&mut self, bytes: usize) -> Result<(), Self::Error>;
     fn before_aggregate_singleton(&mut self, value: u64) -> Result<(), Self::Error>;
 }
-impl BitmapAggregateEncodePort for LegacyBitmapPort {
-    fn before_aggregate_buffer(&mut self, _: usize) -> Result<(), String> {
-        Ok(())
+/// Pure encoding geometry, before materializing an ordered copy or payload.
+/// The optional singleton is read only when `entries == 1`.
+pub fn aggregate_bitmap_byte_len(
+    entries: usize,
+    singleton: Option<u64>,
+) -> Result<usize, BitmapValueFailure> {
+    failure::bitmap_wire_count(entries)?;
+    let bytes = match entries {
+        0 => 1,
+        1 => {
+            let singleton = singleton.ok_or(BitmapValueFailure::MissingSingleton)?;
+            if singleton <= u32::MAX as u64 { 5 } else { 9 }
+        }
+        _ => 5 + entries as u128 * 8,
+    };
+    if bytes > isize::MAX as u128 {
+        return Err(BitmapValueFailure::StorageExtent { required: bytes });
     }
-    fn before_aggregate_singleton(&mut self, _: u64) -> Result<(), String> {
-        Ok(())
-    }
+    Ok(bytes as usize)
 }
-pub fn encode_bitmap_aggregate(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
-    encode_bitmap_aggregate_with_port(values, &mut LegacyBitmapPort)
+pub fn encode_bitmap_aggregate(values: &BTreeSet<u64>) -> Result<Vec<u8>, BitmapValueFailure> {
+    encode_bitmap_aggregate_with_port(values, &mut TypedBitmapPort)
 }
 pub fn encode_bitmap_aggregate_with_port<P: BitmapAggregateEncodePort>(
     values: &BTreeSet<u64>,
     port: &mut P,
 ) -> Result<Vec<u8>, P::Error> {
+    let capacity = aggregate_bitmap_byte_len(values.len(), values.first().copied())
+        .map_err(|source| port.failure(source))?;
     if values.is_empty() {
         port.before_aggregate_buffer(1)?;
         return Ok(vec![BITMAP_TYPE_EMPTY]);
@@ -550,13 +527,7 @@ pub fn encode_bitmap_aggregate_with_port<P: BitmapAggregateEncodePort>(
         return Ok(encode_bitmap_single(value));
     }
 
-    let count = u32::try_from(values.len()).map_err(|_| {
-        port.data(format_args!(
-            "bitmap aggregate value count overflow: {}",
-            values.len()
-        ))
-    })?;
-    let capacity = 1 + 4 + values.len() * 8;
+    let count = bitmap_wire_count(values.len()).map_err(|source| port.failure(source))?;
     port.before_aggregate_buffer(capacity)?;
     let mut out = Vec::with_capacity(capacity);
     out.push(BITMAP_TYPE_SET);
@@ -603,7 +574,7 @@ fn should_encode_run_container(values: &[u32]) -> bool {
     runs.len() <= values.len() / 2
 }
 
-fn encode_roaring32_no_run(values: &[u32]) -> Result<Vec<u8>, String> {
+fn encode_roaring32_no_run(values: &[u32]) -> Result<Vec<u8>, BitmapValueFailure> {
     let mut bitmap = RoaringBitmap::new();
     for &value in values {
         bitmap.insert(value);
@@ -611,7 +582,7 @@ fn encode_roaring32_no_run(values: &[u32]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     bitmap
         .serialize_into(&mut out)
-        .map_err(|e| format!("bitmap encode roaring32 payload failed: {}", e))?;
+        .map_err(BitmapValueFailure::EncodeIo)?;
     Ok(out)
 }
 
@@ -637,7 +608,7 @@ fn encode_roaring32_run_single_container(values: &[u32]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn encode_roaring32_payload(values: &[u32]) -> Result<Vec<u8>, String> {
+fn encode_roaring32_payload(values: &[u32]) -> Result<Vec<u8>, BitmapValueFailure> {
     if should_encode_run_container(values)
         && let Some(out) = encode_roaring32_run_single_container(values)
     {
@@ -646,7 +617,7 @@ fn encode_roaring32_payload(values: &[u32]) -> Result<Vec<u8>, String> {
     encode_roaring32_no_run(values)
 }
 
-pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
+pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, BitmapValueFailure> {
     if values.is_empty() {
         return Ok(vec![BITMAP_TYPE_EMPTY]);
     }
@@ -654,7 +625,7 @@ pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String>
         let value = values
             .first()
             .copied()
-            .ok_or_else(|| "bitmap external encode missing singleton value".to_string())?;
+            .ok_or_else(|| BitmapValueFailure::MissingSingleton)?;
         if let Ok(v32) = u32::try_from(value) {
             let mut out = Vec::with_capacity(5);
             out.push(BITMAP_TYPE_SINGLE32);
@@ -667,8 +638,7 @@ pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String>
         return Ok(out);
     }
     if values.len() <= 32 {
-        let count = u32::try_from(values.len())
-            .map_err(|_| format!("bitmap external value count overflow: {}", values.len()))?;
+        let count = bitmap_wire_count(values.len())?;
         let mut out = Vec::with_capacity(1 + 4 + values.len() * 8);
         out.push(BITMAP_TYPE_SET);
         out.extend_from_slice(&count.to_le_bytes());
@@ -688,7 +658,7 @@ pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String>
         let payload = encode_roaring32_payload(
             buckets
                 .get(&0)
-                .ok_or_else(|| "bitmap external encode missing 32-bit bucket".to_string())?,
+                .ok_or_else(|| BitmapValueFailure::MissingBucket)?,
         )?;
         let mut out = Vec::with_capacity(1 + payload.len());
         out.push(BITMAP_TYPE_BITMAP32);
@@ -699,8 +669,7 @@ pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String>
     let mut out = Vec::new();
     out.push(BITMAP_TYPE_BITMAP64);
     encode_varint_u64(
-        u64::try_from(buckets.len())
-            .map_err(|_| "bitmap external map size overflow".to_string())?,
+        u64::try_from(buckets.len()).map_err(BitmapValueFailure::Position)?,
         &mut out,
     );
     for (high, lows) in buckets {

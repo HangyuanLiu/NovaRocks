@@ -62,7 +62,7 @@ fn scalar_invocation_direct_data_keeps_whole_message_domain_and_last_alias_grant
         let pointer = message.as_ptr();
         let capacity = message.capacity();
         assert!(capacity <= 8192);
-        let data = slot.publish_original(message);
+        let data = slot.publish_original(crate::DataFailureReason::InvalidValue, message);
         let alias = data.clone();
         assert_eq!(data.message().as_ptr(), pointer);
         assert!(data.same_backing(&alias));

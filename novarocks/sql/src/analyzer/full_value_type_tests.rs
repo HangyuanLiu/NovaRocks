@@ -249,7 +249,7 @@ struct StopAt {
 impl PureCompileControl for StopAt {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         if self.at_entry || units == 256 {
-            Err(self.error)
+            Err(self.error.clone())
         } else {
             Ok(())
         }
@@ -273,9 +273,15 @@ fn declared_source_validation_preserves_typed_control_at_entry_and_inside_fields
         CompileControlError::ResourceExhausted,
     ] {
         for at_entry in [true, false] {
-            let failure =
-                helpers::column_value_type(&source, &StopAt { error, at_entry }).unwrap_err();
-            assert_eq!(failure.control_error(), Some(error));
+            let failure = helpers::column_value_type(
+                &source,
+                &StopAt {
+                    error: error.clone(),
+                    at_entry,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure.control_error(), Some(error.clone()));
         }
     }
     let validated =
@@ -946,7 +952,10 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
         CompileControlError::ResourceExhausted,
     ] {
         for at_entry in [true, false] {
-            let control = StopAt { error, at_entry };
+            let control = StopAt {
+                error: error.clone(),
+                at_entry,
+            };
             let failure = crate::analysis::resolve_function_binding(
                 catalog,
                 "coalesce",
@@ -970,12 +979,12 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
                 Ok(_) => panic!("stopped argument binding must fail"),
                 Err(failure) => failure,
             };
-            assert_eq!(failure.control_error(), Some(error));
+            assert_eq!(failure.control_error(), Some(error.clone()));
             assert_eq!(
                 failure
                     .at_type_mismatch(novarocks_parser::Span::new(3, 9))
                     .control_error(),
-                Some(error)
+                Some(error.clone())
             );
         }
     }
@@ -1013,23 +1022,23 @@ fn legacy_type_inspection_never_falls_back_after_request_control_failure() {
                 name,
                 &[DataType::Int64],
                 &StopAt {
-                    error,
+                    error: error.clone(),
                     at_entry: true,
                 },
             )
             .unwrap_err();
-            assert_eq!(failure.control_error(), Some(error));
+            assert_eq!(failure.control_error(), Some(error.clone()));
             let failure = super::functions::infer_scalar_return_type_with_catalog(
                 catalog,
                 name,
                 &[DataType::Int64],
                 &StopAt {
-                    error,
+                    error: error.clone(),
                     at_entry: true,
                 },
             )
             .unwrap_err();
-            assert_eq!(failure.control_error(), Some(error));
+            assert_eq!(failure.control_error(), Some(error.clone()));
         }
     }
     assert_eq!(
@@ -1066,7 +1075,7 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
         CompileControlError::ResourceExhausted,
     ] {
         let control = StopAt {
-            error,
+            error: error.clone(),
             at_entry: true,
         };
         let failure = super::resolve_expr::resolve_aggregate_function_call(
@@ -1079,7 +1088,7 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
             &control,
         )
         .unwrap_err();
-        assert_eq!(failure.control_error(), Some(error));
+        assert_eq!(failure.control_error(), Some(error.clone()));
         let failure = super::value_conversion::convert_value_domain_with_catalog(
             catalog,
             source.clone(),

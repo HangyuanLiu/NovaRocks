@@ -179,3 +179,21 @@ impl RootOutputContract {
         self.output.kind()
     }
 }
+
+impl novarocks_failure_contract::FailureProjection for RootContractError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self {
+            Self::UnsupportedProfile => (FailureClass::Data, 1100),
+            Self::InvalidSchema => (FailureClass::Invariant, 1101),
+            Self::UnsupportedRenderType => (FailureClass::Data, 1102),
+            Self::SchemaLimit => (FailureClass::Resource, 1103),
+            Self::InvalidSequence => (FailureClass::Data, 1104),
+            Self::InvalidPayload => (FailureClass::Data, 1105),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}

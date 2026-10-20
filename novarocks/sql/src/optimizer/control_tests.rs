@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, work: u32) -> Result<(), CompileControlError> {
         self.units.lock().unwrap().push(work);
         if work >= self.fail_at
-            && let Some(error) = self.error
+            && let Some(error) = self.error.clone()
         {
             return Err(error);
         }
@@ -73,7 +73,7 @@ fn environment<'a>(
 fn optimizer_control_entry_preserves_all_three_categories() {
     let settings = options::SessionOptimizerSettings::default();
     for error in errors() {
-        let control = Control::fail(error, 0);
+        let control = Control::fail(error.clone(), 0);
         let result = optimize(
             OptExpr::leaf(values()),
             ScalarArena::new(),
@@ -90,7 +90,7 @@ fn optimizer_control_entry_preserves_all_three_categories() {
 fn optimizer_control_observes_actual_wide_statistics_validation() {
     let settings = options::SessionOptimizerSettings::default();
     for error in errors() {
-        let control = Control::fail(error, 256);
+        let control = Control::fail(error.clone(), 256);
         let plan = OptExpr::new(
             Operator::LogicalUnion(crate::optimizer::operator::UnionOp {
                 all: true,
@@ -128,14 +128,14 @@ fn optimizer_control_observes_real_explore_and_implement_work() {
     options.cbo_max_groups = 1024;
     for error in errors() {
         for exploration in [true, false] {
-            let control = Control::fail(error, 256);
+            let control = Control::fail(error.clone(), 256);
             let mut memo = groups(320);
             let result = if exploration {
                 explore(&mut memo, &[], &options, &control)
             } else {
                 implement(&mut memo, &[], &options, &control)
             };
-            assert_eq!(result, Err(SqlCompileError::from(error)));
+            assert_eq!(result, Err(SqlCompileError::from(error.clone())));
             assert_eq!(*control.units.lock().unwrap(), vec![0, 256]);
         }
     }
@@ -145,14 +145,14 @@ fn optimizer_control_flushes_short_work_before_phase_success() {
     let options = options::OptimizerOptions::default_settings();
     for error in errors() {
         for exploration in [true, false] {
-            let control = Control::fail(error, 1);
+            let control = Control::fail(error.clone(), 1);
             let mut memo = groups(1);
             let result = if exploration {
                 explore(&mut memo, &[], &options, &control)
             } else {
                 implement(&mut memo, &[], &options, &control)
             };
-            assert_eq!(result, Err(SqlCompileError::from(error)));
+            assert_eq!(result, Err(SqlCompileError::from(error.clone())));
             assert_eq!(*control.units.lock().unwrap(), vec![0, 4]);
         }
     }
@@ -174,7 +174,7 @@ fn optimizer_control_existing_time_budget_only_shortens_request() {
     );
     assert_eq!(*owner.units.lock().unwrap(), vec![37]);
     for error in errors() {
-        let owner = Control::fail(error, 0);
+        let owner = Control::fail(error.clone(), 0);
         let control = OptimizerControl {
             request: &owner,
             deadline: Instant::now() + Duration::from_secs(30),

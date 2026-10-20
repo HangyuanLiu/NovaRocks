@@ -42,7 +42,10 @@ INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES (3, 3);
 -- and fragment preparation. All participants must observe the resulting
 -- abort; the subsequent health read proves its bindings and cancellation do
 -- not leak into the next request.
--- @expect_error=query timed out after 1000 ms
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.deadline_exceeded
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1317 (70100): [query.execution.deadline_exceeded]
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
 SET query_timeout = 1;
 SELECT COUNT(*)

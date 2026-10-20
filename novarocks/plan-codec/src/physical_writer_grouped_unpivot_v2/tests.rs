@@ -153,7 +153,7 @@ fn assert_prefix<T>(c: &Control, run: impl Fn() -> Result<T, Error>) {
     assert!(!trace.is_empty());
     for stop in 0..trace.len() {
         for cause in CAUSES {
-            c.arm(Some((stop, cause)));
+            c.arm(Some((stop, cause.clone())));
             assert!(matches!(run(), Err(Error::Control(actual)) if actual == cause));
             assert_eq!(c.trace(), trace[..=stop]);
         }
@@ -486,7 +486,7 @@ fn grouped_unpivot_every_small_callback_preserves_three_primary_causes_and_ordin
                     limits(),
                 )
                 .unwrap();
-                c.arm(Some((stop, cause)));
+                c.arm(Some((stop, cause.clone())));
                 assert!(matches!(token.emit(), Err(Error::Control(actual)) if actual == cause));
                 assert_eq!(c.trace(), trace[..=stop]);
             }
@@ -501,7 +501,7 @@ fn grouped_unpivot_every_small_callback_preserves_three_primary_causes_and_ordin
                 c.arm(None);
                 let token =
                     prepare_writer_grouped_unpivot_decode(&raw, read, SOURCE, limits()).unwrap();
-                c.arm(Some((stop, cause)));
+                c.arm(Some((stop, cause.clone())));
                 assert!(matches!(token.emit(), Err(Error::Control(actual)) if actual == cause));
                 assert_eq!(c.trace(), trace[..=stop]);
             }
@@ -534,7 +534,7 @@ fn grouped_unpivot_wide_inner_constants_observe_real_quantum_and_no_retry() {
             let quantum = trace.iter().position(|(_, units)| *units == 256).unwrap();
             for stop in [0, quantum, trace.len() - 1] {
                 for cause in CAUSES {
-                    c.arm(Some((stop, cause)));
+                    c.arm(Some((stop, cause.clone())));
                     let refused = if decode {
                         decode_writer_grouped_unpivot(&raw, read, SOURCE, limits()).map(|_| ())
                     } else {
@@ -890,7 +890,7 @@ fn grouped_parent_exact_source_occurrences_and_every_small_callback() {
             }
             for at in 0..trace.len() {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(matches!(run(limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause));
                     assert_eq!(c.trace(), trace[..=at]);
                 }

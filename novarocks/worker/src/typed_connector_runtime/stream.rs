@@ -43,13 +43,19 @@ use novarocks_execution::connector::{
     ScheduledSplitFacts, SourcePageConverter, SplitPoll, SplitQueue,
 };
 use novarocks_execution::exec::chunk::Chunk;
-use novarocks_execution::exec::node::scan::{ScanChunkStream, ScanOutputStream, ScanStreamSource};
+use novarocks_execution::exec::node::scan::{
+    ScanChunkStream, ScanExitBodyProof, ScanExitObservation, ScanOutputStream, ScanStreamSource,
+};
+use novarocks_execution::runtime::fragment::ExecutionResult;
+use novarocks_execution::runtime::fragment::connector_failure::{
+    ConnectorCallFailure, ConnectorOperation,
+};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPollBudget, ConnectorPreparationStart, ConnectorPreparedPageSource,
-    ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, OwnedConnectorPageStream,
-    PageSourceFileMetrics, SourcePage,
+    ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, ConnectorSourceOperations,
+    OwnedConnectorPageStream, PageSourceFileMetrics, SourcePage,
 };
 
 #[cfg(novarocks_dev_controls)]
@@ -72,6 +78,20 @@ fn create_scan_stream<T>(
     owner.request(std::alloc::Layout::new::<T>())?;
     let stream = create(owner.storage_lifetime());
     Ok(Box::pin(stream))
+}
+
+/// Runtime streams require the exact Task execution source. Planning-only
+/// requests never acquire a runtime reader or construction scope here.
+fn required_source_operations(
+    request: &novarocks_spi::connector::ConnectorRequestContext,
+) -> ExecutionResult<ConnectorSourceOperations> {
+    if request.range_scope().is_none() {
+        return Err(super::TypedScanBindingFailure::MissingExecutionSource.into());
+    }
+    request
+        .source_operations()
+        .cloned()
+        .ok_or_else(|| super::TypedScanBindingFailure::MissingExecutionSource.into())
 }
 
 /// Hands a typed scan's one stream to the driver that runs it.
@@ -122,10 +142,12 @@ impl ScanStreamSource for TypedScanStreamSource {
         >,
     ) -> novarocks_execution::runtime::fragment::ExecutionResult<ScanOutputStream> {
         if self.claimed.swap(true, Ordering::AcqRel) {
-            return Err("typed connector scan stream is already claimed"
-                .to_string()
-                .into());
+            return Err(super::TypedScanBindingFailure::ReclaimedStream.into());
         }
+        let source_operations = required_source_operations(&self.shared.request)?;
+        let source_failures = source_operations
+            .claim_failure_receiver()
+            .map_err(|cause| ConnectorCallFailure::new(ConnectorOperation::SourceExit, cause))?;
         let provider = self.shared.provider.resolve()?;
         let read_schema = self
             .shared
@@ -138,6 +160,9 @@ impl ScanStreamSource for TypedScanStreamSource {
         let stream = create_scan_stream(read_schema, construction.as_ref(), |stream_storage| {
             TypedConnectorScanStream {
                 provider,
+                source_operations,
+                source_failures: Some(source_failures),
+                failure_reporter: None,
                 _construction_storage: stream_storage,
                 construction: Arc::clone(&construction),
                 converter,
@@ -157,6 +182,10 @@ impl ScanStreamSource for TypedScanStreamSource {
 }
 
 struct TypedConnectorScanStream {
+    source_operations: ConnectorSourceOperations,
+    source_failures: Option<novarocks_spi::connector::read_stack::ConnectorSourceFailureReceiver>,
+    failure_reporter:
+        Option<Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>>,
     shared: Arc<TypedConnectorScanShared>,
     provider: Arc<dyn ConnectorReadPageSourceProvider>,
     queue: Arc<SplitQueue<ReceivedReadSplit>>,
@@ -226,7 +255,7 @@ enum ClaimCandidate {
     Unprepared,
     Prepared(Box<dyn ConnectorPreparedPageSource>),
     /// Its error is reported when the split's turn comes.
-    Failed(String),
+    Failed(ConnectorCallFailure),
 }
 
 enum NextSplit {
@@ -264,8 +293,8 @@ impl TypedConnectorScanStream {
         }
     }
 
-    fn open_split(&mut self, split: ReceivedReadSplit) -> Result<(), String> {
-        self.shared.check_liveness("page stream open")?;
+    fn open_split(&mut self, split: ReceivedReadSplit) -> ExecutionResult<()> {
+        self.shared.check_liveness(ConnectorOperation::OpenReader)?;
         let stream = self
             .provider
             .create_page_stream(
@@ -278,16 +307,14 @@ impl TypedConnectorScanStream {
                 &self.budget,
             )
             .map_err(|error| {
-                format!(
-                    "create typed connector page stream for sequence {}: {error}",
-                    split.sequence_id()
-                )
+                ConnectorCallFailure::new(ConnectorOperation::OpenReader, error)
+                    .at_sequence(split.sequence_id())
             })?;
         self.install(&split, stream);
         Ok(())
     }
 
-    fn open_claim(&mut self, claim: PreparedClaim) -> Result<(), String> {
+    fn open_claim(&mut self, claim: PreparedClaim) -> ExecutionResult<()> {
         let PreparedClaim {
             split,
             candidate,
@@ -301,18 +328,16 @@ impl TypedConnectorScanStream {
                 if let Some(id) = control_id {
                     self.flow.retire(id);
                 }
-                Err(error)
+                Err(error.into())
             }
             ClaimCandidate::Prepared(prepared) => {
                 self.shared
-                    .check_liveness("prepared page stream promotion")?;
+                    .check_liveness(ConnectorOperation::PromoteReader)?;
                 let stream = prepared
                     .promote(&self.shared.dynamic_filter, &self.budget)
                     .map_err(|error| {
-                        format!(
-                            "promote typed connector page stream for sequence {}: {error}",
-                            split.sequence_id()
-                        )
+                        ConnectorCallFailure::new(ConnectorOperation::PromoteReader, error)
+                            .at_sequence(split.sequence_id())
                     })?;
                 if let Some(id) = control_id {
                     self.flow.retire(id);
@@ -384,10 +409,10 @@ impl TypedConnectorScanStream {
             };
             if let Err(error) = prepared.advance(remaining) {
                 prepared.control().request_stop();
-                claim.candidate = ClaimCandidate::Failed(format!(
-                    "prepare typed connector page stream for sequence {}: {error}",
-                    claim.split.sequence_id()
-                ));
+                claim.candidate = ClaimCandidate::Failed(
+                    ConnectorCallFailure::new(ConnectorOperation::PrepareReader, error)
+                        .at_sequence(claim.split.sequence_id()),
+                );
             }
         }
         while self
@@ -412,10 +437,10 @@ impl TypedConnectorScanStream {
                 Ok(ConnectorPreparationStart::Prepared(prepared)) => {
                     ClaimCandidate::Prepared(prepared)
                 }
-                Err(error) => ClaimCandidate::Failed(format!(
-                    "prepare typed connector page stream for sequence {}: {error}",
-                    next.sequence_id()
-                )),
+                Err(error) => ClaimCandidate::Failed(
+                    ConnectorCallFailure::new(ConnectorOperation::PrepareReader, error)
+                        .at_sequence(next.sequence_id()),
+                ),
             };
             let control_id = match &candidate {
                 ClaimCandidate::Prepared(prepared) => Some(self.flow.register(prepared.control())),
@@ -461,7 +486,7 @@ impl Stream for TypedConnectorScanStream {
             if this.ended {
                 return Poll::Ready(None);
             }
-            if let Err(error) = this.shared.check_liveness("split driver") {
+            if let Err(error) = this.shared.check_liveness(ConnectorOperation::ReadPage) {
                 return this.fail(error);
             }
             match std::mem::replace(&mut this.step, SplitStep::Idle) {
@@ -478,8 +503,13 @@ impl Stream for TypedConnectorScanStream {
                             this.shared.plan_node_id,
                         );
                         if let Err(error) = result {
-                            return this
-                                .fail(format!("close typed connector page stream: {error}"));
+                            let cause =
+                                ConnectorCallFailure::new(ConnectorOperation::CloseReader, error)
+                                    .into();
+                            this.failure_reporter
+                                .as_ref()
+                                .expect("source observer is bound before reading")
+                                .report_cleanup(&cause);
                         }
                         if let Some(profile) = this.profile.as_ref() {
                             profile.counter_add("TypedConnectorSplitsRead", ProfileUnit::Unit, 1);
@@ -516,7 +546,10 @@ impl Stream for TypedConnectorScanStream {
                         Poll::Ready(Some(Err(error))) => {
                             // Kept open for `close` to observe its exit.
                             this.step = SplitStep::Reading(split);
-                            return this.fail(format!("read typed connector page stream: {error}"));
+                            return this.fail(ConnectorCallFailure::new(
+                                ConnectorOperation::ReadPage,
+                                error,
+                            ));
                         }
                         Poll::Ready(None) => {
                             this.step = SplitStep::Closing(ClosingSplit::of(*split, &this.flow));
@@ -550,8 +583,129 @@ impl Stream for TypedConnectorScanStream {
     }
 }
 
+/// Observe every real exit while reporting each known failure immediately.
+/// Waiting for sibling work never postpones the originating cause.
+async fn observe_scan_close(
+    reader_exit: impl Future<Output = Result<(), ConnectorError>>,
+    source_exit: impl Future<Output = novarocks_spi::connector::read_stack::ConnectorSourceExitProof>,
+    failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+) -> ExecutionResult<()> {
+    let reader = async {
+        if let Err(error) = reader_exit.await {
+            let cause: novarocks_execution::runtime::fragment::ExecutionFailure =
+                ConnectorCallFailure::new(ConnectorOperation::CloseReader, error).into();
+            failures.report_cleanup(&cause);
+        }
+    };
+    let source = async {
+        let _proof = source_exit.await;
+        // The independent observer owns Required events and the actual proof.
+        // This future proves only its own reader/close body completed.
+    };
+    futures::future::join(reader, source).await;
+    Ok(())
+}
+
+async fn observe_source_exit(
+    mut events: novarocks_spi::connector::read_stack::ConnectorSourceFailureReceiver,
+    source: impl Future<Output = novarocks_spi::connector::read_stack::ConnectorSourceExitProof>,
+    drained: impl Future<Output = novarocks_spi::connector::read_stack::ConnectorPreparationExit>,
+    failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+) -> novarocks_execution::exec::node::scan::ScanExitProof {
+    use novarocks_spi::connector::read_stack::{
+        ConnectorSourceExitProof, ConnectorSourceFailureEvent,
+    };
+    futures::pin_mut!(source, drained);
+    let mut proof = None;
+    let mut flow_proof = None;
+    let mut events_ended = false;
+    futures::future::poll_fn(move |cx| {
+        if !events_ended {
+            loop {
+                match events.poll_event(cx) {
+                    Poll::Ready(Some(ConnectorSourceFailureEvent::Required(error))) => {
+                        failures.report_failure(
+                            ConnectorCallFailure::new(ConnectorOperation::SourceExit, error).into(),
+                        );
+                    }
+                    Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(error))) => {
+                        let cause: novarocks_execution::runtime::fragment::ExecutionFailure =
+                            ConnectorCallFailure::new(ConnectorOperation::SourceExit, error).into();
+                        failures.report_cleanup(&cause);
+                        failures.report_unresolved_exit(&cause);
+                    }
+                    Poll::Ready(None) => {
+                        events_ended = true;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+        }
+        if proof.is_none()
+            && let Poll::Ready(observed) = source.as_mut().poll(cx)
+        {
+            proof = Some(observed);
+        }
+        if flow_proof.is_none()
+            && let Poll::Ready(observed) = drained.as_mut().poll(cx)
+        {
+            flow_proof = Some(observed);
+        }
+        if events_ended
+            && let Some(flow_proof) = &flow_proof
+            && let Some(proof) = proof
+        {
+            if matches!(
+                flow_proof,
+                novarocks_spi::connector::read_stack::ConnectorPreparationExit::Unresolved(_)
+            ) {
+                return Poll::Ready(
+                    novarocks_execution::exec::node::scan::ScanExitProof::Unresolved,
+                );
+            }
+            return Poll::Ready(match proof {
+                ConnectorSourceExitProof::Exited => {
+                    novarocks_execution::exec::node::scan::ScanExitProof::Exited
+                }
+                ConnectorSourceExitProof::Unresolved => {
+                    novarocks_execution::exec::node::scan::ScanExitProof::Unresolved
+                }
+            });
+        }
+        // An unresolved stop never skips later events or another live scope.
+        Poll::Pending
+    })
+    .await
+}
+
 impl ScanChunkStream for TypedConnectorScanStream {
-    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>> {
+    fn take_exit_observation(
+        self: Pin<&mut Self>,
+        failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+    ) -> ExecutionResult<ScanExitObservation> {
+        let this = self.get_mut();
+        let events = this.source_failures.take().ok_or_else(|| {
+            ConnectorCallFailure::new(ConnectorOperation::SourceExit,
+                ConnectorError::from_domain(novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    novarocks_spi::connector::read_stack::ConnectorSourceFailure::ReceiverAlreadyClaimed))
+        })?;
+        this.failure_reporter = Some(failures.clone());
+        let source = this.source_operations.exited();
+        let runtime = this.shared.stream_host.runtime().clone();
+        let drained = this.flow.observe_exit();
+        Ok(ScanExitObservation {
+            body_proof: ScanExitBodyProof::CloseBodyRequired,
+            actual_exit: Box::pin(InScanRuntime {
+                runtime,
+                inner: Box::pin(observe_source_exit(events, source, drained, failures)),
+            }),
+        })
+    }
+    fn close(
+        self: Pin<Box<Self>>,
+        failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+    ) -> BoxFuture<'static, novarocks_execution::runtime::fragment::ExecutionResult<()>> {
         let this = *Pin::into_inner(self);
         let runtime = this.shared.stream_host.runtime().clone();
         let _context = runtime.enter();
@@ -565,8 +719,9 @@ impl ScanChunkStream for TypedConnectorScanStream {
         };
         // Stopped with the flow, which observes their exit.
         drop(this.claims);
-        let task_exit = seal_task_source(&this.shared.request);
-        let drained = this.flow.drained();
+        this.source_operations.seal();
+        let task_exit = this.source_operations.exited();
+        let drained = this.flow.observe_exit();
         #[cfg(novarocks_dev_controls)]
         let markers = (
             this.shared.test_observation.clone(),
@@ -574,29 +729,27 @@ impl ScanChunkStream for TypedConnectorScanStream {
         );
         Box::pin(InScanRuntime {
             runtime,
-            inner: Box::pin(async move {
-                let mut first_error = None;
-                if let Some(split) = split {
-                    let result = split.exit.await;
-                    #[cfg(novarocks_dev_controls)]
-                    emit_split_close_markers(
-                        split.reader_marker.as_ref(),
-                        markers.0.as_deref(),
-                        markers.1,
-                    );
-                    if let Err(error) = result {
-                        first_error
-                            .get_or_insert(format!("close typed connector page stream: {error}"));
+            inner: Box::pin(observe_scan_close(
+                async move {
+                    if let Some(split) = split {
+                        let result = split.exit.await;
+                        #[cfg(novarocks_dev_controls)]
+                        emit_split_close_markers(
+                            split.reader_marker.as_ref(),
+                            markers.0.as_deref(),
+                            markers.1,
+                        );
+                        result
+                    } else {
+                        Ok(())
                     }
-                }
-                drained.await;
-                if let Some(exit) = task_exit
-                    && let Err(error) = exit.await
-                {
-                    first_error.get_or_insert(format!("typed connector scan source exit: {error}"));
-                }
-                first_error.map_or(Ok(()), Err)
-            }),
+                },
+                async move {
+                    drained.await;
+                    task_exit.await
+                },
+                failures,
+            )),
         })
     }
 }
@@ -619,26 +772,15 @@ fn emit_split_close_markers(
     );
 }
 
-/// Seals the scan's task source, so none of its operations starts after
-/// this, and returns the observation of their exit.
-fn seal_task_source(
-    request: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Option<novarocks_spi::connector::read_stack::ConnectorSourceExit> {
-    request.source_operations().map(|operations| {
-        operations.seal();
-        operations.exited()
-    })
-}
-
 /// Polls `inner` inside the scan I/O runtime's context, where page streams
 /// may use its timers and spawn onto it.
-struct InScanRuntime {
+struct InScanRuntime<T> {
     runtime: tokio::runtime::Handle,
-    inner: BoxFuture<'static, Result<(), String>>,
+    inner: BoxFuture<'static, T>,
 }
 
-impl Future for InScanRuntime {
-    type Output = Result<(), String>;
+impl<T> Future for InScanRuntime<T> {
+    type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let _context = self.runtime.enter();
@@ -675,10 +817,12 @@ impl ScanStreamSource for TypedSystemTableStreamSource {
         >,
     ) -> novarocks_execution::runtime::fragment::ExecutionResult<ScanOutputStream> {
         if self.claimed.swap(true, Ordering::AcqRel) {
-            return Err("typed system relation scan stream is already claimed"
-                .to_string()
-                .into());
+            return Err(super::TypedScanBindingFailure::ReclaimedStream.into());
         }
+        let source_operations = required_source_operations(&self.shared.request)?;
+        let source_failures = source_operations
+            .claim_failure_receiver()
+            .map_err(|cause| ConnectorCallFailure::new(ConnectorOperation::SourceExit, cause))?;
         let provider = self.shared.provider.resolve()?;
         let read_schema = self
             .shared
@@ -691,6 +835,9 @@ impl ScanStreamSource for TypedSystemTableStreamSource {
         let stream = create_scan_stream(read_schema, construction.as_ref(), |stream_storage| {
             TypedSystemTableStream {
                 provider,
+                source_operations,
+                source_failures: Some(source_failures),
+                failure_reporter: None,
                 _construction_storage: stream_storage,
                 construction: Arc::clone(&construction),
                 converter,
@@ -706,6 +853,10 @@ impl ScanStreamSource for TypedSystemTableStreamSource {
 }
 
 struct TypedSystemTableStream {
+    source_operations: ConnectorSourceOperations,
+    source_failures: Option<novarocks_spi::connector::read_stack::ConnectorSourceFailureReceiver>,
+    failure_reporter:
+        Option<Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>>,
     shared: Arc<TypedSystemTableScanShared>,
     provider: Arc<dyn ConnectorReadSystemTableProvider>,
     budget: ConnectorPollBudget,
@@ -731,8 +882,8 @@ enum SystemStep {
 }
 
 impl TypedSystemTableStream {
-    fn open(&mut self) -> Result<OwnedConnectorPageStream, String> {
-        self.shared.check_liveness("open")?;
+    fn open(&mut self) -> ExecutionResult<OwnedConnectorPageStream> {
+        self.shared.check_liveness(ConnectorOperation::OpenReader)?;
         let stream = self
             .provider
             .create_system_page_stream(
@@ -741,7 +892,7 @@ impl TypedSystemTableStream {
                 self.shared.descriptor.assignments(),
                 &self.budget,
             )
-            .map_err(|error| format!("create typed system relation page stream: {error}"))?;
+            .map_err(|error| ConnectorCallFailure::new(ConnectorOperation::OpenReader, error))?;
         // No sequence: a system relation read has no split, and printing one
         // would be the first step toward asserting scheduling identity it does
         // not have.
@@ -803,7 +954,7 @@ impl Stream for TypedSystemTableStream {
                     mut stream,
                     mut file_metrics,
                 } => {
-                    if let Err(error) = this.shared.check_liveness("read") {
+                    if let Err(error) = this.shared.check_liveness(ConnectorOperation::ReadPage) {
                         this.step = SystemStep::Reading {
                             stream,
                             file_metrics,
@@ -829,9 +980,9 @@ impl Stream for TypedSystemTableStream {
                                     Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
                                     Err(error) => this.fail(error),
                                 },
-                                Poll::Ready(Some(Err(error))) => this.fail(format!(
-                                    "read typed system relation page stream: {error}"
-                                )),
+                                Poll::Ready(Some(Err(error))) => this.fail(
+                                    ConnectorCallFailure::new(ConnectorOperation::ReadPage, error),
+                                ),
                                 Poll::Ready(None) => unreachable!("handled above"),
                             };
                         }
@@ -850,11 +1001,16 @@ impl Stream for TypedSystemTableStream {
                             this.shared.plan_node_id,
                             None,
                         );
-                        return match result {
-                            Ok(()) => Poll::Ready(None),
-                            Err(error) => this
-                                .fail(format!("close typed system relation page stream: {error}")),
-                        };
+                        if let Err(error) = result {
+                            let cause =
+                                ConnectorCallFailure::new(ConnectorOperation::CloseReader, error)
+                                    .into();
+                            this.failure_reporter
+                                .as_ref()
+                                .expect("source observer is bound before reading")
+                                .report_cleanup(&cause);
+                        }
+                        return Poll::Ready(None);
                     }
                 },
             }
@@ -863,7 +1019,34 @@ impl Stream for TypedSystemTableStream {
 }
 
 impl ScanChunkStream for TypedSystemTableStream {
-    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>> {
+    fn take_exit_observation(
+        self: Pin<&mut Self>,
+        failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+    ) -> ExecutionResult<ScanExitObservation> {
+        let this = self.get_mut();
+        let events = this.source_failures.take().ok_or_else(|| {
+            ConnectorCallFailure::new(ConnectorOperation::SourceExit,
+                ConnectorError::from_domain(novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    novarocks_spi::connector::read_stack::ConnectorSourceFailure::ReceiverAlreadyClaimed))
+        })?;
+        this.failure_reporter = Some(failures.clone());
+        let source = this.source_operations.exited();
+        let runtime = this.shared.stream_runtime.clone();
+        let drained = futures::future::ready(
+            novarocks_spi::connector::read_stack::ConnectorPreparationExit::Exited,
+        );
+        Ok(ScanExitObservation {
+            body_proof: ScanExitBodyProof::CloseBodyRequired,
+            actual_exit: Box::pin(InScanRuntime {
+                runtime,
+                inner: Box::pin(observe_source_exit(events, source, drained, failures)),
+            }),
+        })
+    }
+    fn close(
+        self: Pin<Box<Self>>,
+        failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+    ) -> BoxFuture<'static, novarocks_execution::runtime::fragment::ExecutionResult<()>> {
         let this = *Pin::into_inner(self);
         let runtime = this.shared.stream_runtime.clone();
         let _context = runtime.enter();
@@ -872,7 +1055,8 @@ impl ScanChunkStream for TypedSystemTableStream {
             SystemStep::Closing(exit) => Some(exit),
             SystemStep::Unopened | SystemStep::Ended => None,
         };
-        let task_exit = seal_task_source(&this.shared.request);
+        this.source_operations.seal();
+        let task_exit = this.source_operations.exited();
         #[cfg(novarocks_dev_controls)]
         let markers = (
             this.shared.test_observation.clone(),
@@ -880,31 +1064,25 @@ impl ScanChunkStream for TypedSystemTableStream {
         );
         Box::pin(InScanRuntime {
             runtime,
-            inner: Box::pin(async move {
-                let mut first_error = None;
-                if let Some(exit) = exit {
-                    let result = exit.await;
-                    #[cfg(novarocks_dev_controls)]
-                    emit_page_source_marker(
-                        markers.0.as_deref(),
-                        "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
-                        markers.1,
-                        None,
-                    );
-                    if let Err(error) = result {
-                        first_error.get_or_insert(format!(
-                            "close typed system relation page stream: {error}"
-                        ));
+            inner: Box::pin(observe_scan_close(
+                async move {
+                    if let Some(exit) = exit {
+                        let result = exit.await;
+                        #[cfg(novarocks_dev_controls)]
+                        emit_page_source_marker(
+                            markers.0.as_deref(),
+                            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
+                            markers.1,
+                            None,
+                        );
+                        result
+                    } else {
+                        Ok(())
                     }
-                }
-                if let Some(exit) = task_exit
-                    && let Err(error) = exit.await
-                {
-                    first_error
-                        .get_or_insert(format!("typed system relation scan source exit: {error}"));
-                }
-                first_error.map_or(Ok(()), Err)
-            }),
+                },
+                async move { task_exit.await },
+                failures,
+            )),
         })
     }
 }
@@ -919,6 +1097,244 @@ mod stream_construction_tests {
     use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
     use novarocks_execution::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
     use novarocks_type_contract::ValueTypeStorageLifetime;
+
+    #[test]
+    fn close_failure_is_reported_while_sibling_exit_is_still_pending() {
+        use novarocks_execution::runtime::fragment::ExecutionFailureReporter;
+        use novarocks_spi::connector::{
+            ConnectorErrorKind,
+            read_stack::{ConnectorOperationExit, ConnectorSourceExitProof},
+        };
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Reports {
+            required: Mutex<Vec<ExecutionFailure>>,
+            cleanup: Mutex<Vec<ExecutionFailure>>,
+            health: Mutex<Vec<ExecutionFailure>>,
+        }
+        impl ExecutionFailureReporter for Reports {
+            fn report_failure(&self, cause: ExecutionFailure) {
+                self.required.lock().unwrap().push(cause);
+            }
+            fn report_cleanup(&self, cause: &ExecutionFailure) {
+                self.cleanup.lock().unwrap().push(cause.clone());
+            }
+            fn report_unresolved_exit(&self, cause: &ExecutionFailure) {
+                self.health.lock().unwrap().push(cause.clone());
+            }
+        }
+        for reader_first in [true, false] {
+            let reports = Arc::new(Reports::default());
+            let operations = ConnectorSourceOperations::new();
+            let receiver = operations.claim_failure_receiver().unwrap();
+            let mut work = Some(operations.admit(Arc::new(|| {})).unwrap());
+            let sibling = operations.admit(Arc::new(|| {})).unwrap();
+            let reader_error = ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "actual reader cleanup failed",
+            );
+            let work_error = ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "actual source operation failed",
+            );
+            let expected_reader: ExecutionFailure =
+                ConnectorCallFailure::new(ConnectorOperation::CloseReader, reader_error.clone())
+                    .into();
+            let expected_work: ExecutionFailure =
+                ConnectorCallFailure::new(ConnectorOperation::SourceExit, work_error.clone())
+                    .into();
+            let (send, wait) = futures::channel::oneshot::channel::<ConnectorError>();
+            let reader: BoxFuture<'static, Result<(), ConnectorError>> = if reader_first {
+                Box::pin(futures::future::ready(Err(reader_error.clone())))
+            } else {
+                Box::pin(async move { Err(wait.await.unwrap()) })
+            };
+            if !reader_first {
+                work.take()
+                    .unwrap()
+                    .end(ConnectorOperationExit::WorkFailed(work_error.clone()));
+            }
+            operations.seal();
+            let mut observe = Box::pin(observe_source_exit(
+                receiver,
+                operations.exited(),
+                futures::future::ready(
+                    novarocks_spi::connector::read_stack::ConnectorPreparationExit::Exited,
+                ),
+                reports.clone(),
+            ));
+            let mut close = Box::pin(observe_scan_close(
+                reader,
+                operations.exited(),
+                reports.clone(),
+            ));
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(observe.as_mut().poll(&mut cx).is_pending());
+            assert!(close.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(
+                reports.required.lock().unwrap().len(),
+                usize::from(!reader_first)
+            );
+            assert_eq!(
+                reports.cleanup.lock().unwrap().len(),
+                usize::from(reader_first)
+            );
+            if reader_first {
+                work.take()
+                    .unwrap()
+                    .end(ConnectorOperationExit::WorkFailed(work_error));
+            } else {
+                send.send(reader_error).unwrap();
+            }
+            assert!(observe.as_mut().poll(&mut cx).is_pending());
+            assert!(close.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(*reports.required.lock().unwrap(), vec![expected_work]);
+            assert_eq!(*reports.cleanup.lock().unwrap(), vec![expected_reader]);
+            assert!(reports.health.lock().unwrap().is_empty());
+            assert!(!operations.is_exited());
+            drop(sibling);
+            assert_eq!(
+                futures::executor::block_on(operations.exited()),
+                ConnectorSourceExitProof::Exited
+            );
+            assert_eq!(
+                observe.as_mut().poll(&mut cx),
+                Poll::Ready(novarocks_execution::exec::node::scan::ScanExitProof::Exited)
+            );
+            assert_eq!(close.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            assert_eq!(reports.required.lock().unwrap().len(), 1);
+            assert_eq!(reports.cleanup.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn preparation_unknown_reports_cleanup_and_health_before_later_required_and_real_sibling_exit()
+    {
+        use novarocks_execution::runtime::fragment::ExecutionFailureReporter;
+        use novarocks_spi::connector::{
+            ConnectorErrorKind,
+            read_stack::{ConnectorOperationExit, ConnectorPreparationExit},
+        };
+        #[derive(Default)]
+        struct Reports {
+            required: std::sync::Mutex<Vec<ExecutionFailure>>,
+            cleanup: std::sync::Mutex<Vec<ExecutionFailure>>,
+            health: std::sync::Mutex<Vec<ExecutionFailure>>,
+        }
+        impl ExecutionFailureReporter for Reports {
+            fn report_failure(&self, cause: ExecutionFailure) {
+                self.required.lock().unwrap().push(cause);
+            }
+            fn report_cleanup(&self, cause: &ExecutionFailure) {
+                self.cleanup.lock().unwrap().push(cause.clone());
+            }
+            fn report_unresolved_exit(&self, cause: &ExecutionFailure) {
+                self.health.lock().unwrap().push(cause.clone());
+            }
+        }
+        let reports = Arc::new(Reports::default());
+        let operations = ConnectorSourceOperations::new();
+        let events = operations.claim_failure_receiver().unwrap();
+        let unknown = operations.admit(Arc::new(|| {})).unwrap();
+        let work = operations.admit(Arc::new(|| {})).unwrap();
+        let healthy = operations.admit(Arc::new(|| {})).unwrap();
+        let cleanup = ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "original preparation owner could not prove physical exit",
+        );
+        let original = ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "later accepted source operation failed",
+        );
+        let expected_cleanup: ExecutionFailure =
+            ConnectorCallFailure::new(ConnectorOperation::SourceExit, cleanup.clone()).into();
+        let expected_work: ExecutionFailure =
+            ConnectorCallFailure::new(ConnectorOperation::SourceExit, original.clone()).into();
+        let (release_flow, flow) = futures::channel::oneshot::channel();
+        let mut observer = Box::pin(observe_source_exit(
+            events,
+            operations.exited(),
+            async move { flow.await.unwrap() },
+            reports.clone(),
+        ));
+        unknown.end(ConnectorOperationExit::CleanupUnresolved(cleanup.clone()));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(observer.as_mut().poll(&mut cx).is_pending());
+        assert!(reports.required.lock().unwrap().is_empty());
+        assert_eq!(
+            *reports.cleanup.lock().unwrap(),
+            vec![expected_cleanup.clone()]
+        );
+        assert_eq!(*reports.health.lock().unwrap(), vec![expected_cleanup]);
+        work.report_work_failure(original);
+        assert!(observer.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(*reports.required.lock().unwrap(), vec![expected_work]);
+        work.end(ConnectorOperationExit::Exited);
+        operations.seal();
+        release_flow
+            .send(ConnectorPreparationExit::Unresolved(cleanup))
+            .unwrap();
+        assert!(
+            observer.as_mut().poll(&mut cx).is_pending(),
+            "early unknown never drops the remaining work receiver"
+        );
+        assert_eq!(operations.live_operations(), 1);
+        healthy.end(ConnectorOperationExit::Exited);
+        assert_eq!(
+            observer.as_mut().poll(&mut cx),
+            Poll::Ready(novarocks_execution::exec::node::scan::ScanExitProof::Unresolved)
+        );
+        assert_eq!(reports.required.lock().unwrap().len(), 1);
+        assert_eq!(reports.cleanup.lock().unwrap().len(), 1);
+        assert_eq!(reports.health.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runtime_stream_requires_the_actual_task_source_before_construction() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+        let request = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ConnectorStopOwner::new().view(),
+            1 << 20,
+            1 << 22,
+        )
+        .unwrap();
+        let failure = match required_source_operations(&request) {
+            Err(failure) => failure,
+            Ok(_) => panic!("planning-only context must not authorize a runtime stream"),
+        };
+        let expected = super::super::TypedScanBindingFailure::MissingExecutionSource;
+        assert_eq!(
+            failure.failure_fact(),
+            novarocks_execution_contract::failure::FailureFact::new(
+                FailureClass::Invariant,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    novarocks_execution_contract::failure::domain::WORKER,
+                    std::num::NonZeroU16::new(14).unwrap(),
+                ),
+            )
+        );
+        assert_eq!(failure.failure_fact(), expected.failure_fact());
+        assert_eq!(failure.to_string(), expected.to_string());
+        assert!(
+            matches!(failure.cause(), ExecutionFailureCause::Domain(source)
+            if source.downcast_ref::<super::super::TypedScanBindingFailure>().is_some())
+        );
+        let operations = ConnectorSourceOperations::new();
+        let request = request.with_execution_source(
+            novarocks_spi::connector::ConnectorRangeScope::try_new(1, 2, 1, 3, 4, 7).unwrap(),
+            operations.clone(),
+        );
+        let same = required_source_operations(&request).unwrap();
+        let ticket = same.admit(Arc::new(|| {})).unwrap();
+        assert_eq!(operations.live_operations(), 1);
+        operations.seal();
+        assert!(!same.is_exited());
+        ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+        assert!(same.is_exited());
+    }
 
     struct StreamStorage {
         _storage: ValueTypeStorageLifetime,
@@ -996,7 +1412,7 @@ mod stream_construction_tests {
             "no constructor tail after the original tracker refusal"
         );
         assert_eq!(tracker.current(), initial);
-        let original = ExecutionFailure::from("original claim stop".to_owned());
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Cancelled);
         error.set_error(original.clone());
         let refusal = create_scan_stream(&schema, factory.as_ref(), |storage| {
             entered.set(true);

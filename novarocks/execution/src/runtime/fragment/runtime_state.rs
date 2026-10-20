@@ -35,6 +35,7 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) execution_runtime: Option<Arc<ExecutionRuntime>>,
     pub(crate) query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     pub(crate) task_identity: Option<novarocks_execution_contract::TaskIdentity>,
+    pub(crate) task_control: Option<Arc<crate::runtime::task_control::TaskExecutionControl>>,
     #[cfg(novarocks_dev_controls)]
     pub(crate) exchange_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
 }
@@ -58,25 +59,39 @@ pub(crate) fn apply_query_option_overrides(
     query_options
 }
 
-pub(crate) fn build_runtime_state(inputs: RuntimeStateInputs) -> Result<Arc<RuntimeState>, String> {
+pub(crate) fn build_runtime_state(
+    inputs: RuntimeStateInputs,
+) -> super::ExecutionResult<Arc<RuntimeState>> {
     if let Some(memory) = inputs.query_memory.as_ref() {
         use crate::runtime::query_memory::QueryMemoryBindingError;
         if inputs.query_id != Some(memory.execution().query_id()) {
-            return Err(QueryMemoryBindingError::QueryIdentityMismatch.to_string());
+            return Err(QueryMemoryBindingError::QueryIdentityMismatch.into());
         }
         let identity = inputs
             .task_identity
-            .ok_or(QueryMemoryBindingError::MissingTaskIdentity)
-            .map_err(|error| error.to_string())?;
+            .ok_or(QueryMemoryBindingError::MissingTaskIdentity)?;
         let runtime = inputs
             .execution_runtime
             .as_ref()
-            .ok_or(QueryMemoryBindingError::MissingExecutionRuntime)
-            .map_err(|error| error.to_string())?;
-        memory
-            .validate_task(identity, runtime.memory_authority())
-            .map_err(|error| error.to_string())?;
+            .ok_or(QueryMemoryBindingError::MissingExecutionRuntime)?;
+        memory.validate_task(identity, runtime.memory_authority())?;
     }
+    let error_state = match (inputs.task_identity, inputs.task_control) {
+        (Some(identity), Some(control)) if identity == control.identity() => {
+            crate::runtime::runtime_state::RuntimeErrorState::for_task(control)
+        }
+        (None, None) => crate::runtime::runtime_state::RuntimeErrorState::default(),
+        (Some(_), None) => {
+            return Err(super::ExecutionFailure::from_domain(
+                crate::runtime::task_control::MissingTaskExecutionControl,
+            ));
+        }
+        _ => {
+            return Err(super::ExecutionFailure::from_domain(
+                crate::runtime::task_control::TaskControlIdentityMismatch,
+            ));
+        }
+    };
     let cache_options = crate::runtime::cache::ExecutionCacheOptions::from_query_options(
         inputs.query_options.as_ref(),
     )?;
@@ -88,6 +103,7 @@ pub(crate) fn build_runtime_state(inputs: RuntimeStateInputs) -> Result<Arc<Runt
         inputs.backend_num,
         inputs.mem_tracker,
         inputs.execution_runtime,
+        Arc::new(error_state),
     )
     .with_runtime_filter_session(inputs.runtime_filter_session)
     .with_query_memory(inputs.query_memory);

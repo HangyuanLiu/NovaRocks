@@ -72,11 +72,14 @@ impl CompiledWriterBindings {
         &mut self,
         node: ProgramNodeId,
         binding: TableWriterRuntimeBinding,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if self.writers.insert(node, binding).is_some() {
-            return Err(format!(
-                "compiled table writer at local node {} is bound twice",
-                node.index()
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled table writer at local node {} is bound twice",
+                    node.index()
+                ),
             ));
         }
         Ok(())
@@ -88,11 +91,14 @@ impl CompiledWriterBindings {
         &mut self,
         node: ProgramNodeId,
         binding: TableFinishRuntimeBinding,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if self.finishers.insert(node, binding).is_some() {
-            return Err(format!(
-                "compiled table finish at local node {} is bound twice",
-                node.index()
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled table finish at local node {} is bound twice",
+                    node.index()
+                ),
             ));
         }
         Ok(())
@@ -114,7 +120,10 @@ impl CompiledWriterBindings {
     /// capability per TableWriter, which is exactly a node with a provider
     /// recipe, bound for the recipe's own write binding; one validation
     /// authority per TableFinish; nothing else.
-    pub fn validate(&self, program: &LocalProgram) -> Result<(), String> {
+    pub fn validate(
+        &self,
+        program: &LocalProgram,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let mut writers = BTreeSet::new();
         let mut finishers = BTreeSet::new();
         for (index, node) in program.graph().nodes().iter().enumerate() {
@@ -129,28 +138,32 @@ impl CompiledWriterBindings {
             }
         }
         if writers != program.write_recipes().keys().copied().collect() {
-            return Err(
-                "compiled write recipes do not address exactly the program's table writers"
-                    .to_string(),
-            );
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                "compiled write recipes do not address exactly the program's table writers",
+            ));
         }
         if writers != self.writers.keys().copied().collect() {
-            return Err(
-                "Task write bindings do not cover exactly the program's table writers".to_string(),
-            );
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                "Task write bindings do not cover exactly the program's table writers",
+            ));
         }
         if finishers != self.finishers.keys().copied().collect() {
-            return Err(
-                "Task finish bindings do not cover exactly the program's table finishes"
-                    .to_string(),
-            );
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                "Task finish bindings do not cover exactly the program's table finishes",
+            ));
         }
         for (node, binding) in &self.writers {
             let recipe = &program.write_recipes()[node];
             if binding.handle().binding() != recipe.draft().binding() {
-                return Err(format!(
-                    "Task write binding of local node {} is not its recipe's write binding",
-                    node.index()
+                return Err(crate::exec::fragment::error::program_binding_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!(
+                        "Task write binding of local node {} is not its recipe's write binding",
+                        node.index()
+                    ),
                 ));
             }
         }
@@ -189,7 +202,7 @@ impl CompiledFragmentSubmission {
         program: Arc<LocalProgram>,
         scans: CompiledScanSources,
         instance: FragmentInstanceSpec,
-    ) -> Result<Self, FragmentBindingError> {
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
         Self::try_new_with_writers(program, scans, CompiledWriterBindings::default(), instance)
     }
 
@@ -201,7 +214,7 @@ impl CompiledFragmentSubmission {
         scans: CompiledScanSources,
         writers: CompiledWriterBindings,
         instance: FragmentInstanceSpec,
-    ) -> Result<Self, FragmentBindingError> {
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
         let expected_dop = program.graph().profile().pipeline_dop();
         if expected_dop != instance.pipeline_dop() {
             return Err(FragmentBindingError::new(
@@ -212,18 +225,13 @@ impl CompiledFragmentSubmission {
                     expected_dop.get(),
                     instance.pipeline_dop().get()
                 ),
-            ));
+            )
+            .into());
         }
         // A scan without its Task source, or a source or assignment without
         // its scan, is refused before anything is registered.
         validate_compiled_scan_sources(&program, &scans, &instance)?;
-        writers.validate(&program).map_err(|detail| {
-            FragmentBindingError::new(
-                FragmentBindingTarget::Program,
-                FragmentBindingErrorKind::InvalidAssignment,
-                detail,
-            )
-        })?;
+        writers.validate(&program)?;
         let sink_kind = compiled_sink_kind(program.graph().sink())?;
         Ok(Self {
             program,
@@ -301,13 +309,18 @@ fn prepare_compiled_fragment_in(
     let query_id = instance.query_id();
     let finst_id = instance.fragment_instance_id().get();
     let pipeline_dop = i32::try_from(instance.pipeline_dop().get()).map_err(|_| {
-        FragmentLaunchError::new(
+        FragmentLaunchError::from_failure(
             FragmentLaunchStage::BuildPipelines,
             FragmentLaunchErrorKind::PipelineBuild,
-            format!(
-                "pipeline DOP {} exceeds runtime representation",
-                instance.pipeline_dop()
-            ),
+            FragmentBindingError::new(
+                FragmentBindingTarget::Instance,
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "pipeline DOP {} exceeds runtime representation",
+                    instance.pipeline_dop()
+                ),
+            )
+            .into(),
         )
     })?;
     // The root sink width is a compiled profile fact; a host override that
@@ -318,13 +331,14 @@ fn prepare_compiled_fragment_in(
         .root_sink_dop()
         .and_then(|dop| i32::try_from(dop.get()).ok());
     if context.root_sink_dop.is_some() && context.root_sink_dop != frozen_root_sink_dop {
-        return Err(FragmentLaunchError::new(
+        return Err(FragmentLaunchError::from_failure(
             FragmentLaunchStage::ValidateSubmission,
             FragmentLaunchErrorKind::Binding,
-            format!(
-                "host root sink width {:?} differs from compiled width {frozen_root_sink_dop:?}",
-                context.root_sink_dop
-            ),
+            FragmentBindingError::new(
+                FragmentBindingTarget::Sink,
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("host root sink width {:?} differs from compiled width {frozen_root_sink_dop:?}", context.root_sink_dop),
+            ).into(),
         ));
     }
     let mut resources = FragmentResources::new(
@@ -370,11 +384,12 @@ fn prepare_compiled_fragment_in(
             execution_runtime: context.execution_runtime.clone(),
             query_memory: context.query_memory.clone(),
             task_identity: context.result_identity,
+            task_control: context.task_control.clone(),
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: context.exchange_test_observer.clone(),
         })
         .map_err(|error| {
-            FragmentLaunchError::new(
+            FragmentLaunchError::from_failure(
                 FragmentLaunchStage::BuildRuntimeState,
                 FragmentLaunchErrorKind::ResourceUnavailable,
                 error,
@@ -420,26 +435,35 @@ fn prepare_compiled_fragment_in(
         let result_sink = match program.graph().sink() {
             Some(StaticSinkProgram::RootResult(_)) => {
                 let session = resources.root_result_session().ok_or_else(|| {
-                    FragmentLaunchError::new(
+                    FragmentLaunchError::from_failure(
                         FragmentLaunchStage::Materialize,
                         FragmentLaunchErrorKind::Materialization,
-                        "compiled bounded root requires an opened host-owned RootResult session",
+                        FragmentBindingError::new(
+                            FragmentBindingTarget::Sink,
+                            FragmentBindingErrorKind::MissingAssignment,
+                            "compiled bounded root requires an opened host-owned RootResult session",
+                        ).into(),
                     )
                 })?;
                 let dop = frozen_root_sink_dop.ok_or_else(|| {
-                    FragmentLaunchError::new(
+                    FragmentLaunchError::from_failure(
                         FragmentLaunchStage::Materialize,
                         FragmentLaunchErrorKind::Materialization,
-                        "compiled bounded root requires its frozen sink DOP",
+                        FragmentBindingError::new(
+                            FragmentBindingTarget::Sink,
+                            FragmentBindingErrorKind::MissingAssignment,
+                            "compiled bounded root requires its frozen sink DOP",
+                        )
+                        .into(),
                     )
                 })?;
                 Some(Box::new(
                     crate::exec::operators::RootResultSinkFactory::try_new(session, dop).map_err(
                         |error| {
-                            FragmentLaunchError::new(
+                            FragmentLaunchError::from_failure(
                                 FragmentLaunchStage::Materialize,
                                 FragmentLaunchErrorKind::Materialization,
-                                error,
+                                error.into(),
                             )
                         },
                     )?,
@@ -447,10 +471,15 @@ fn prepare_compiled_fragment_in(
             }
             Some(StaticSinkProgram::Result) => {
                 let session = resources.result_session().ok_or_else(|| {
-                    FragmentLaunchError::new(
+                    FragmentLaunchError::from_failure(
                         FragmentLaunchStage::Materialize,
                         FragmentLaunchErrorKind::Materialization,
-                        "compiled RESULT_SINK requires an opened Fragment result session",
+                        FragmentBindingError::new(
+                            FragmentBindingTarget::Sink,
+                            FragmentBindingErrorKind::MissingAssignment,
+                            "compiled RESULT_SINK requires an opened Fragment result session",
+                        )
+                        .into(),
                     )
                 })?;
                 Some(Box::new(ResultBufferSinkFactory::new(session, None))

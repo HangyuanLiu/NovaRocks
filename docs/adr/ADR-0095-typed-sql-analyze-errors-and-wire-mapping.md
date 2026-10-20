@@ -5,13 +5,16 @@ domain: [error-contracts]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0187]
+partially-superseded-scope:
+  ADR-0187: "Known non-analyze execution facts remain typed even without SQL source/span; Analyze code/span and the separate historical MV lineage facade remain unchanged."
 date: 2026-08-21
 provenance:
   - "discussion: 2026-08-21 typed SQL analyze errors and MySQL wire mapping"
   - "PR: pending — typed SQL analyze error convergence"
 code-anchors:
   - "novarocks/sql/src/analyze_error.rs (AnalyzeError)"
-  - "novarocks/frontend/src/mysql/error_mapping.rs (error_kind_for_code)"
+  - "novarocks/mysql-adapter/src/error_mapping.rs (error_kind_for_domain_code)"
 ---
 
 ## 问题

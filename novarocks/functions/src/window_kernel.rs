@@ -17,7 +17,7 @@
 
 //! Pure window preparation and complete-input partition lifecycles.
 
-use crate::aggregate_kernel::{finish_lifecycle, specialize_aggregate_once};
+use crate::aggregate_kernel::specialize_aggregate_once;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
@@ -363,7 +363,7 @@ fn specialize_window_once<O: PureWindowImplementation + ?Sized>(
         |contract| {
             owner
                 .prepare_window(input, contract, control)
-                .map_err(FunctionSpecializationFailure::Kernel)
+                .map_err(FunctionSpecializationFailure::from)
         },
     )
 }
@@ -396,7 +396,7 @@ pub(crate) fn specialize_window_once_checked<O: PureWindowImplementation + ?Size
                 .prepare_window_checked(input, checked, contract, control)
                 .map_err(|error| match error {
                     crate::CheckedOwnerFailure::Original(error) => {
-                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::from(
                             error,
                         ))
                     }
@@ -428,11 +428,11 @@ fn specialize_window_once_core<
     let (receipt, effects) = refine(arguments)?;
     let call = Arc::new(
         FunctionCallContract::from_refined(input, &receipt, selected, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let contract = Arc::new(
         WindowCallContract::try_window(call, options, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
@@ -571,11 +571,11 @@ fn specialize_aggregate_window_once_core<
     let aggregate = specialization.into_prepared();
     let contract = Arc::new(
         WindowCallContract::try_aggregate(aggregate.contract().clone(), window_options, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let prepared = owner
         .prepare_aggregate_window(aggregate, contract.clone(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+        .map_err(FunctionSpecializationFailure::from)?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
         return Err(FunctionSpecializationFailure::Kernel(internal(
             "aggregate window adapter replaced its exact immutable contract",
@@ -782,8 +782,13 @@ impl<'input> WindowEvaluationPartition<'input> {
             control.checkpoint(0)?;
             Ok(output)
         })();
-        let result = finish_lifecycle(result, self.validate_retained());
-        let result = finish_lifecycle(result, self.validate_metadata());
+        // Only successful work starts fallible post-validation. The cursor/
+        // partition still owns its real finish operation and eventual Drop.
+        let result = result.and_then(|value| {
+            self.validate_retained()?;
+            self.validate_metadata()?;
+            Ok(value)
+        });
         if result.is_err() {
             self.status = PartitionStatus::Failed;
         }
@@ -801,8 +806,13 @@ impl<'input> WindowEvaluationPartition<'input> {
             self.instance.finish(control)?;
             control.checkpoint(0)
         })();
-        let result = finish_lifecycle(result, self.validate_retained());
-        let result = finish_lifecycle(result, self.validate_metadata());
+        // Only successful work starts fallible post-validation. The cursor/
+        // partition still owns its real finish operation and eventual Drop.
+        let result = result.and_then(|value| {
+            self.validate_retained()?;
+            self.validate_metadata()?;
+            Ok(value)
+        });
         if result.is_err() {
             self.status = PartitionStatus::Failed;
         }

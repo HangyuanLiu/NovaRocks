@@ -759,12 +759,16 @@ fn array_original_ordered_merge_offsets_error_drops_decoded_graph_and_latches() 
     let target_host = Arc::new(Host::default());
     let mut target = new_state(&last, target_host.clone());
     let error = merge(&last, &mut target, &bad, &setup).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 340);
     assert_eq!(
-        error,
-        KernelFailure::Operational(KernelDiagnostic::new(
-            "array_agg merge struct field[1] offsets mismatch"
-        ))
+        error.to_string(),
+        "array_agg merge struct field[1] offsets mismatch"
     );
+    let input_owner = Arc::downgrade(&bad);
+    drop(bad);
+    assert!(input_owner.upgrade().is_none());
     assert_failed(&last, &target);
     assert_metadata_only(&target_host);
     drop(target);
@@ -1066,7 +1070,10 @@ fn array_complete_selected_port_control_is_primary_and_has_no_tail() {
             trace: Mutex::new(Vec::new()),
             refuse: Some(at),
         };
-        assert_eq!(execute(&control).unwrap_err(), KernelFailure::Cancelled);
+        assert_eq!(
+            execute(&control).unwrap_err(),
+            KernelFailure::CompileControl(CompileControlError::Cancelled)
+        );
         assert_eq!(control.trace.into_inner().unwrap(), trace[..=at]);
     }
 }

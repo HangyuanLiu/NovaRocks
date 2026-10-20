@@ -336,18 +336,18 @@ fn exact_percentile_owner_final_error_has_real_emission_domain_and_original_mess
     let failure = kernel
         .build_final_evaluation_with_context(std::iter::once(&state), &context, &Control::default())
         .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("whole final data")
+    let EvaluationFailure::Kernel(cause) = failure else {
+        panic!("output contract failure");
     };
     assert_eq!(
-        data.message(),
-        "build aggregate final output: unsupported percentile_cont output type Int64"
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+        novarocks_failure_contract::FailureClass::Invariant
     );
-    assert_eq!(data.input_rows(), &[0]);
-    assert_eq!(data.state_indices(), &[9]);
-    assert_eq!(data.emission_row_capacity(), Some(32));
-    assert_eq!(data.aggregate_phase(), AggregateInvocationPhase::Final);
-    drop(data);
+    assert_eq!(
+        cause.to_string(),
+        "unsupported percentile_cont output type Int64"
+    );
+    drop(cause);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
@@ -456,7 +456,7 @@ fn exact_percentile_owner_merge_serde_full_error_and_resource_journal_are_distin
 }
 
 #[test]
-fn exact_percentile_owner_original_long_nested_diagnostic_is_unbounded_data() {
+fn exact_percentile_owner_unsupported_nested_scalar_is_bounded_contract() {
     let ty = DataType::Struct(Fields::from(vec![Field::new(
         "payload",
         DataType::Utf8,
@@ -504,19 +504,22 @@ fn exact_percentile_owner_original_long_nested_diagnostic_is_unbounded_data() {
         &Control::default(),
     )
     .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("full original Data")
+    let EvaluationFailure::Kernel(cause) = failure else {
+        panic!("unsupported frozen scalar contract");
     };
     assert!(expected.len() > 512);
     assert_eq!(
-        data.message(),
-        crate::aggregate_format::AggregateFailureStage::Update
-            .message(&expected)
-            .to_string()
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+        novarocks_failure_contract::FailureClass::Invariant
     );
-    assert_eq!(data.state_indices(), &[19]);
+    assert!(
+        cause
+            .to_string()
+            .starts_with("unsupported percentile_disc/cont input scalar")
+    );
+    assert!(cause.to_string().len() <= 512);
     drop(legacy_value);
-    drop(data);
+    drop(cause);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
@@ -525,7 +528,7 @@ fn exact_percentile_owner_compile_three_causes_preserved() {
     struct Refuse(CompileControlError);
     impl PureCompileControl for Refuse {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
@@ -546,7 +549,7 @@ fn exact_percentile_owner_compile_three_causes_preserved() {
                 logical_argument_count: 2,
                 expected_result_type: None,
             },
-            &Refuse(cause),
+            &Refuse(cause.clone()),
         );
         assert!(matches!(result,Err(FunctionBindingError::Control(actual)) if actual==cause));
     }

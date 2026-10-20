@@ -25,6 +25,7 @@ use crate::runtime::preparation_memory::PreparationMemoryRefusal;
 use crate::runtime::preparation_metadata::{
     CompiledSchemaPreparationScope, CompiledSchemaSite, PreparationMetadataFailure,
 };
+use novarocks_failure_contract::FailureProjection;
 use novarocks_local_program::StaticLayout;
 
 struct Scope {
@@ -136,15 +137,17 @@ fn graph(
     let tracker =
         crate::runtime::mem_tracker::MemTracker::new_root("Window pipeline observer fixture");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
-    let state = Arc::new(crate::runtime::runtime_state::RuntimeState::new(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(tracker),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
-    ));
+    let state = Arc::new(
+        crate::runtime::runtime_state::RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(tracker),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        ),
+    );
     crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
         Arc::clone(program), std::time::Duration::from_millis(10),
         Box::new(crate::exec::operators::ResultSinkFactory::new(crate::exec::operators::ResultSinkHandle::new())),
@@ -186,7 +189,8 @@ fn analytic_schema_original_precheck_preserves_message_before_host() {
     let hosted = hosted_window_factory(Arc::clone(&program), missing, error, &mut host)
         .err()
         .unwrap();
-    assert_eq!(hosted.into_pipeline_message(), direct);
+    assert_eq!(hosted.failure_fact(), direct.failure_fact());
+    assert_eq!(hosted.detail(), direct.detail());
     assert!(host.sites.is_empty());
     assert_eq!(host.bodies, 0);
 }

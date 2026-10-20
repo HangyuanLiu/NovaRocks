@@ -68,7 +68,7 @@ fn build(
     values: Vec<Option<AggScalarValue>>,
     control: &Control,
     observed: bool,
-) -> Result<ArrayRef, ScalarStateError> {
+) -> Result<ArrayRef, KernelFailure> {
     let mut checkpoints = EvaluationCheckpoints::new(control);
     let mut work = ScalarWork::new(Some(&mut checkpoints));
     if observed {
@@ -170,27 +170,30 @@ fn scalar_largeint_each_builder_boundary_and_quantum_preserves_all_typed_causes(
                 ..Control::default()
             };
             let error = build(&fixed(), values(), &control, true).unwrap_err();
-            assert!(matches!(error, ScalarStateError::Kernel(actual) if actual == cause));
+            assert!(matches!(error, actual if actual == cause));
             assert_eq!(*control.calls.lock().unwrap(), prefix[..=stop]);
         }
     }
 }
 #[test]
-fn scalar_largeint_mismatch_stays_original_data_before_builder_and_control_is_required() {
+fn scalar_largeint_mismatch_is_contract_before_builder_and_control_is_required() {
     let values = || vec![Some(AggScalarValue::Utf8("original".into()))];
     for observed in [false, true] {
         let control = Control::default();
         let error = build(&fixed(), values(), &control, observed).unwrap_err();
-        assert!(
-            matches!(error, ScalarStateError::Legacy(message) if message == "scalar output type mismatch for LargeInt")
+        let cause = error;
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(cause.failure_fact().reason().code(), 315);
+        assert_eq!(
+            cause.to_string(),
+            "scalar output type mismatch for LargeInt"
         );
         assert!(control.calls.lock().unwrap().is_empty());
     }
     let error =
         build_scalar_array_with_largeint_observation(&fixed(), vec![], &mut ScalarWork::new(None))
             .unwrap_err();
-    assert!(
-        matches!(error, ScalarStateError::Kernel(KernelFailure::InvalidProgram(diagnostic))
-        if diagnostic.message() == "observed LARGEINT scalar builder requires evaluation control")
-    );
+    assert!(matches!(error, KernelFailure::InvalidProgram(diagnostic)
+        if diagnostic.message() == "observed LARGEINT scalar builder requires evaluation control"));
 }

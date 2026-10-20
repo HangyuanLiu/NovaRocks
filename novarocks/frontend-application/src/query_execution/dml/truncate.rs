@@ -69,8 +69,9 @@ pub struct PlanTruncateRequest {
     pub execution: QueryExecutionContext,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TruncateFailureKind {
+    Interrupted(novarocks_type_contract::CompileControlError),
     InvalidRequest,
     NotFound,
     AlreadyExists,
@@ -90,6 +91,16 @@ pub enum TruncateFailureKind {
 pub struct TruncateFailure {
     pub kind: TruncateFailureKind,
     pub message: String,
+}
+impl TruncateFailure {
+    pub(crate) fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        match &self.kind {
+            TruncateFailureKind::Interrupted(cause) => Some(cause.clone()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,6 +517,11 @@ fn project_uncommitted(
 fn project_connector_error(error: ConnectorError) -> TruncateFailure {
     TruncateFailure {
         kind: match error.kind() {
+            ConnectorErrorKind::Interrupted => TruncateFailureKind::Interrupted(
+                novarocks_type_contract::CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::new(error.clone()),
+                ),
+            ),
             ConnectorErrorKind::InvalidRequest => TruncateFailureKind::InvalidRequest,
             ConnectorErrorKind::NotFound => TruncateFailureKind::NotFound,
             ConnectorErrorKind::PermissionDenied => TruncateFailureKind::PermissionDenied,
@@ -524,6 +540,11 @@ fn project_connector_error(error: ConnectorError) -> TruncateFailure {
 fn project_mutation_failure(failure: ConnectorMutationFailure) -> TruncateFailure {
     TruncateFailure {
         kind: match failure.kind() {
+            ConnectorMutationFailureKind::Interrupted => TruncateFailureKind::Interrupted(
+                novarocks_type_contract::CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::new(failure.clone()),
+                ),
+            ),
             ConnectorMutationFailureKind::InvalidRequest => TruncateFailureKind::InvalidRequest,
             ConnectorMutationFailureKind::NotFound => TruncateFailureKind::NotFound,
             ConnectorMutationFailureKind::AlreadyExists => TruncateFailureKind::AlreadyExists,

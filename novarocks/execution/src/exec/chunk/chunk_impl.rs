@@ -14,6 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use super::construction_failure::{
+    ChunkConstructionFailure, ChunkObservationFailure, ChunkRecordBatchFailure, ChunkViolation,
+    schema_type_mismatch,
+};
 use std::alloc::Layout;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -111,6 +115,14 @@ struct ChunkSourceStorageHold {
 }
 impl novarocks_type_contract::ValueTypeStorageHold for ChunkSourceStorageHold {}
 
+// A multi-source result shares one flat set of finite source holders. Folding
+// singleton holders would form an input-sized recursive destruction chain.
+struct ChunkSourceStorageSet {
+    sources: Vec<ChunkSourceStorageHold>,
+    storage: ValueTypeStorageLifetime,
+}
+impl novarocks_type_contract::ValueTypeStorageHold for ChunkSourceStorageSet {}
+
 // Stack-only construction inputs keep actual storage ahead of its creating
 // hold in drop order, including validation and original callback refusals.
 struct TypedChunkColumns {
@@ -207,6 +219,45 @@ impl Chunk {
         )))
     }
 
+    /// Retain all original source charges without retaining their Arrow batches
+    /// or any runtime capability. The shared holder has flat destruction cost.
+    pub(crate) fn source_set_storage_lifetime_observed<E: From<LayoutResourceError>>(
+        sources: &[Chunk],
+        storage: ValueTypeStorageLifetime,
+        mut request: impl FnMut(Layout) -> Result<(), E>,
+    ) -> Result<ValueTypeStorageLifetime, E> {
+        if sources.is_empty() {
+            return Ok(storage);
+        }
+        request(
+            Layout::array::<ChunkSourceStorageHold>(sources.len())
+                .map_err(|_| LayoutResourceError::Arithmetic)?,
+        )?;
+        request(
+            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
+                ChunkSourceStorageSet,
+            >())?,
+        )?;
+        let mut held = Vec::with_capacity(sources.len());
+        for source in sources {
+            held.push(ChunkSourceStorageHold {
+                schema: source.chunk_schema.clone(),
+                accounting: source.accounting.clone(),
+                connector_output_memory: source.connector_output_memory.clone(),
+                array_type_storage: source.array_type_storage.clone(),
+                construction_storage: source.construction_storage.clone(),
+                output_column_metadata: source.output_column_metadata.clone(),
+                storage: ValueTypeStorageLifetime::pure(),
+            });
+        }
+        Ok(ValueTypeStorageLifetime::held(Arc::new(
+            ChunkSourceStorageSet {
+                sources: held,
+                storage,
+            },
+        )))
+    }
+
     pub fn record_batch(&self) -> &RecordBatch {
         self.batch.as_ref()
     }
@@ -259,7 +310,7 @@ impl Chunk {
         observe: F,
     ) -> Result<Self, E>
     where
-        E: From<String>,
+        E: From<ChunkConstructionFailure>,
         F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     {
         Self::try_new_typed_with_columns_owned_observed(
@@ -281,20 +332,28 @@ impl Chunk {
         mut observe: F,
     ) -> Result<Self, E>
     where
-        E: From<String>,
+        E: From<ChunkConstructionFailure>,
         F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     {
         let mut source = TypedChunkColumns { columns, storage };
         if !chunk_schema.is_typed() || source.columns.len() != chunk_schema.slots().len() {
-            return Err(E::from(
-                "typed chunk requires its exact typed channel contract".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::source(
+                ChunkViolation::TypedChannels {
+                    typed: chunk_schema.is_typed(),
+                    expected: chunk_schema.slots().len(),
+                    actual: source.columns.len(),
+                },
+            )));
         }
         for (index, column) in source.columns.iter_mut().enumerate() {
             let slot = &chunk_schema.slots()[index];
             if column.len() != row_count {
-                return Err(E::from(format!(
-                    "typed chunk channel {index} has a different row count"
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::ColumnRows {
+                        column: index,
+                        expected: row_count,
+                        actual: column.len(),
+                    },
                 )));
             }
             if !execution_carrier_matches_layout_observed(
@@ -302,11 +361,14 @@ impl Chunk {
                 column.data_type(),
                 &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
             )? {
-                return Err(E::from(format!(
-                    "typed chunk channel {index} carrier does not match its explicit value layout"
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::ColumnLayout { column: index },
                 )));
             }
-            let normalized = normalize_execution_array_observed(column, &mut observe)?;
+            let normalized = normalize_execution_array_observed(column, |step| {
+                observe(step).map_err(ChunkObservationFailure::Caller)
+            })
+            .map_err(ChunkObservationFailure::into_caller)?;
             if normalized.data_type() != slot.data_type()
                 || !execution_carrier_matches_layout_observed(
                     slot.typed_binding().data_type(),
@@ -314,26 +376,28 @@ impl Chunk {
                     &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
                 )?
             {
-                return Err(E::from(format!(
-                    "typed chunk channel {index} carrier does not match its explicit binding"
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::ColumnBinding { column: index },
                 )));
             }
             let root_has_nulls = validate_encoded_keys_and_root_nulls_observed(
                 &normalized,
-                &mut observe,
+                &mut |step| observe(step).map_err(ChunkObservationFailure::Caller),
                 1,
                 &mut 0,
-            )?;
+            )
+            .map_err(ChunkObservationFailure::into_caller)?;
             if !slot.nullable() && root_has_nulls {
-                return Err(E::from(format!(
-                    "typed chunk required channel {index} contains nulls"
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::RequiredNull { column: index },
                 )));
             }
             super::required_dictionary_nulls::validate_required_dictionary_children(
                 &normalized,
                 slot.typed_binding().value_type(),
-                &mut observe,
-            )?;
+                &mut |step| observe(step).map_err(ChunkObservationFailure::Caller),
+            )
+            .map_err(ChunkObservationFailure::into_caller)?;
             *column = normalized;
         }
         let batch = build_record_batch(chunk_schema.arrow_schema_ref(), source.columns, row_count)
@@ -364,7 +428,7 @@ impl Chunk {
         mut observe: F,
     ) -> Result<Self, E>
     where
-        E: From<String> + From<LayoutResourceError>,
+        E: From<ChunkConstructionFailure>,
         F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
         R: FnMut(Layout) -> Result<(), E>,
     {
@@ -373,9 +437,13 @@ impl Chunk {
             storage: original_array_storage,
         };
         if !chunk_schema.is_typed() || source.batch.num_columns() != chunk_schema.slots().len() {
-            return Err(E::from(
-                "typed chunk requires its exact typed channel contract".to_owned(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::source(
+                ChunkViolation::TypedChannels {
+                    typed: chunk_schema.is_typed(),
+                    expected: chunk_schema.slots().len(),
+                    actual: source.batch.num_columns(),
+                },
+            )));
         }
         for (index, (field, slot)) in source
             .batch
@@ -390,11 +458,15 @@ impl Chunk {
                 .len()
                 .checked_add(slot.name().len())
                 .and_then(|units| units.checked_add(1))
-                .ok_or_else(|| E::from(LayoutResourceError::Arithmetic))?;
+                .ok_or_else(|| {
+                    E::from(ChunkConstructionFailure::from(
+                        LayoutResourceError::Arithmetic,
+                    ))
+                })?;
             observe(ArrayNormalizationStep::InspectConstructionWork { units })?;
             if field.name() != slot.name() || field.is_nullable() != slot.nullable() {
-                return Err(E::from(format!(
-                    "typed chunk batch occurrence {index} differs from its explicit label or nullability"
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::BatchOccurrence { column: index },
                 )));
             }
             if !execution_carrier_matches_layout_observed(
@@ -402,15 +474,18 @@ impl Chunk {
                 field.data_type(),
                 &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
             )? {
-                return Err(E::from(format!(
-                    "typed chunk batch occurrence {index} differs from its explicit value layout"
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::ColumnLayout { column: index },
                 )));
             }
         }
         // The callback runs before the only possible extra shared hold. It is
         // skipped when the actual original and new owner are already identical.
-        let array_storage =
-            construction_storage.retaining_observed(&source.storage, &mut request)?;
+        let array_storage = construction_storage
+            .retaining_observed(&source.storage, |layout| {
+                request(layout).map_err(ChunkObservationFailure::Caller)
+            })
+            .map_err(ChunkObservationFailure::into_caller)?;
         let (_source_schema, columns, row_count) = source.batch.into_parts();
         let mut result = Self::try_new_typed_with_columns_owned_observed(
             chunk_schema,
@@ -426,7 +501,7 @@ impl Chunk {
     pub fn try_new_with_columns(
         chunk_schema: ChunkSchemaRef,
         columns: Vec<ArrayRef>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         let row_count = columns.first().map(|col| col.len()).unwrap_or(0);
         if chunk_schema.is_typed() {
             return Self::try_new_typed_with_columns_observed(
@@ -450,7 +525,10 @@ impl Chunk {
         })
     }
 
-    pub fn try_new_like(batch: RecordBatch, source: &Chunk) -> Result<Self, String> {
+    pub fn try_new_like(
+        batch: RecordBatch,
+        source: &Chunk,
+    ) -> Result<Self, ChunkConstructionFailure> {
         let mut result = Self::try_new_with_chunk_schema(batch, source.chunk_schema_ref())?;
         result.array_type_storage = source.array_type_storage.clone();
         result.output_column_metadata = source.output_column_metadata.clone();
@@ -467,7 +545,7 @@ impl Chunk {
     pub fn try_new_with_chunk_schema(
         batch: RecordBatch,
         chunk_schema: ChunkSchemaRef,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         if chunk_schema.is_typed() {
             if batch.num_columns() != chunk_schema.slots().len()
                 || batch
@@ -477,9 +555,9 @@ impl Chunk {
                     .zip(chunk_schema.slots())
                     .any(|(field, slot)| field.name() != slot.name())
             {
-                return Err(
-                    "typed chunk batch occurrence labels differ from its explicit contract".into(),
-                );
+                return Err(ChunkConstructionFailure::source(
+                    ChunkViolation::BatchLabels,
+                ));
             }
             let (_source_schema, columns, row_count) = batch.into_parts();
             return Self::try_new_typed_with_columns_observed(
@@ -530,12 +608,7 @@ impl Chunk {
         }
         let source = UnpublishedColumns { batch, metadata };
         if source.batch.num_columns() != source.metadata.columns() {
-            return Err(novarocks_functions::KernelFailure::InvalidProgram(
-                novarocks_functions::KernelDiagnostic::new(
-                    "output column metadata requires the original frozen column container",
-                ),
-            )
-            .into());
+            return Err(ChunkConstructionFailure::source(ChunkViolation::OutputMetadata).into());
         }
         let mut output = Self::try_new_typed_record_batch_owned_observed::<
             crate::exec::pipeline::operator::ConstructionFailure,
@@ -615,25 +688,26 @@ impl Chunk {
         self.chunk_schema.index_by_slot()
     }
 
-    pub fn column_by_slot_id(&self, slot_id: SlotId) -> Result<ArrayRef, String> {
+    pub fn column_by_slot_id(&self, slot_id: SlotId) -> Result<ArrayRef, ChunkAccessFailure> {
+        let columns = self.batch.num_columns();
         let idx = self
             .chunk_schema
             .index_by_slot()
             .get(&slot_id)
             .copied()
-            .ok_or_else(|| {
-                format!(
-                    "slot id {} not found in chunk (num_columns={}, slot_ids={:?})",
-                    slot_id,
-                    self.batch.num_columns(),
-                    self.chunk_schema.index_by_slot().keys().collect::<Vec<_>>()
-                )
+            .ok_or(ChunkAccessFailure::MissingSlot {
+                slot: slot_id,
+                columns,
             })?;
         self.batch
             .columns()
             .get(idx)
             .cloned()
-            .ok_or_else(|| format!("slot id {} mapped to invalid index {}", slot_id, idx))
+            .ok_or(ChunkAccessFailure::InvalidIndex {
+                slot: slot_id,
+                index: idx,
+                columns,
+            })
     }
 
     pub fn len(&self) -> usize {
@@ -676,13 +750,18 @@ impl Chunk {
         observe: F,
     ) -> Result<Self, E>
     where
-        E: From<String>,
+        E: From<ChunkConstructionFailure>,
         F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     {
         if !self.chunk_schema.is_typed() {
-            return Err(E::from(
-                "typed chunk slice requires its explicit source contract".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::source(
+                ChunkViolation::Slice {
+                    typed: self.chunk_schema.is_typed(),
+                    offset,
+                    length,
+                    rows: self.len(),
+                },
+            )));
         }
         self.slice_with_creation_observed(offset, length, storage, observe)
     }
@@ -697,16 +776,21 @@ impl Chunk {
         mut observe: F,
     ) -> Result<Self, E>
     where
-        E: From<String>,
+        E: From<ChunkConstructionFailure>,
         F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     {
         if offset
             .checked_add(length)
             .is_none_or(|end| end > self.len())
         {
-            return Err(E::from(
-                "chunk slice is outside its explicit source contract".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::source(
+                ChunkViolation::Slice {
+                    typed: self.chunk_schema.is_typed(),
+                    offset,
+                    length,
+                    rows: self.len(),
+                },
+            )));
         }
         observe(ArrayNormalizationStep::CreateChunkColumns {
             channels: self.columns().len(),
@@ -801,14 +885,7 @@ impl Chunk {
     /// destination tracker limit. A failed first charge remains attached to
     /// the chunk so dropping it releases the live bytes instead of leaking an
     /// exceeded counter.
-    pub fn try_transfer_to(&mut self, tracker: &Arc<MemTracker>) -> Result<(), String> {
-        self.try_transfer_to_typed(tracker)
-            .map_err(|error| error.detail().to_owned())
-    }
-
-    /// Preserve the original tracker refusal across the same accounting
-    /// transfer. The source charge and connector reservation laws are unchanged.
-    pub fn try_transfer_to_typed(
+    pub fn try_transfer_to(
         &mut self,
         tracker: &Arc<MemTracker>,
     ) -> Result<(), crate::runtime::mem_tracker::MemTrackerLimitExceeded> {
@@ -894,9 +971,11 @@ impl Chunk {
     pub(crate) fn attach_connector_output_memory(
         &mut self,
         output_memory: ConnectorOutputMemoryToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), ChunkConstructionFailure> {
         if self.accounting.is_some() || self.connector_output_memory.is_some() {
-            return Err("chunk output memory already has an accounting owner".to_string());
+            return Err(ChunkConstructionFailure::source(
+                ChunkViolation::AccountingOwner,
+            ));
         }
         self.connector_output_memory = Some(Arc::new(Mutex::new(output_memory)));
         Ok(())
@@ -913,20 +992,14 @@ use novarocks_functions::array_projection::validate_encoded_keys_and_root_nulls_
 fn retag_columns_to_chunk_schema(
     columns: &[ArrayRef],
     chunk_schema: &ChunkSchema,
-) -> Result<Vec<ArrayRef>, String> {
+) -> Result<Vec<ArrayRef>, ChunkConstructionFailure> {
     columns
         .iter()
         .zip(chunk_schema.slots())
         .enumerate()
         .map(|(idx, (column, slot))| {
-            retag_column(column, slot.data_type()).map_err(|e| {
-                format!(
-                    "retag chunk column {} to target descriptor type {:?} failed: {:?}",
-                    idx,
-                    slot.data_type(),
-                    e
-                )
-            })
+            retag_column(column, slot.data_type())
+                .map_err(|source| schema_type_mismatch(&format!("column {idx}"), source))
         })
         .collect()
 }
@@ -935,14 +1008,14 @@ fn build_record_batch(
     schema: SchemaRef,
     columns: Vec<ArrayRef>,
     row_count: usize,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, ChunkConstructionFailure> {
     let result = if columns.is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         RecordBatch::try_new_with_options(schema, columns, &options)
     } else {
         RecordBatch::try_new(schema, columns)
     };
-    result.map_err(|e| format!("build chunk record batch failed: {e}"))
+    result.map_err(|source| ChunkConstructionFailure::source(ChunkRecordBatchFailure(source)))
 }
 
 impl Default for Chunk {
@@ -1049,14 +1122,12 @@ mod dictionary_validation_tests {
         // No invalid DictionaryArray is created or published through unsafe.
         for keys in [vec![-1, 1], vec![2, 1], vec![0, -1], vec![0, 2]] {
             let keys = Int32Array::from(keys);
-            let error = validate_dictionary_rows_observed::<String, _>(
-                &source,
-                &keys,
-                &values,
-                &mut |_| Ok(()),
-            )
+            let error = validate_dictionary_rows_observed::<
+                crate::runtime::fragment::ExecutionFailure,
+                _,
+            >(&source, &keys, &values, &mut |_| Ok(()))
             .unwrap_err();
-            assert!(error.contains("key is outside its value array"));
+            assert!(error.to_string().contains("key is outside its value array"));
         }
     }
 
@@ -1074,7 +1145,10 @@ mod dictionary_validation_tests {
         let parent: ArrayRef =
             Arc::new(StructArray::try_new(fields.into(), vec![dictionary.clone()], None).unwrap());
         let mut visited = Vec::new();
-        let nulls = validate_encoded_keys_and_root_nulls_observed::<String, _>(
+        let nulls = validate_encoded_keys_and_root_nulls_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             &parent,
             &mut |step| {
                 if let ArrayNormalizationStep::InspectDictionaryRows {
@@ -1092,12 +1166,10 @@ mod dictionary_validation_tests {
         .unwrap();
         assert!(!nulls);
         assert_eq!(visited, vec![2]);
-        let nulls = validate_encoded_keys_and_root_nulls_observed::<String, _>(
-            &dictionary,
-            &mut |_| Ok(()),
-            1,
-            &mut 0,
-        )
+        let nulls = validate_encoded_keys_and_root_nulls_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(&dictionary, &mut |_| Ok(()), 1, &mut 0)
         .unwrap();
         assert!(nulls);
     }
@@ -1144,12 +1216,10 @@ mod shared_batch_projection_tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let array_storage = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
         let original: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
-        let chunk = Chunk::try_new_typed_with_columns_observed::<String, _>(
-            schema(),
-            vec![original.clone()],
-            2,
-            |_| Ok(()),
-        )
+        let chunk = Chunk::try_new_typed_with_columns_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(schema(), vec![original.clone()], 2, |_| Ok(()))
         .unwrap();
         let schema = chunk.chunk_schema_ref();
         let mut requests = 0;
@@ -1175,7 +1245,10 @@ mod shared_batch_projection_tests {
     fn neutral_source_storage_preserves_buffer_charge_and_creation_after_chunk_drop() {
         let drops = Arc::new(AtomicUsize::new(0));
         let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
-        let mut chunk = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        let mut chunk = Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             schema(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
             3,
@@ -1201,8 +1274,58 @@ mod shared_batch_projection_tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
     #[test]
+    fn neutral_source_set_keeps_all_finite_charges_without_keeping_batches() {
+        let tracker = MemTracker::new_root("multiple source custody");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut inputs = Vec::new();
+        let mut batches = Vec::new();
+        for value in [1, 2, 3] {
+            let mut chunk = Chunk::try_new_typed_with_columns_owned_observed::<
+                crate::runtime::fragment::ExecutionFailure,
+                _,
+            >(
+                schema(),
+                vec![Arc::new(Int32Array::from(vec![value]))],
+                1,
+                ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone()))),
+                |_| Ok(()),
+            )
+            .unwrap();
+            chunk.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+                ChunkAccounting::new(4, &tracker),
+            )));
+            batches.push(Arc::downgrade(&chunk.batch));
+            inputs.push(chunk);
+        }
+        let mut requests = 0;
+        let storage = Chunk::source_set_storage_lifetime_observed::<LayoutResourceError>(
+            &inputs,
+            ValueTypeStorageLifetime::pure(),
+            |_| {
+                requests += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(requests, 2, "one source vector and one shared holder");
+        drop(inputs);
+        assert!(batches.iter().all(|batch| batch.upgrade().is_none()));
+        assert_eq!(tracker.current(), 12);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let last = storage.clone();
+        drop(storage);
+        assert_eq!(tracker.current(), 12);
+        std::thread::spawn(move || drop(last)).join().unwrap();
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn neutral_source_storage_refusal_keeps_original_charge_and_arrays() {
-        let mut chunk = Chunk::try_new_typed_with_columns_observed::<String, _>(
+        let mut chunk = Chunk::try_new_typed_with_columns_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             schema(),
             vec![Arc::new(Int32Array::from(vec![1]))],
             1,
@@ -1231,7 +1354,10 @@ mod shared_batch_projection_tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
         let mut wrapper_requests = 0;
-        let mut source = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        let mut source = Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             schema(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
             3,
@@ -1283,20 +1409,30 @@ mod shared_batch_projection_tests {
     fn record_batch_holder_refusal_precedes_publication_and_keeps_source_array() {
         let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
         let original = array.to_data();
-        let result = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        let result = Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             schema(),
             vec![array.clone()],
             3,
             ValueTypeStorageLifetime::pure(),
             |step| {
                 if matches!(step, ArrayNormalizationStep::CreateRecordBatchWrapper) {
-                    Err("original holder refusal".into())
+                    Err(crate::runtime::fragment::ExecutionFailure::from(
+                        novarocks_functions::KernelFailure::Cancelled,
+                    ))
                 } else {
                     Ok(())
                 }
             },
         );
-        assert_eq!(result.unwrap_err(), "original holder refusal");
+        assert_eq!(
+            result.unwrap_err(),
+            crate::runtime::fragment::ExecutionFailure::from(
+                novarocks_functions::KernelFailure::Cancelled
+            )
+        );
         assert_eq!(array.to_data(), original);
     }
 
@@ -1446,7 +1582,31 @@ mod shared_batch_projection_tests {
                     |_| panic!("invalid occurrence must fail before any new hold"),
                     |_| Ok(()),
                 );
-            assert!(matches!(result, Err(ConstructionFailure::InvalidSource(_))));
+            let cause = result.unwrap_err();
+            let fact = novarocks_failure_contract::FailureProjection::failure_fact(&cause);
+            assert_eq!(
+                fact.class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            assert_eq!(
+                fact.reason(),
+                crate::runtime::fragment::ExecutionReason::ChunkBatchOccurrence.reason()
+            );
+            let mut original: &dyn std::error::Error = &cause;
+            loop {
+                if let Some(violation) =
+                    original.downcast_ref::<super::super::construction_failure::ChunkViolation>()
+                {
+                    assert!(matches!(
+                        violation,
+                        super::super::construction_failure::ChunkViolation::BatchOccurrence {
+                            column: 0
+                        }
+                    ));
+                    break;
+                }
+                original = original.source().expect("the original occurrence cause");
+            }
         }
         let original =
             ValueTypeStorageLifetime::held(Arc::new(Hold(Arc::new(AtomicUsize::new(0)))));
@@ -1454,7 +1614,9 @@ mod shared_batch_projection_tests {
             ValueTypeStorageLifetime::held(Arc::new(Hold(Arc::new(AtomicUsize::new(0)))));
         let batch = RecordBatch::try_new(schema.arrow_schema_ref(), vec![array.clone()]).unwrap();
         let refusal = ConstructionFailure::Caller(Box::new(
-            crate::runtime::fragment::ExecutionFailure::from("original construction refusal"),
+            crate::runtime::fragment::ExecutionFailure::from(
+                novarocks_functions::KernelFailure::Cancelled,
+            ),
         ));
         let result = Chunk::try_new_typed_record_batch_owned_observed::<ConstructionFailure, _, _>(
             batch,
@@ -1494,13 +1656,10 @@ mod shared_batch_projection_tests {
             array: Arc::downgrade(&array),
             drops: drops.clone(),
         }));
-        let result = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
-            schema(),
-            vec![array],
-            3,
-            storage,
-            |_| Ok(()),
-        );
+        let result = Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(schema(), vec![array], 3, storage, |_| Ok(()));
         assert!(result.is_err());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
@@ -1533,20 +1692,24 @@ mod shared_batch_projection_tests {
             array: Arc::downgrade(&array),
             drops: drops.clone(),
         }));
-        let result = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
-            schema(),
-            vec![array],
-            2,
-            storage,
-            |step| {
-                if matches!(step, ArrayNormalizationStep::CreateRecordBatchWrapper) {
-                    Err("original holder refusal".into())
-                } else {
-                    Ok(())
-                }
-            },
+        let result = Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(schema(), vec![array], 2, storage, |step| {
+            if matches!(step, ArrayNormalizationStep::CreateRecordBatchWrapper) {
+                Err(crate::runtime::fragment::ExecutionFailure::from(
+                    novarocks_functions::KernelFailure::Cancelled,
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            crate::runtime::fragment::ExecutionFailure::from(
+                novarocks_functions::KernelFailure::Cancelled
+            )
         );
-        assert_eq!(result.unwrap_err(), "original holder refusal");
         assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 
@@ -1656,7 +1819,7 @@ mod shared_batch_projection_tests {
             let owner = factory.begin_input_construction(&source).unwrap();
             let refusal = ConstructionFailure::Caller(Box::new(
                 crate::runtime::fragment::ExecutionFailure::from(
-                    "original slice constructor refusal",
+                    novarocks_functions::KernelFailure::Cancelled,
                 ),
             ));
             let result = source.slice_typed_observed::<ConstructionFailure, _>(
@@ -1769,3 +1932,53 @@ mod shared_batch_projection_tests {
 
 #[path = "evaluation_creation.rs"]
 mod evaluation_creation;
+
+/// Immutable slot-access facts. Failure capture neither retains the batch nor
+/// enumerates/allocates the whole schema while execution is already failing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkAccessFailure {
+    MissingSlot {
+        slot: SlotId,
+        columns: usize,
+    },
+    InvalidIndex {
+        slot: SlotId,
+        index: usize,
+        columns: usize,
+    },
+}
+impl std::fmt::Display for ChunkAccessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSlot { slot, columns } => write!(
+                f,
+                "slot id {slot} not found in chunk (num_columns={columns})"
+            ),
+            Self::InvalidIndex {
+                slot,
+                index,
+                columns,
+            } => write!(
+                f,
+                "slot id {slot} mapped to invalid index {index} (num_columns={columns})"
+            ),
+        }
+    }
+}
+impl std::error::Error for ChunkAccessFailure {}
+impl novarocks_failure_contract::FailureProjection for ChunkAccessFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::MissingSlot { .. } => ExecutionReason::ChunkMissingSlot,
+            Self::InvalidIndex { .. } => ExecutionReason::ChunkInvalidColumnIndex,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<ChunkAccessFailure> for crate::runtime::fragment::ExecutionFailure {
+    fn from(cause: ChunkAccessFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}

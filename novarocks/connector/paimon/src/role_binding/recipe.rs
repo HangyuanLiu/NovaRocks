@@ -236,7 +236,7 @@ fn indexed(error: ConnectorCodecError, root: &str, index: usize) -> ConnectorCod
     }
     ConnectorCodecError::new(
         ConnectorFieldPath::root(root).index(index),
-        error.kind(),
+        error.kind().clone(),
         format!("{}: {}", error.path(), error.detail()),
     )
 }

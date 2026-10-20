@@ -45,17 +45,17 @@ pub fn catalog_bindings(
     payload: &dyn CodecOwnedContent,
 ) -> Result<Vec<CatalogProperties>, HostRejection> {
     let raw = stored_message::<novarocks_proto_models::catalog::CatalogSet>(payload)
-        .ok_or_else(|| internal("catalog binding payload is not a catalog set"))?;
+        .ok_or_else(|| carrier_mismatch(SharedFactCarrier::Catalog))?;
     CatalogSet::parse(raw.clone())
         .and_then(|catalog_set| catalog_set.catalogs())
-        .map_err(|error| protocol(&format!("catalog binding is invalid: {error}")))
+        .map_err(|error| HostRejection::from_domain(TaskFailureCategory::Protocol, error))
 }
 
 pub fn runtime_filter_install(
     payload: &dyn CodecOwnedContent,
 ) -> Result<&proto::RuntimeFilterContribution, HostRejection> {
     stored_message::<proto::RuntimeFilterContribution>(payload)
-        .ok_or_else(|| internal("runtime filter payload is not a participant contribution"))
+        .ok_or_else(|| carrier_mismatch(SharedFactCarrier::RuntimeFilter))
 }
 
 pub fn sealed_runtime_filter_evidence(
@@ -84,33 +84,65 @@ pub fn release_runtime_filter_telemetry(
             let raw = stored_message::<proto::QueryTerminalProfileContributionTelemetry>(
                 payload.as_ref(),
             )
-            .ok_or_else(|| internal("release runtime-filter evidence is not terminal telemetry"))?;
-            QueryTerminalProfileContributionTelemetry::parse(raw.clone()).map_err(|error| {
-                internal(&format!(
-                    "release runtime-filter evidence violates the terminal contract: {error}"
-                ))
-            })
+            .ok_or_else(|| carrier_mismatch(SharedFactCarrier::Terminal))?;
+            QueryTerminalProfileContributionTelemetry::parse(raw.clone())
+                .map_err(|error| HostRejection::from_domain(TaskFailureCategory::Internal, error))
         })
         .transpose()
 }
 
 pub fn query_options(payload: &dyn CodecOwnedContent) -> Result<QueryOptions, HostRejection> {
     let raw = stored_message::<proto::QueryOptions>(payload)
-        .ok_or_else(|| internal("query options payload is not a native query options message"))?;
+        .ok_or_else(|| carrier_mismatch(SharedFactCarrier::QueryOptions))?;
     Ok(decode_query_options(raw))
 }
 
 pub fn credential_material(update: &CredentialUpdate) -> Result<&WireCredential, HostRejection> {
     stored_credential(update.material().as_ref())
-        .ok_or_else(|| internal("credential payload is not a decoded credential rotation"))
+        .ok_or_else(|| carrier_mismatch(SharedFactCarrier::Credential))
 }
 
-fn internal(detail: &str) -> HostRejection {
-    HostRejection::new(TaskFailureCategory::Internal, detail)
+/// These are owned-codec carrier type mismatches, independent of their
+/// diagnostic wording. Connector/protocol errors retain their own projections.
+#[derive(Debug)]
+enum SharedFactCarrier {
+    Catalog,
+    RuntimeFilter,
+    Terminal,
+    QueryOptions,
+    Credential,
 }
-
-fn protocol(detail: &str) -> HostRejection {
-    HostRejection::new(TaskFailureCategory::Protocol, detail)
+impl std::fmt::Display for SharedFactCarrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Catalog => "catalog binding payload is not a catalog set",
+            Self::RuntimeFilter => "runtime filter payload is not a participant contribution",
+            Self::Terminal => "release runtime-filter evidence is not terminal telemetry",
+            Self::QueryOptions => "query options payload is not a native query options message",
+            Self::Credential => "credential payload is not a decoded credential rotation",
+        })
+    }
+}
+impl std::error::Error for SharedFactCarrier {}
+impl novarocks_execution_contract::failure::FailureProjection for SharedFactCarrier {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let code = match self {
+            Self::Catalog => 800,
+            Self::RuntimeFilter => 801,
+            Self::Terminal => 802,
+            Self::QueryOptions => 803,
+            Self::Credential => 804,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+fn carrier_mismatch(source: SharedFactCarrier) -> HostRejection {
+    let detail = novarocks_execution_contract::SafeDetail::truncating_display(&source);
+    HostRejection::from_domain_with_detail(TaskFailureCategory::Internal, source, detail)
 }
 
 #[cfg(test)]

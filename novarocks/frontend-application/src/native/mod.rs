@@ -9,6 +9,7 @@ pub(crate) mod fragment_encoder;
 pub(crate) mod fragment_transport;
 mod original_retirement;
 pub(crate) mod report_server;
+mod root_result_codec;
 mod subscription_owner;
 pub(crate) mod task_transport;
 pub(crate) mod transport;

@@ -62,7 +62,7 @@ fn compare_integral(dtype: DataType) {
                         Ok(array) => wanted.push(values(&array)[0]),
                         Err(message) => {
                             wanted.push(None);
-                            errors.push((ordinal, message));
+                            errors.push((ordinal, message.detail().to_owned()));
                         }
                     }
                 }

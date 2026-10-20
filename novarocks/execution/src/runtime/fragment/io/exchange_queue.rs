@@ -32,6 +32,50 @@ use super::exchange_edge::{EdgeSendGate, ExchangeDestinationKey};
 use super::exchange_metrics::observe_exchange_shuffle_bytes;
 use super::{ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection};
 
+/// Queue ownership/control facts, independent of client cancellation policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeSendQueueFailure {
+    OwnerStopped,
+    ObservationPoisoned,
+    ObservationRebound,
+}
+impl std::fmt::Display for ExchangeSendQueueFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OwnerStopped => "exchange send owner was cancelled",
+            Self::ObservationPoisoned => "exchange tracker observation lock failed",
+            Self::ObservationRebound => "exchange tracker already bound to another test observer",
+        })
+    }
+}
+impl std::error::Error for ExchangeSendQueueFailure {}
+impl novarocks_failure_contract::FailureProjection for ExchangeSendQueueFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match self {
+            Self::OwnerStopped => (
+                FailureClass::Control,
+                ExecutionReason::ExchangeQueueOwnerStopped,
+            ),
+            Self::ObservationPoisoned => (
+                FailureClass::Unexpected,
+                ExecutionReason::ExchangeObservationPoisoned,
+            ),
+            Self::ObservationRebound => (
+                FailureClass::Invariant,
+                ExecutionReason::ExchangeObservationRebound,
+            ),
+        };
+        FailureFact::new(class, reason.reason())
+    }
+}
+impl From<ExchangeSendQueueFailure> for crate::runtime::fragment::ExecutionFailure {
+    fn from(source: ExchangeSendQueueFailure) -> Self {
+        Self::from_domain(source)
+    }
+}
+
 pub struct ExchangeSendTracker {
     #[cfg(novarocks_dev_controls)]
     test_observer: Mutex<Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>>,
@@ -47,16 +91,16 @@ impl ExchangeSendTracker {
     pub fn install_test_observer(
         &self,
         observer: Arc<dyn crate::runtime::exchange::TestEventObserver>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExchangeSendQueueFailure> {
         let mut slot = self
             .test_observer
             .lock()
-            .map_err(|_| "exchange tracker observation lock failed")?;
+            .map_err(|_| ExchangeSendQueueFailure::ObservationPoisoned)?;
         if let Some(existing) = slot.as_ref() {
             if Arc::ptr_eq(existing, &observer) {
                 return Ok(());
             }
-            return Err("exchange tracker already bound to another test observer".into());
+            return Err(ExchangeSendQueueFailure::ObservationRebound);
         }
         *slot = Some(observer);
         Ok(())
@@ -285,13 +329,13 @@ impl ExchangeSendQueue {
         self: &Arc<Self>,
         task: ExchangeSendTask,
         reserve_bytes: usize,
-    ) -> Result<ExchangeSendEnqueue, String> {
+    ) -> Result<ExchangeSendEnqueue, ExchangeSendQueueFailure> {
         let reserve_bytes = reserve_bytes.max(1);
         task.tracker.on_enqueue(reserve_bytes);
         if self.enqueue_task(task, reserve_bytes) {
             Ok(ExchangeSendEnqueue::Enqueued)
         } else {
-            Err("exchange send owner was cancelled".to_string())
+            Err(ExchangeSendQueueFailure::OwnerStopped)
         }
     }
 
@@ -299,7 +343,7 @@ impl ExchangeSendQueue {
         self: &Arc<Self>,
         task: ExchangeSendTask,
         allow_overflow: bool,
-    ) -> Result<ExchangeSendEnqueue, String> {
+    ) -> Result<ExchangeSendEnqueue, ExchangeSendQueueFailure> {
         let reserve_bytes = task.payload_bytes.max(1);
         let key = ExchangeSendKey::from_task(&task);
         if allow_overflow {
@@ -320,7 +364,7 @@ impl ExchangeSendQueue {
         if self.enqueue_task(task, reserve_bytes) {
             Ok(ExchangeSendEnqueue::Enqueued)
         } else {
-            Err("exchange send owner was cancelled".to_string())
+            Err(ExchangeSendQueueFailure::OwnerStopped)
         }
     }
 
@@ -682,7 +726,11 @@ impl ExchangeSendQueue {
                         sequence,
                         message
                     );
-                    error_state.set_error(message);
+                    error_state.set_error(super::FragmentIoError::new(
+                        super::FragmentIoOperation::ExchangeTransmit,
+                        super::FragmentIoErrorKind::InvalidResponse,
+                        message,
+                    ));
                 }
             },
             Err(ExchangeTransmitRejection::Failed(err)) => {
@@ -708,7 +756,7 @@ impl ExchangeSendQueue {
                         },
                     );
                 }
-                error_state.set_error(err.to_string());
+                error_state.set_error(err.clone());
                 error!(
                     "exchange send failed: dest={} dest_finst={} sender_finst={} node_id={} sender_id={} seq={} error={}",
                     destination,
@@ -984,6 +1032,51 @@ mod tests {
                 let _ = self.release.lock().expect("release lock").recv();
             }
             Ok(())
+        }
+    }
+
+    #[test]
+    fn stopped_owner_refuses_each_admission_path_and_releases_reserved_responsibility() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for admission in 0..3 {
+            let queue = Arc::new(ExchangeSendQueue::with_limits(100, 100));
+            let tracker = ExchangeSendTracker::new();
+            let error_state = Arc::new(RuntimeErrorState::default());
+            let transmitter = Arc::new(RecordingTransmitter::default());
+            queue.cancel_tracker(&tracker);
+            let task = exchange_task(transmitter.clone(), error_state.clone(), tracker.clone());
+            let result = if admission == 2 {
+                assert!(queue.reserve_bytes_for(
+                    task.frame.destination.host(),
+                    task.frame.destination.port() as u16,
+                    task.frame.destination_fragment_instance_id,
+                    task.frame.destination_node_id,
+                    task.frame.sender_id,
+                    task.payload_bytes
+                ));
+                let bytes = task.payload_bytes;
+                queue.submit_reserved(task, bytes)
+            } else {
+                queue.try_submit(task, admission == 1)
+            };
+            let source = result.unwrap_err();
+            assert_eq!(source, ExchangeSendQueueFailure::OwnerStopped);
+            let fact = source.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Control);
+            assert_eq!(fact.reason().code(), 355);
+            let failure = crate::runtime::fragment::ExecutionFailure::from(source);
+            assert_eq!(failure.failure_fact(), fact);
+            assert_eq!(transmitter.frame_count(), 0);
+            assert_eq!(
+                error_state.error(),
+                None,
+                "observing a stopped owner does not accept client cancellation"
+            );
+            assert_eq!(queue.backlog_len_for_test(), 0);
+            assert_eq!(queue.inflight_bytes(), 0);
+            assert!(queue.per_dest_bytes.lock().unwrap().is_empty());
+            assert_eq!(tracker.inflight_bytes(), 0);
+            assert!(tracker.is_idle());
         }
     }
 

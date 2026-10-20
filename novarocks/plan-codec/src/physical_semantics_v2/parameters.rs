@@ -323,7 +323,7 @@ mod tests {
             let mut events = self.events.lock().unwrap();
             let ordinal = events.len();
             events.push((phase, work_units));
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((at, error)) if ordinal == at => Err(error),
                 _ => Ok(()),
             }
@@ -761,7 +761,7 @@ mod tests {
                 for phase in [CompilePhase::Encode, CompilePhase::Decode] {
                     let control = Control {
                         events: Mutex::default(),
-                        refusal: Some((ordinal, error)),
+                        refusal: Some((ordinal, error.clone())),
                     };
                     let result = if phase == CompilePhase::Encode {
                         encode(&table, &control).map(|_| ())

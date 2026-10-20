@@ -94,13 +94,22 @@ fn extrema_selected_all_seven_control_causes_preserve_first_refusal() {
     }
 }
 #[test]
-fn extrema_core_legacy_error_callback_preserves_complete_source_type() {
+fn extrema_core_retains_bounded_typed_carrier_failure() {
     let field = "long_field_".to_string() + &"x".repeat(1025);
     let ty = DataType::Struct(vec![arrow_schema::Field::new(field, DataType::Int64, true)].into());
     let arrays = [arrow_array::new_null_array(&ty, 1)];
     for operation in [ExtremaOperation::Greatest, ExtremaOperation::Least] {
         let error = evaluate_legacy(operation, &arrays, 1, Some(&DataType::Float64)).unwrap_err();
-        assert_eq!(error, format!("unsupported numeric type: {ty:?}"));
-        assert!(error.len() > 512);
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use std::error::Error;
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        let source = error.source().unwrap().source().unwrap();
+        assert!(source.is::<crate::math_numeric::NumericArrayFailure>());
+        assert!(
+            error
+                .to_string()
+                .starts_with("unsupported numeric type: Struct")
+        );
+        assert!(error.to_string().len() <= 512);
     }
 }

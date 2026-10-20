@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, ListArray, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -26,7 +28,12 @@ pub fn eval_array_join<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if !matches!(args.len(), 2 | 3) {
+        return Err(expression_contract(
+            "array_join requires two or three prepared arguments",
+        ));
+    }
     let list_arr = arena.eval(args[0], chunk)?;
     let sep_arr = arena.eval(args[1], chunk)?;
     let null_replace_arr = if args.len() == 3 {
@@ -39,37 +46,39 @@ pub fn eval_array_join<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_join expects ListArray, got {:?}",
                 list_arr.data_type()
-            )
+            ))
         })?;
 
     let mut list_values = list.values().clone();
     if list_values.data_type() != &DataType::Utf8 {
         list_values = cast(&list_values, &DataType::Utf8)
-            .map_err(|e| format!("array_join failed to cast array elements to VARCHAR: {}", e))?;
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
     let list_values = list_values
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "array_join failed to downcast list values to StringArray".to_string())?;
+        .ok_or_else(|| {
+            expression_contract("array_join failed to downcast list values to StringArray")
+        })?;
 
     let mut sep_cast = sep_arr.clone();
     if sep_cast.data_type() != &DataType::Utf8 {
         sep_cast = cast(&sep_cast, &DataType::Utf8)
-            .map_err(|e| format!("array_join: invalid sep: {}", e))?;
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
     let sep = sep_cast
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "array_join failed to downcast sep to StringArray".to_string())?;
+        .ok_or_else(|| expression_contract("array_join failed to downcast sep to StringArray"))?;
 
     let null_replace_cast = if let Some(arr) = null_replace_arr {
         let mut casted = arr;
         if casted.data_type() != &DataType::Utf8 {
             casted = cast(&casted, &DataType::Utf8)
-                .map_err(|e| format!("array_join: invalid null_replace: {}", e))?;
+                .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
         }
         Some(casted)
     } else {
@@ -79,12 +88,18 @@ pub fn eval_array_join<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .as_ref()
         .map(|arr| {
             arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                "array_join failed to downcast null_replace to StringArray".to_string()
+                expression_contract("array_join failed to downcast null_replace to StringArray")
             })
         })
         .transpose()?;
 
+    super::common::validate_rows(list.len(), chunk.len(), "array_join input")?;
+    super::common::validate_rows(sep.len(), chunk.len(), "array_join separator")?;
+    if let Some(replacement) = null_replace {
+        super::common::validate_rows(replacement.len(), chunk.len(), "array_join replacement")?;
+    }
     let list_offsets = list.value_offsets();
+    let mut output_offset = 0;
     let mut out = Vec::<Option<String>>::with_capacity(chunk.len());
 
     for row in 0..chunk.len() {
@@ -106,15 +121,29 @@ pub fn eval_array_join<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let sep_val = sep.value(sep_row);
         let null_replace_val = null_replace_row.map(|idx| null_replace.unwrap().value(idx));
 
-        let mut parts = Vec::<String>::new();
+        let mut parts = Vec::<&str>::new();
         for idx in start..end {
             if list_values.is_null(idx) {
                 if let Some(v) = null_replace_val {
-                    parts.push(v.to_string());
+                    parts.push(v);
                 }
             } else {
-                parts.push(list_values.value(idx).to_string());
+                parts.push(list_values.value(idx));
             }
+        }
+        // Check the exact output before join allocates it; the original buffers
+        // remain borrowed, including repeated NULL replacement and separators.
+        for part in &parts {
+            output_offset = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+                output_offset,
+                part.len(),
+            )?;
+        }
+        for _ in 1..parts.len() {
+            output_offset = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+                output_offset,
+                sep_val.len(),
+            )?;
         }
         out.push(Some(parts.join(sep_val)));
     }

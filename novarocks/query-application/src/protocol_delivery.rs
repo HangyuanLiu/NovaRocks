@@ -19,15 +19,16 @@
 
 use crate::api::{
     ExecutionHandle, ExecutionOutput, LocalResultProducer, OwnedLocalResult, QueryExecutionError,
-    QueryExecutionErrorKind, QueryResult, QueryResultStream, ResultDelivery, ResultFailureView,
-    SchemaDelivery,
+    QueryResult, QueryResultStream, ResultDelivery, ResultFailureView, SchemaDelivery,
 };
 use crate::cancellation::QueryCancellationView;
+use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
 use crate::session_control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
     GovernedStatementVisibilitySealOutcome, StatementToken,
 };
 use crate::session_error::QueryServiceError;
+use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_workload_control::{ResultWindowClass, ResultWindowGrant, WorkError};
 
 /// Shared move-only owner for any governed query result presented to a client.
@@ -444,16 +445,22 @@ impl StreamingStatementResult {
             Some(ExecutionOutput::Rows(stream)) => stream,
             Some(ExecutionOutput::Completion) => {
                 let _ = execution.request_cancel();
-                return Err(QueryExecutionError::new(
-                    QueryExecutionErrorKind::InvalidRequest,
-                    "read execution returned completion-only output",
+                return Err(QueryExecutionError::from_execution(
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::ResultProtocol.failure_fact(),
+                        SafeDetail::truncating("read execution returned completion-only output"),
+                        ExecutionFailureSite::Coordinator,
+                    ),
                 ));
             }
             None => {
                 let _ = execution.request_cancel();
-                return Err(QueryExecutionError::new(
-                    QueryExecutionErrorKind::InvalidRequest,
-                    "read execution output was already transferred",
+                return Err(QueryExecutionError::from_execution(
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::ResultProtocol.failure_fact(),
+                        SafeDetail::truncating("read execution output was already transferred"),
+                        ExecutionFailureSite::Coordinator,
+                    ),
                 ));
             }
         };
@@ -592,6 +599,98 @@ impl Drop for StreamingStatementResult {
     fn drop(&mut self) {
         if !self.settled {
             let _ = self.execution.request_cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_handoff_tests {
+    use super::*;
+    use crate::client_connection::ClientConnectionToken;
+    use crate::query_control::QueryApplicationControl;
+    use crate::session_control::{QueryControlService, SessionIdentity};
+    use novarocks_workload_control::{
+        CancellationReason, ResourceConfig, WorkloadConfig, WorkloadControl,
+    };
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn real_output_handoff_guards_preserve_cancel_and_original_work_exit() {
+        for already_transferred in [false, true] {
+            let application = Arc::new(QueryApplicationControl::default());
+            let service = QueryControlService::new(application);
+            let session = service
+                .register_session(SessionIdentity::new(
+                    ClientConnectionToken::new(7, 1).unwrap(),
+                    "root",
+                ))
+                .unwrap();
+            let workload = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 1024,
+                    control_bytes: 128,
+                    per_scope_bytes: 896,
+                },
+            )
+            .unwrap();
+            workload.mark_ready().unwrap();
+            let mut statement = service
+                .begin_queued_governed_query_statement(
+                    session.token(),
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let scope = statement.scope().clone();
+            let owner = statement.take_execution_owner().unwrap();
+            let mut execution =
+                ExecutionHandle::new(owner.cancellation_requester(), ExecutionOutput::Completion);
+            if already_transferred {
+                assert!(matches!(
+                    execution.take_output(),
+                    Some(ExecutionOutput::Completion)
+                ));
+            }
+            let error = match StreamingStatementResult::try_from_execution(execution, statement) {
+                Err(error) => error,
+                Ok(_) => panic!("Rows handoff cannot accept this output shape"),
+            };
+            let input = error
+                .execution_failure()
+                .expect("the guard supplies its own result contract fact");
+            assert_eq!(
+                input.fact(),
+                QueryFailureReason::ResultProtocol.failure_fact()
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                input.user_error().phase(),
+                novarocks_user_error::ErrorPhase::Execution
+            );
+            assert_eq!(input.user_error().location(), None);
+            assert_eq!(
+                error.message(),
+                if already_transferred {
+                    "read execution output was already transferred"
+                } else {
+                    "read execution returned completion-only output"
+                }
+            );
+            assert_eq!(
+                scope.cancellation().unwrap().reason(),
+                Some(CancellationReason::Requested)
+            );
+            assert_eq!(workload.snapshot().root_responsibilities, 1);
+            owner.complete();
+            while let Some(permit) = workload.next_control() {
+                permit.acknowledge();
+            }
+            scope.wait_released().await;
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
         }
     }
 }

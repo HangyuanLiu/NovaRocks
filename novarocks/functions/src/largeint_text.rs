@@ -32,13 +32,16 @@ pub fn parse_utf8(value: &str) -> Option<i128> {
 }
 
 /// Same original signed big-endian reader and native i128 text conversion.
-pub fn value_text(source: &FixedSizeBinaryArray, row: usize) -> Result<String, String> {
-    Ok(largeint::value_at(source, row)?.to_string())
+pub fn value_text(
+    source: &FixedSizeBinaryArray,
+    row: usize,
+) -> Result<String, largeint::LargeIntCarrierFailure> {
+    Ok(largeint::i128_from_be_bytes(source.value(row))?.to_string())
 }
 
 /// Original v1 batch adapter; selected callers reuse value_text at exact addresses.
-pub fn cast_array(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to VARCHAR")?;
+pub fn cast_array(child_array: &ArrayRef) -> Result<ArrayRef, largeint::LargeIntCarrierFailure> {
+    let arr = largeint::as_fixed_size_binary_array(child_array, "LARGEINT text")?;
     let mut builder = StringBuilder::new();
     for row in 0..arr.len() {
         if arr.is_null(row) {

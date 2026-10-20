@@ -41,10 +41,18 @@ fn setup(columns: &[ArrayRef]) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
-fn call(name: &str, arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> Result<ArrayRef, String> {
+fn call(
+    name: &str,
+    arena: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     super::function::string::eval_string_function(name, arena, ExprId(usize::MAX), args, chunk)
 }
-fn raw(name: &str, columns: &[ArrayRef]) -> Result<ArrayRef, String> {
+fn raw(
+    name: &str,
+    columns: &[ArrayRef],
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, chunk) = setup(columns);
     call(name, &arena, &args, &chunk)
 }
@@ -191,28 +199,28 @@ fn original_repeat_pad_shared_original_carrier_errors_before_empty_or_null_rows(
         let s: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; rows]));
         let n: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; rows]));
         assert_eq!(
-            raw("repeat", &[wrong.clone(), n.clone()]).unwrap_err(),
+            (raw("repeat", &[wrong.clone(), n.clone()]).unwrap_err()).to_string(),
             "repeat expects string"
         );
         assert_eq!(
-            raw("repeat", &[s.clone(), wrong.clone()]).unwrap_err(),
+            (raw("repeat", &[s.clone(), wrong.clone()]).unwrap_err()).to_string(),
             "repeat expects int"
         );
         assert_eq!(
-            raw("space", &[wrong.clone()]).unwrap_err(),
+            (raw("space", &[wrong.clone()]).unwrap_err()).to_string(),
             "space expects int"
         );
         for name in ["lpad", "rpad"] {
             assert_eq!(
-                raw(name, &[wrong.clone(), n.clone(), s.clone()]).unwrap_err(),
+                (raw(name, &[wrong.clone(), n.clone(), s.clone()]).unwrap_err()).to_string(),
                 "pad expects string"
             );
             assert_eq!(
-                raw(name, &[s.clone(), wrong.clone(), wrong.clone()]).unwrap_err(),
+                (raw(name, &[s.clone(), wrong.clone(), wrong.clone()]).unwrap_err()).to_string(),
                 "pad expects int"
             );
             assert_eq!(
-                raw(name, &[s.clone(), n.clone(), wrong.clone()]).unwrap_err(),
+                (raw(name, &[s.clone(), n.clone(), wrong.clone()]).unwrap_err()).to_string(),
                 "pad expects string"
             );
         }
@@ -243,7 +251,7 @@ fn original_repeat_pad_shared_children_eager_required_extra_ignored_and_arity_pa
             let mut bad = actual.clone();
             bad[position] = missing;
             assert_eq!(
-                call(name, &arena, &bad, &chunk).unwrap_err(),
+                (call(name, &arena, &bad, &chunk).unwrap_err()).to_string(),
                 "invalid ExprId"
             );
         }
@@ -259,11 +267,11 @@ fn original_repeat_pad_shared_children_eager_required_extra_ignored_and_arity_pa
     }
     // All required children are evaluated before the first carrier check.
     assert_eq!(
-        call("repeat", &arena, &[args[1], missing], &chunk).unwrap_err(),
+        (call("repeat", &arena, &[args[1], missing], &chunk).unwrap_err()).to_string(),
         "invalid ExprId"
     );
     assert_eq!(
-        call("lpad", &arena, &[args[1], args[1], missing], &chunk).unwrap_err(),
+        (call("lpad", &arena, &[args[1], args[1], missing], &chunk).unwrap_err()).to_string(),
         "invalid ExprId"
     );
 }

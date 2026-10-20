@@ -28,6 +28,7 @@ mod typed_layout;
 mod change_events_lowering_tests;
 mod channels;
 mod creation;
+mod failure_projection;
 pub use creation::FragmentCreationError;
 mod exchange;
 mod expressions;
@@ -203,11 +204,7 @@ pub fn validate_fragment_providers<E: Error + 'static>(
                 writes,
             })
         })();
-    if matches!(&result, Err(ProviderPreparationError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, ProviderPreparationError::Control)
 }
 
 #[cfg(test)]

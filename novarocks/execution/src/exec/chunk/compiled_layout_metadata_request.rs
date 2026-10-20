@@ -29,10 +29,82 @@ use novarocks_type_contract::{
 use novarocks_types::SlotId;
 use std::alloc::Layout;
 
+/// The complete request author retains array inspection separately from its
+/// own metadata request faults. A foreign type-profile refusal is not a new
+/// generic invalid-source conclusion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompiledSchemaRequestFailure {
+    Request(MetadataRequestError),
+    Projection(crate::runtime::fragment::SharedDomainFailure),
+}
+impl From<MetadataRequestError> for CompiledSchemaRequestFailure {
+    fn from(source: MetadataRequestError) -> Self {
+        Self::Request(source)
+    }
+}
+impl From<novarocks_type_contract::CompileControlError> for CompiledSchemaRequestFailure {
+    fn from(source: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Request(source.into())
+    }
+}
+impl From<novarocks_functions::array_projection::ArrayProjectionFailure>
+    for CompiledSchemaRequestFailure
+{
+    fn from(source: novarocks_functions::array_projection::ArrayProjectionFailure) -> Self {
+        Self::Projection(crate::runtime::fragment::SharedDomainFailure::new(source))
+    }
+}
+impl From<layout::LayoutResourceError> for CompiledSchemaRequestFailure {
+    fn from(source: layout::LayoutResourceError) -> Self {
+        Self::Projection(crate::runtime::fragment::SharedDomainFailure::new(
+            super::ChunkConstructionFailure::from(source),
+        ))
+    }
+}
+impl From<hashmap::HashMapResourceError> for CompiledSchemaRequestFailure {
+    fn from(source: hashmap::HashMapResourceError) -> Self {
+        Self::Projection(crate::runtime::fragment::SharedDomainFailure::new(
+            super::ChunkConstructionFailure::from(source),
+        ))
+    }
+}
+impl CompiledSchemaRequestFailure {
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::Request(_) => "compiled schema metadata request failed",
+            Self::Projection(source) => source.detail(),
+        }
+    }
+}
+impl std::fmt::Display for CompiledSchemaRequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(source) => source.fmt(f),
+            Self::Projection(source) => source.fmt(f),
+        }
+    }
+}
+impl std::error::Error for CompiledSchemaRequestFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            Self::Request(source) => source,
+            Self::Projection(source) => source,
+        })
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CompiledSchemaRequestFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Request(source) => source.failure_fact(),
+            Self::Projection(source) => source.failure_fact(),
+        }
+    }
+}
+
 pub fn original_compiled_schema_metadata_request(
     source_layout: &StaticLayout,
     control: &dyn PureCompileControl,
-) -> Result<CompleteMetadataRequestFacts, MetadataRequestError> {
+) -> Result<CompleteMetadataRequestFacts, CompiledSchemaRequestFailure> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = original_request(source_layout, &mut work)?;
     work.finish()?;
@@ -42,23 +114,15 @@ pub fn original_compiled_schema_metadata_request(
 fn original_request(
     source: &StaticLayout,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<CompleteMetadataRequestFacts, MetadataRequestError> {
+) -> Result<CompleteMetadataRequestFacts, CompiledSchemaRequestFailure> {
     if !source.is_typed()
         || source.schema().fields().len() != source.slots().len()
         || source.schema().metadata().capacity() != 0
     {
         return Err(MetadataRequestError::SourceModel(
             "compiled schema request requires its exact typed execution layout",
-        ));
-    }
-    enum InspectionFailure {
-        Original(MetadataRequestError),
-        InvalidSource,
-    }
-    impl From<String> for InspectionFailure {
-        fn from(_: String) -> Self {
-            Self::InvalidSource
-        }
+        )
+        .into());
     }
     for (index, field) in source.schema().fields().iter().enumerate() {
         work.step()?;
@@ -68,22 +132,16 @@ fn original_request(
                 field,
                 &mut |units| {
                     for _ in 0..units {
-                        work.step()
-                            .map_err(|cause| InspectionFailure::Original(cause.into()))?;
+                        work.step().map_err(CompiledSchemaRequestFailure::from)?;
                     }
-                    Ok::<_, InspectionFailure>(())
+                    Ok::<_, CompiledSchemaRequestFailure>(())
                 },
-            )
-            .map_err(|failure| match failure {
-                InspectionFailure::Original(cause) => cause,
-                InspectionFailure::InvalidSource => MetadataRequestError::SourceModel(
-                    "compiled schema request has an invalid type structure",
-                ),
-            })?
+            )?
         {
             return Err(MetadataRequestError::SourceModel(
                 "compiled schema request has no canonical complete typed occurrence",
-            ));
+            )
+            .into());
         }
     }
     let mut sum = MetadataRequestSum::default();
@@ -296,7 +354,9 @@ mod tests {
                 .unwrap();
         assert!(matches!(
             original_compiled_schema_metadata_request(&untyped, &Control),
-            Err(MetadataRequestError::SourceModel(_))
+            Err(CompiledSchemaRequestFailure::Request(
+                MetadataRequestError::SourceModel(_)
+            ))
         ));
     }
     struct PrefixControl {
@@ -329,8 +389,8 @@ mod tests {
             };
             assert_eq!(
                 original_compiled_schema_metadata_request(&source, &control),
-                Err(MetadataRequestError::Control(
-                    CompileControlError::Cancelled
+                Err(CompiledSchemaRequestFailure::Request(
+                    MetadataRequestError::Control(CompileControlError::Cancelled)
                 ))
             );
         }

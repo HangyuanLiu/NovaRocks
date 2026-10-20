@@ -18,7 +18,7 @@
 //! Funding for the original BE type materialization tail, before its first
 //! Arrow allocation. No writer exists across a Pending wait or requalification.
 
-use super::preparation_memory_control::{WorkerPreparationMemoryControl, worker_stop};
+use super::preparation_memory_control::WorkerPreparationMemoryControl;
 #[cfg(test)]
 use novarocks_execution::runtime::kernel_memory::KernelMemoryAdmission;
 use novarocks_execution::runtime::{
@@ -38,11 +38,11 @@ use novarocks_plan_codec::{
     },
 };
 use novarocks_type_contract::CompleteMetadataRequestFacts;
-use novarocks_worker::{PreparationControlLoan, PreparationStop};
+use novarocks_worker::PreparationControlLoan;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeMaterializationRefusal {
-    Stopped(PreparationStop),
+    Interrupted(novarocks_execution::runtime::fragment::ExecutionFailure),
     MissingQueryMemory,
     SharedShortage(ShortageReceipt),
     Capacity(CapacityError),
@@ -50,7 +50,7 @@ pub enum TypeMaterializationRefusal {
 impl std::fmt::Display for TypeMaterializationRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Stopped(stop) => write!(f, "type materialization stopped: {stop:?}"),
+            Self::Interrupted(stop) => write!(f, "type materialization interrupted: {stop}"),
             Self::MissingQueryMemory => f.write_str("type materialization requires query memory"),
             Self::SharedShortage(receipt) => {
                 write!(f, "type materialization shared shortage: {receipt:?}")
@@ -59,7 +59,30 @@ impl std::fmt::Display for TypeMaterializationRefusal {
         }
     }
 }
-impl std::error::Error for TypeMaterializationRefusal {}
+impl std::error::Error for TypeMaterializationRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Interrupted(cause) => Some(cause),
+            Self::Capacity(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for TypeMaterializationRefusal {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::FailureProjection;
+        match self {
+            Self::Interrupted(source) => source.failure_fact(),
+            Self::MissingQueryMemory => PreparationMemoryRefusal::MissingQueryMemory.failure_fact(),
+            Self::SharedShortage(cause) => {
+                novarocks_memory_failure::ShortageFailureProjection::new(cause).failure_fact()
+            }
+            Self::Capacity(cause) => {
+                novarocks_memory_failure::CapacityFailureProjection::new(cause).failure_fact()
+            }
+        }
+    }
+}
 
 /// Fixed receipt of one completed namespace; moved, never cloned after failure.
 #[derive(Debug, Default)]
@@ -215,8 +238,8 @@ fn original_failure<C>(
     match failure {
         SynchronousPreparationFailure::Body(error) => ProjectionFailure::Codec(error),
         SynchronousPreparationFailure::Host(error) => ProjectionFailure::Host(match error {
-            PreparationMemoryRefusal::Stopped(stop) => {
-                TypeMaterializationRefusal::Stopped(worker_stop(stop))
+            PreparationMemoryRefusal::Interrupted(stop) => {
+                TypeMaterializationRefusal::Interrupted(stop)
             }
             PreparationMemoryRefusal::MissingQueryMemory => {
                 TypeMaterializationRefusal::MissingQueryMemory

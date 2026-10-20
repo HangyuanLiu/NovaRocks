@@ -89,7 +89,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         s.trace.push((phase, units));
-        match s.stop {
+        match s.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -719,7 +719,7 @@ fn prefixes(c: &Control, action: impl Fn() -> Result<(), Error>) {
     assert!(baseline_result.is_ok() || matches!(baseline_result, Err(Error::InvalidShape(_))));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             assert!(matches!(action(),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(c.trace(), baseline[..=at]);
         }
@@ -1130,7 +1130,7 @@ fn topn_each_actual_small_success_ordinary_and_prepared_emit_prefix_keeps_three_
                 for cause in CAUSES {
                     c.disarm();
                     let p = prepare_topn_node_encode(&n, v, e, SOURCE, limits()).unwrap();
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(matches!(p.emit(),Err(Error::Control(actual)) if actual==cause));
                     assert_eq!(c.trace(), trace[..=at]);
                 }
@@ -1145,7 +1145,7 @@ fn topn_each_actual_small_success_ordinary_and_prepared_emit_prefix_keeps_three_
                 for cause in CAUSES {
                     c.disarm();
                     let p = prepare_topn_node_decode(&wire, d, a, SOURCE, limits()).unwrap();
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(matches!(p.emit(),Err(Error::Control(actual)) if actual==cause));
                     assert_eq!(c.trace(), trace[..=at]);
                 }
@@ -1186,7 +1186,7 @@ fn topn_wide_actual_sort_and_nested_lists_observe_quantum_and_numeric_first_refu
                     .expect("actual sort/nested emission must observe its owned 320-item loop");
                 for at in [0, quantum, trace.len() - 1] {
                     for cause in CAUSES {
-                        c.arm(Some((at, cause)));
+                        c.arm(Some((at, cause.clone())));
                         assert!(matches!(action(),Err(Error::Control(actual)) if actual==cause));
                         assert_eq!(c.trace(), trace[..=at]);
                     }
@@ -1473,7 +1473,7 @@ fn topn_caller_owned_actual320_ordered_rows_and_grouped_paths_share_same_parent(
                 let at = trace.iter().position(|(_, u)| *u == 256).unwrap();
                 for stop in [0, at, trace.len() - 1] {
                     for cause in CAUSES {
-                        c.arm(Some((stop, cause)));
+                        c.arm(Some((stop, cause.clone())));
                         let result = if receive {
                             caller_topn_decode(&wire, d, a, limits(), &c, &mut |_| Ok(()))
                                 .map(|_| ())

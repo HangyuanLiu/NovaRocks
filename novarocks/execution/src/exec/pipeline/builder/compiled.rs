@@ -43,10 +43,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::program_failure;
 use super::runtime_filter::{runtime_filter_consumer_contract, runtime_filter_producer};
 use super::*;
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
+use crate::exec::fragment::error::FragmentBindingErrorKind;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessorFactory;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
@@ -130,24 +132,35 @@ impl CompiledOrderedFilterContext {
 
 /// Operator display identity for a compiled node: its local program index.
 /// Profiles keep the program's provenance as the source relation.
-fn display_id(id: ProgramNodeId) -> Result<i32, String> {
-    i32::try_from(id.index()).map_err(|_| "compiled program node index exceeds i32".to_string())
+fn display_id(id: ProgramNodeId) -> ExecutionResult<i32> {
+    i32::try_from(id.index()).map_err(|_| {
+        program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "compiled program node index exceeds i32",
+        )
+    })
 }
 
 /// The receiver node id a compiled ExchangeSource is addressed by: the
 /// physical destination node of its edge, which is also the sender's
 /// `dest_node_id` routing key.
-fn receiver_node_id(program: &LocalProgram, id: ProgramNodeId) -> Result<i32, String> {
+fn receiver_node_id(program: &LocalProgram, id: ProgramNodeId) -> ExecutionResult<i32> {
     let input = program.exchange_inputs().get(&id).ok_or_else(|| {
-        format!(
-            "compiled exchange source at local node {} has no exchange address",
-            id.index()
+        program_failure(
+            FragmentBindingErrorKind::MissingAssignment,
+            format!(
+                "compiled exchange source at local node {} has no exchange address",
+                id.index()
+            ),
         )
     })?;
     i32::try_from(input.receiver_node).map_err(|_| {
-        format!(
-            "compiled exchange receiver node {} exceeds i32",
-            input.receiver_node
+        program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled exchange receiver node {} exceeds i32",
+                input.receiver_node
+            ),
         )
     })
 }
@@ -158,7 +171,7 @@ fn receiver_node_id(program: &LocalProgram, id: ProgramNodeId) -> Result<i32, St
 fn validate_compiled_exchange_bindings(
     program: &LocalProgram,
     bindings: &ExchangeBindings,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let sources = program
         .graph()
         .nodes()
@@ -168,31 +181,42 @@ fn validate_compiled_exchange_bindings(
         .map(|(index, _)| ProgramNodeId::new(index))
         .collect::<BTreeSet<_>>();
     if sources != program.exchange_inputs().keys().copied().collect() {
-        return Err(
-            "compiled exchange addresses do not match the program's exchange sources".to_string(),
-        );
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "compiled exchange addresses do not match the program's exchange sources",
+        ));
     }
     let mut receivers = BTreeSet::new();
     for id in &sources {
         let receiver = receiver_node_id(program, *id)?;
         if !receivers.insert(receiver) {
-            return Err(format!(
-                "compiled exchange receiver node {receiver} is addressed by more than one source"
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled exchange receiver node {receiver} is addressed by more than one source"
+                ),
             ));
         }
         let binding = bindings.get(receiver).ok_or_else(|| {
-            format!("missing exchange binding for compiled receiver node {receiver}")
+            program_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                format!("missing exchange binding for compiled receiver node {receiver}"),
+            )
         })?;
         if binding.key.node_id != receiver {
-            return Err(format!(
-                "exchange binding for compiled receiver node {receiver} is keyed to node {}",
-                binding.key.node_id
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "exchange binding for compiled receiver node {receiver} is keyed to node {}",
+                    binding.key.node_id
+                ),
             ));
         }
     }
     if let Some(extra) = bindings.node_ids().find(|id| !receivers.contains(id)) {
-        return Err(format!(
-            "exchange binding for node {extra} has no compiled exchange source"
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!("exchange binding for node {extra} has no compiled exchange source"),
         ));
     }
     Ok(())
@@ -200,15 +224,22 @@ fn validate_compiled_exchange_bindings(
 
 /// The physical scan node a compiled Scan is addressed by: the key of its
 /// Task split queue and of the scan binding its Task materialized.
-fn scan_node_id(program: &LocalProgram, id: ProgramNodeId) -> Result<i32, String> {
+fn scan_node_id(program: &LocalProgram, id: ProgramNodeId) -> ExecutionResult<i32> {
     let input = program.scan_inputs().get(&id).ok_or_else(|| {
-        format!(
-            "compiled scan at local node {} has no scan address",
-            id.index()
+        program_failure(
+            FragmentBindingErrorKind::MissingAssignment,
+            format!(
+                "compiled scan at local node {} has no scan address",
+                id.index()
+            ),
         )
     })?;
-    i32::try_from(input.scan_node)
-        .map_err(|_| format!("compiled scan node {} exceeds i32", input.scan_node))
+    i32::try_from(input.scan_node).map_err(|_| {
+        program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!("compiled scan node {} exceeds i32", input.scan_node),
+        )
+    })
 }
 
 /// The Task's scan bindings must cover exactly the program's compiled scans:
@@ -217,7 +248,7 @@ fn scan_node_id(program: &LocalProgram, id: ProgramNodeId) -> Result<i32, String
 fn validate_compiled_scan_bindings(
     program: &LocalProgram,
     bindings: &ScanBindings,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let scans = program
         .graph()
         .nodes()
@@ -227,25 +258,31 @@ fn validate_compiled_scan_bindings(
         .map(|(index, _)| ProgramNodeId::new(index))
         .collect::<BTreeSet<_>>();
     if scans != program.scan_inputs().keys().copied().collect() {
-        return Err("compiled scan addresses do not match the program's scans".to_string());
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "compiled scan addresses do not match the program's scans",
+        ));
     }
     let mut scan_nodes = BTreeSet::new();
     for id in &scans {
         let scan_node = scan_node_id(program, *id)?;
         if !scan_nodes.insert(scan_node) {
-            return Err(format!(
-                "compiled scan node {scan_node} is addressed by more than one scan"
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("compiled scan node {scan_node} is addressed by more than one scan"),
             ));
         }
         if bindings.get(scan_node).is_none() {
-            return Err(format!(
-                "missing scan binding for compiled scan node {scan_node}"
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("missing scan binding for compiled scan node {scan_node}"),
             ));
         }
     }
     if let Some(extra) = bindings.node_ids().find(|id| !scan_nodes.contains(id)) {
-        return Err(format!(
-            "scan binding for node {extra} has no compiled scan"
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!("scan binding for node {extra} has no compiled scan"),
         ));
     }
     Ok(())
@@ -297,18 +334,21 @@ fn node_runtime_filter_bindings(kind: &ProgramNodeKind) -> Vec<u32> {
 fn validate_compiled_runtime_filter_bindings(
     program: &LocalProgram,
     session: Option<&crate::runtime_filter::RuntimeFilterSessionRef>,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let mut sites = BTreeMap::<i32, usize>::new();
     for (index, node) in program.graph().nodes().iter().enumerate() {
         for binding_id in node_runtime_filter_bindings(node.kind()) {
             let binding_id = i32::try_from(binding_id).map_err(|_| {
-                format!(
+                program_failure(FragmentBindingErrorKind::InvalidAssignment, format!(
                     "compiled runtime-filter binding_id={binding_id} at local node {index} exceeds i32"
-                )
+                ))
             })?;
             if let Some(other) = sites.insert(binding_id, index) {
-                return Err(format!(
-                    "compiled runtime-filter binding_id={binding_id} has a site at local node {other} and at local node {index}"
+                return Err(program_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!(
+                        "compiled runtime-filter binding_id={binding_id} has a site at local node {other} and at local node {index}"
+                    ),
                 ));
             }
         }
@@ -324,20 +364,29 @@ fn validate_compiled_runtime_filter_bindings(
         })
         .collect::<BTreeSet<_>>();
     if let Some((binding_id, index)) = sites.iter().find(|(id, _)| !required.contains(id)) {
-        return Err(format!(
-            "compiled runtime-filter binding_id={binding_id} at local node {index} has no binding requirement"
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled runtime-filter binding_id={binding_id} at local node {index} has no binding requirement"
+            ),
         ));
     }
     if let Some(binding_id) = required.iter().find(|id| !sites.contains_key(id)) {
-        return Err(format!(
-            "compiled runtime-filter binding requirement binding_id={binding_id} has no program site"
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled runtime-filter binding requirement binding_id={binding_id} has no program site"
+            ),
         ));
     }
     if let Some((binding_id, index)) = sites.iter().next()
         && session.is_none()
     {
-        return Err(format!(
-            "compiled runtime-filter binding_id={binding_id} at local node {index} requires an execution runtime-filter session"
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled runtime-filter binding_id={binding_id} at local node {index} requires an execution runtime-filter session"
+            ),
         ));
     }
     Ok(())
@@ -355,7 +404,7 @@ fn compiled_runtime_filter_consumers(
     bindings: &[FilterConsumerAtExpr],
     ctx: &PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<Option<Arc<CompiledRuntimeFilterConsumers>>, String> {
+) -> ExecutionResult<Option<Arc<CompiledRuntimeFilterConsumers>>> {
     compiled_runtime_filter_consumers_selected(
         owner,
         display_owner,
@@ -383,7 +432,7 @@ fn compiled_runtime_filter_consumers_selected(
     ctx: &PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
     omit_ordered: bool,
-) -> Result<Option<Arc<CompiledRuntimeFilterConsumers>>, String> {
+) -> ExecutionResult<Option<Arc<CompiledRuntimeFilterConsumers>>> {
     if bindings.is_empty() {
         return Ok(None);
     }
@@ -394,23 +443,33 @@ fn compiled_runtime_filter_consumers_selected(
             if omit_ordered {
                 continue;
             }
-            return Err(format!(
-                "compiled {display_owner} at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
-                id.index(),
-                consumer.binding_id()
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled {display_owner} at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                    id.index(),
+                    consumer.binding_id()
+                ),
             ));
         }
         if let FilterConsumerActivation::NonBlockingLive { late_apply } = consumer.activation() {
-            return Err(format!(
-                "compiled {display_owner} at local node {} runtime-filter binding_id={} with NonBlockingLive {late_apply:?} activation is not executable yet",
-                id.index(),
-                consumer.binding_id()
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled {display_owner} at local node {} runtime-filter binding_id={} with NonBlockingLive {late_apply:?} activation is not executable yet",
+                    id.index(),
+                    consumer.binding_id()
+                ),
             ));
         }
         runtime_filter_session(&ctx.runtime_filter_execution, consumer.binding_id())?;
         contracts.push((
-            u32::try_from(ordinal)
-                .map_err(|_| "compiled runtime-filter binding count exceeds u32")?,
+            u32::try_from(ordinal).map_err(|_| {
+                program_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    "compiled runtime-filter binding count exceeds u32",
+                )
+            })?,
             runtime_filter_consumer_contract(consumer)?,
         ));
     }
@@ -443,7 +502,7 @@ pub fn build_compiled_pipeline_graph_for_test(
     root_sink_dop: Option<i32>,
     function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
-) -> Result<PipelineGraph, String> {
+) -> ExecutionResult<PipelineGraph> {
     build_compiled_pipeline_graph(
         program,
         exchange_bindings,
@@ -473,7 +532,7 @@ pub(crate) fn build_compiled_pipeline_graph(
     root_sink_dop: Option<i32>,
     function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
-) -> Result<PipelineGraph, String> {
+) -> ExecutionResult<PipelineGraph> {
     build_compiled_pipeline_graph_typed(
         program,
         exchange_bindings,
@@ -487,7 +546,6 @@ pub(crate) fn build_compiled_pipeline_graph(
         error,
         None,
     )
-    .map_err(ExecutionFailure::into_pipeline_message)
 }
 
 #[expect(
@@ -513,9 +571,10 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
         .iter()
         .any(|node| node.legacy_native_node_id().is_some())
     {
-        return Err("legacy-lowered nodes cannot enter the compiled pipeline"
-            .to_string()
-            .into());
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "legacy-lowered nodes cannot enter the compiled pipeline",
+        ));
     }
     validate_compiled_exchange_bindings(program, &exchange_bindings)?;
     validate_compiled_scan_bindings(program, &scan_bindings)?;
@@ -557,7 +616,10 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
         // The frozen profile places the root sink on one driver.
         Some(1) => build = gather_to_one(build, &mut ctx, ROOT_SINK_LOCAL_EXCHANGE_NODE_ID),
         Some(other) => {
-            return Err(format!("compiled root sink width {other} is not executable yet").into());
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("compiled root sink width {other} is not executable yet"),
+            ));
         }
     }
     build.pipeline.needs_sink = true;
@@ -574,11 +636,12 @@ fn build_node(
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
-    let node = program
-        .graph()
-        .nodes()
-        .get(id.index())
-        .ok_or_else(|| format!("missing compiled program node {}", id.index()))?;
+    let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
+        program_failure(
+            FragmentBindingErrorKind::MissingAssignment,
+            format!("missing compiled program node {}", id.index()),
+        )
+    })?;
     let node_id = display_id(id)?;
     match node.kind() {
         ProgramNodeKind::Values { .. } => {
@@ -640,48 +703,84 @@ fn build_node(
             limit,
         } => {
             if source.compiled().is_none() {
-                return Err(format!(
-                    "scan at local node {} carries no compiled provider read",
-                    id.index()
-                ).into());
+                return Err(program_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!(
+                        "scan at local node {} carries no compiled provider read",
+                        id.index()
+                    ),
+                ));
             }
-            let ordered_binding = runtime_filters.iter().find(|binding| matches!(binding.consumer.contract(), StaticFilterContract::Ordered { .. }));
+            let ordered_binding = runtime_filters.iter().find(|binding| {
+                matches!(
+                    binding.consumer.contract(),
+                    StaticFilterContract::Ordered { .. }
+                )
+            });
             let ordered_factory = if let Some(binding) = ordered_binding {
                 if !matches!(binding.consumer.contract(), StaticFilterContract::Ordered { keys, .. }
-                    if matches!(keys.as_slice(), [key] if novarocks_local_program::is_aggregate_topn_key_type(&key.value_type))) {
-                    return Err(format!(
-                        "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
-                        id.index(), binding.consumer.binding_id(),
-                    ).into());
+                    if matches!(keys.as_slice(), [key] if novarocks_local_program::is_aggregate_topn_key_type(&key.value_type)))
+                {
+                    return Err(program_failure(
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        format!(
+                            "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                            id.index(),
+                            binding.consumer.binding_id(),
+                        ),
+                    ));
                 }
                 let Some(context) = ordered else {
-                    // The original text-only test bridge installs no new
-                    // ordered resources. Production freezes its real context
-                    // before entering this typed builder.
-                    return Err(format!(
-                        "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
-                        id.index(), binding.consumer.binding_id(),
-                    ).into());
+                    // Ordered resources must belong to the exact Task context
+                    // frozen before entering the builder.
+                    return Err(program_failure(
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        format!(
+                            "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                            id.index(),
+                            binding.consumer.binding_id(),
+                        ),
+                    ));
                 };
                 Some(CompiledOrderedScanFactory::try_new(
-                    Arc::clone(program), id,
-                    Arc::clone(runtime_filter_session(&ctx.runtime_filter_execution, binding.consumer.binding_id())?),
-                    &context.host, &context.control,
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(runtime_filter_session(
+                        &ctx.runtime_filter_execution,
+                        binding.consumer.binding_id(),
+                    )?),
+                    &context.host,
+                    &context.control,
                 )?)
-            } else { None };
+            } else {
+                None
+            };
             // Consumers are built first, so a refused binding builds no driver.
             let runtime_filters = compiled_runtime_filter_consumers_selected(
-                "Scan", "scan", program, id, runtime_filters, ctx, error, ordered_factory.is_some(),
+                "Scan",
+                "scan",
+                program,
+                id,
+                runtime_filters,
+                ctx,
+                error,
+                ordered_factory.is_some(),
             )?;
             if limit.is_some() && ordered_factory.is_none() {
-                return Err(format!(
-                    "compiled scan at local node {} with a scan limit is not executable yet",
-                    id.index()
-                ).into());
+                return Err(program_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!(
+                        "compiled scan at local node {} with a scan limit is not executable yet",
+                        id.index()
+                    ),
+                ));
             }
             let scan_node = scan_node_id(program, id)?;
             let op = ctx.scan_bindings.get(scan_node).ok_or_else(|| {
-                format!("missing scan binding for compiled scan node {scan_node}")
+                program_failure(
+                    FragmentBindingErrorKind::MissingAssignment,
+                    format!("missing scan binding for compiled scan node {scan_node}"),
+                )
             })?;
             // The residual is the scan's own TruthOnly root over its output;
             // it is built first so a refused root binds no driver.
@@ -704,11 +803,21 @@ fn build_node(
             let source: Box<dyn OperatorFactory> = if let Some(factory) = ordered_factory {
                 let context = ordered.expect("validated original ordered Task context");
                 Box::new(StreamScanSourceFactory::new_compiled_ordered(
-                    node_id, op, runtime_filters, factory, residual.take(), *limit,
-                    context.host.clone(), context.control.clone(),
+                    node_id,
+                    op,
+                    runtime_filters,
+                    factory,
+                    residual.take(),
+                    *limit,
+                    context.host.clone(),
+                    context.control.clone(),
                 ))
             } else {
-                Box::new(StreamScanSourceFactory::new_compiled(node_id, op, runtime_filters))
+                Box::new(StreamScanSourceFactory::new_compiled(
+                    node_id,
+                    op,
+                    runtime_filters,
+                ))
             };
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             let mut build = PipelineBuildResult {
@@ -733,20 +842,29 @@ fn build_node(
             hash_partition_exprs,
         } => {
             if !runtime_filters.is_empty() {
-                return Err(format!(
-                    "compiled exchange source at local node {} with runtime-filter consumers is not executable yet",
-                    id.index()
-                ).into());
+                return Err(program_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!(
+                        "compiled exchange source at local node {} with runtime-filter consumers is not executable yet",
+                        id.index()
+                    ),
+                ));
             }
             if !hash_partition_exprs.is_empty() {
-                return Err(format!(
-                    "compiled exchange source at local node {} with hash-key expressions is not executable yet",
-                    id.index()
-                ).into());
+                return Err(program_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!(
+                        "compiled exchange source at local node {} with hash-key expressions is not executable yet",
+                        id.index()
+                    ),
+                ));
             }
             let receiver = receiver_node_id(program, id)?;
             let binding = ctx.exchange_bindings.get(receiver).ok_or_else(|| {
-                format!("missing exchange binding for compiled receiver node {receiver}")
+                program_failure(
+                    FragmentBindingErrorKind::MissingAssignment,
+                    format!("missing exchange binding for compiled receiver node {receiver}"),
+                )
             })?;
             let source: Box<dyn OperatorFactory> = Box::new(ExchangeSourceFactory::new_compiled(
                 node_id, *timeout, binding,
@@ -811,17 +929,25 @@ fn build_node(
             build.stream = StreamDesc::single();
             Ok(build)
         }
-        ProgramNodeKind::Aggregate { input, topn_filters, .. } => {
+        ProgramNodeKind::Aggregate {
+            input,
+            topn_filters,
+            ..
+        } => {
             // Preserve the original driver-local Partial -> exchange -> Final
             // chronology. Grouped states hash actual emitted key slots; a
             // group-less state uses the original Single exchange.
             let mut factory = if ordered.is_some() && !topn_filters.is_empty() {
                 CompiledAggregateProcessorFactory::prepare_ordered(
-                    Arc::clone(program), id, Arc::clone(error),
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
                 )?
             } else {
                 CompiledAggregateProcessorFactory::try_new(
-                    Arc::clone(program), id, Arc::clone(error),
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
                 )?
             };
             let complete = factory.completes_groups();
@@ -861,8 +987,10 @@ fn build_node(
                 // The processor that now owns the original endpoint acquires
                 // its producer using this actual pipeline's width.
                 factory.install_ordered(
-                    Arc::clone(session), build.pipeline.dop,
-                    &ordered.host, &ordered.control,
+                    Arc::clone(session),
+                    build.pipeline.dop,
+                    &ordered.host,
+                    &ordered.control,
                 )?;
             }
             build.pipeline.factories.push(Box::new(factory));
@@ -946,10 +1074,10 @@ fn build_node(
                                         ))
                                     }
                                 })
-                                .collect::<Result<Vec<_>, String>>()?,
+                                .collect::<ExecutionResult<Vec<_>>>()?,
                         })
                     })
-                    .collect::<Result<Vec<_>, String>>()?;
+                    .collect::<ExecutionResult<Vec<_>>>()?;
                 let node = &program.graph().nodes()[id.index()];
                 build.pipeline.factories.push(Box::new(
                     crate::exec::operators::StatisticsMaterializerFactory::try_new_compiled(
@@ -1010,20 +1138,28 @@ fn build_node(
             writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error, ordered)
         }
         // The probe is the left input and the build the right input.
-        ProgramNodeKind::Join { left, right, .. } => {
-            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error, ordered)
-        }
+        ProgramNodeKind::Join { left, right, .. } => join_pipelines::build_hash_join(
+            program, id, node_id, *left, *right, ctx, error, ordered,
+        ),
         ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
-            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error, ordered)
+            join_pipelines::build_nested_loop_join(
+                program, id, node_id, *left, *right, ctx, error, ordered,
+            )
         }
-        ProgramNodeKind::RuntimeFilterConsumer { .. } => Err(format!(
-            "compiled join probe-key runtime-filter consumer at local node {} is not executable yet",
-            id.index()
-        ).into()),
-        _ => Err(format!(
-            "compiled node family at local node {} has no compiled processor yet",
-            id.index()
-        ).into()),
+        ProgramNodeKind::RuntimeFilterConsumer { .. } => Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled join probe-key runtime-filter consumer at local node {} is not executable yet",
+                id.index()
+            ),
+        )),
+        _ => Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled node family at local node {} has no compiled processor yet",
+                id.index()
+            ),
+        )),
     }
 }
 
@@ -1077,22 +1213,33 @@ fn validate_union_branches(
     program: &LocalProgram,
     id: ProgramNodeId,
     inputs: &[ProgramNodeId],
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let nodes = program.graph().nodes();
     let layout = nodes
         .get(id.index())
-        .ok_or_else(|| format!("missing compiled UnionAll node {}", id.index()))?
+        .ok_or_else(|| {
+            program_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                format!("missing compiled UnionAll node {}", id.index()),
+            )
+        })?
         .output_layout();
     if inputs.len() < 2 {
-        return Err(format!(
-            "compiled UnionAll at local node {} has fewer than two branches",
-            id.index()
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled UnionAll at local node {} has fewer than two branches",
+                id.index()
+            ),
         ));
     }
     for (ordinal, input) in inputs.iter().enumerate() {
-        let branch = nodes
-            .get(input.index())
-            .ok_or_else(|| format!("missing compiled UnionAll branch {}", input.index()))?;
+        let branch = nodes.get(input.index()).ok_or_else(|| {
+            program_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                format!("missing compiled UnionAll branch {}", input.index()),
+            )
+        })?;
         let normalizer = matches!(
             branch.kind(),
             ProgramNodeKind::Project {
@@ -1103,9 +1250,12 @@ fn validate_union_branches(
         let same_layout = branch.output_layout().schema() == layout.schema()
             && branch.output_layout().slots() == layout.slots();
         if !normalizer || !same_layout {
-            return Err(format!(
-                "compiled UnionAll at local node {} branch {ordinal} is not a normalizer owning the union layout",
-                id.index()
+            return Err(program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "compiled UnionAll at local node {} branch {ordinal} is not a normalizer owning the union layout",
+                    id.index()
+                ),
             ));
         }
     }

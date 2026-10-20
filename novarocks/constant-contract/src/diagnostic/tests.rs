@@ -58,7 +58,7 @@ impl PureCompileControl for Control {
         let mut calls = self.calls.lock().unwrap();
         let at = calls.len();
         calls.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((index, cause)) if index == at => Err(cause),
             _ => Ok(()),
         }
@@ -116,7 +116,7 @@ fn assert_all_callbacks(value: &ConstantValue, ordinary_error: bool) -> Vec<(Com
     let baseline = Control::good();
     let result = format(value, PHASE, &baseline);
     if ordinary_error {
-        assert!(matches!(result, Err(ConstantError::Arrow(_))));
+        assert!(matches!(result, Err(ConstantError::Source(_))));
     } else {
         result.unwrap();
     }
@@ -129,7 +129,7 @@ fn assert_all_callbacks(value: &ConstantValue, ordinary_error: bool) -> Vec<(Com
     );
     for at in 0..trace.len() {
         for cause in causes() {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(format(value, PHASE, &control), Err(ConstantError::Control(actual)) if actual == cause)
             );
@@ -287,7 +287,7 @@ fn diagnostic_observes_wide_actual_fields_and_ordinary_date_failure_tail() {
         trace.len() - 1,
     ] {
         for cause in causes() {
-            let refusal = Control::refusing(at, cause);
+            let refusal = Control::refusing(at, cause.clone());
             assert!(
                 matches!(format(&value, PHASE, &refusal), Err(ConstantError::Control(actual)) if actual == cause)
             );
@@ -298,7 +298,7 @@ fn diagnostic_observes_wide_actual_fields_and_ordinary_date_failure_tail() {
     let value = p.value(1).unwrap();
     let error = format(&value, PHASE, &Control::good()).unwrap_err();
     assert!(
-        matches!(error, ConstantError::Arrow(message) if message.contains("Failed to convert"))
+        matches!(error, ConstantError::Source(message) if message.detail().contains("Failed to convert"))
     );
     let trace = assert_all_callbacks(&value, true);
     assert!(trace.len() > 1);
@@ -330,7 +330,7 @@ fn diagnostic_long_selected_unicode_text_observes_each_pass_and_never_publishes_
         trace.len() - 1,
     ] {
         for cause in causes() {
-            let refusal = Control::refusing(at, cause);
+            let refusal = Control::refusing(at, cause.clone());
             assert!(
                 matches!(format(&value, PHASE, &refusal), Err(ConstantError::Control(actual)) if actual == cause)
             );
@@ -374,15 +374,15 @@ fn diagnostic_writer_checks_growth_overflow_unicode_and_first_primary_failure() 
     assert_eq!(control.trace(), before);
 
     for cause in causes() {
-        let refusal = Control::refusing(1, cause);
+        let refusal = Control::refusing(1, cause.clone());
         let mut work = CompileCheckpoints::try_new(&refusal, PHASE).unwrap();
         let mut writer = ObservedWriter::output(&mut work, 5);
         // The mandatory pre-growth callback fails before copying any bytes.
         assert!(writer.write_str("é").is_err());
         assert_eq!(writer.output.as_deref(), Some(""));
-        assert!(matches!(writer.error, Some(ConstantError::Control(actual)) if actual == cause));
+        assert!(matches!(&writer.error, Some(ConstantError::Control(actual)) if actual == &cause));
         assert!(writer.write_str("exceeds bound").is_err());
-        assert!(matches!(writer.error, Some(ConstantError::Control(actual)) if actual == cause));
+        assert!(matches!(&writer.error, Some(ConstantError::Control(actual)) if actual == &cause));
         assert_eq!(refusal.trace().len(), 2);
     }
     let refusal = Control::refusing(1, CompileControlError::Cancelled);
@@ -392,4 +392,21 @@ fn diagnostic_writer_checks_growth_overflow_unicode_and_first_primary_failure() 
     assert!(matches!(writer.error, Some(ConstantError::Limit(_))));
     assert!(writer.write_str("x").is_err());
     assert_eq!(refusal.trace().len(), 1);
+}
+
+#[test]
+fn actual_diagnostic_backing_refuses_unrepresentable_string_before_allocation() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    let error = super::reserve_output(usize::MAX).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Representation);
+    let facts = error.failure_fact().representation().unwrap();
+    assert_eq!(facts.boundary, RepresentationBoundary::SingleOutput);
+    assert_eq!(facts.required, Some(usize::MAX as u64));
+    assert_eq!(facts.extent_limit, Some(isize::MAX as u64));
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    while !source.is::<std::alloc::LayoutError>() {
+        source = source.source().expect("actual Rust string layout refusal");
+    }
+    assert!(super::reserve_output(0).unwrap().is_empty());
+    assert!(super::reserve_output(64).unwrap().capacity() >= 64);
 }

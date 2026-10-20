@@ -41,7 +41,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -357,7 +357,7 @@ fn basic_window_compile_and_runtime_refusals_remain_primary() {
     ] {
         for stop in 0..calls {
             let c = CompileControl {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..CompileControl::default()
             };
             assert!(fixture.try_window(None, false, false, &c).is_err());
@@ -619,11 +619,10 @@ fn shared_moment_core_retains_legacy_text_formats_and_diagnostic_messages() {
             .value(0),
         "2,2,3"
     );
-    assert_eq!(
-        core.decode_bytes(&[0; 8], &mut work)
-            .unwrap_err()
-            .into_kernel_failure(),
-        failure("variance/stddev intermediate binary size mismatch: expected 24, got 8")
+    assert_state_refusal(
+        core.decode_bytes(&[0; 8], &mut work).unwrap_err(),
+        156,
+        "variance/stddev intermediate binary size mismatch: expected 24, got 8",
     );
     let avg = BasicComputation {
         operation: BasicOperation::Avg,
@@ -632,18 +631,27 @@ fn shared_moment_core_retains_legacy_text_formats_and_diagnostic_messages() {
         output_type: &t,
         intermediate_type: &state_type,
     };
-    assert_eq!(
-        avg.decode_text("hello,3", &mut work)
-            .unwrap_err()
-            .into_kernel_failure(),
-        failure("invalid avg state sum 'hello': invalid float literal")
+    let error = avg.decode_text("hello,3", &mut work).unwrap_err();
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<std::num::ParseFloatError>()
+    );
+    assert_state_refusal(
+        error,
+        157,
+        "invalid avg state sum 'hello': invalid float literal",
     );
     let long = "x".repeat(4096);
+    let error = avg.decode_text(&long, &mut work).unwrap_err();
+    let text = error.to_string();
+    assert!(text.starts_with("invalid avg state '"));
+    assert!(text.len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
     assert_eq!(
-        avg.decode_text(&long, &mut work)
-            .unwrap_err()
-            .into_legacy_message(),
-        format!("invalid avg state '{}': missing ','", long)
+        novarocks_failure_contract::FailureProjection::failure_fact(&error)
+            .reason()
+            .code(),
+        156
     );
     let corr = BasicComputation {
         operation: BasicOperation::Corr,
@@ -666,11 +674,11 @@ fn shared_moment_core_retains_legacy_text_formats_and_diagnostic_messages() {
             .abs()
             < 1e-15
     );
-    assert_eq!(
+    assert_state_refusal(
         corr.decode_text("2,4,4,3,2,8,trailing", &mut work)
-            .unwrap_err()
-            .into_kernel_failure(),
-        failure("corr utf8 state expects 6 parts")
+            .unwrap_err(),
+        156,
+        "corr utf8 state expects 6 parts",
     );
 }
 
@@ -837,4 +845,270 @@ fn basic_window_every_numeric_overload_and_alias_has_independent_values() {
             .collect::<Vec<_>>(),
         vec![Some(2); 3]
     );
+}
+
+fn assert_state_refusal(error: BasicStateError, reason: u16, message: &str) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.to_string(), message);
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Invariant);
+    assert_eq!(fact.reason().code(), reason);
+    let outer = error.into_kernel_failure();
+    assert_eq!(outer.failure_fact(), fact);
+    assert!(matches!(outer, KernelFailure::Source(ref cause)
+        if std::error::Error::source(cause).unwrap().is::<BasicStateError>()));
+}
+#[test]
+fn basic_numeric_and_state_decode_refusals_have_distinct_facts_and_sources() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let data = round_i256(i256::MIN, -1).unwrap_err();
+    assert_eq!(
+        data.failure_fact(),
+        crate::DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    assert_eq!(data.failure_fact().class(), FailureClass::Data);
+    let state = state_error("decimal overflow ResourceExhausted");
+    assert_eq!(state.failure_fact().class(), FailureClass::Invariant);
+    let control = BasicStateError::from(KernelFailure::Cancelled).into_kernel_failure();
+    assert_eq!(control, KernelFailure::Cancelled);
+}
+
+#[test]
+fn basic_real_state_contract_failure_precedes_an_armed_completion_cancel() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let output = DataType::Float64;
+    let frozen_invalid_state = DataType::Int64;
+    let core = BasicComputation {
+        operation: BasicOperation::VarPop,
+        domain: BasicStateDomain::Plain,
+        input_scale: None,
+        output_type: &output,
+        intermediate_type: &frozen_invalid_state,
+    };
+    // Four actual pre-error callbacks: entry, snapshot reservation boundaries,
+    // and its single state. The optional fifth callback must not replace the
+    // real frozen intermediate contract failure.
+    let control = Control {
+        trace: Mutex::default(),
+        refusal: Some((4, KernelFailure::Cancelled)),
+    };
+    let error = core
+        .build([Ok(BasicState::default())].into_iter(), true, &control)
+        .unwrap_err();
+    assert!(matches!(&error, BasicStateError::StateContract(_)));
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 156);
+    assert_eq!(*control.trace.lock().unwrap(), [0, 0, 0, 1]);
+    let projected = error.into_kernel_failure();
+    assert_eq!(projected.failure_fact().reason().code(), 156);
+    assert!(
+        matches!(projected, KernelFailure::Source(ref source) if std::error::Error::source(source).unwrap().is::<BasicStateError>())
+    );
+}
+
+#[test]
+fn basic_real_arrow_precision_failure_precedes_an_armed_completion_cancel() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    // Fault-injected invalid frozen output metadata reaches the actual Arrow
+    // precision validator. No new SQL/type admission is implied by this probe.
+    let output = DataType::Decimal128(0, 0);
+    let state_type = DataType::Utf8;
+    let core = BasicComputation {
+        operation: BasicOperation::Avg,
+        domain: BasicStateDomain::Decimal128,
+        input_scale: Some(0),
+        output_type: &output,
+        intermediate_type: &state_type,
+    };
+    let state = BasicState {
+        decimal: 1,
+        count: 1,
+        ..Default::default()
+    };
+    let control = Control {
+        trace: Mutex::default(),
+        refusal: Some((7, KernelFailure::Cancelled)),
+    };
+    let error = core
+        .build([Ok(state)].into_iter(), false, &control)
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        BasicStateError::StateArrow(arrow_schema::ArrowError::InvalidArgumentError(_))
+    ));
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 159);
+    assert_eq!(*control.trace.lock().unwrap(), [0, 0, 0, 1, 0, 0, 1]);
+    let projected = error.into_kernel_failure();
+    assert_eq!(projected.failure_fact().reason().code(), 159);
+    let KernelFailure::Source(source) = projected else {
+        panic!("original typed Arrow outer cause");
+    };
+    let original = std::error::Error::source(&source)
+        .unwrap()
+        .downcast_ref::<BasicStateError>()
+        .unwrap();
+    assert!(
+        std::error::Error::source(original)
+            .unwrap()
+            .is::<arrow_schema::ArrowError>()
+    );
+}
+
+#[test]
+fn basic_typed_scope_keeps_the_actual_decoder_box_and_earlier_observer_refusal() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Later {
+        cancelled: AtomicBool,
+        calls_after: AtomicUsize,
+    }
+    impl KernelEvaluationControl for Later {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            if self.cancelled.load(Ordering::SeqCst) {
+                self.calls_after.fetch_add(1, Ordering::SeqCst);
+                Err(KernelFailure::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("no decoder wait");
+        }
+    }
+    let output = DataType::Float64;
+    let state_type = DataType::Utf8;
+    let core = BasicComputation {
+        operation: BasicOperation::Avg,
+        domain: BasicStateDomain::Plain,
+        input_scale: None,
+        output_type: &output,
+        intermediate_type: &state_type,
+    };
+    let control = Later {
+        cancelled: AtomicBool::new(false),
+        calls_after: AtomicUsize::new(0),
+    };
+    let original_pointer = AtomicUsize::new(0);
+    // observed_core's current production caller is build. This direct typed
+    // helper probe uses the real decoder author to check the nominal error
+    // transport without claiming decode_text is a current build sub-operation.
+    let error = observed_core::<()>(&control, |work| {
+        let error = core.decode_text("hello,3", work).unwrap_err();
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(source.is::<std::num::ParseFloatError>());
+        original_pointer.store(
+            source as *const dyn std::error::Error as *const () as usize,
+            Ordering::SeqCst,
+        );
+        control.cancelled.store(true, Ordering::SeqCst);
+        Err(error)
+    })
+    .unwrap_err();
+    assert!(matches!(&error, BasicStateError::StateDecode { .. }));
+    let projected = error.into_kernel_failure();
+    let KernelFailure::Source(source) = projected else {
+        panic!("typed original decoder cause");
+    };
+    let original = std::error::Error::source(&source)
+        .unwrap()
+        .downcast_ref::<BasicStateError>()
+        .unwrap();
+    let primitive = std::error::Error::source(original).unwrap();
+    assert!(primitive.is::<std::num::ParseFloatError>());
+    assert_eq!(
+        primitive as *const dyn std::error::Error as *const () as usize,
+        original_pointer.load(Ordering::SeqCst)
+    );
+    assert_eq!(control.calls_after.load(Ordering::SeqCst), 0);
+    let earlier = Control {
+        trace: Mutex::default(),
+        refusal: Some((1, KernelFailure::DeadlineExceeded)),
+    };
+    let result = observed_core::<()>(&earlier, |work| {
+        // Deliberately ignored first control refusal; the existing observer
+        // still owns it before this later, actual primitive parse failure.
+        assert_eq!(work.flush(), Err(KernelFailure::DeadlineExceeded));
+        Err(state_decode_source("bad".parse::<i64>().unwrap_err()))
+    });
+    assert!(matches!(
+        result,
+        Err(BasicStateError::Kernel(KernelFailure::DeadlineExceeded))
+    ));
+    assert_eq!(*earlier.trace.lock().unwrap(), [0, 0]);
+}
+
+#[test]
+fn basic_successful_sql_null_keeps_its_final_cooperative_observation() {
+    let output = DataType::Float64;
+    let state_type = DataType::Utf8;
+    let core = BasicComputation {
+        operation: BasicOperation::Avg,
+        domain: BasicStateDomain::Plain,
+        input_scale: None,
+        output_type: &output,
+        intermediate_type: &state_type,
+    };
+    let success = Control::default();
+    let result = core
+        .build([Ok(BasicState::default())].into_iter(), false, &success)
+        .unwrap();
+    assert_eq!(result.null_count(), 1);
+    let trace = success.trace.lock().unwrap().clone();
+    let last = trace.len().checked_sub(1).unwrap();
+    let stopped = Control {
+        trace: Mutex::default(),
+        refusal: Some((last, KernelFailure::Cancelled)),
+    };
+    assert!(matches!(
+        core.build([Ok(BasicState::default())].into_iter(), false, &stopped),
+        Err(BasicStateError::Kernel(KernelFailure::Cancelled))
+    ));
+    assert_eq!(*stopped.trace.lock().unwrap(), trace);
+}
+
+#[test]
+fn basic_installed_compile_semantic_error_keeps_first_cause_and_drops_temporary_owners() {
+    let fixture = Fixture::new(
+        "avg",
+        FunctionValueType::new(DataType::Int64, true),
+        DecimalOverflowPolicy::OutputNull,
+    );
+    let baseline = CompileControl::default();
+    assert!(matches!(
+        fixture.try_window(None, false, true, &baseline),
+        Err(FunctionSpecializationFailure::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
+    ));
+    let trace = baseline.trace.lock().unwrap().clone();
+    assert!(!trace.is_empty());
+    let source = CompileControlError::from_domain(
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+    );
+    let original_owners = Arc::strong_count(&fixture.selected);
+    let control = CompileControl {
+        trace: Mutex::default(),
+        refusal: Some((trace.len(), source.clone())),
+    };
+    assert!(matches!(
+        fixture.try_window(None, false, true, &control),
+        Err(FunctionSpecializationFailure::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
+    ));
+    assert_eq!(*control.trace.lock().unwrap(), trace);
+    assert_eq!(Arc::strong_count(&fixture.selected), original_owners);
+    // Earlier real control callbacks, including a native typed Source, stay
+    // primary through the actual binder/refiner/preparation stack.
+    for at in 0..trace.len() {
+        let control = CompileControl {
+            trace: Mutex::default(),
+            refusal: Some((at, source.clone())),
+        };
+        assert!(
+            matches!(fixture.try_window(None,false,true,&control),Err(FunctionSpecializationFailure::Control(actual)) if actual==source)
+        );
+        assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        assert_eq!(Arc::strong_count(&fixture.selected), original_owners);
+    }
 }

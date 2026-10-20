@@ -44,7 +44,7 @@ impl Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
         let at = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some((wanted, error)) = self.refusal
+        if let Some((wanted, error)) = self.refusal.clone()
             && wanted == at
         {
             return Err(error);
@@ -115,16 +115,20 @@ fn project_metadata_route_uses_actual_namespace_loans_and_preserves_open_constru
     for count in [0, 1, 320] {
         let layout = positive(count);
         assert_eq!(
-            original_schema_route(&layout, &Control::good()),
-            Ok(OriginalSchemaRoute::NormalPositive)
+            original_schema_route(&layout, &Control::good()).unwrap(),
+            OriginalSchemaRoute::NormalPositive
         );
         assert!(!layout.is_typed());
-        assert_eq!(
-            original_compiled_schema_metadata_request(&layout, &Control::good()),
-            Err(MetadataRequestError::SourceModel(
-                "compiled schema request requires its exact typed execution layout",
-            ))
-        );
+        let error =
+            original_compiled_schema_metadata_request(&layout, &Control::good()).unwrap_err();
+        assert!(matches!(
+            error,
+            novarocks_execution::exec::chunk::CompiledSchemaRequestFailure::Request(
+                MetadataRequestError::SourceModel(
+                    "compiled schema request requires its exact typed execution layout"
+                )
+            )
+        ));
         ChunkSchema::from_compiled_layout(&layout).unwrap();
 
         let typed = typed_positive(count);
@@ -169,7 +173,7 @@ fn project_metadata_route_control_refusal_cannot_become_an_open_source_route() {
             ] {
                 let control = Control {
                     calls: AtomicUsize::new(0),
-                    refusal: Some((at, error)),
+                    refusal: Some((at, error.clone())),
                 };
                 assert_eq!(
                     original_schema_route(&layout, &control),

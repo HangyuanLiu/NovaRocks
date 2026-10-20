@@ -53,7 +53,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after the original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -478,7 +478,7 @@ fn single_original_layout_refusal_and_success_preserve_every_original_control_pr
             ] {
                 let control = Control {
                     trace: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(authored(plan, &control), Err(ContractLoweringError::Control(actual)) if actual == cause)
@@ -555,7 +555,7 @@ fn single_journal_reader_borrows_same_request_selection_and_preserves_control_pr
             ] {
                 let control = Control {
                     trace: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(invoke(&control), Err(PhysicalAggregateRequestError::Control(actual)) if actual == cause)
@@ -606,7 +606,7 @@ fn single_wide_nested_metadata_emission_observes_bounded_original_control() {
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(authored(&plan, &control), Err(ContractLoweringError::Control(actual)) if actual == cause)

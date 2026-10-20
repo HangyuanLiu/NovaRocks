@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 // The original ilike consumer borrows the same sole matcher.
 pub use novarocks_functions::native_like::like_match;
@@ -24,8 +26,9 @@ pub fn eval_like<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     str_expr: ExprId,
     pattern_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let str_array = arena.eval(str_expr, chunk)?;
     let pattern_array = arena.eval(pattern_expr, chunk)?;
-    Ok((novarocks_functions::native_like::evaluate_legacy(&str_array, &pattern_array))?)
+    novarocks_functions::native_like::evaluate_required(&str_array, &pattern_array)
+        .map_err(ExecutionFailure::from)
 }

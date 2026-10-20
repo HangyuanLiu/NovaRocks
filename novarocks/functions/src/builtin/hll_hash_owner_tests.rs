@@ -479,7 +479,7 @@ struct CompileRefusal(CompileControlError);
 impl PureCompileControl for CompileRefusal {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        Err(self.0)
+        Err(self.0.clone())
     }
 }
 #[test]
@@ -496,9 +496,21 @@ fn hll_hash_native_n1_compile_three_causes_are_not_row_data() {
         ),
     ] {
         let uses = [Some(ExpressionUseId::new(42))];
-        assert!(matches!(prepare_with(1,&uses,&CompileRefusal(cause)),
-            Err(FunctionSpecializationFailure::Control(c)) if c==cause));
-        assert_eq!(crate::kernel_control::compile_failure(cause), expected);
+        assert!(
+            matches!(prepare_with(1,&uses,&CompileRefusal(cause.clone())),
+            Err(FunctionSpecializationFailure::Control(c)) if c==cause)
+        );
+        let original_fact = novarocks_failure_contract::FailureProjection::failure_fact(&cause);
+        let actual = crate::kernel_control::compile_failure(cause.clone());
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&actual),
+            original_fact
+        );
+        assert_eq!(
+            original_fact.class(),
+            novarocks_failure_contract::FailureProjection::failure_fact(&expected).class()
+        );
+        assert_eq!(actual, KernelFailure::CompileControl(cause));
     }
 }
 

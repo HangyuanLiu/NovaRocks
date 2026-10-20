@@ -228,12 +228,11 @@ fn ordered_topn_owned_candidate_slot_refusal_keeps_new_group_uncommitted() {
         &host,
     )
     .unwrap();
-    assert_eq!(
-        state.observe_owned_group(0, null, &Pass),
-        Err(OwnedTopNBoundaryError::Kernel(
-            KernelFailure::ResourceExhausted
-        ))
-    );
+    let error = state.observe_owned_group(0, null, &Pass).unwrap_err();
+    let OwnedTopNBoundaryError::Kernel(cause) = error else {
+        panic!("actual candidate allocator refusal: {error:?}");
+    };
+    crate::runtime_filter::assert_real_vector_refusal(&cause, None);
     assert_eq!(state.observed_group_count, 0);
     assert!(state.snapshot_owned(&Pass).unwrap().is_none());
     drop(state);
@@ -632,8 +631,8 @@ fn topn_boundary_shared_numeric_projection_keeps_exact_carriers_and_null_order()
     assert_eq!(
         tuple_from_group_array(&order, &wrong, 1),
         Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
-            expected: DataType::Int64,
-            actual: DataType::Int32
+            expected: novarocks_failure_contract::BoundedDetail::truncating_display("Int64"),
+            actual: novarocks_failure_contract::BoundedDetail::truncating_display("Int32")
         })
     );
 }
@@ -659,12 +658,11 @@ fn topn_boundary_owned_numeric_candidate_refuses_actual_container_growth() {
         .copy_scalar(Some(OrderedScalarRef::Int64(7)), &Pass)
         .unwrap();
     assert_eq!(tracker.current(), 0);
-    assert_eq!(
-        state.observe_owned_group(0, key, &Pass),
-        Err(OwnedTopNBoundaryError::Kernel(
-            KernelFailure::ResourceExhausted
-        ))
-    );
+    let error = state.observe_owned_group(0, key, &Pass).unwrap_err();
+    let OwnedTopNBoundaryError::Kernel(cause) = error else {
+        panic!("actual candidate allocator refusal: {error:?}");
+    };
+    crate::runtime_filter::assert_real_vector_refusal(&cause, None);
     assert_eq!(state.observed_group_count, 0);
     assert_eq!(tracker.current(), 0);
     drop(state);

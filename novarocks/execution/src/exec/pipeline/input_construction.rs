@@ -50,6 +50,7 @@ pub enum ConstructionFailure {
     MissingOwner,
     Memory(crate::runtime::mem_tracker::MemTrackerLimitExceeded),
     InvalidSource(String),
+    Source(crate::runtime::fragment::SharedDomainFailure),
     Control(novarocks_type_contract::CompileControlError),
     Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     Caller(Box<ExecutionFailure>),
@@ -60,6 +61,7 @@ impl ConstructionFailure {
             Self::MissingOwner => "typed input construction owner is missing",
             Self::Memory(error) => error.detail(),
             Self::InvalidSource(error) => error,
+            Self::Source(error) => error.detail(),
             Self::Control(novarocks_type_contract::CompileControlError::Cancelled) => {
                 "input construction was cancelled"
             }
@@ -69,14 +71,22 @@ impl ConstructionFailure {
             Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted) => {
                 "input construction work resources were exhausted"
             }
+            Self::Control(novarocks_type_contract::CompileControlError::Source(source)) => {
+                source.detail()
+            }
             Self::Caller(error) => error.detail(),
             Self::Resource(_) => "input construction storage layout cannot be represented",
         }
     }
 }
-impl From<String> for ConstructionFailure {
-    fn from(error: String) -> Self {
-        Self::InvalidSource(error)
+impl From<novarocks_functions::array_projection::ArrayProjectionFailure> for ConstructionFailure {
+    fn from(source: novarocks_functions::array_projection::ArrayProjectionFailure) -> Self {
+        Self::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
+    }
+}
+impl From<crate::exec::chunk::ChunkConstructionFailure> for ConstructionFailure {
+    fn from(source: crate::exec::chunk::ChunkConstructionFailure) -> Self {
+        Self::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
     }
 }
 impl From<novarocks_type_contract::CompileControlError> for ConstructionFailure {
@@ -102,6 +112,7 @@ impl std::fmt::Display for ConstructionFailure {
             Self::MissingOwner => f.write_str("typed input construction owner is missing"),
             Self::Memory(error) => error.fmt(f),
             Self::InvalidSource(error) => f.write_str(error),
+            Self::Source(error) => error.fmt(f),
             Self::Control(error) => error.fmt(f),
             Self::Caller(error) => error.fmt(f),
             Self::Resource(error) => write!(f, "input construction storage layout: {error:?}"),
@@ -114,6 +125,7 @@ impl std::error::Error for ConstructionFailure {
             Self::Control(error) => Some(error),
             Self::Memory(error) => Some(error),
             Self::Caller(error) => Some(error.as_ref()),
+            Self::Source(error) => Some(error),
             _ => None,
         }
     }
@@ -202,4 +214,25 @@ pub trait InputConstructionOwner: Send + Sync {
         path: &[ArrayPathStep],
         step: ArrayNormalizationStep<'_>,
     ) -> Result<(), ConstructionFailure>;
+}
+
+impl novarocks_failure_contract::FailureProjection for ConstructionFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        match self {
+            Self::MissingOwner => FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::CONSTRUCTION, std::num::NonZeroU16::new(1).unwrap()),
+            ),
+            Self::InvalidSource(_) => FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::CONSTRUCTION, std::num::NonZeroU16::new(2).unwrap()),
+            ),
+            Self::Memory(cause) => cause.failure_fact(),
+            Self::Control(cause) => cause.failure_fact(),
+            Self::Resource(cause) => cause.failure_fact(),
+            Self::Caller(cause) => cause.failure_fact(),
+            Self::Source(cause) => cause.failure_fact(),
+        }
+    }
 }

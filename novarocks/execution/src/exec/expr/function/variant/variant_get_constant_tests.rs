@@ -87,7 +87,12 @@ fn chunk(array: ArrayRef) -> Chunk {
             .unwrap();
     Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
 }
-type Evaluate = fn(&ExprArena, ExprId, &[ExprId], &Chunk) -> Result<ArrayRef, String>;
+type Evaluate = fn(
+    &ExprArena,
+    ExprId,
+    &[ExprId],
+    &Chunk,
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef>;
 const FUNCTIONS: [(&str, Evaluate); 2] = [
     ("variant_get", eval_variant_get),
     ("try_variant_get", eval_try_variant_get),
@@ -226,7 +231,9 @@ fn variant_get_frozen_null_nominal_and_wrong_types_still_refuse_before_input_eva
                 };
                 let source = chunk(Arc::new(StringArray::from(vec!["$", "$", "$"])));
                 assert_eq!(
-                    evaluate(&arena, missing, &args, &source).unwrap_err(),
+                    evaluate(&arena, missing, &args, &source)
+                        .unwrap_err()
+                        .to_string(),
                     format!("{name} requires a constant string literal for the {what} argument")
                 );
             }
@@ -261,7 +268,9 @@ fn variant_get_dynamic_slot_and_foldable_cast_do_not_become_literal_parameters()
                 };
                 let source = chunk(Arc::new(StringArray::from(vec!["$", "$", "$"])));
                 assert_eq!(
-                    evaluate(&arena, missing, &args, &source).unwrap_err(),
+                    evaluate(&arena, missing, &args, &source)
+                        .unwrap_err()
+                        .to_string(),
                     format!("{name} requires a constant string literal for the {what} argument")
                 );
             }

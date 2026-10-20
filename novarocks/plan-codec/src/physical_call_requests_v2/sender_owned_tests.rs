@@ -203,7 +203,7 @@ fn caller_sender_known_header_and_emit_refusal_precede_pending_control_and_forei
     let requests = project(&params, &args);
     for cause in CAUSES {
         for local in [true, false] {
-            c.arm(Some((1, cause)));
+            c.arm(Some((1, cause.clone())));
             let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
             for _ in 0..255 {
                 work.step().unwrap();
@@ -317,7 +317,7 @@ fn caller_sender_actual_success_and_ordinary_failure_preserve_every_control_pref
         assert!(!trace.is_empty());
         for at in 0..trace.len() {
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(invoke(&f,&types,&requests,&c,SOURCE,limits(),&mut |_|Ok(())),Err(Error::Control(actual)) if actual==cause)
                 );
@@ -427,7 +427,7 @@ fn caller_sender_wide_actual_lambda_emission_observes_and_refuses_real_quantum()
         .expect("actual owned Lambda emission quantum");
     for at in [0, quantum, trace.len() / 2, trace.len() - 1] {
         for cause in CAUSES {
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             assert!(
                 matches!(invoke(&f,&types,&requests,&c,SOURCE,cap,&mut |_|Ok(())),Err(Error::Control(actual)) if actual==cause)
             );

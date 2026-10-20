@@ -939,37 +939,6 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let (request_seen, requests) = std::sync::mpsc::channel();
         let (release, wait_release) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let until = Instant::now() + Duration::from_secs(3);
-            loop {
-                match listener.accept() {
-                    Ok((mut socket, _)) => {
-                        socket
-                            .set_read_timeout(Some(Duration::from_secs(3)))
-                            .unwrap();
-                        // TCP reads need not contain a complete request line.
-                        let mut line = String::new();
-                        let _ = std::io::BufReader::new(&socket).read_line(&mut line);
-                        if line.is_empty() {
-                            // An empty connection issued no HTTP request. Only
-                            // an actual DELETE exercises response-loss behavior.
-                            continue;
-                        }
-                        let _ = request_seen.send(line);
-                        let _ = wait_release.recv_timeout(Duration::from_secs(3));
-                        let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                        return;
-                    }
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && Instant::now() < until =>
-                    {
-                        std::thread::sleep(Duration::from_millis(1))
-                    }
-                    _ => return,
-                }
-            }
-        });
         let runtime = tokio::runtime::Handle::current();
         let binding = IcebergReadBinding::new(
             Some(novarocks_fs::ObjectStoreConfig {
@@ -1013,6 +982,49 @@ mod tests {
         .unwrap();
         let object = ObjectIdentity::new("s3://bucket/table/data/owned.parquet").unwrap();
         operation.adopt_session_data(object.clone()).unwrap();
+        // This fault oracle needs an issued DELETE with a missing response,
+        // so prepare the same binding's pooled client before its finite phase.
+        // Resolution builds the client only; it sends no object-store request.
+        let prepared_access = crate::fs_io::resolve_access_for_location(
+            object.path(),
+            &operation
+                .inner
+                .binding
+                .for_request(operation.request_context().clone()),
+        )
+        .unwrap();
+        drop(prepared_access);
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        // TCP reads need not contain a complete request line.
+                        let mut line = String::new();
+                        let _ = std::io::BufReader::new(&socket).read_line(&mut line);
+                        if line.is_empty() {
+                            // An empty connection issued no HTTP request. Only
+                            // an actual DELETE exercises response-loss behavior.
+                            continue;
+                        }
+                        let _ = request_seen.send(line);
+                        let _ = wait_release.recv_timeout(Duration::from_secs(3));
+                        let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < until =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    _ => return,
+                }
+            }
+        });
         stop.request_stop();
         let began = Instant::now();
         let report = operation.cleanup(CleanupScope::EntireOperation).await;

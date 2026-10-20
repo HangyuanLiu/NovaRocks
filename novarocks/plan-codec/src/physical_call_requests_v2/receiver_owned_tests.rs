@@ -277,7 +277,7 @@ fn caller_request_receiver_root_and_captured_dictionary_numeric_refusal_precedes
     // allocation cap permits the clone; the real pending control still wins.
     for cause in CAUSES {
         let c = Control {
-            stop: Some((1, cause)),
+            stop: Some((1, cause.clone())),
             ..Control::default()
         };
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
@@ -460,7 +460,7 @@ fn caller_request_receiver_wide_actual_index_quantum_and_complete_emit_admission
     for at in [0, quantum, baseline.len() - 1] {
         for cause in CAUSES {
             let c = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(

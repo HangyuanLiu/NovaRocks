@@ -53,7 +53,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after original refusal");
         }
@@ -276,7 +276,7 @@ fn assert_prefix<T>(
     assert!(baseline.iter().all(|(p, _)| *p == phase));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(matches!(operation(), Err(Error::Control(actual)) if actual == cause));
             assert_eq!(control.trace(), baseline[..=at]);
         }
@@ -297,7 +297,7 @@ fn assert_ordinary_prefix<T>(
     // A zero-unit tail is legal after delegates flush completed work.
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(matches!(operation(), Err(Error::Control(actual)) if actual == cause));
             assert_eq!(control.trace(), baseline[..=at]);
         }
@@ -675,7 +675,7 @@ fn repeat_known_resource_refusal_precedes_late_control_and_never_runs_footer() {
         let mut cap = limits();
         cap.max_input_nodes = 0;
         for cause in CAUSES {
-            control.arm(Some((1, cause)));
+            control.arm(Some((1, cause.clone())));
             assert!(matches!(
                 encode_repeat_node(&original, encoded, SOURCE, cap),
                 Err(Error::Control(CompileControlError::ResourceExhausted))
@@ -864,7 +864,7 @@ fn real_wide_lists_observe_quantum_and_original_refusal_before_further_work() {
                 .filter(|i| *i == 0 || *i + 1 == baseline.len() || baseline[*i].1 == 256)
             {
                 for cause in CAUSES {
-                    control.arm(Some((at, cause)));
+                    control.arm(Some((at, cause.clone())));
                     assert!(matches!(run(), Err(Error::Control(actual)) if actual == cause));
                     assert_eq!(control.trace(), baseline[..=at]);
                 }

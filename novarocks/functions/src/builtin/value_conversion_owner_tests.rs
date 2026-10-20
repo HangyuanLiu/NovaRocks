@@ -508,7 +508,7 @@ impl PureCompileControl for CompileTrace {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        match self.failure {
+        match self.failure.clone() {
             Some((at, cause)) if trace.len() - 1 == at => Err(cause),
             _ => Ok(()),
         }
@@ -517,15 +517,7 @@ impl PureCompileControl for CompileTrace {
 fn failure(error: FunctionSpecializationFailure) -> CompileControlError {
     match error {
         FunctionSpecializationFailure::Control(cause) => cause,
-        FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
-            CompileControlError::Cancelled
-        }
-        FunctionSpecializationFailure::Kernel(KernelFailure::DeadlineExceeded) => {
-            CompileControlError::DeadlineExceeded
-        }
-        FunctionSpecializationFailure::Kernel(KernelFailure::ResourceExhausted) => {
-            CompileControlError::ResourceExhausted
-        }
+        FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(cause)) => cause,
         other => panic!("original typed refusal: {other:?}"),
     }
 }
@@ -574,7 +566,7 @@ fn actual_owner_specialization_preserves_every_three_cause_callback_prefix_witho
         ] {
             let control = CompileTrace {
                 trace: Mutex::new(Vec::new()),
-                failure: Some((at, cause)),
+                failure: Some((at, cause.clone())),
             };
             let error = specialize_scalar(
                 &owner,
@@ -720,4 +712,393 @@ fn largeint_decimal_effects_refine_exact_range_and_freeze_overflow_policy() {
             );
         }
     }
+}
+
+fn conversion_compile_profiles() -> Vec<(FunctionValueType, FunctionValueType)> {
+    let json = Arc::new(
+        Field::new("actual_json", DataType::Utf8, true).with_metadata(HashMap::from([
+            (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+            ("provider_id".to_owned(), "731".to_owned()),
+        ])),
+    );
+    let mut metadata = json.metadata().clone();
+    metadata.remove(NR_LOGICAL_TYPE_KEY);
+    let text = Arc::new(json.as_ref().clone().with_metadata(metadata));
+    vec![
+        (ty(DataType::Int64, true), large(true)),
+        (
+            ty(DataType::List(json), true),
+            ty(DataType::List(text), true),
+        ),
+    ]
+}
+fn with_installed_conversion<T>(
+    source: FunctionValueType,
+    target: FunctionValueType,
+    action: impl FnOnce(&ValueConversionOwner, CallEffectInput<'_>, Arc<ScalarCallContract>) -> T,
+) -> T {
+    let owner = owner();
+    let catalog = super::super::catalogue::builtin_engine_function_catalog();
+    let args = arguments(&source);
+    let bound = catalog
+        .resolve_bound_trusted(
+            value_conversion::VALUE_CONVERSION_NAME,
+            FunctionKind::Scalar,
+            request(&args, &target),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let selected = Arc::new(bound.selected);
+    let parameters = SemanticParameters::default();
+    let uses = [Some(ExpressionUseId::new(42))];
+    let exact = input(
+        &owner,
+        &selected,
+        &args,
+        &target,
+        &parameters,
+        &uses,
+        DecimalOverflowPolicy::ReportError,
+    );
+    assert_eq!(exact.function_id, &bound.function_id);
+    let fresh = catalog
+        .prepare_fresh_selected(
+            exact,
+            selected.clone(),
+            crate::PureCallPreparation::Scalar {
+                arguments: ScopedExpressionEffects::pure_value(context()),
+            },
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let frozen = catalog
+        .prepare_frozen_selected(
+            exact,
+            selected.clone(),
+            fresh.call_contract().effects(),
+            crate::PureCallPreparation::Scalar {
+                arguments: ScopedExpressionEffects::pure_value(context()),
+            },
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    assert_eq!(fresh.implementation(), frozen.implementation());
+    let crate::PreparedPureKernel::Scalar(prepared) = fresh.into_prepared() else {
+        panic!("the actual value-conversion registry must prepare ScalarV1");
+    };
+    assert!(std::ptr::eq(
+        prepared.contract().selected(),
+        selected.as_ref()
+    ));
+    action(&owner, exact, prepared.contract().clone())
+}
+fn compile_trace() -> CompileTrace {
+    CompileTrace {
+        trace: Mutex::new(vec![]),
+        failure: None,
+    }
+}
+fn compile_causes() -> [CompileControlError; 4] {
+    [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+        CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+        ),
+    ]
+}
+
+#[test]
+fn conversion_owner_captured_contract_and_nested_binding_errors_have_no_later_compile_footer() {
+    for (source, target) in conversion_compile_profiles() {
+        with_installed_conversion(source, target, |owner, exact, contract| {
+            let foreign = FunctionId::try_new("foreign.conversion/compile/v1").unwrap();
+            for mismatch in 0..3 {
+                let mut wrong = exact;
+                match mismatch {
+                    0 => wrong.function_id = &foreign,
+                    1 => wrong.kind = FunctionKind::Aggregate,
+                    2 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(999)),
+                    _ => unreachable!(),
+                }
+                let control = compile_trace();
+                let error = owner.validate_and_refine(wrong, &control).unwrap_err();
+                let expected = if mismatch < 2 {
+                    FunctionBindingError::UnknownFunction
+                } else {
+                    FunctionBindingError::InvalidBinding(
+                        "value conversion requires its exact proof scope and no environment".into(),
+                    )
+                };
+                match error {
+                    FunctionEffectOwnerError::Owner(actual) => assert_eq!(actual, expected),
+                    other => {
+                        panic!("the original conversion author error must stay intact: {other:?}")
+                    }
+                }
+                assert_eq!(
+                    *control.trace.lock().unwrap(),
+                    [(CompilePhase::FunctionSpecialization, 0)]
+                );
+                let control = compile_trace();
+                assert_eq!(
+                    owner
+                        .prepare_scalar(wrong, contract.clone(), &control)
+                        .unwrap_err(),
+                    KernelFailure::InvalidProgram(crate::KernelDiagnostic::new(
+                        "value conversion differs from its exact checked call"
+                    ))
+                );
+                assert_eq!(
+                    *control.trace.lock().unwrap(),
+                    [(CompilePhase::FunctionSpecialization, 0)]
+                );
+            }
+            let mut forged = (*exact.selected).clone();
+            forged.argument_types =
+                vec![FunctionArgumentType::Value(ty(DataType::Int32, true))].into();
+            let direct = compile_trace();
+            let expected = owner
+                .validate_selected(&forged, exact.request, &direct)
+                .unwrap_err();
+            let mut wrong = exact;
+            wrong.selected = &forged;
+            let control = compile_trace();
+            match owner.validate_and_refine(wrong, &control).unwrap_err() {
+                FunctionEffectOwnerError::Owner(actual) => assert_eq!(actual, expected),
+                other => {
+                    panic!("the original nested binding author error must stay intact: {other:?}")
+                }
+            }
+            let mut expected_trace = vec![
+                (CompilePhase::FunctionSpecialization, 0),
+                (CompilePhase::FunctionSpecialization, 2),
+            ];
+            expected_trace.extend_from_slice(&direct.trace.lock().unwrap());
+            assert_eq!(
+                *control.trace.lock().unwrap(),
+                expected_trace,
+                "nested binding failure has no enclosing callback footer"
+            );
+        });
+    }
+}
+
+#[test]
+fn conversion_recipe_and_owner_success_flush_each_original_scope_and_keep_all_refusal_prefixes() {
+    for (source, target) in conversion_compile_profiles() {
+        with_installed_conversion(source, target, |owner, exact, contract| {
+            let binding = compile_trace();
+            owner
+                .validate_selected(exact.selected, exact.request, &binding)
+                .unwrap();
+            let recipe_control = compile_trace();
+            let recipe = ConversionRecipe::try_new(&contract, &recipe_control).unwrap();
+            assert!(recipe.retained_bytes() >= std::mem::size_of::<ConversionRecipe>());
+            if matches!(exact.request.arguments[0], FunctionArgument::Value { ref value_type, .. } if matches!(value_type.data_type(), DataType::List(_)))
+            {
+                assert!(
+                    recipe.retained_bytes() > std::mem::size_of::<ConversionRecipe>(),
+                    "the real nested recipe owns its allocated graph"
+                );
+            }
+            drop(recipe);
+            let recipe_trace = recipe_control.trace.lock().unwrap().clone();
+            assert_eq!(
+                recipe_trace.first(),
+                Some(&(CompilePhase::FunctionSpecialization, 0))
+            );
+            assert!(
+                recipe_trace.last().unwrap().1 > 0,
+                "the recipe success path really flushes pending work"
+            );
+            let mut refine_trace = vec![
+                (CompilePhase::FunctionSpecialization, 0),
+                (CompilePhase::FunctionSpecialization, 2),
+            ];
+            refine_trace.extend_from_slice(&binding.trace.lock().unwrap());
+            refine_trace.push((CompilePhase::FunctionSpecialization, 0));
+            let refined = compile_trace();
+            assert_eq!(
+                &owner.validate_and_refine(exact, &refined).unwrap(),
+                contract.effects()
+            );
+            assert_eq!(*refined.trace.lock().unwrap(), refine_trace);
+            let mut prepare_trace = vec![
+                (CompilePhase::FunctionSpecialization, 0),
+                (CompilePhase::FunctionSpecialization, 1),
+            ];
+            prepare_trace.extend_from_slice(&binding.trace.lock().unwrap());
+            prepare_trace.push((CompilePhase::FunctionSpecialization, 0));
+            let recipe_start = prepare_trace.len();
+            prepare_trace.extend_from_slice(&recipe_trace);
+            prepare_trace.push((CompilePhase::FunctionSpecialization, 0));
+            let prepared_control = compile_trace();
+            let prepared = owner
+                .prepare_scalar(exact, contract.clone(), &prepared_control)
+                .unwrap();
+            assert!(Arc::ptr_eq(prepared.contract(), &contract));
+            assert_eq!(*prepared_control.trace.lock().unwrap(), prepare_trace);
+            drop(prepared);
+            for at in 0..recipe_trace.len() {
+                for cause in compile_causes() {
+                    let control = CompileTrace {
+                        trace: Mutex::new(vec![]),
+                        failure: Some((at, cause.clone())),
+                    };
+                    assert_eq!(
+                        ConversionRecipe::try_new(&contract, &control).unwrap_err(),
+                        KernelFailure::CompileControl(cause.clone())
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), recipe_trace[..=at]);
+                    let control = CompileTrace {
+                        trace: Mutex::new(vec![]),
+                        failure: Some((recipe_start + at, cause.clone())),
+                    };
+                    assert_eq!(
+                        owner
+                            .prepare_scalar(exact, contract.clone(), &control)
+                            .unwrap_err(),
+                        KernelFailure::CompileControl(cause)
+                    );
+                    assert_eq!(
+                        *control.trace.lock().unwrap(),
+                        prepare_trace[..=recipe_start + at],
+                        "an inner refusal cannot append an outer footer"
+                    );
+                }
+            }
+            for at in 0..prepare_trace.len() {
+                for cause in compile_causes() {
+                    let control = CompileTrace {
+                        trace: Mutex::new(vec![]),
+                        failure: Some((at, cause.clone())),
+                    };
+                    assert_eq!(
+                        owner
+                            .prepare_scalar(exact, contract.clone(), &control)
+                            .unwrap_err(),
+                        KernelFailure::CompileControl(cause)
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), prepare_trace[..=at]);
+                }
+            }
+            for at in 0..refine_trace.len() {
+                for cause in compile_causes() {
+                    let control = CompileTrace {
+                        trace: Mutex::new(vec![]),
+                        failure: Some((at, cause.clone())),
+                    };
+                    match owner.validate_and_refine(exact, &control).unwrap_err() {
+                        FunctionEffectOwnerError::Control(actual) => assert_eq!(actual, cause),
+                        other => {
+                            panic!("the actual refinement refusal must stay original: {other:?}")
+                        }
+                    }
+                    assert_eq!(*control.trace.lock().unwrap(), refine_trace[..=at]);
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn conversion_prepared_and_real_instance_release_recipe_custody_only_at_actual_drop() {
+    for (source, target) in conversion_compile_profiles() {
+        with_installed_conversion(source, target, |owner, exact, contract| {
+            let selected = contract.call().selected_owner();
+            let original_owners = Arc::strong_count(selected);
+            let control = Arc::new(compile_trace());
+            let weak_control = Arc::downgrade(&control);
+            let prepared = owner
+                .prepare_scalar(exact, contract.clone(), control.as_ref())
+                .unwrap();
+            drop(control);
+            assert!(
+                weak_control.upgrade().is_none(),
+                "actual immutable preparation retains no caller control"
+            );
+            assert_eq!(
+                Arc::strong_count(selected),
+                original_owners + 1,
+                "the real compiled recipe owns the exact selected backing"
+            );
+            let weak_prepared = Arc::downgrade(&prepared);
+            let instance = ScalarEvaluationInstance::instantiate(prepared.clone()).unwrap();
+            drop(prepared);
+            assert!(
+                weak_prepared.upgrade().is_some(),
+                "the actual live instance retains its preparation"
+            );
+            assert_eq!(Arc::strong_count(selected), original_owners + 1);
+            assert!(instance.retained_bytes().unwrap() > 0);
+            drop(instance);
+            assert!(weak_prepared.upgrade().is_none());
+            assert_eq!(
+                Arc::strong_count(selected),
+                original_owners,
+                "real instance and preparation destruction released the recipe's selected owner"
+            );
+        });
+    }
+}
+
+#[test]
+fn conversion_recipe_refuses_a_real_foreign_canonical_kernel_without_a_later_callback() {
+    let catalog = super::super::catalogue::builtin_engine_function_catalog();
+    let args = arguments(&ty(DataType::Utf8, true));
+    let request = FunctionBindingRequest {
+        arguments: &args,
+        logical_argument_count: 1,
+        expected_result_type: None,
+    };
+    let bound = catalog
+        .resolve_bound_user(
+            "to_days",
+            FunctionKind::Scalar,
+            request,
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let selected = Arc::new(bound.selected);
+    let parameters = SemanticParameters::default();
+    let uses = [Some(ExpressionUseId::new(42))];
+    let input = CallEffectInput {
+        context: context(),
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
+        function_id: &bound.function_id,
+        kind: FunctionKind::Scalar,
+        selected: &selected,
+        request,
+        environment: &[],
+        parameters: &parameters,
+        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        proof_scope: CallProofScope::Domain(context().domain),
+    };
+    let foreign = catalog
+        .prepare_fresh_selected(
+            input,
+            selected.clone(),
+            crate::PureCallPreparation::Scalar {
+                arguments: ScopedExpressionEffects::pure_value(context()),
+            },
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let crate::PreparedPureKernel::Scalar(prepared) = foreign.into_prepared() else {
+        panic!("the real foreign author must return its ScalarV1 contract");
+    };
+    let control = compile_trace();
+    assert_eq!(
+        ConversionRecipe::try_new(prepared.contract(), &control).unwrap_err(),
+        KernelFailure::InvalidProgram(crate::KernelDiagnostic::new(
+            "conversion has an unknown canonical overload"
+        ))
+    );
+    assert_eq!(
+        *control.trace.lock().unwrap(),
+        [(CompilePhase::FunctionSpecialization, 0)],
+        "the actual private recipe error must not flush a late callback"
+    );
 }

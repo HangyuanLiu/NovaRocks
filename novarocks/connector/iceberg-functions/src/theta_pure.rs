@@ -35,11 +35,7 @@ fn internal(message: &str) -> KernelFailure {
     KernelFailure::Internal(KernelDiagnostic::new(message))
 }
 fn compile_failure(cause: CompileControlError) -> KernelFailure {
-    match cause {
-        CompileControlError::Cancelled => KernelFailure::Cancelled,
-        CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
-        CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
-    }
+    KernelFailure::CompileControl(cause)
 }
 fn author_failure(error: IcebergThetaError) -> KernelFailure {
     match error {
@@ -54,14 +50,6 @@ fn author_failure(error: IcebergThetaError) -> KernelFailure {
         IcebergThetaError::OutputResourceExhausted => KernelFailure::ResourceExhausted,
         _ => internal(&error.to_string()),
     }
-}
-fn terminal(error: &KernelFailure) -> bool {
-    matches!(
-        error,
-        KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted
-    )
 }
 fn observed<T>(
     control: &dyn KernelEvaluationControl,
@@ -459,11 +447,9 @@ impl ThetaPureOwner {
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();
-        if result.as_ref().is_err_and(terminal) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        // A nested author may have already refused its original callback.
+        // Finish this same scope without starting a callback after that result.
+        work.finish_result(result, compile_failure)
     }
 }
 

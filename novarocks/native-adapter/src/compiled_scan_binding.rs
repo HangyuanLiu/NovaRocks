@@ -37,6 +37,10 @@
 //! applies the consumers to rows, and the connector is handed the truthful
 //! complete-all filter, which never narrows a read.
 
+use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_execution::runtime::fragment::connector_failure::{
+    ConnectorCallFailure, ConnectorOperation,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -90,43 +94,189 @@ pub(crate) struct CompiledScanTask<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledScanBindingError {
     scan_node: Option<i32>,
-    detail: String,
+    source: ExecutionFailure,
 }
-
 impl CompiledScanBindingError {
-    fn program(detail: impl Into<String>) -> Self {
-        Self {
-            scan_node: None,
-            detail: detail.into(),
-        }
-    }
-
-    fn at(scan_node: i32, detail: impl Into<String>) -> Self {
+    fn at_failure(scan_node: i32, source: ExecutionFailure) -> Self {
         Self {
             scan_node: Some(scan_node),
-            detail: detail.into(),
+            source,
         }
     }
-
+    fn at_domain<E>(scan_node: i32, source: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_execution_contract::failure::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::at_failure(scan_node, ExecutionFailure::from_domain(source))
+    }
+    fn program_failure(source: ExecutionFailure) -> Self {
+        Self {
+            scan_node: None,
+            source,
+        }
+    }
     pub const fn scan_node(&self) -> Option<i32> {
         self.scan_node
     }
-
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.source.detail()
     }
 }
-
 impl fmt::Display for CompiledScanBindingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.scan_node {
-            Some(node) => write!(f, "compiled scan node {node}: {}", self.detail),
-            None => f.write_str(&self.detail),
+            Some(node) => write!(f, "compiled scan node {node}: {}", self.source),
+            None => self.source.fmt(f),
         }
     }
 }
+impl std::error::Error for CompiledScanBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for CompiledScanBindingError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        self.source.failure_fact()
+    }
+}
 
-impl std::error::Error for CompiledScanBindingError {}
+#[derive(Clone, Copy, Debug)]
+enum ScanOrdinalFact {
+    EnforcedPredicate,
+    UnenforcedPredicate,
+    Distribution,
+    Ordering,
+}
+impl fmt::Display for ScanOrdinalFact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EnforcedPredicate => "enforced predicate",
+            Self::UnenforcedPredicate => "unenforced predicate",
+            Self::Distribution => "distribution key",
+            Self::Ordering => "ordering key",
+        })
+    }
+}
+#[derive(Debug)]
+enum ScanBindingContractFailure {
+    MissingNode(usize),
+    DisplayRange {
+        node: u32,
+        source: std::num::TryFromIntError,
+    },
+    WrongNode(usize),
+    MissingRecipe,
+    UnsupportedRelation(ConnectorReadRelationKind),
+    WholeRelation,
+    NegativeNode {
+        node: i32,
+        source: std::num::TryFromIntError,
+    },
+    LayoutArity {
+        slots: usize,
+        assignments: usize,
+    },
+    WrongBinding,
+    WrongRelation {
+        decoded: ConnectorReadRelationKind,
+        expected: ConnectorReadRelationKind,
+    },
+    MissingOrdinal {
+        fact: ScanOrdinalFact,
+        ordinal: usize,
+    },
+    NonFirstOrdinal {
+        fact: ScanOrdinalFact,
+        ordinal: usize,
+        first: usize,
+    },
+    Observation(novarocks_execution_contract::failure::BoundedDetail),
+}
+impl fmt::Display for ScanBindingContractFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingNode(node) => {
+                write!(f, "compiled scan address names absent local node {node}")
+            }
+            Self::DisplayRange { node, .. } => write!(f, "compiled scan node {node} exceeds i32"),
+            Self::WrongNode(node) => write!(f, "local node {node} is not a Scan"),
+            Self::MissingRecipe => f.write_str("the Scan carries no compiled provider read"),
+            Self::UnsupportedRelation(kind) => write!(
+                f,
+                "provider relation {kind:?} is not read by a compiled scan"
+            ),
+            Self::WholeRelation => {
+                f.write_str("a whole-relation compiled scan is not executable yet")
+            }
+            Self::NegativeNode { node, .. } => write!(f, "compiled scan node {node} is negative"),
+            Self::LayoutArity { slots, assignments } => write!(
+                f,
+                "the compiled layout has {slots} slots for {assignments} assignments"
+            ),
+            Self::WrongBinding => {
+                f.write_str("compiled scan binding does not match the installed read execution")
+            }
+            Self::WrongRelation { decoded, expected } => write!(
+                f,
+                "provider decoded relation {decoded:?} from a frozen {expected:?} relation"
+            ),
+            Self::MissingOrdinal { fact, ordinal } => {
+                write!(f, "{fact} names absent scan ordinal {ordinal}")
+            }
+            Self::NonFirstOrdinal {
+                fact,
+                ordinal,
+                first,
+            } => write!(
+                f,
+                "{fact} is stated at ordinal {ordinal} of a provider column first assigned at ordinal {first}"
+            ),
+            Self::Observation(detail) => write!(f, "compiled scan observation refused: {detail}"),
+        }
+    }
+}
+impl std::error::Error for ScanBindingContractFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DisplayRange { source, .. } | Self::NegativeNode { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for ScanBindingContractFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let code = match self {
+            Self::MissingNode(_) => 9700,
+            Self::DisplayRange { .. } => 9701,
+            Self::WrongNode(_) => 9702,
+            Self::MissingRecipe => 9703,
+            Self::UnsupportedRelation(_) => 9704,
+            Self::WholeRelation => 9705,
+            Self::NegativeNode { .. } => 9706,
+            Self::LayoutArity { .. } => 9707,
+            Self::WrongBinding => 9708,
+            Self::WrongRelation { .. } => 9709,
+            Self::MissingOrdinal { .. } => 9710,
+            Self::NonFirstOrdinal { .. } => 9711,
+            Self::Observation(_) => 9712,
+        };
+        let class = match self {
+            Self::UnsupportedRelation(_) | Self::WholeRelation => FailureClass::Dependency,
+            Self::Observation(_) => FailureClass::Unexpected,
+            _ => FailureClass::Invariant,
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
 /// Bind every compiled Scan of `program` to the Task: one typed scan source
 /// per Scan node, keyed by its local node. Every refusal precedes the first
@@ -139,15 +289,16 @@ pub(crate) fn bind_compiled_scans(
     let mut sources = CompiledScanSources::new();
     for (id, input) in program.scan_inputs() {
         let node = nodes.get(id.index()).ok_or_else(|| {
-            CompiledScanBindingError::program(format!(
-                "compiled scan address names absent local node {}",
-                id.index()
+            CompiledScanBindingError::program_failure(ExecutionFailure::from_domain(
+                ScanBindingContractFailure::MissingNode(id.index()),
             ))
         })?;
-        let scan_node = i32::try_from(input.scan_node).map_err(|_| {
-            CompiledScanBindingError::program(format!(
-                "compiled scan node {} exceeds i32",
-                input.scan_node
+        let scan_node = i32::try_from(input.scan_node).map_err(|source| {
+            CompiledScanBindingError::program_failure(ExecutionFailure::from_domain(
+                ScanBindingContractFailure::DisplayRange {
+                    node: input.scan_node,
+                    source,
+                },
             ))
         })?;
         let ProgramNodeKind::Scan {
@@ -156,13 +307,16 @@ pub(crate) fn bind_compiled_scans(
             ..
         } = node.kind()
         else {
-            return Err(CompiledScanBindingError::at(
+            return Err(CompiledScanBindingError::at_domain(
                 scan_node,
-                format!("local node {} is not a Scan", id.index()),
+                ScanBindingContractFailure::WrongNode(id.index()),
             ));
         };
         let recipe = source.compiled().ok_or_else(|| {
-            CompiledScanBindingError::at(scan_node, "the Scan carries no compiled provider read")
+            CompiledScanBindingError::at_domain(
+                scan_node,
+                ScanBindingContractFailure::MissingRecipe,
+            )
         })?;
         let bound = bind_compiled_scan(
             scan_node,
@@ -185,7 +339,6 @@ pub(crate) fn bind_compiled_scan(
     layout: &StaticLayout,
     task: &CompiledScanTask<'_>,
 ) -> Result<Arc<dyn ScanSource>, CompiledScanBindingError> {
-    let refused = |detail: String| CompiledScanBindingError::at(scan_node, detail);
     let frozen: &FrozenConnectorRead = recipe.frozen();
     let scan = frozen.scan();
     let draft = scan.recipe();
@@ -200,70 +353,85 @@ pub(crate) fn bind_compiled_scan(
         | ConnectorReadRelationKind::TableExecute => {}
         kind @ (ConnectorReadRelationKind::TableFunction
         | ConnectorReadRelationKind::MergeTable) => {
-            return Err(refused(format!(
-                "provider relation {kind:?} is not read by a compiled scan"
-            )));
+            return Err(CompiledScanBindingError::at_domain(
+                scan_node,
+                ScanBindingContractFailure::UnsupportedRelation(kind),
+            ));
         }
     }
     match scan.work_source() {
         ConnectorReadWorkSource::RuntimeSplits => {}
         ConnectorReadWorkSource::WholeRelation => {
-            return Err(refused(
-                "a whole-relation compiled scan is not executable yet".to_string(),
+            return Err(CompiledScanBindingError::at_domain(
+                scan_node,
+                ScanBindingContractFailure::WholeRelation,
             ));
         }
     }
     // Each frozen dynamic filter names its consumer binding through the
     // package's table; the source applies the consumers, the connector
     // prunes nothing.
-    let physical_node = u32::try_from(scan_node)
-        .map_err(|_| refused(format!("compiled scan node {scan_node} is negative")))?;
+    let physical_node = u32::try_from(scan_node).map_err(|source| {
+        CompiledScanBindingError::at_domain(
+            scan_node,
+            ScanBindingContractFailure::NegativeNode {
+                node: scan_node,
+                source,
+            },
+        )
+    })?;
     validate_scan_dynamic_filters(
         physical_node,
         scan.dynamic_filters(),
         consumers,
         task.runtime_filters,
     )
-    .map_err(|error| refused(format!("scan runtime filters: {error}")))?;
+    .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     // `slot_ids[i]` names page channel `i`, and a channel exists for each
     // assignment, so the layout is exactly one slot per assignment.
     if layout.slots().len() != scan.assignments().len() {
-        return Err(refused(format!(
-            "the compiled layout has {} slots for {} assignments",
-            layout.slots().len(),
-            scan.assignments().len()
-        )));
+        return Err(CompiledScanBindingError::at_domain(
+            scan_node,
+            ScanBindingContractFailure::LayoutArity {
+                slots: layout.slots().len(),
+                assignments: scan.assignments().len(),
+            },
+        ));
     }
     let output_schema = ChunkSchema::from_compiled_layout(layout)
-        .map_err(|error| refused(format!("compiled scan layout: {error}")))?;
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
 
     let execution = task
         .runtime
         .catalog_read_execution(draft.binding().catalog_handle())
-        .map_err(|error| refused(format!("no installed read execution: {error}")))?;
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     if draft.binding() != execution.binding() {
-        return Err(refused(
-            "compiled scan binding does not match the installed read execution".to_string(),
+        return Err(CompiledScanBindingError::at_domain(
+            scan_node,
+            ScanBindingContractFailure::WrongBinding,
         ));
     }
     let decoder = execution.decoder();
     let relation = decoder
         .decode_relation_payload(draft.relation())
-        .map_err(|error| refused(format!("provider relation is not decodable: {error}")))?;
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     if relation.kind() != draft.relation().kind() {
-        return Err(refused(format!(
-            "provider decoded relation {:?} from a frozen {:?} relation",
-            relation.kind(),
-            draft.relation().kind()
-        )));
+        return Err(CompiledScanBindingError::at_domain(
+            scan_node,
+            ScanBindingContractFailure::WrongRelation {
+                decoded: relation.kind(),
+                expected: draft.relation().kind(),
+            },
+        ));
     }
     let columns = draft
         .columns()
         .iter()
         .map(|payload| decoder.decode_column_payload(payload))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| refused(format!("provider column is not decodable: {error}")))?;
-    require_first_ordinal_facts(frozen, &columns).map_err(refused)?;
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
+    require_first_ordinal_facts(frozen, &columns)
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     let assignments = scan
         .assignments()
         .iter()
@@ -272,7 +440,7 @@ pub(crate) fn bind_compiled_scan(
             Assignment::try_new(assignment.variable(), column, assignment.value_type())
         })
         .collect::<Result<Vec<ConnectorReadAssignment>, _>>()
-        .map_err(|error| refused(format!("scan assignment: {error}")))?;
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     let dynamic_filter = complete_all_dynamic_filter(scan, &assignments);
     let descriptor =
         TypedConnectorReadDescriptor::new(relation.table().clone(), assignments, dynamic_filter);
@@ -286,7 +454,7 @@ pub(crate) fn bind_compiled_scan(
         task.fragment_instance_id.low(),
         scan_node,
     )
-    .map_err(|error| refused(format!("scan range scope: {error}")))?;
+    .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     let (_, query_expire) = novarocks_execution::runtime::query_options::query_expire_durations(
         Some(task.query_options),
     );
@@ -303,12 +471,13 @@ pub(crate) fn bind_compiled_scan(
             .with_storage_resolver(task.runtime.storage_resolver())
             .with_execution_source(range_scope, ConnectorSourceOperations::new())
     })
-    .map_err(|error| refused(format!("connector request: {error}")))?;
-    let reader_policy = reader_policy(task.query_options).map_err(refused)?;
+    .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
+    let reader_policy = reader_policy(task.query_options)
+        .map_err(|source| CompiledScanBindingError::at_failure(scan_node, source))?;
 
     task.runtime
         .register_read_execution(scan_node, execution.clone())
-        .map_err(refused)?;
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     // The provider is opened only when the source is bound, after the Task's
     // admission installed its fragment tracker.
     let provider_factory = execution.provider_factory();
@@ -319,7 +488,12 @@ pub(crate) fn bind_compiled_scan(
             runtime.admitted_connector_resources_for_bound_task(runtime.execution_id())?;
         provider_factory
             .create_page_source_provider(&provider_request, resources, reader_policy)
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                ExecutionFailure::from(ConnectorCallFailure::new(
+                    ConnectorOperation::OpenReader,
+                    error,
+                ))
+            })
     });
     Ok(Arc::new(TypedConnectorScanSource::new_deferred(
         descriptor,
@@ -337,7 +511,14 @@ pub(crate) fn bind_compiled_scan(
             .as_deref()
             .map(|controls| controls.observation_for("reader-marker", task.runtime.execution_id()))
             .transpose()
-            .map_err(refused)?
+            .map_err(|detail| {
+                CompiledScanBindingError::at_domain(
+                    scan_node,
+                    ScanBindingContractFailure::Observation(
+                        novarocks_execution_contract::failure::BoundedDetail::truncating(&detail),
+                    ),
+                )
+            })?
             .flatten(),
         task.runtime.stream_host().clone(),
     )))
@@ -351,29 +532,40 @@ pub(crate) fn bind_compiled_scan(
 fn require_first_ordinal_facts(
     frozen: &FrozenConnectorRead,
     columns: &[ConnectorReadColumnHandle],
-) -> Result<(), String> {
+) -> Result<(), ScanBindingContractFailure> {
     let mut first = BTreeMap::<&ConnectorReadColumnHandle, ScanColumnId>::new();
     for (ordinal, column) in columns.iter().enumerate() {
         first.entry(column).or_insert(ScanColumnId::new(ordinal));
     }
-    let check = |fact: &str, ordinal: ScanColumnId| -> Result<(), String> {
-        let column = columns
-            .get(ordinal.index())
-            .ok_or_else(|| format!("{fact} names absent scan ordinal {}", ordinal.index()))?;
-        let canonical = first[column];
-        if canonical != ordinal {
-            return Err(format!(
-                "{fact} is stated at ordinal {} of a provider column first assigned at ordinal {}",
-                ordinal.index(),
-                canonical.index()
-            ));
-        }
-        Ok(())
-    };
+    let check =
+        |fact: ScanOrdinalFact, ordinal: ScanColumnId| -> Result<(), ScanBindingContractFailure> {
+            let column =
+                columns
+                    .get(ordinal.index())
+                    .ok_or(ScanBindingContractFailure::MissingOrdinal {
+                        fact,
+                        ordinal: ordinal.index(),
+                    })?;
+            let canonical = first[column];
+            if canonical != ordinal {
+                return Err(ScanBindingContractFailure::NonFirstOrdinal {
+                    fact,
+                    ordinal: ordinal.index(),
+                    first: canonical.index(),
+                });
+            }
+            Ok(())
+        };
     let scan = frozen.scan();
     for (fact, domain) in [
-        ("enforced predicate", scan.enforced_predicate()),
-        ("unenforced predicate", scan.unenforced_predicate()),
+        (
+            ScanOrdinalFact::EnforcedPredicate,
+            scan.enforced_predicate(),
+        ),
+        (
+            ScanOrdinalFact::UnenforcedPredicate,
+            scan.unenforced_predicate(),
+        ),
     ] {
         if let Some(domains) = domain.domains() {
             for ordinal in domains.keys() {
@@ -389,12 +581,12 @@ fn require_first_ordinal_facts(
         ConnectorReadDistribution::Hash { keys, .. }
         | ConnectorReadDistribution::BucketShuffle { keys, .. } => {
             for key in keys.iter() {
-                check("distribution key", *key)?;
+                check(ScanOrdinalFact::Distribution, *key)?;
             }
         }
     }
     for key in properties.ordering() {
-        check("ordering key", *key.column())?;
+        check(ScanOrdinalFact::Ordering, *key.column())?;
     }
     Ok(())
 }
@@ -441,7 +633,9 @@ impl TypedScanLiveDynamicFilterFactory for NoLiveDynamicFilter {
 }
 
 /// The reader policy a Task's query options give its connector page sources.
-fn reader_policy(options: &QueryOptions) -> Result<ConnectorPageSourceProviderOptions, String> {
+fn reader_policy(
+    options: &QueryOptions,
+) -> Result<ConnectorPageSourceProviderOptions, ExecutionFailure> {
     let cache = novarocks_execution::runtime::cache::ExecutionCacheOptions::from_query_options(
         Some(options),
     )?;

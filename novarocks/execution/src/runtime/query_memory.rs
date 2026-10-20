@@ -45,7 +45,14 @@ impl std::fmt::Display for QueryMemoryBindingError {
         }
     }
 }
-impl std::error::Error for QueryMemoryBindingError {}
+impl std::error::Error for QueryMemoryBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Authority(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
 
 /// Supplied by the exact context owner. Clones reference one account; they
 /// neither duplicate redemption rights nor establish an invocation scope.
@@ -100,3 +107,27 @@ impl QueryMemoryBinding {
 #[cfg(test)]
 #[path = "query_memory_tests.rs"]
 mod tests;
+
+impl novarocks_failure_contract::FailureProjection for QueryMemoryBindingError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::OwnerAttemptMismatch => ExecutionReason::QueryMemoryOwnerAttempt,
+            Self::TaskAttemptMismatch => ExecutionReason::QueryMemoryTaskAttempt,
+            Self::MissingTaskIdentity => ExecutionReason::QueryMemoryMissingTask,
+            Self::QueryIdentityMismatch => ExecutionReason::QueryMemoryQueryIdentity,
+            Self::MissingExecutionRuntime => ExecutionReason::QueryMemoryMissingRuntime,
+            Self::Authority(cause) => {
+                return novarocks_memory_failure::CapacityFailureProjection::new(cause)
+                    .failure_fact();
+            }
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<QueryMemoryBindingError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(cause: QueryMemoryBindingError) -> Self {
+        Self::from_domain(cause)
+    }
+}

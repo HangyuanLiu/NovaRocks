@@ -18,6 +18,7 @@
 use super::{ExprArena, ExprId, ExprNode};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::eval_string_function;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, LargeStringArray, ListArray, NullArray, StringArray,
     StructArray, new_null_array,
@@ -25,6 +26,7 @@ use arrow::array::{
 use arrow::array::{Int32Builder, ListBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::SlotId;
 use std::sync::Arc;
 fn setup(columns: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
@@ -47,7 +49,7 @@ fn setup(columns: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
-fn raw(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn raw(name: &str, columns: Vec<ArrayRef>) -> ExecutionResult<ArrayRef> {
     let (arena, args, chunk) = setup(columns);
     eval_string_function(name, &arena, ExprId(usize::MAX), &args, &chunk)
 }
@@ -141,7 +143,9 @@ fn original_null_or_empty_null_and_typed_all_null_unsupported_are_true() {
 fn original_null_or_empty_mixed_unsupported_errors_before_row_projection() {
     let a: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(1)]));
     assert_eq!(
-        raw("null_or_empty", vec![a.clone()]).unwrap_err(),
+        raw("null_or_empty", vec![a.clone()])
+            .unwrap_err()
+            .to_string(),
         "null_or_empty expects string or array, got Int64"
     );
     assert_eq!(
@@ -153,12 +157,13 @@ fn original_null_or_empty_mixed_unsupported_errors_before_row_projection() {
             "null_or_empty",
             vec![Arc::new(LargeStringArray::from(vec![Some(""), None]))]
         )
-        .unwrap_err(),
+        .unwrap_err()
+        .to_string(),
         "null_or_empty expects string or array, got LargeUtf8"
     );
 }
 #[test]
-fn original_null_or_empty_preserves_full_unsupported_type_diagnostic() {
+fn null_or_empty_unsupported_type_uses_bounded_nominal_diagnostic() {
     let field = Arc::new(Field::new("x".repeat(900), DataType::Int64, true));
     let input: ArrayRef = Arc::new(StructArray::new(
         vec![field].into(),
@@ -170,45 +175,47 @@ fn original_null_or_empty_preserves_full_unsupported_type_diagnostic() {
         input.data_type()
     );
     assert!(expected.len() > 512);
-    assert_eq!(raw("null_or_empty", vec![input]).unwrap_err(), expected);
+    let failure = raw("null_or_empty", vec![input]).unwrap_err();
+    assert_eq!(
+        failure.to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(&expected).to_string()
+    );
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 361);
 }
 #[test]
-fn original_null_or_empty_tail_ignored_zero_arity_panics_and_eval_error_kept() {
+fn null_or_empty_exact_unary_shape_and_valid_child_error_are_preserved() {
     let (mut arena, args, chunk) = setup(vec![text(vec![Some("")])]);
     let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(99)), DataType::Utf8);
+    for arguments in [&[][..], &[args[0], missing][..]] {
+        let failure = eval_string_function(
+            "null_or_empty",
+            &arena,
+            ExprId(usize::MAX),
+            arguments,
+            &chunk,
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 430);
+    }
     assert_eq!(
         bools(
-            &eval_string_function(
-                "null_or_empty",
-                &arena,
-                ExprId(usize::MAX),
-                &[args[0], missing],
-                &chunk
-            )
-            .unwrap()
+            &eval_string_function("null_or_empty", &arena, ExprId(usize::MAX), &args, &chunk)
+                .unwrap()
         ),
         vec![Some(true)]
     );
     let expected = arena.eval(missing, &chunk).unwrap_err();
-    assert_eq!(
-        eval_string_function(
-            "null_or_empty",
-            &arena,
-            ExprId(usize::MAX),
-            &[missing],
-            &chunk
-        )
-        .unwrap_err(),
-        expected
-    );
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_string_function(
-            "null_or_empty",
-            &arena,
-            ExprId(usize::MAX),
-            &[],
-            &chunk
-        )))
-        .is_err()
-    );
+    let failure = eval_string_function(
+        "null_or_empty",
+        &arena,
+        ExprId(usize::MAX),
+        &[missing],
+        &chunk,
+    )
+    .unwrap_err();
+    assert_eq!(failure.failure_fact(), expected.failure_fact());
+    assert_eq!(failure.to_string(), expected.to_string());
+    assert!(!failure.same_occurrence(&expected));
 }

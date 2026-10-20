@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
@@ -24,18 +25,18 @@ pub fn eval_append_trailing_char_if_absent<__Eval: crate::exec::expr::ExprEvalua
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let ch_arr = arena.eval(args[1], chunk)?;
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "append_trailing_char_if_absent expects string".to_string())?;
+        .ok_or_else(|| expression_contract("append_trailing_char_if_absent expects string"))?;
     let c_arr = ch_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "append_trailing_char_if_absent expects string".to_string())?;
+        .ok_or_else(|| expression_contract("append_trailing_char_if_absent expects string"))?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {

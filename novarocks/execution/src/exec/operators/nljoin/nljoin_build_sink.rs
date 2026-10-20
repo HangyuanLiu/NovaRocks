@@ -27,13 +27,20 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::sync::Arc;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{SinkKernel, SinkStep, Transform},
+    step::NextStep,
+    step_context::StepContext,
+};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -63,13 +70,13 @@ impl OperatorFactory for NlJoinBuildSinkFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(NlJoinBuildSinkOperator {
+        Box::new(Transform::hydrating(NlJoinBuildSinkOperator {
             name: self.name.clone(),
             state: Arc::clone(&self.state),
             build_batches: Vec::new(),
-            finished: false,
             build_batches_mem_tracker: None,
-        })
+            artifact_memory: None,
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -81,11 +88,14 @@ struct NlJoinBuildSinkOperator {
     name: String,
     state: Arc<NlJoinSharedState>,
     build_batches: Vec<Chunk>,
-    finished: bool,
     build_batches_mem_tracker: Option<Arc<MemTracker>>,
+    artifact_memory: Option<BuildArtifactMemory>,
+}
+struct BuildArtifactMemory {
+    batches: Option<Arc<MemTracker>>,
 }
 
-impl Operator for NlJoinBuildSinkOperator {
+impl OperatorLifecycle for NlJoinBuildSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
@@ -98,63 +108,147 @@ impl Operator for NlJoinBuildSinkOperator {
         }
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        let batches = state.mem_tracker().map(|root| {
+            let artifact = MemTracker::new_child(
+                format!("JoinBuildArtifact: {}", self.state.build_dep().name()),
+                &root,
+            );
+            MemTracker::new_child("BuildBatches", &artifact)
+        });
+        self.artifact_memory = Some(BuildArtifactMemory { batches });
+        Ok(())
     }
 }
-
-impl ProcessorOperator for NlJoinBuildSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.is_finished()
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, mut chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
+impl InputEncodingPolicy for NlJoinBuildSinkOperator {}
+impl SinkKernel for NlJoinBuildSinkOperator {
+    fn consume(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let mut chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         if !chunk.is_empty() {
             if let Some(tracker) = self.build_batches_mem_tracker.as_ref() {
                 chunk.transfer_to(tracker);
             }
             self.build_batches.push(chunk);
         }
-        Ok(())
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        let binding = self.artifact_memory.as_ref().ok_or_else(|| {
+            novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "nested-loop join build runtime binding is missing",
+                ),
+            )
+        })?;
         let mut batches = std::mem::take(&mut self.build_batches);
-
-        if let Some(root) = state.mem_tracker() {
-            let label = format!("JoinBuildArtifact: {}", self.state.build_dep().name());
-            let artifact = MemTracker::new_child(label, &root);
-            let artifact_batches = MemTracker::new_child("BuildBatches", &artifact);
-            for chunk in batches.iter_mut() {
-                chunk.transfer_to(&artifact_batches);
+        if let Some(tracker) = &binding.batches {
+            for chunk in &mut batches {
+                chunk.transfer_to(tracker);
             }
         }
-
         let artifact = Arc::new(NlJoinBuildArtifact::new(batches));
-        self.state.set_build(artifact).map_err(|e| e.to_string())?;
-        Ok(())
+        self.state.set_build(artifact)?;
+        Ok(SinkStep::new(NextStep::Finished, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::{
+        chunk::{ChunkSchema, ChunkSlotSchema},
+        pipeline::{
+            dependency::DependencyManager, input::RawInput, step::InputResult,
+            step_context::TurnWork,
+        },
+    };
+    use arrow::{
+        array::Int32Array,
+        datatypes::{DataType, Field},
+    };
+    use novarocks_types::SlotId;
+
+    #[test]
+    fn build_steps_publish_once_and_retained_rows_outlive_the_sink() {
+        let root = MemTracker::new_root("nested-loop build shape");
+        let runtime = RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root.clone()),
+            None,
+        );
+        let shared = Arc::new(NlJoinSharedState::new(17, 1, DependencyManager::default()));
+        let factory = NlJoinBuildSinkFactory::new(shared.clone());
+        let mut sink = factory.create(1, 0);
+        sink.set_mem_tracker(MemTracker::new_child("sink", &root));
+        sink.bind_runtime_state(&runtime).unwrap();
+        sink.prepare().unwrap();
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("value", DataType::Int32, false),
+                None,
+                None,
+            )])
+            .unwrap(),
+        );
+        let chunk =
+            Chunk::try_new_with_columns(schema, vec![Arc::new(Int32Array::from(vec![7, 11]))])
+                .unwrap();
+        let control = runtime.error_state();
+        let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut turn);
+        let step = sink.as_mut();
+        assert!(matches!(
+            step.try_push(&mut ctx, RawInput::for_test(chunk)),
+            InputResult::Accepted(Ok(_))
+        ));
+        assert!(!shared.build_dep().is_ready());
+        let consumed = step.drive(&mut ctx).unwrap();
+        assert!(consumed.output.is_none());
+        assert_eq!(consumed.committed_rows, 2);
+        assert!(matches!(consumed.next, NextStep::NeedInput));
+        assert!(!shared.has_build());
+        step.finish(&mut ctx).unwrap();
+        assert!(
+            !shared.has_build(),
+            "EOS signals control without publishing payload work"
+        );
+        let finalized = step.drive(&mut ctx).unwrap();
+        assert!(finalized.output.is_none());
+        assert!(matches!(finalized.next, NextStep::Finished));
+        assert!(shared.build_dep().is_ready());
+        let artifact = shared.get_build().unwrap();
+        assert_eq!(artifact.build_batches.len(), 1);
+        let values = artifact.build_batches[0].columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[7, 11]);
+        step.finish(&mut ctx).unwrap();
+        assert!(matches!(
+            step.drive(&mut ctx).unwrap().next,
+            NextStep::Finished
+        ));
+        assert!(Arc::ptr_eq(&artifact, &shared.get_build().unwrap()));
+        let last_alias = artifact.build_batches[0].clone();
+        drop(sink);
+        drop(factory);
+        drop(shared);
+        drop(artifact);
+        assert!(
+            root.current() > 0,
+            "the retained batch owns its artifact charge"
+        );
+        drop(last_alias);
+        assert_eq!(root.current(), 0);
     }
 }

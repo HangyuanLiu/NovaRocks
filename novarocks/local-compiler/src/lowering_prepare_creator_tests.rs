@@ -96,7 +96,7 @@ impl PureCompileControl for Observations {
         let mut events = self.events.lock().unwrap();
         let at = events.len();
         events.push(Event::Control(phase, units));
-        match *self.control_stop.lock().unwrap() {
+        match self.control_stop.lock().unwrap().clone() {
             Some((stop, cause)) if stop == at => {
                 self.stopped.store(true, Ordering::SeqCst);
                 Err(cause)
@@ -566,7 +566,7 @@ fn actual_public_frozen_preparation_control_prefixes_have_no_creator_or_footer_t
                 let factory = Factory::new();
                 let mut scope = factory.begin_scope().unwrap();
                 factory.observations.start();
-                *factory.observations.control_stop.lock().unwrap() = Some((at, cause));
+                *factory.observations.control_stop.lock().unwrap() = Some((at, cause.clone()));
                 assert_eq!(
                     checked_control(
                         preparation(
@@ -647,7 +647,8 @@ fn actual_public_compiler_functions_keep_primary_h_and_real_bounded_scope_exit()
         .expect("actual selected validation has a bounded positive checkpoint");
     for cause in causes() {
         let stopped = Factory::new();
-        *stopped.observations.control_stop.lock().unwrap() = Some((function_control, cause));
+        *stopped.observations.control_stop.lock().unwrap() =
+            Some((function_control, cause.clone()));
         assert!(
             matches!(compile_created(source.clone(),&functions,&stopped),
             Err(FragmentCreationError::Control(actual)) if actual==cause)
@@ -945,7 +946,7 @@ fn actual_nonempty_original_request_preserves_each_first_h_and_control_prefix_wi
         if matches!(event, Event::Control(..)) {
             for cause in causes() {
                 let factory = Factory::new();
-                *factory.observations.control_stop.lock().unwrap() = Some((at, cause));
+                *factory.observations.control_stop.lock().unwrap() = Some((at, cause.clone()));
                 assert!(
                     matches!(materialize_created_request(&source, &pools, &factory), Err(F::Control(actual)) if actual == cause)
                 );
@@ -1023,7 +1024,7 @@ fn original_request_header_gates_and_pending_control_precede_lazy_scope_creation
         )
         .unwrap();
         work.step().unwrap();
-        *factory.observations.control_stop.lock().unwrap() = Some((1, cause));
+        *factory.observations.control_stop.lock().unwrap() = Some((1, cause.clone()));
         *factory.observations.request_stop.lock().unwrap() = Some(2);
         assert!(
             matches!(crate::original_requests::materialize_call_request_created(
@@ -1314,7 +1315,7 @@ fn ordered_topn_compiler_actual_creator_preserves_every_refusal_prefix() {
                     CompileControlError::ResourceExhausted,
                 ] {
                     let factory = Factory::new();
-                    *factory.observations.control_stop.lock().unwrap() = Some((at, cause));
+                    *factory.observations.control_stop.lock().unwrap() = Some((at, cause.clone()));
                     assert!(
                         matches!(run(&factory), Err(FragmentCreationError::Control(actual)) if actual == cause)
                     );

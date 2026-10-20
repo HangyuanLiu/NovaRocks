@@ -194,7 +194,7 @@ impl ConnectorVariantPathTransform {
         let path_owner = factory.begin_input_construction(&chunk)?;
         let batch=novarocks_execution::exec::variant_read::materialize_variant_path_columns_owned(chunk.record_batch(),self.read_schema.slot_ids(),self.output_schema.slot_ids(),&self.specs,self.output_schema.arrow_schema_ref(),owner.as_ref(),path_owner.as_ref()).map_err(|error|match error{
             novarocks_execution::exec::variant_read::VariantMaterializationFailure::Construction(error)=>novarocks_execution::runtime::fragment::ExecutionFailure::from(error),
-            novarocks_execution::exec::variant_read::VariantMaterializationFailure::Kernel(error)=>novarocks_execution::runtime::fragment::ExecutionFailure::from(error),
+            novarocks_execution::exec::variant_read::VariantMaterializationFailure::Evaluation(error)=>error,
         })?;
         drop(path_owner);
         novarocks_execution::exec::chunk::Chunk::try_new_typed_record_batch_owned_observed::<

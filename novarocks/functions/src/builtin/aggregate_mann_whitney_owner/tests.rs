@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use novarocks_type_contract::{
     CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
     ExpressionEffectContext, ExpressionUseId, SemanticParameters,
@@ -33,7 +34,7 @@ impl PureCompileControl for Control {
         let mut calls = self.calls.lock().unwrap();
         let at = *calls;
         *calls += 1;
-        if let Some((stop, cause)) = self.refusal {
+        if let Some((stop, cause)) = self.refusal.clone() {
             assert!(at <= stop, "callback after primary compile refusal");
             if at == stop {
                 return Err(cause);
@@ -268,7 +269,7 @@ fn mann_whitney_owner_each_actual_compile_frontier_preserves_primary_cause() {
             ] {
                 let control = Control {
                     calls: Mutex::new(0),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 let error = fixture
                     .prepare(phase, false, CallProofScope::Unconditional, &control)

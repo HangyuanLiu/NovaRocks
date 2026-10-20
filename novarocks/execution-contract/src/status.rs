@@ -32,7 +32,7 @@ use crate::task_execution::domain::DomainVersion;
 use crate::task_execution::identity::{IdentityMismatch, TaskIdentity};
 
 /// Largest human-readable detail carried by a failure or rejection.
-pub const SAFE_DETAIL_MAX_BYTES: usize = 512;
+pub const SAFE_DETAIL_MAX_BYTES: usize = novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES;
 
 /// Largest structured field path carried by a validation failure.
 pub const SAFE_FIELD_PATH_MAX_BYTES: usize = 256;
@@ -181,6 +181,12 @@ impl SafeDetail {
         Self(value[..end].to_owned())
     }
 
+    /// Formats directly into the diagnostic bound, without first allocating
+    /// an unbounded rendering of a provider error or panic payload.
+    pub fn truncating_display(value: impl fmt::Display) -> Self {
+        Self(novarocks_failure_contract::BoundedDetail::truncating_display(value).into_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -219,7 +225,7 @@ impl fmt::Display for SafeFieldPath {
     }
 }
 
-/// Closed category of a task's own failure.
+/// Coarse response carrier. Task failure facts remain authoritative.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TaskFailureCategory {
     /// An operator, connector, or runtime error inside this task.
@@ -277,47 +283,60 @@ impl fmt::Display for TaskFailurePhase {
     }
 }
 
-/// A task's own bounded, redacted failure cause.
+/// The producer's neutral facts and bounded, redacted detail for one Task failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskFailure {
-    category: TaskFailureCategory,
+    fact: crate::failure::FailureFact,
     detail: SafeDetail,
     phase: TaskFailurePhase,
 }
 
 impl TaskFailure {
-    pub const fn new(category: TaskFailureCategory, detail: SafeDetail) -> Self {
-        Self::new_in_phase(category, detail, TaskFailurePhase::Execution)
+    pub const fn new(fact: crate::failure::FailureFact, detail: SafeDetail) -> Self {
+        Self::new_in_phase(fact, detail, TaskFailurePhase::Execution)
     }
-
     pub const fn new_in_phase(
-        category: TaskFailureCategory,
+        fact: crate::failure::FailureFact,
         detail: SafeDetail,
         phase: TaskFailurePhase,
     ) -> Self {
         Self {
-            category,
+            fact,
             detail,
             phase,
         }
     }
-
-    pub const fn category(&self) -> TaskFailureCategory {
-        self.category
+    pub const fn fact(&self) -> crate::failure::FailureFact {
+        self.fact
     }
-
+    /// A lossy response projection, never recovery policy or a source of facts.
+    pub const fn category(&self) -> TaskFailureCategory {
+        use crate::failure::FailureClass;
+        match self.fact.class() {
+            FailureClass::Unsupported => TaskFailureCategory::Unsupported,
+            FailureClass::Resource => TaskFailureCategory::ResourceExhausted,
+            FailureClass::Invariant | FailureClass::Unexpected => TaskFailureCategory::Internal,
+            FailureClass::Data
+            | FailureClass::Dependency
+            | FailureClass::Representation
+            | FailureClass::Control => TaskFailureCategory::Execution,
+        }
+    }
     pub const fn detail(&self) -> &SafeDetail {
         &self.detail
     }
-
     pub const fn phase(&self) -> TaskFailurePhase {
         self.phase
     }
 }
-
+impl crate::failure::FailureProjection for TaskFailure {
+    fn failure_fact(&self) -> crate::failure::FailureFact {
+        self.fact
+    }
+}
 impl fmt::Display for TaskFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.category, self.detail)
+        write!(formatter, "{}: {}", self.category(), self.detail)
     }
 }
 
@@ -1203,7 +1222,13 @@ mod tests {
     fn preparation_failure_cannot_claim_installation_history() {
         for state in [TaskState::Failing, TaskState::Failed] {
             let failure = Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
-                TaskFailureCategory::Protocol,
+                crate::failure::FailureFact::new(
+                    crate::failure::FailureClass::Invariant,
+                    crate::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(3).unwrap(),
+                    ),
+                ),
                 SafeDetail::truncating("preparation failed"),
                 TaskFailurePhase::Preparation,
             )));
@@ -1236,11 +1261,19 @@ mod tests {
     fn unsupported_category_has_stable_text_and_keeps_preparation_phase() {
         assert_eq!(TaskFailureCategory::Unsupported.as_str(), "UNSUPPORTED");
         assert_eq!(TaskFailureCategory::Unsupported.to_string(), "UNSUPPORTED");
+        let fact = crate::failure::FailureFact::new(
+            crate::failure::FailureClass::Unsupported,
+            crate::failure::FailureReason::new(
+                crate::failure::domain::LOCAL_COMPILER,
+                std::num::NonZeroU16::new(1).unwrap(),
+            ),
+        );
         let failure = TaskFailure::new_in_phase(
-            TaskFailureCategory::Unsupported,
+            fact,
             SafeDetail::truncating("FULL OUTER hash join"),
             TaskFailurePhase::Preparation,
         );
+        assert_eq!(failure.fact(), fact);
         assert_eq!(failure.category(), TaskFailureCategory::Unsupported);
         assert_eq!(failure.phase(), TaskFailurePhase::Preparation);
     }
@@ -1257,6 +1290,10 @@ mod tests {
     fn safe_text_is_bounded() {
         assert!(SafeDetail::new("x".repeat(SAFE_DETAIL_MAX_BYTES)).is_ok());
         assert!(SafeDetail::new("x".repeat(SAFE_DETAIL_MAX_BYTES + 1)).is_err());
+        let bounded = SafeDetail::truncating_display(format_args!("prefix:{}", "界".repeat(1000)));
+        assert!(bounded.as_str().len() <= SAFE_DETAIL_MAX_BYTES);
+        assert!(bounded.as_str().starts_with("prefix:"));
+        assert_eq!(SafeDetail::truncating_display(17).as_str(), "17");
         assert!(SafeFieldPath::new("field").is_ok());
     }
 

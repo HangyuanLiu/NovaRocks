@@ -26,6 +26,10 @@
 //! absolute evaluation deadline and memory admission are not yet loaned to
 //! this host; they remain open host obligations, not implied by this control.
 
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,8 +46,12 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::{
     CompiledExpressionInstance, input_source::CompiledInputLoan,
 };
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
@@ -62,7 +70,7 @@ pub(crate) mod runtime_scalar_memory_test_support;
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
-    allocator: Option<Arc<super::compiled_aggregate::TrackedStateAllocator>>,
+    allocator: Option<Arc<crate::runtime::tracked_state_allocator::TrackedStateAllocator>>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 impl RuntimeKernelControl {
@@ -72,6 +80,19 @@ impl RuntimeKernelControl {
             query_memory: None,
             allocator: None,
             construction: None,
+        }
+    }
+    pub(crate) fn failure_port(&self) -> Arc<RuntimeErrorState> {
+        Arc::clone(&self.error)
+    }
+    /// Bind a nested receiver to the same fragment services. Its allocator is
+    /// installed separately on that receiver; this creates no memory authority.
+    pub(crate) fn for_receiver(&self) -> Self {
+        Self {
+            error: Arc::clone(&self.error),
+            query_memory: self.query_memory.clone(),
+            allocator: None,
+            construction: self.construction.clone(),
         }
     }
     /// Borrow the already-validated task capability at original operator binding.
@@ -109,9 +130,8 @@ impl RuntimeKernelControl {
         &mut self,
         tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
     ) {
-        self.allocator = Some(super::compiled_aggregate::expression_allocation_host(
-            tracker,
-        ));
+        self.allocator =
+            Some(crate::runtime::tracked_state_allocator::expression_allocation_host(tracker));
     }
     pub(crate) fn allocator(
         &self,
@@ -127,7 +147,7 @@ impl RuntimeKernelControl {
         &self,
         original: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<
-        &super::compiled_aggregate::TrackedStateAllocator,
+        &crate::runtime::tracked_state_allocator::TrackedStateAllocator,
         novarocks_functions::ScalarResourceError,
     > {
         let Some(host) = &self.allocator else {
@@ -301,7 +321,13 @@ pub(crate) fn instances(
 pub(crate) fn root_value_type(
     program: &LocalProgram,
     site: ProgramExpressionRootSite,
-) -> Result<novarocks_type_contract::FunctionValueType, String> {
+) -> Result<
+    novarocks_type_contract::FunctionValueType,
+    crate::exec::fragment::error::FragmentBindingError,
+> {
+    use crate::exec::fragment::error::{
+        FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+    };
     let expressions = program.checked().channels().expressions();
     let root = expressions
         .resolved_calls()
@@ -309,12 +335,24 @@ pub(crate) fn root_value_type(
         .roots()
         .sites()
         .get(&site)
-        .ok_or_else(|| format!("compiled program has no expression root {site:?}"))?;
+        .ok_or_else(|| {
+            FragmentBindingError::new(
+                FragmentBindingTarget::Program,
+                FragmentBindingErrorKind::MissingAssignment,
+                format!("compiled program has no expression root {site:?}"),
+            )
+        })?;
     match expressions.definition_type(site.arena(), root.definition) {
         Some(novarocks_type_contract::FunctionArgumentType::Value(value)) => Ok(value.clone()),
-        Some(_) => Err(format!("compiled expression root {site:?} is not a value")),
-        None => Err(format!(
-            "compiled expression root {site:?} has no static type"
+        Some(_) => Err(FragmentBindingError::new(
+            FragmentBindingTarget::Program,
+            FragmentBindingErrorKind::WrongAssignmentKind,
+            format!("compiled expression root {site:?} is not a value"),
+        )),
+        None => Err(FragmentBindingError::new(
+            FragmentBindingTarget::Program,
+            FragmentBindingErrorKind::MissingAssignment,
+            format!("compiled expression root {site:?} has no static type"),
         )),
     }
 }
@@ -362,21 +400,28 @@ impl CompiledProjectProcessorFactory {
     pub(crate) fn try_new_final_result_boundary(
         program: Arc<LocalProgram>,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if !matches!(
             program.graph().sink(),
             Some(novarocks_local_program::StaticSinkProgram::RootResult(_))
         ) {
-            return Err("final result boundary requires its actual RootResult sink".into());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "final result boundary requires its actual RootResult sink",
+            ));
         }
         let root = program.graph().root();
-        let node = program
-            .graph()
-            .nodes()
-            .get(root.index())
-            .ok_or("compiled final result root is absent")?;
+        let node = program.graph().nodes().get(root.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                "compiled final result root is absent",
+            )
+        })?;
         if !node.output_layout().is_typed() {
-            return Err("compiled final result requires a complete output layout".into());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled final result requires a complete output layout",
+            ));
         }
         let pairs = node
             .output_layout()
@@ -399,12 +444,13 @@ impl CompiledProjectProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or("compiled Project node is absent")?;
+    ) -> ExecutionResult<Self> {
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                "compiled Project node is absent",
+            )
+        })?;
         let ProgramNodeKind::Project {
             exprs,
             expr_slot_ids,
@@ -413,11 +459,15 @@ impl CompiledProjectProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err("compiled node is not a Project".to_string());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled node is not a Project",
+            ));
         };
         let mut sites = Vec::with_capacity(exprs.len());
         for ordinal in 0..exprs.len() {
-            let expression = u32::try_from(ordinal).map_err(|_| "Project width exceeds u32")?;
+            let expression = novarocks_local_program::checked_program_ordinal(ordinal)
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             sites.push(root(
                 node,
                 ProgramNodeExpressionRole::ProjectOutput { expression },
@@ -425,9 +475,10 @@ impl CompiledProjectProcessorFactory {
         }
         let final_identity_slots = if *validate_final_result_input {
             if output_indices.is_some() || exprs.len() != expr_slot_ids.len() {
-                return Err(
-                    "final result input validation requires an identity output layout".into(),
-                );
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    "final result input validation requires an identity output layout",
+                ));
             }
             Some(
                 exprs
@@ -443,19 +494,22 @@ impl CompiledProjectProcessorFactory {
                             Some(novarocks_local_program::StaticExprKind::SlotId(source)) => {
                                 Ok((*source, *output))
                             }
-                            _ => Err(
-                                "final result input validation requires identity expressions"
-                                    .to_string(),
-                            ),
+                            _ => Err(program_binding_failure(
+                                PlanBindingKind::InvalidAssignment,
+                                "final result input validation requires identity expressions",
+                            )),
                         }
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
+                    .collect::<ExecutionResult<Vec<_>>>()?,
             )
         } else {
             None
         };
         if !graph_node.output_layout().is_typed() {
-            return Err("compiled Project requires its complete output layout".into());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled Project requires its complete output layout",
+            ));
         }
         Ok(Self {
             name: format!("COMPILED_PROJECT (node={})", node.index()),
@@ -475,7 +529,7 @@ impl OperatorFactory for CompiledProjectProcessorFactory {
         &self.name
     }
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledProjectProcessor {
+        Box::new(Transform::hydrating(CompiledProjectProcessor {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
@@ -486,10 +540,7 @@ impl OperatorFactory for CompiledProjectProcessorFactory {
             construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
-            pending: None,
-            finishing: false,
-            finished: false,
-        })
+        }))
     }
 }
 struct CompiledProjectProcessor {
@@ -503,9 +554,6 @@ struct CompiledProjectProcessor {
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
-    pending: Option<Chunk>,
-    finishing: bool,
-    finished: bool,
 }
 #[cfg(test)]
 pub(crate) fn project_chunk_with_source_observer(
@@ -529,9 +577,6 @@ pub(crate) fn project_chunk_with_source_observer(
         construction: None,
         control: RuntimeKernelControl::new(factory.error),
         instances: None,
-        pending: None,
-        finishing: false,
-        finished: false,
     };
     let tracker =
         crate::runtime::mem_tracker::MemTracker::new_root("slot source fixture construction");
@@ -552,13 +597,26 @@ pub(crate) fn project_chunk_with_source_observer(
     for instance in processor.instances.as_mut().unwrap() {
         instance.observe_slot_source(Arc::clone(&observer));
     }
-    let state = RuntimeState::default();
-    processor.push_chunk(&state, chunk)?;
+    let control = RuntimeErrorState::default();
+    let mut turn =
+        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut ctx = crate::exec::pipeline::step_context::StepContext::new(&control, &mut turn);
     processor
-        .pull_chunk(&state)?
-        .ok_or_else(|| "source fixture Project has no output".into())
+        .apply(
+            &mut ctx,
+            crate::exec::pipeline::input::PreparedInput::for_test(chunk),
+        )?
+        .output
+        .ok_or_else(|| {
+            novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(
+                    &("source fixture Project has no output"),
+                ),
+            )
+            .into()
+        })
 }
-impl Operator for CompiledProjectProcessor {
+impl OperatorLifecycle for CompiledProjectProcessor {
     #[cfg(any(test, novarocks_dev_controls))]
     fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> {
         self.output.clone()
@@ -615,18 +673,9 @@ impl Operator for CompiledProjectProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
-impl ProcessorOperator for CompiledProjectProcessor {
-    fn accepts_encoded_path(
+impl InputEncodingPolicy for CompiledProjectProcessor {
+    fn retains_encoded_path(
         &self,
         occurrence: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
     ) -> bool {
@@ -638,20 +687,28 @@ impl ProcessorOperator for CompiledProjectProcessor {
                 && matches!(value.as_ref(), arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8));
         installed && pairs.iter().any(|(source, _)| *source == occurrence.slot)
     }
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending.is_none()
+}
+impl TransformKernel for CompiledProjectProcessor {
+    fn end_input(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
+        // Every accepted input has already emitted its sole result. This
+        // computing boundary owns no EOS payload or further materialization.
+        Ok(crate::exec::pipeline::shape::TransformInputEnd::Finished)
     }
-    fn has_output(&self) -> bool {
-        self.pending.is_some()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+
+    fn apply(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        chunk: crate::exec::pipeline::input::PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = chunk.into_uncovered_chunk()?;
         use super::project_processor::{
             ProjectEncodingSource, materialize_project_output_owned, project_reserve,
         };
         use crate::exec::pipeline::operator::ConstructionFailure;
-        if self.pending.is_some() {
-            return Err("compiled Project received input while output is pending".into());
-        }
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         let output = self
             .output
             .as_ref()
@@ -685,7 +742,7 @@ impl ProcessorOperator for CompiledProjectProcessor {
             for (source, _) in pairs {
                 columns.push(chunk.column_by_slot_id(*source)?);
             }
-            self.pending = Some(materialize_project_output_owned(
+            let projected = materialize_project_output_owned(
                 columns,
                 chunk.record_batch().num_rows(),
                 output,
@@ -697,8 +754,8 @@ impl ProcessorOperator for CompiledProjectProcessor {
                 },
                 storage,
                 owner.as_ref(),
-            )?);
-            return Ok(());
+            )?;
+            return Ok(StepResult::new(Some(projected), NextStep::NeedInput, rows));
         }
         instances(
             &mut self.instances,
@@ -711,7 +768,7 @@ impl ProcessorOperator for CompiledProjectProcessor {
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
             columns.push(evaluate_chunk_all(instance, *site, &chunk, &self.control)?);
         }
-        self.pending = Some(materialize_project_output_owned(
+        let projected = materialize_project_output_owned(
             columns,
             chunk.record_batch().num_rows(),
             output,
@@ -724,22 +781,8 @@ impl ProcessorOperator for CompiledProjectProcessor {
             |_| Ok(ProjectEncodingSource::Plain),
             storage,
             owner.as_ref(),
-        )?);
-        Ok(())
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let output = self.pending.take();
-        if self.finishing {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        if self.pending.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+        )?;
+        Ok(StepResult::new(Some(projected), NextStep::NeedInput, rows))
     }
 }
 
@@ -761,17 +804,19 @@ impl CompiledFilterProcessorFactory {
         program: Arc<LocalProgram>,
         site: ProgramExpressionRootSite,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let ProgramExpressionRootSite::Node { node, role } = site else {
-            return Err(format!(
-                "compiled filter root {site:?} is not a node predicate"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled filter root {site:?} is not a node predicate"),
             ));
         };
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or_else(|| format!("compiled filter node {} is absent", node.index()))?;
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled filter node {} is absent", node.index()),
+            )
+        })?;
         let label = match (graph_node.kind(), role) {
             (
                 ProgramNodeKind::Filter { .. },
@@ -782,9 +827,12 @@ impl CompiledFilterProcessorFactory {
                 ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
             ) => "COMPILED_SCAN_RESIDUAL",
             _ => {
-                return Err(format!(
-                    "compiled filter root {role:?} at local node {} is neither a Filter predicate nor a Scan residual",
-                    node.index()
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled filter root {role:?} at local node {} is neither a Filter predicate nor a Scan residual",
+                        node.index()
+                    ),
                 ));
             }
         };
@@ -794,9 +842,12 @@ impl CompiledFilterProcessorFactory {
                 ..
             }) => {}
             _ => {
-                return Err(format!(
-                    "compiled filter root {role:?} at local node {} has no single node-output input port",
-                    node.index()
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled filter root {role:?} at local node {} has no single node-output input port",
+                        node.index()
+                    ),
                 ));
             }
         }
@@ -870,25 +921,19 @@ impl OperatorFactory for CompiledFilterProcessorFactory {
         &self.name
     }
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledFilterProcessor {
+        Box::new(Transform::hydrating(CompiledFilterProcessor {
             name: self.name.clone(),
             body: self.create_body(),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
-            pending: None,
-            finishing: false,
-            finished: false,
-        })
+        }))
     }
 }
 struct CompiledFilterProcessor {
     name: String,
     body: CompiledFilterBody,
     control: RuntimeKernelControl,
-    pending: Option<Chunk>,
-    finishing: bool,
-    finished: bool,
 }
-impl Operator for CompiledFilterProcessor {
+impl OperatorLifecycle for CompiledFilterProcessor {
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -899,53 +944,34 @@ impl Operator for CompiledFilterProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
-impl ProcessorOperator for CompiledFilterProcessor {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending.is_none()
+impl crate::exec::pipeline::operator::InputEncodingPolicy for CompiledFilterProcessor {}
+impl crate::exec::pipeline::shape::TransformKernel for CompiledFilterProcessor {
+    fn end_input(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
+        // Every accepted input has already emitted its sole result. This
+        // computing boundary owns no EOS payload or further materialization.
+        Ok(crate::exec::pipeline::shape::TransformInputEnd::Finished)
     }
-    fn has_output(&self) -> bool {
-        self.pending.is_some()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.pending.is_some() {
-            return Err("compiled Filter received input while output is pending".into());
-        }
-        let truth = self.body.evaluate(
-            CompiledInputLoan::RecordBatch(chunk.record_batch()),
-            &self.control,
-        )?;
+
+    fn apply(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        chunk: crate::exec::pipeline::input::PreparedInput,
+    ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+        let chunk = chunk.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let truth = self
+            .body
+            .evaluate(CompiledInputLoan::from_chunk(&chunk), &self.control)?;
         let mask = crate::exec::chunk::normalize_filter_mask_observed(&truth, || Ok(()))?;
-        let batch = filter_record_batch(chunk.record_batch(), &mask)
-            .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?;
-        self.pending = Some(Chunk::try_new_with_chunk_schema(
-            batch,
-            chunk.chunk_schema_ref(),
-        )?);
-        Ok(())
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let output = self.pending.take();
-        if self.finishing {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        if self.pending.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+        let batch = filter_record_batch(chunk.record_batch(), &mask).map_err(|error| {
+            ExecutionFailure::from_domain(super::filter_processor::FilterFailure::Arrow(error))
+        })?;
+        let output = Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref())?;
+        Ok(StepResult::new(Some(output), NextStep::NeedInput, rows))
     }
 }
 

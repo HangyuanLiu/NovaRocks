@@ -468,7 +468,7 @@ fn runtime_invocation_memory_original_early_and_validate_only_paths_do_not_quali
 }
 
 #[test]
-fn runtime_invocation_memory_whole_data_latches_and_failed_replay_reads_no_stopped_account() {
+fn runtime_invocation_memory_shape_refusal_latches_and_failed_replay_reads_no_stopped_account() {
     use arrow::{
         array::{ArrayRef, LargeListArray, new_empty_array},
         buffer::{OffsetBuffer, ScalarBuffer},
@@ -477,9 +477,9 @@ fn runtime_invocation_memory_whole_data_latches_and_failed_replay_reads_no_stopp
     let binding = json_binding();
     let (control, tracker) = json_control(Some(&binding), "actual-query");
     let host = control.allocator().unwrap();
-    // List item names are anonymous in the selected type. Keep the long
-    // diagnostic name on a semantic Struct field and use the declared layout
-    // for the actual array, so the original LargeList Data failure is reached.
+    // An unsupported frozen carrier is an outer contract refusal. Keep the
+    // long real declaration to check bounded diagnostics without granting it
+    // a SQL-row Data channel or retaining its metadata graph.
     let declared = novarocks_type_contract::FunctionValueType::new(
         DataType::LargeList(Arc::new(Field::new(
             "item",
@@ -509,27 +509,29 @@ fn runtime_invocation_memory_whole_data_latches_and_failed_replay_reads_no_stopp
         Some(&host),
         &control,
     );
-    let data = match result {
-        Err(RuntimeScalarEvaluationFailure::Data(data)) => data,
-        Err(error) => panic!("original full Data; actual failure: {error:?}"),
-        Ok(_) => panic!("original full Data; actual result was unexpected success"),
+    let failure = match result {
+        Err(RuntimeScalarEvaluationFailure::Kernel(cause)) => cause,
+        Err(error) => panic!("the carrier must remain an outer contract refusal: {error:?}"),
+        Ok(_) => panic!("the unsupported carrier must not produce an output"),
     };
-    assert!(
-        data.message()
-            .starts_with("unsupported scalar type: LargeList")
-    );
-    assert!(data.message().len() > 512);
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&failure);
     assert_eq!(
-        data.message(),
-        format!("unsupported scalar type: {:?}", unsupported.data_type())
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
     );
-    assert_eq!(data.source_row(0), Some(1));
-    assert_eq!(data.source_row(1), Some(3));
+    assert_eq!(fact.reason().code(), 301);
+    let expected = novarocks_functions::KernelDiagnostic::new(&format!(
+        "unsupported scalar type: {:?}",
+        unsupported.data_type()
+    ));
+    assert!(failure.to_string().contains(expected.message()));
     assert!(instance.is_failed());
     assert_completed_operation(journal.preparation.as_ref().unwrap());
     assert_completed_operation(&journal.body);
     let error = Arc::new(RuntimeErrorState::default());
-    error.set_error("stopped");
+    error.set_error(novarocks_functions::KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new(&("stopped")),
+    ));
     let stopped = super::contract_tests::control(None, error);
     let replay = RuntimeScalarMemoryScope::new(&stopped, &mut journal).evaluate_invocation(
         &mut instance,
@@ -550,8 +552,85 @@ fn runtime_invocation_memory_whole_data_latches_and_failed_replay_reads_no_stopp
             && journal.preparation.is_none()
             && journal.body.settlement.is_none()
     );
+    drop(failure);
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn runtime_invocation_memory_real_date_data_keeps_selected_rows_and_failed_replay() {
+    use arrow::array::{ArrayRef, Date32Array, StringArray};
+    let binding = json_binding();
+    let (control, tracker) = json_control(Some(&binding), "actual-json-data");
+    let host = control.allocator().unwrap();
+    let keys: ArrayRef = Arc::new(StringArray::from(vec!["guard", "a", "guard", "b"]));
+    let values: ArrayRef = Arc::new(Date32Array::from(vec![
+        0,
+        -1_000_000_000,
+        0,
+        -1_000_000_000,
+    ]));
+    let mut instance = actual_json(
+        &[keys.data_type().clone(), values.data_type().clone()],
+        &host,
+    );
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let failure = RuntimeScalarMemoryScope::new(&control, &mut journal)
+        .evaluate_invocation(
+            &mut instance,
+            Selection::try_sparse(4, &[1, 3]).unwrap(),
+            &[
+                EvaluatedArgument::Column(&keys),
+                EvaluatedArgument::Column(&values),
+            ],
+            ScalarInvocationActivation::Activated,
+            Some(&host),
+            &control,
+        )
+        .unwrap_err();
+    let RuntimeScalarEvaluationFailure::Data(data) = failure else {
+        panic!("the actual Date32 value error must retain its Data channel");
+    };
+    assert_eq!(
+        data.message(),
+        "json_object invalid date32 day value: -1000000000"
+    );
+    assert_eq!(data.source_row(0), Some(1));
+    assert_eq!(data.source_row(1), Some(3));
+    assert!(instance.is_failed());
+    assert_completed_operation(journal.preparation.as_ref().unwrap());
+    assert_completed_operation(&journal.body);
+    let error = Arc::new(RuntimeErrorState::default());
+    error.set_error(KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new("stopped"),
+    ));
+    let stopped = super::contract_tests::control(None, error);
+    assert!(matches!(
+        RuntimeScalarMemoryScope::new(&stopped, &mut journal).evaluate_invocation(
+            &mut instance,
+            Selection::all(usize::MAX),
+            &[],
+            ScalarInvocationActivation::Activated,
+            None,
+            &stopped,
+        ),
+        Err(RuntimeScalarEvaluationFailure::Kernel(
+            KernelFailure::InstanceFailed
+        ))
+    ));
+    assert!(
+        journal.workset_bytes.is_none()
+            && journal.preparation.is_none()
+            && journal.body.settlement.is_none()
+    );
+    let alias = data.clone();
     drop(data);
     drop(instance);
+    assert_eq!(
+        alias.message(),
+        "json_object invalid date32 day value: -1000000000"
+    );
+    drop(alias);
     assert_eq!(tracker.current(), 0);
 }
 
@@ -600,7 +679,11 @@ fn runtime_scalar_memory_missing_binding_and_stop_before_request_run_no_body() {
     for stopped in [false, true] {
         let error = Arc::new(RuntimeErrorState::default());
         if stopped {
-            error.set_error("original runtime error".repeat(2048));
+            error.set_error(novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(
+                    &("original runtime error".repeat(2048)),
+                ),
+            ));
         }
         let control = control(None, error.clone());
         let mut journal = RuntimeScalarMemoryJournal::default();
@@ -617,8 +700,15 @@ fn runtime_scalar_memory_missing_binding_and_stop_before_request_run_no_body() {
                 ))
             );
             assert_eq!(
-                error.error().unwrap().to_string(),
-                "original runtime error".repeat(2048)
+                error.error().unwrap().detail(),
+                novarocks_failure_contract::BoundedDetail::truncating(
+                    &"original runtime error".repeat(2048)
+                )
+                .as_str()
+            );
+            assert!(
+                error.error().unwrap().detail().len()
+                    <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
             );
         } else {
             assert_eq!(
@@ -647,7 +737,9 @@ fn runtime_scalar_memory_stop_after_actual_grant_returns_unused_rights() {
                 panic!("real grant required");
             };
             *domain.borrow_mut() = Some(ready.domain().clone());
-            error.set_error("stop during qualification");
+            error.set_error(novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(&("stop during qualification")),
+            ));
             admission
         },
     );
@@ -711,7 +803,9 @@ fn runtime_scalar_memory_pending_uses_original_registered_stop_notification() {
                         );
                         std::thread::yield_now();
                     }
-                    error.set_error("registered stop");
+                    error.set_error(novarocks_functions::KernelFailure::Internal(
+                        novarocks_functions::KernelDiagnostic::new(&("registered stop")),
+                    ));
                 })
             });
             let result = RuntimeScalarMemoryScope::new(&control, &mut journal).run(
@@ -732,7 +826,11 @@ fn runtime_scalar_memory_pending_uses_original_registered_stop_notification() {
                         KernelMemoryAdmission::SettlementPending(_)
                     ));
                     if !registered {
-                        error.set_error("stop before registration");
+                        error.set_error(novarocks_functions::KernelFailure::Internal(
+                            novarocks_functions::KernelDiagnostic::new(
+                                &("stop before registration"),
+                            ),
+                        ));
                     }
                     admission
                 },
@@ -1330,12 +1428,17 @@ fn runtime_scalar_memory_actual_bitwise_refusals_preserve_uncalled_instance_and_
                     .evaluate(selection, invalid, &funded)
                     .unwrap_err();
                 let mut malformed = actual_scalar(name, &types);
+                let actual = RuntimeScalarMemoryScope::new(&funded, &mut journal)
+                    .evaluate(&mut malformed, selection, invalid, &funded)
+                    .unwrap_err();
+                let RuntimeScalarEvaluationFailure::Kernel(actual) = actual else {
+                    panic!("the exact outer shape failure must survive the host");
+                };
                 assert_eq!(
-                    RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                        .evaluate(&mut malformed, selection, invalid, &funded)
-                        .unwrap_err(),
-                    RuntimeScalarEvaluationFailure::Kernel(expected)
+                    novarocks_failure_contract::FailureProjection::failure_fact(&actual),
+                    novarocks_failure_contract::FailureProjection::failure_fact(&expected)
                 );
+                assert_eq!(actual.to_string(), expected.to_string());
                 assert!(journal.body.settlement.is_some());
                 assert_eq!(
                     RuntimeScalarMemoryScope::new(&funded, &mut journal)
@@ -1486,12 +1589,17 @@ fn runtime_scalar_memory_actual_narrow_refusals_preserve_uncalled_instance_and_o
                 .evaluate(Selection::all(2), &arguments, &funded)
                 .unwrap_err();
             let mut malformed = actual_shift(name, ty.clone());
+            let actual = RuntimeScalarMemoryScope::new(&funded, &mut journal)
+                .evaluate(&mut malformed, Selection::all(2), &arguments, &funded)
+                .unwrap_err();
+            let RuntimeScalarEvaluationFailure::Kernel(actual) = actual else {
+                panic!("the original shape author must survive the host");
+            };
             assert_eq!(
-                RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                    .evaluate(&mut malformed, Selection::all(2), &arguments, &funded)
-                    .unwrap_err(),
-                RuntimeScalarEvaluationFailure::Kernel(expected)
+                novarocks_failure_contract::FailureProjection::failure_fact(&actual),
+                novarocks_failure_contract::FailureProjection::failure_fact(&expected)
             );
+            assert_eq!(actual.to_string(), expected.to_string());
             assert!(journal.body.settlement.is_some());
             assert_eq!(
                 RuntimeScalarMemoryScope::new(&funded, &mut journal)
@@ -1720,4 +1828,95 @@ fn runtime_scalar_memory_original_unwind_settles_and_disposes_without_replacing_
     assert_eq!(journal.body.stopped, Some(Ok(())));
     assert!(journal.observations.next_step_refused);
     assert!(!domain.borrow().as_ref().unwrap().snapshot().active);
+}
+
+#[test]
+fn runtime_scalar_memory_original_domain_error_and_late_cancel_keep_real_settlement() {
+    use novarocks_memory::attribution::AttributingAllocator;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    struct Release<'a>(&'a Cell<*mut u8>, &'a AttributingAllocator<System>, Layout);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            let pointer = self.0.replace(std::ptr::null_mut());
+            if !pointer.is_null() {
+                // SAFETY: free exactly the successful block with its original Layout.
+                unsafe {
+                    self.1.dealloc(pointer, self.2);
+                }
+            }
+        }
+    }
+    let binding = bound();
+    let stopped = Arc::new(RuntimeErrorState::default());
+    let control = control(Some(&binding), stopped.clone());
+    let allocator = AttributingAllocator::new(System);
+    let layout = Layout::from_size_align(1200, 8).unwrap();
+    let pointer = Cell::new(std::ptr::null_mut());
+    let release = Release(&pointer, &allocator, layout);
+    let domain = RefCell::new(None::<novarocks_memory::FundingDomain>);
+    let expected = KernelFailure::from_domain(LayoutResourceError::SourceModel);
+    let late_cancel: crate::runtime::fragment::ExecutionFailure = KernelFailure::Cancelled.into();
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let actual = RuntimeScalarMemoryScope::new(&control, &mut journal)
+        .run(
+            608,
+            || {
+                let mut work = novarocks_functions::EvaluationCheckpoints::new(&control);
+                work.step()?;
+                // An intentional source-bound fault exercises actual secondary
+                // debt; it is not a valid complete-operation funding invoice.
+                // SAFETY: Release owns the exact successful block and matching Layout.
+                pointer.set(unsafe { allocator.alloc(layout) });
+                assert!(!pointer.get().is_null());
+                binding
+                    .account()
+                    .install_policy(0, novarocks_memory::LimitDimension::Work);
+                let original: Result<(), KernelFailure> = Err(expected.clone());
+                stopped.set_error(late_cancel.clone());
+                work.finish_result(original)
+                    .map_err(RuntimeScalarEvaluationFailure::Kernel)
+            },
+            |binding, peak| {
+                let admission = request(binding, peak);
+                let KernelMemoryAdmission::Granted(ready) = &admission else {
+                    panic!("real grant required");
+                };
+                *domain.borrow_mut() = Some(ready.domain().clone());
+                admission
+            },
+        )
+        .unwrap_err();
+    // Shared source equality denotes the actual occurrence, not equal facts.
+    assert_eq!(actual, RuntimeScalarEvaluationFailure::Kernel(expected));
+    assert!(stopped.error().unwrap().same_occurrence(&late_cancel));
+    assert_eq!(
+        KernelEvaluationControl::checkpoint(&control, 0),
+        Err(KernelFailure::Cancelled)
+    );
+    assert_eq!(
+        journal.body.observation.entry(),
+        AmbientEntryObservation::Bound
+    );
+    assert_eq!(
+        journal.body.observation.exit(),
+        AmbientExitObservation::Restored
+    );
+    let receipt = journal.body.settlement.as_ref().unwrap();
+    assert_eq!(receipt.accepted_live, 1208);
+    assert_eq!(receipt.debt, 600);
+    assert!(matches!(
+        receipt.next_step,
+        Err(CapacityError::QueryLimit(_))
+    ));
+    assert_eq!(journal.body.stopped, Some(Ok(())));
+    assert!(journal.capacity.is_none());
+    assert!(journal.observations.debt && journal.observations.next_step_refused);
+    let domain = domain.into_inner().unwrap();
+    assert!(!domain.snapshot().active);
+    assert!(domain.snapshot().sealed);
+    assert_eq!(domain.snapshot().live, 1208);
+    drop(release);
+    assert_eq!(domain.snapshot().live, 0);
+    assert!(!domain.snapshot().active);
 }

@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::ArrayRef;
-use arrow::datatypes::DataType;
 use novarocks_functions::{Selection, builtin::calendar_parts_shared::legacy_year_array};
 
 // YEAR function for Arrow arrays
@@ -25,24 +24,33 @@ pub fn eval_year<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     year_expr_id: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let expected_type = arena.data_type(year_expr_id).ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "year requires a frozen result type",
+        )
+    })?;
     // Get the child expression (input date/timestamp)
     // For FunctionCall, the first argument is the input
     let child_expr_id = match arena.node(year_expr_id) {
-        Some(crate::exec::expr::ExprNode::FunctionCall { args, .. }) => args
-            .first()
-            .copied()
-            .ok_or_else(|| "year: missing argument".to_string())?,
-        _ => return Err(("Year expression node type mismatch".to_string()).into()),
+        Some(crate::exec::expr::ExprNode::FunctionCall { args, .. }) => {
+            args.first().copied().ok_or_else(|| {
+                novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                    "year: missing argument",
+                )
+            })?
+        }
+        _ => {
+            return Err(
+                novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                    "Year expression node type mismatch",
+                )
+                .into(),
+            );
+        }
     };
 
     let array = arena.eval(child_expr_id, chunk)?;
 
-    // Get expected return type from arena (for the Year expression itself)
-    let expected_type = arena
-        .data_type(year_expr_id)
-        .cloned()
-        .unwrap_or(DataType::Int64);
-
-    Ok((legacy_year_array(&array, &expected_type, Selection::all(array.len())))?)
+    legacy_year_array(&array, expected_type, Selection::all(array.len())).map_err(Into::into)
 }

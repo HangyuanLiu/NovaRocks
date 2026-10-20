@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let index = trace.len();
         trace.push(units);
-        if let Some((at, cause)) = self.stop
+        if let Some((at, cause)) = self.stop.clone()
             && index == at
         {
             return Err(cause);
@@ -543,10 +543,10 @@ fn actual_final_scan_owner_refusals_keep_original_control_at_every_callback() {
         ] {
             let control = Control {
                 trace: Mutex::default(),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             let error = finish(source.clone(), &control).unwrap_err();
-            assert_eq!(error, LocalProgramCompileError::Control(cause));
+            assert_eq!(error, LocalProgramCompileError::Control(cause.clone()));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             assert_eq!(
                 std::error::Error::source(&error)

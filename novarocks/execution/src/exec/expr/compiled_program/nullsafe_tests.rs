@@ -665,7 +665,7 @@ impl PureCompileControl for CompileCallbacks {
         trace.push((phase, units));
         if trace.len() == self.stop_at {
             *refused = true;
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -693,7 +693,7 @@ fn nullsafe_compilation_keeps_all_original_refusals_including_unsupported_tail()
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let refusal = CompileCallbacks::new(cause, stop_at);
+                let refusal = CompileCallbacks::new(cause.clone(), stop_at);
                 let failure = compile(&functions, package.clone(), &refusal).unwrap_err();
                 assert!(
                     matches!(failure, novarocks_local_compiler::FragmentCompileError::Control(actual) if actual == cause)

@@ -128,7 +128,7 @@ fn parent_schema_reader_success_and_malformed_every_actual_prefix() {
         let baseline = control.trace();
         for at in 0..baseline.len() {
             for cause in CAUSES {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert!(
                     matches!(run(&control),Err(TypeCodecError::Control(actual))if actual==cause)
                 );

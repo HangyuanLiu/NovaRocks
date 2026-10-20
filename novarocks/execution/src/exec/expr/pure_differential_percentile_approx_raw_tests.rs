@@ -23,6 +23,7 @@ fn binary(v: &[Option<Vec<u8>>]) -> ArrayRef {
 }
 fn payload() -> Vec<u8> {
     novarocks_functions::approx_percentile_core::encode_single_value(10.)
+        .expect("percentile codec fixture")
 }
 fn check(p: ArrayRef, q: ArrayRef, nullable: bool) {
     assert_scalar_matches_v1(

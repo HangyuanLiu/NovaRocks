@@ -1269,7 +1269,7 @@ mod tests {
         fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError> {
             assert_eq!(ordinal, 0);
             self.calls.lock().unwrap().push("cohort");
-            Err(TerminalError::from_compile_control(self.control))
+            Err(TerminalError::from_compile_control(self.control.clone()))
         }
         fn commit(&mut self) -> Result<RewriteCommit, String> {
             panic!("a compilation failure must not commit")
@@ -1299,7 +1299,7 @@ mod tests {
             for abort_fails in [false, true] {
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let session = CompileFailureSession {
-                    control,
+                    control: control.clone(),
                     abort_fails,
                     calls: calls.clone(),
                 };
@@ -1308,7 +1308,7 @@ mod tests {
                     RewriteIntent::DataFiles { rewrite_all: true },
                 )
                 .unwrap_err();
-                assert_eq!(failure.compile_control, Some(control));
+                assert_eq!(failure.compile_control, Some(control.clone()));
                 assert_eq!(
                     failure.state,
                     if abort_fails {

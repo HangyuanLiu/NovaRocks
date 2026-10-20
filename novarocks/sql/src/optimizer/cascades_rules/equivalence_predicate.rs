@@ -894,7 +894,7 @@ mod tests {
                 let mut trace = self.trace.lock().unwrap();
                 trace.push((phase, units));
                 if self.refuse == Some(trace.len() - 1) {
-                    return Err(self.cause);
+                    return Err(self.cause.clone());
                 }
                 Ok(())
             }
@@ -934,7 +934,7 @@ mod tests {
                 let control = Control {
                     trace: Default::default(),
                     refuse: Some(index),
-                    cause,
+                    cause: cause.clone(),
                 };
                 assert!(
                     matches!(InnerJoinEquivalencePredicateRule.apply(&join, &mut memo, &control), Err(error) if error == crate::compiler::SqlCompileError::from(cause))

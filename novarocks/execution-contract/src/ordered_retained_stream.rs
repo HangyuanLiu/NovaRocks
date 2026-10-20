@@ -112,10 +112,11 @@ pub struct RetainedStreamSnapshot {
     pub sealed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamError {
     InvalidWindow,
-    MetadataCapacity,
+    MetadataArithmetic,
+    MetadataBacking(novarocks_failure_contract::SharedFailureCause),
     PayloadTooLarge,
     WindowFull,
     SequenceOverflow,
@@ -130,7 +131,8 @@ impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::InvalidWindow => "ordered stream window limits must be positive",
-            Self::MetadataCapacity => "ordered stream metadata capacity cannot be reserved",
+            Self::MetadataArithmetic => "ordered stream metadata position arithmetic overflowed",
+            Self::MetadataBacking(cause) => return cause.fmt(f),
             Self::PayloadTooLarge => "ordered stream item exceeds the payload window",
             Self::WindowFull => "ordered stream data window is full",
             Self::SequenceOverflow => "ordered stream sequence would overflow",
@@ -144,7 +146,90 @@ impl std::fmt::Display for StreamError {
         })
     }
 }
-impl std::error::Error for StreamError {}
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MetadataBacking(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for StreamError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self {
+            Self::MetadataBacking(cause) => return cause.failure_fact(),
+            Self::InvalidWindow => (FailureClass::Invariant, 200),
+            Self::MetadataArithmetic => (FailureClass::Resource, 201),
+            Self::PayloadTooLarge => (FailureClass::Resource, 202),
+            // Full is an owner control signal. Projection does not authorize
+            // its promotion into a Task failure, cancellation or retry.
+            Self::WindowFull => (FailureClass::Control, 203),
+            Self::SequenceOverflow => (FailureClass::Representation, 204),
+            Self::ProducerEnded => (FailureClass::Control, 205),
+            Self::Sealed => (FailureClass::Control, 206),
+            Self::WantedZero => (FailureClass::Data, 207),
+            Self::OfferGap => (FailureClass::Data, 208),
+            Self::AcknowledgementBeyondOffered => (FailureClass::Data, 209),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        if matches!(self, Self::SequenceOverflow) {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::MinimumUnit,
+                layout: RepresentationLayout {
+                    domain: domain::RESULT,
+                    code: std::num::NonZeroU16::new(1002).unwrap(),
+                },
+                required: None,
+                extent_limit: Some(u64::MAX),
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+#[derive(Debug)]
+struct StreamMetadataBackingFailure {
+    requested: usize,
+    source: std::collections::TryReserveError,
+}
+impl std::fmt::Display for StreamMetadataBackingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ordered stream cannot reserve {} metadata entries: {}",
+            self.requested, self.source
+        )
+    }
+}
+impl std::error::Error for StreamMetadataBackingFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for StreamMetadataBackingFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(210).unwrap()),
+        )
+        .with_resource(ResourceFacts {
+            dimension: ResourceDimension::Items,
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: None,
+            requested: u64::try_from(self.requested).ok(),
+            required_growth: None,
+            limit: None,
+            committed: None,
+            live: None,
+        })
+    }
+}
 
 pub struct OrderedRetainedStream {
     window: RetainedStreamWindow,
@@ -169,11 +254,16 @@ impl OrderedRetainedStream {
         let capacity = window
             .data_positions()
             .checked_add(1)
-            .ok_or(StreamError::MetadataCapacity)?;
+            .ok_or(StreamError::MetadataArithmetic)?;
         let mut items = VecDeque::new();
-        items
-            .try_reserve_exact(capacity)
-            .map_err(|_| StreamError::MetadataCapacity)?;
+        items.try_reserve_exact(capacity).map_err(|source| {
+            StreamError::MetadataBacking(novarocks_failure_contract::SharedFailureCause::new(
+                StreamMetadataBackingFailure {
+                    requested: capacity,
+                    source,
+                },
+            ))
+        })?;
         Ok(Self {
             window,
             items,
@@ -510,5 +600,45 @@ mod tests {
         assert_eq!(s.publish_data(1, true), Err(StreamError::SequenceOverflow));
         assert_eq!(s.snapshot(), before);
         assert_eq!(s.publish_end().unwrap().end_sequence, Some(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod stream_backing_source_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    #[test]
+    fn actual_queue_backing_width_refusal_keeps_the_sdk_cause_and_is_not_an_arrow_extent() {
+        let window = RetainedStreamWindow::try_new(usize::MAX - 1, 1).unwrap();
+        let cause = OrderedRetainedStream::try_new(window)
+            .err()
+            .expect("metadata item layout exceeds the addressable request");
+        assert!(matches!(cause, StreamError::MetadataBacking(_)));
+        let fact = cause.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().code(), 210);
+        assert_eq!(
+            fact.resource().unwrap().requested,
+            u64::try_from(usize::MAX).ok()
+        );
+        assert_eq!(fact.representation(), None);
+        let mut source = cause.source();
+        let mut saw_sdk = false;
+        while let Some(error) = source {
+            saw_sdk |= error
+                .downcast_ref::<std::collections::TryReserveError>()
+                .is_some();
+            source = error.source();
+        }
+        assert!(saw_sdk);
+        let window = RetainedStreamWindow::try_new(usize::MAX, 1).unwrap();
+        let cause = OrderedRetainedStream::try_new(window)
+            .err()
+            .expect("metadata position addition overflows before reserve");
+        assert_eq!(cause, StreamError::MetadataArithmetic);
+        assert_eq!(cause.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(cause.failure_fact().reason().code(), 201);
+        assert_eq!(cause.failure_fact().representation(), None);
     }
 }

@@ -66,7 +66,7 @@ use crate::runner::{
 };
 use crate::session::MysqlSession;
 use crate::sql_error_codes::{
-    SqlErrorDescriptor, SqlErrorPhase, is_sql_error_code_token, lookup_sql_error_descriptor,
+    SqlErrorDescriptor, SqlErrorPhase, is_sql_error_identity, lookup_sql_error_descriptor,
 };
 use crate::suite_manifest::select_suite_names;
 use crate::types::*;
@@ -111,15 +111,19 @@ fn parse_sql_error_manifest(source: &'static str) -> Result<Vec<SqlErrorDescript
         let mut fields = line.split('\t');
         let code = fields.next().unwrap_or_default();
         let phase = fields.next().unwrap_or_default();
-        if fields.next().is_some() || !is_sql_error_code_token(code) {
+        if fields.next().is_some() {
             return Err(format!("invalid SQL error manifest entry: {line}"));
         }
         let phase = SqlErrorPhase::parse(phase)
             .ok_or_else(|| format!("invalid SQL error manifest phase: {phase}"))?;
+        let descriptor = SqlErrorDescriptor { code, phase };
+        if !is_sql_error_identity(code, std::slice::from_ref(&descriptor)) {
+            return Err(format!("invalid SQL error manifest entry: {line}"));
+        }
         if !codes.insert(code) {
             return Err(format!("duplicate SQL error manifest code: {code}"));
         }
-        descriptors.push(SqlErrorDescriptor { code, phase });
+        descriptors.push(descriptor);
     }
     Ok(descriptors)
 }
@@ -6731,6 +6735,60 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn compiled_execution_identity_manifest_is_exact_and_rejects_bad_entries() {
+        let descriptors = super::parse_sql_error_manifest(
+            "schema_version=1\ncode\tphase\nUnsupportedCompiledShape\tExecution\n",
+        )
+        .unwrap();
+        assert_eq!(
+            descriptors,
+            [crate::sql_error_codes::SqlErrorDescriptor {
+                code: "UnsupportedCompiledShape",
+                phase: SqlErrorPhase::Execution,
+            }]
+        );
+        let production = super::production_sql_error_descriptors();
+        assert_eq!(
+            production
+                .iter()
+                .filter(|entry| entry.code == "UnsupportedCompiledShape")
+                .count(),
+            1,
+            "the generated production manifest must register the exact identity once",
+        );
+        assert_eq!(
+            crate::sql_error_codes::lookup_sql_error_descriptor(
+                production,
+                "UnsupportedCompiledShape"
+            )
+            .unwrap()
+            .phase,
+            SqlErrorPhase::Execution,
+        );
+        assert_eq!(
+            crate::runner::extract_sql_error_code(
+                "ERROR 1105 (HY000): [UnsupportedCompiledShape] FULL OUTER hash join",
+            )
+            .as_deref(),
+            Some("UnsupportedCompiledShape"),
+        );
+        for invalid in [
+            "schema_version=1\ncode\tphase\nUnsupportedCompiledShape\tAnalyze\n",
+            "schema_version=1\ncode\tphase\nUnsupportedCompiledShape\tParse\n",
+            "schema_version=1\ncode\tphase\nCommitUnknown\tExecution\n",
+            "schema_version=1\ncode\tphase\nUnsupportedcompiledShape\tExecution\n",
+            "schema_version=1\ncode\tphase\nUnsupportedCompiledShapeX\tExecution\n",
+            "schema_version=1\ncode\tphase\nUnsupportedCompiledShape\tExecution\nUnsupportedCompiledShape\tExecution\n",
+            "schema_version=1\ncode\tphase\nUnsupportedCompiledShape\tExecution\textra\n",
+        ] {
+            assert!(
+                super::parse_sql_error_manifest(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
     fn test_runtime_dir() -> PathBuf {
         let dir = crate::resolve_repo_root()
             .expect("repo root")
@@ -6937,6 +6995,10 @@ mod tests {
             local_sequence: 2,
             attempt_id: 3,
             error_source: None,
+            failure_fact: None,
+            failure_detail: None,
+            failure_site: None,
+            worker_contexts_converged: false,
             runtime_filter: harness::RuntimeFilterTerminalRollup::Available {
                 participants: vec![harness::RuntimeFilterParticipantTerminalTelemetry {
                     participant: harness::RuntimeFilterTerminalParticipant {

@@ -46,7 +46,7 @@ impl PureCompileControl for Refuse {
             0,
             "no tail callback"
         );
-        Err(self.cause)
+        Err(self.cause.clone())
     }
 }
 #[test]
@@ -61,7 +61,7 @@ fn e08s1_late_actual_source_three_compile_causes_stop_before_first_definition() 
         CompileControlError::ResourceExhausted,
     ] {
         let control = Refuse {
-            cause,
+            cause: cause.clone(),
             calls: AtomicUsize::new(0),
         };
         let expected: SqlCompileError = cause.into();

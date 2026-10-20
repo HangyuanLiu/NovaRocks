@@ -255,7 +255,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let index = trace.len();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && at == index
         {
             return Err(cause);
@@ -309,7 +309,7 @@ fn actual_selected_long_text_read_preserves_every_original_callback_and_primary_
         ] {
             for index in 0..baseline.len() {
                 let refusing = Control {
-                    refusal: Some((index, cause)),
+                    refusal: Some((index, cause.clone())),
                     ..Default::default()
                 };
                 let error = if frozen {
@@ -319,7 +319,7 @@ fn actual_selected_long_text_read_preserves_every_original_callback_and_primary_
                 } else {
                     resolver.resolve(request(&args), &refusing).unwrap_err()
                 };
-                assert_eq!(error.control_error(), Some(cause));
+                assert_eq!(error.control_error(), Some(cause.clone()));
                 assert_eq!(*refusing.trace.lock().unwrap(), baseline[..=index]);
             }
         }

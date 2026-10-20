@@ -52,7 +52,7 @@ impl PureCompileControl for Control {
         }
         let at = trace.len();
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -230,7 +230,7 @@ fn assert_causes(run: impl Fn(&Control) -> Result<(), E>) {
     for at in 0..trace.len() {
         for cause in CAUSES {
             let c = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(run(&c),Err(E::Control(actual)) if actual==cause));
@@ -706,7 +706,7 @@ fn original_request_decode_wide_real_argument_quantum_and_budget_prefixes() {
     for at in [0, trace.len() / 2, trace.len() - 1] {
         for cause in CAUSES {
             let c = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(
@@ -729,7 +729,7 @@ fn original_request_decode_wide_real_argument_quantum_and_budget_prefixes() {
         .expect("actual key loop quantum");
     for cause in CAUSES {
         let c = Control {
-            stop: Some((quantum, cause)),
+            stop: Some((quantum, cause.clone())),
             ..Control::default()
         };
         assert!(

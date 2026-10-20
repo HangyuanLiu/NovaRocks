@@ -763,7 +763,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             trace.push(units);
             if trace.len() == 2 {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -934,7 +934,7 @@ mod tests {
                     assert!(at <= stop, "callback after refusal");
                 }
                 trace.push(units);
-                if let Some((stop, cause)) = self.stop
+                if let Some((stop, cause)) = self.stop.clone()
                     && stop == at
                 {
                     Err(cause)
@@ -1038,7 +1038,7 @@ mod tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     trace: Mutex::new(Vec::new()),
                 };
                 assert!(

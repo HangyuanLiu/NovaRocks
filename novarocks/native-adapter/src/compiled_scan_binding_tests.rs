@@ -465,16 +465,23 @@ fn a_compiled_read_binds_the_installed_execution_of_its_binding() {
     let duplicate = runtime
         .register_read_execution(SCAN_NODE, test_support::installed_read_execution())
         .expect_err("the scan node is registered once");
-    assert!(
-        duplicate.contains("duplicate typed read execution for plan node 10"),
-        "{duplicate}"
+    assert_eq!(
+        duplicate,
+        novarocks_worker::read_attempt::ReadExecutionRegistrationError::Duplicate {
+            plan_node_id: SCAN_NODE
+        }
     );
     // The provider opens only once admission installed the fragment tracker.
     let early = source
         .bind(BoundScanRanges::None)
         .err()
         .expect("no provider before admission");
-    assert!(early.contains("before fragment admission"), "{early}");
+    assert_eq!(
+        novarocks_execution_contract::failure::FailureProjection::failure_fact(&early),
+        novarocks_execution_contract::failure::FailureProjection::failure_fact(
+            &novarocks_worker::ConnectorResourceBindingError::BeforeAdmission
+        )
+    );
     runtime
         .install_connector_resource_tracker(MemTracker::new_root("admitted-fragment"))
         .expect("admission installs the fragment tracker");
@@ -570,6 +577,7 @@ fn a_compiled_read_binds_dynamic_filters_that_match_its_consumer_bindings() {
 
 #[test]
 fn dynamic_filters_that_do_not_match_the_consumer_bindings_are_refused_before_registration() {
+    use crate::compiled_runtime_filter::CompiledRuntimeFilterBindingError as Refusal;
     let filtered = |filter_id| {
         recipe(&frozen_read(
             "fixture",
@@ -580,21 +588,29 @@ fn dynamic_filters_that_do_not_match_the_consumer_bindings_are_refused_before_re
     let unfiltered = recipe(&frozen_read("fixture", TupleDomain::all(), vec![]));
     for (recipe, consumers, expected) in [
         // A dynamic filter no consumer site of the scan binds.
-        (filtered(7), vec![], "has no scan-source consumer binding"),
+        (
+            filtered(7),
+            vec![],
+            Refusal::MissingDynamicConsumer { filter: 7 },
+        ),
         // A dynamic filter of another filter than the site's binding.
         (
             filtered(8),
             vec![consumer(3)],
-            "runtime filter 8 has no scan-source consumer binding",
+            Refusal::MissingDynamicConsumer { filter: 8 },
         ),
         // A scan-source consumer whose dynamic filter the read does not state.
         (
             unfiltered,
             vec![consumer(3)],
-            "have no frozen dynamic filter",
+            Refusal::MissingFrozenDynamicFilter { filter: 7 },
         ),
         // A site binding the package does not number.
-        (filtered(7), vec![consumer(4)], "is not numbered"),
+        (
+            filtered(7),
+            vec![consumer(4)],
+            Refusal::UnnumberedScanBinding { binding: 4 },
+        ),
     ] {
         let runtime = test_support::typed_scan_runtime();
         let error = match bind_filtered(
@@ -608,7 +624,12 @@ fn dynamic_filters_that_do_not_match_the_consumer_bindings_are_refused_before_re
             Err(error) => error,
         };
         assert_eq!(error.scan_node(), Some(SCAN_NODE));
-        assert!(error.detail().contains(expected), "{error}");
+        assert_eq!(
+            crate::backend_test_support::find_source::<Refusal>(&error),
+            Some(&expected)
+        );
+        use novarocks_execution_contract::failure::FailureProjection;
+        assert_eq!(error.failure_fact(), expected.failure_fact());
         assert_unregistered(&runtime);
     }
 }
@@ -982,4 +1003,30 @@ pub(crate) fn scan_producer_package() -> (Vec<u8>, u32) {
         .expect("v2 bytes")
         .encode_to_vec();
     (bytes, RECEIVER.get())
+}
+
+// Reuses the actual admitted-binding fixture and public Worker owner, without
+// another fake registry. Refusal must preserve the first exact capability.
+#[test]
+fn duplicate_read_registration_keeps_the_original_capability() {
+    use novarocks_worker::read_attempt::{ReadExecutionRegistrationError, TypedReadAttemptContext};
+    let context = TypedReadAttemptContext::new();
+    let first = test_support::installed_read_execution();
+    let original = first.provider_factory();
+    let second = test_support::installed_read_execution();
+    assert!(!Arc::ptr_eq(&original, &second.provider_factory()));
+    context.register(SCAN_NODE, first).expect("first binding");
+    assert!(
+        context.resolve(SCAN_NODE).is_none(),
+        "unpublished bindings remain private"
+    );
+    assert_eq!(
+        context.register(SCAN_NODE, second),
+        Err(ReadExecutionRegistrationError::Duplicate {
+            plan_node_id: SCAN_NODE
+        })
+    );
+    context.publish();
+    let resolved = context.resolve(SCAN_NODE).expect("published original");
+    assert!(Arc::ptr_eq(&original, &resolved.provider_factory()));
 }

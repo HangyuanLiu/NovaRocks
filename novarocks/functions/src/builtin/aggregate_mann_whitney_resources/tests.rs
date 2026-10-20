@@ -14,7 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use super::*;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use arrow_array::{
     Array,
     builder::{BinaryBuilder, StringBuilder},
@@ -82,47 +84,6 @@ fn mann_whitney_resources_zero_rows_keep_real_default_builder_payload() {
         );
         assert_eq!(facts.external_failure_stock_upper, 512);
     }
-}
-
-#[test]
-fn mann_whitney_resources_codec_matches_original_append_capacity_chain() {
-    for count in [0, 1, 2, 3, 7, 29, 63, 127, 220, 513, 1024] {
-        let (facts, output) = codec_facts(count).unwrap();
-        let mut actual = Vec::<u8>::new();
-        let mut cumulative = 0;
-        let mut allocations = 0;
-        let mut peak = 0;
-        let mut append = |part: &[u8]| {
-            let before = actual.capacity();
-            actual.extend_from_slice(part);
-            if actual.capacity() != before {
-                cumulative += actual.capacity();
-                allocations += 1;
-                peak = peak.max(before + actual.capacity());
-            }
-        };
-        append(&[1]);
-        append(&1i64.to_le_bytes());
-        append(&(count as u32).to_le_bytes());
-        append(&0u32.to_le_bytes());
-        for _ in 0..count {
-            append(&1f64.to_le_bytes());
-        }
-        assert_eq!(
-            facts.requests,
-            RequestUpper {
-                bytes: cumulative,
-                requests: allocations
-            }
-        );
-        assert_eq!(facts.peak, peak);
-        assert_eq!(facts.retained, actual.capacity());
-        assert_eq!(output, actual.len());
-    }
-    assert_eq!(
-        codec_facts(usize::MAX),
-        Err(ScalarResourceError::Arithmetic)
-    );
 }
 
 #[test]

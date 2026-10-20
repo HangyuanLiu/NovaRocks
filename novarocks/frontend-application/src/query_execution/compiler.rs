@@ -1359,7 +1359,7 @@ impl PreparedDmlWriteAssembly {
             crate::query_execution::service::QueryExecutionService,
             crate::query_execution::contract::DistributedQueryRequest,
         ),
-        String,
+        crate::dml::error::DmlExecutionError,
     > {
         let request = crate::query_execution::contract::build_request_from_finalized_execution(
             crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
@@ -1371,12 +1371,12 @@ impl PreparedDmlWriteAssembly {
             &self.execution,
             None,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
         let request = crate::query_execution::contract::with_connector_write_session(
             request,
             self.write_session,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
         Ok((self.query_execution, request))
     }
 
@@ -1811,7 +1811,7 @@ fn execute_distributed_write_request(
         .execute(request)
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
-        .map_err(crate::dml::error::DmlExecutionError::from)
+        .map_err(crate::dml::error::DmlExecutionError::from_distributed)
 }
 
 #[cfg(test)]

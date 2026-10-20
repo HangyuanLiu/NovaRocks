@@ -19,13 +19,13 @@
 use super::{
     array_difference_core::{self, DifferenceFailure, Operation},
     array_literal_core::CollectionObservation,
-    collection_selected::{compact, reserve},
+    collection_selected::compact,
 };
 use crate::{
     KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallInput, SelectedValues,
     kernel_control::internal, kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{new_empty_array, new_null_array};
+use arrow_array::new_empty_array;
 use std::cell::RefCell;
 pub(super) fn evaluate<'a>(
     _operation: Operation,
@@ -66,28 +66,40 @@ pub(super) fn evaluate<'a>(
             }
             result
         };
-        let result = array_difference_core::difference_observed(
+        let mut errors = Vec::new();
+        let values = array_difference_core::difference_observed(
             &array,
             Some(target),
             selection.len(),
             &mut observer,
-        );
-        let (values, errors) = match result {
-            Ok(values) => (values, Box::default()),
-            Err(DifferenceFailure::Control(cause)) => return Err(cause),
-            // Normalizer errors precede all parent decisions in the original vector body.
-            Err(DifferenceFailure::Data(message)) => {
-                let mut errors = reserve::<RowDataError>(selection.len(), &work)?;
-                for ordinal in 0..selection.len() {
-                    work.borrow_mut().step()?;
-                    errors.push(RowDataError::new(ordinal, &message));
+            &mut |cause| {
+                // Only this explicit arithmetic row outcome may enter a journal.
+                // SDK, shape, allocation and format failures use Operation.
+                work.borrow_mut().step()?;
+                if errors.len() == errors.capacity() {
+                    work.borrow_mut().flush()?;
+                    errors.try_reserve(1).map_err(|source| {
+                        KernelFailure::from_domain(
+                            crate::allocation_failure::AllocationRefusal::new(
+                                "array_difference row journal",
+                                source,
+                            ),
+                        )
+                    })?;
+                    work.borrow_mut().flush()?;
                 }
-                (
-                    new_null_array(target, selection.len()),
-                    errors.into_boxed_slice(),
-                )
-            }
-        };
+                errors.push(RowDataError::with_reason(
+                    cause.row,
+                    crate::DataFailureReason::NumericOutOfRange,
+                    &cause.to_string(),
+                ));
+                Ok(())
+            },
+        )
+        .map_err(|source| match source {
+            DifferenceFailure::Operation(source) | DifferenceFailure::Caller(source) => source,
+        })?;
+        let errors = errors.into_boxed_slice();
         SelectedValues::try_new(selection, target, values, errors)
             .map_err(|_| internal("array difference selected result violated its exact contract"))
     })();

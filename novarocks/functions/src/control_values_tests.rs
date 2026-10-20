@@ -93,7 +93,7 @@ fn control_values_legacy_tail_action_retains_original_first_round_backings() {
     let first: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; 2]));
     let weak = Arc::downgrade(&first);
     let right: ArrayRef = Arc::new(Int64Array::from(vec![Some(9), None]));
-    let action = coalesce_legacy(vec![first, right], &DataType::Null).unwrap();
+    let action = coalesce_legacy(vec![first, right], &DataType::Utf8).unwrap();
     let CoalesceStep::ReevaluateTail(keep_alive) = action else {
         panic!("original all-NULL head must re-evaluate its tail");
     };
@@ -115,7 +115,7 @@ fn control_values_legacy_tail_action_retains_original_first_round_backings() {
     assert!(Arc::ptr_eq(&first, &output));
 }
 #[test]
-fn control_values_legacy_arrow_errors_remain_complete_and_unprefixed() {
+fn control_values_retains_actual_arrow_source_with_bounded_diagnostic() {
     let left: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
     let short: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     let error = assemble_values(
@@ -144,7 +144,17 @@ fn control_values_legacy_arrow_errors_remain_complete_and_unprefixed() {
         .unwrap_err()
         .to_string();
     assert!(expected.len() > 512);
-    assert_eq!(ifnull_legacy(left, bad).unwrap_err(), expected);
+    let error = ifnull_legacy(left, bad, &DataType::Int64).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        error.to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(&expected).as_str()
+    );
+    let source = error.source().unwrap().source().unwrap().source().unwrap();
+    assert!(source.is::<arrow_schema::ArrowError>());
+    assert_eq!(source.to_string(), expected);
 }
 #[test]
 fn control_values_indexed_rejects_dedicated_carriers_without_fallback() {
@@ -176,9 +186,7 @@ fn control_values_indexed_rejects_dedicated_carriers_without_fallback() {
             &LegacyControl,
         )
         .unwrap_err();
-        let AssemblyFailure::Kernel(error) = error else {
-            panic!("exact carrier admission is typed");
-        };
+        let error = error.into_kernel();
         assert_eq!(
             error,
             invalid("guarded result requires its dedicated carrier protocol")
@@ -249,11 +257,80 @@ fn control_values_every_control_refusal_is_primary_in_both_representations() {
                 refuse,
             };
             let error = call(&control).unwrap_err();
-            let AssemblyFailure::Kernel(error) = error else {
-                panic!("control refusal must not become an Arrow diagnostic");
-            };
+            let error = error.into_kernel();
             assert_eq!(error, invalid("original assembly control refusal"));
             assert_eq!(control.calls.load(Ordering::Relaxed), refuse);
         }
     }
+}
+
+#[test]
+fn control_values_sources_are_typed_and_never_inferred_from_text() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    let memory = AssemblyFailure::arrow(
+        "numeric overflow cancelled",
+        arrow_schema::ArrowError::MemoryError("invalid row value".into()),
+    );
+    assert_eq!(memory.failure_fact().class(), FailureClass::Resource);
+    assert!(memory.source().unwrap().is::<arrow_schema::ArrowError>());
+    let offsets = AssemblyFailure::arrow(
+        "conditional assembly",
+        arrow_schema::ArrowError::OffsetOverflowError(0),
+    );
+    assert_eq!(offsets.failure_fact().class(), FailureClass::Representation);
+    assert_eq!(
+        offsets.failure_fact().representation().unwrap().required,
+        None
+    );
+    let contract = AssemblyFailure::contract("numeric overflow resource exhausted cancelled");
+    assert_eq!(contract.failure_fact().class(), FailureClass::Invariant);
+    let original = KernelFailure::Cancelled;
+    assert_eq!(
+        AssemblyFailure::from(original.clone()).into_kernel(),
+        original
+    );
+}
+#[test]
+fn control_values_text_extent_keeps_exact_value_and_whole_output_boundaries() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    let mut whole = ConditionalTextExtent::default();
+    whole.append(i32::MAX as usize).unwrap();
+    let cause = whole.append(1).unwrap_err();
+    assert_eq!(cause.failure_fact().class(), FailureClass::Representation);
+    assert_eq!(
+        cause.failure_fact().representation().unwrap().boundary,
+        RepresentationBoundary::SingleOutput
+    );
+    assert_eq!(
+        cause.failure_fact().representation().unwrap().required,
+        Some(i32::MAX as u64 + 1)
+    );
+    let mut value = ConditionalTextExtent::default();
+    let cause = value.append(i32::MAX as usize + 1).unwrap_err();
+    assert_eq!(
+        cause.failure_fact().representation().unwrap().boundary,
+        RepresentationBoundary::MinimumUnit
+    );
+}
+
+#[test]
+fn control_values_frozen_result_type_governs_null_and_numeric_inputs() {
+    let left: ArrayRef = Arc::new(arrow_array::Int8Array::from(vec![Some(7), None, None]));
+    let right: ArrayRef = Arc::new(Int64Array::from(vec![Some(1000), Some(120), Some(1000)]));
+    let output = ifnull_legacy(left, right, &DataType::Int64).unwrap();
+    assert_eq!(
+        output.to_data(),
+        Int64Array::from(vec![7, 120, 1000]).to_data()
+    );
+    let nulls: ArrayRef = Arc::new(arrow_array::NullArray::new(3));
+    let CoalesceStep::Complete(output) =
+        coalesce_legacy(vec![nulls.clone(), nulls.clone()], &DataType::Null).unwrap()
+    else {
+        panic!("exact Null result");
+    };
+    assert_eq!(output.data_type(), &DataType::Null);
+    assert_eq!(output.len(), 3);
+    let output = ifnull_legacy(nulls.clone(), nulls, &DataType::Null).unwrap();
+    assert_eq!(output.data_type(), &DataType::Null);
 }

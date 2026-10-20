@@ -22,6 +22,7 @@
 //! classifiers. It contains no generated transport model, I/O, compiler,
 //! scheduler, or execution-kernel implementation.
 
+pub mod conclusion;
 pub mod context_convergence;
 pub mod creation;
 pub mod descriptor;
@@ -74,6 +75,7 @@ pub mod task_execution {
     }
 }
 
+pub use conclusion::*;
 pub use context_convergence::*;
 pub use creation::*;
 pub use descriptor::*;
@@ -81,6 +83,7 @@ pub use domain::*;
 pub use identity::*;
 pub use lease::*;
 pub use membership::*;
+pub use novarocks_failure_contract as failure;
 pub use operation::*;
 pub use status::*;
 pub use task_convergence::*;

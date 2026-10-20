@@ -14,94 +14,110 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Shared ARRAY_REPEAT computation over already evaluated Arrow arguments.
+//! ARRAY_REPEAT retains one original MutableArrayData author. Its exact ordered
+//! constructor/extension plan is checked before any output copy or allocation.
+use super::collection_arrow::{self, ArrowSite};
+use crate::KernelFailure;
+use crate::selected_copy::{CopyError, ExtendSegment, preflight_extend_multi};
 use arrow_array::{Array, ArrayRef, Int64Array, ListArray, make_array, new_null_array};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
-use arrow_cast::cast;
 use arrow_data::transform::MutableArrayData;
 use arrow_schema::{DataType, FieldRef};
 use std::sync::Arc;
-
-pub fn cast_repeat_count(array: ArrayRef) -> Result<ArrayRef, String> {
+fn reserve<T>(count: usize) -> Result<Vec<T>, KernelFailure> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|source| {
+        KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+            "array_repeat plan",
+            source,
+        ))
+    })?;
+    Ok(out)
+}
+pub fn cast_repeat_count(array: ArrayRef) -> Result<ArrayRef, KernelFailure> {
     if array.data_type() == &DataType::Int64 {
         return Ok(array);
     }
-    cast(&array, &DataType::Int64).map_err(|e| {
-        format!(
-            "array_repeat failed to cast repeat count {:?} -> BIGINT: {}",
-            array.data_type(),
-            e
-        )
+    arrow_cast::cast(&array, &DataType::Int64).map_err(|source| {
+        collection_arrow::arrow_failure("array_repeat count", ArrowSite::Cast, source)
     })
 }
-
-/// Repeats the original materialized invocation rows using the supplied result field.
 pub fn repeat_values(
     source: ArrayRef,
     counts: &Int64Array,
     rows: usize,
     output_field: FieldRef,
-) -> Result<ArrayRef, String> {
-    let item_type = output_field.data_type().clone();
-    let mut values = if source.data_type() == &DataType::Null && item_type != DataType::Null {
-        new_null_array(&item_type, source.len())
-    } else if source.data_type() == &item_type {
+) -> Result<ArrayRef, KernelFailure> {
+    if (source.len() != 1 && source.len() != rows) || (counts.len() != 1 && counts.len() != rows) {
+        return Err(collection_arrow::contract(
+            "array_repeat prepared argument lengths differ from their invocation",
+        ));
+    }
+    let target = output_field.data_type();
+    let values = if source.data_type() == &DataType::Null && target != &DataType::Null {
+        new_null_array(target, source.len())
+    } else if source.data_type() == target {
         source
     } else {
-        cast(&source, &item_type).map_err(|e| {
-            format!(
-                "array_repeat failed to cast source type {:?} -> {:?}: {}",
-                source.data_type(),
-                item_type,
-                e
-            )
+        arrow_cast::cast(&source, target).map_err(|source| {
+            collection_arrow::arrow_failure("array_repeat source", ArrowSite::Cast, source)
         })?
     };
-    if values.is_empty() && rows != 0 {
-        values = new_null_array(&item_type, rows);
-    }
-
-    let values_data = values.to_data();
-    let mut mutable = MutableArrayData::new(vec![&values_data], false, 0);
-    let mut offsets = Vec::with_capacity(rows + 1);
-    offsets.push(0_i32);
-    let mut null_builder = NullBufferBuilder::new(rows);
-    let mut current: i64 = 0;
-
+    let mut segments = Vec::new();
+    let mut current = 0i32;
+    let offset_count = collection_arrow::list_offset_entries(rows)?;
+    let mut offsets = reserve::<i32>(offset_count)?;
+    offsets.push(0);
+    let mut nulls = NullBufferBuilder::new(rows);
     for row in 0..rows {
-        let source_row = super::map_lookup_core::row_index(row, values.len());
-        let count_row = super::map_lookup_core::row_index(row, counts.len());
+        let source_row = if values.len() == 1 { 0 } else { row };
+        let count_row = if counts.len() == 1 { 0 } else { row };
         if counts.is_null(count_row) {
-            null_builder.append_null();
-            offsets.push(current as i32);
+            nulls.append_null();
+            offsets.push(current);
             continue;
         }
-
-        let repeat_count = counts.value(count_row);
-        if repeat_count > 0 {
-            for _ in 0..repeat_count {
-                mutable.extend(0, source_row, source_row + 1);
-            }
-            current = current
-                .checked_add(repeat_count)
-                .ok_or_else(|| "array_repeat offset overflow".to_string())?;
-            if current > i32::MAX as i64 {
-                return Err("array_repeat offset overflow".to_string());
-            }
+        let count = counts.value(count_row);
+        if count > 0 {
+            current =
+                crate::aggregate_scalar::checked_list_output_offset_u128(current, count as u128)?;
+            segments.try_reserve(1).map_err(|source| {
+                KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                    "array_repeat extension plan",
+                    source,
+                ))
+            })?;
+            segments.push(ExtendSegment {
+                source: 0,
+                start: source_row,
+                len: 1,
+                repeats: count as usize,
+                nulls: 0,
+            });
         }
-        null_builder.append_non_null();
-        offsets.push(current as i32);
+        nulls.append_non_null();
+        offsets.push(current);
     }
-
-    let out = ListArray::new(
+    preflight_extend_multi(&[values.as_ref()], &segments, 0, |_| Ok(()))
+        .map_err(CopyError::into_kernel)?;
+    let data = values.to_data();
+    let mut out = MutableArrayData::new(vec![&data], false, 0);
+    for segment in segments {
+        for _ in 0..segment.repeats {
+            out.extend(0, segment.start, segment.start + 1);
+        }
+    }
+    let result = ListArray::try_new(
         output_field,
         OffsetBuffer::new(offsets.into()),
-        make_array(mutable.freeze()),
-        null_builder.finish(),
-    );
-    Ok(Arc::new(out) as ArrayRef)
+        make_array(out.freeze()),
+        nulls.finish(),
+    )
+    .map_err(|source| {
+        collection_arrow::arrow_failure("array_repeat", ArrowSite::Construct, source)
+    })?;
+    Ok(Arc::new(result))
 }
-
 #[cfg(test)]
 #[path = "array_repeat_core_tests.rs"]
 mod tests;

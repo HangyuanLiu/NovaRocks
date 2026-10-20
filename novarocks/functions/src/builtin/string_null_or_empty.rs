@@ -32,30 +32,30 @@ pub enum Observation {
     OpaqueBoundary,
 }
 #[derive(Debug)]
-pub enum CoreError {
-    Unsupported(DataType),
-    Kernel(KernelFailure),
-}
-impl From<KernelFailure> for CoreError {
-    fn from(cause: KernelFailure) -> Self {
-        Self::Kernel(cause)
-    }
-}
-impl std::fmt::Display for CoreError {
+struct NullOrEmptyFailure(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for NullOrEmptyFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unsupported(ty) => write!(f, "null_or_empty expects string or array, got {ty:?}"),
-            Self::Kernel(cause) => write!(f, "{cause}"),
-        }
+        self.0.fmt(f)
     }
 }
+impl std::error::Error for NullOrEmptyFailure {}
+impl novarocks_failure_contract::FailureProjection for NullOrEmptyFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(361).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for NullOrEmptyFailure {}
 enum Source<'a> {
     Null,
     Text(&'a StringArray),
     List(&'a ListArray),
     AllNull,
 }
-fn source(input: &dyn Array) -> Result<Source<'_>, CoreError> {
+fn source(input: &dyn Array) -> Result<Source<'_>, KernelFailure> {
     if input.as_any().downcast_ref::<NullArray>().is_some() {
         return Ok(Source::Null);
     }
@@ -70,14 +70,19 @@ fn source(input: &dyn Array) -> Result<Source<'_>, CoreError> {
     if input.null_count() == input.len() {
         return Ok(Source::AllNull);
     }
-    Err(CoreError::Unsupported(input.data_type().clone()))
+    Err(KernelFailure::from_domain(NullOrEmptyFailure(
+        novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "null_or_empty expects string or array, got {:?}",
+            input.data_type()
+        )),
+    )))
 }
 pub fn evaluate_observed(
     input: &dyn Array,
     selection: Selection<'_>,
     mut address: impl FnMut(usize, usize) -> usize,
     observe: &mut impl FnMut(Observation) -> Result<(), KernelFailure>,
-) -> Result<ArrayRef, CoreError> {
+) -> Result<ArrayRef, KernelFailure> {
     observe(Observation::OpaqueBoundary)?;
     let source = source(input)?;
     observe(Observation::OpaqueBoundary)?;
@@ -118,14 +123,13 @@ pub fn evaluate_observed(
     observe(Observation::OpaqueBoundary)?;
     Ok(result)
 }
-pub fn evaluate_legacy(input: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn evaluate_required(input: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
     evaluate_observed(
         input.as_ref(),
         Selection::all(input.len()),
         |_, row| row,
         &mut |_| Ok(()),
     )
-    .map_err(|e| e.to_string())
 }
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
@@ -198,11 +202,7 @@ pub(super) fn evaluate<'a>(
                 Observation::Step => work.step(),
                 Observation::OpaqueBoundary => work.flush(),
             },
-        )
-        .map_err(|error| match error {
-            CoreError::Kernel(cause) => cause,
-            other => internal(&other.to_string()),
-        })?;
+        )?;
         SelectedValues::try_new_observed(
             selection,
             input.contract().result_type().data_type(),

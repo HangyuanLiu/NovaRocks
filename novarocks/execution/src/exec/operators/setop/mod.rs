@@ -49,3 +49,5 @@ pub(crate) use set_op_stage::SetOpStageController;
 pub(crate) use union_all_shared::UnionAllSharedState;
 pub use union_all_sink::UnionAllSinkFactory;
 pub use union_all_source::UnionAllSourceFactory;
+
+mod failure;

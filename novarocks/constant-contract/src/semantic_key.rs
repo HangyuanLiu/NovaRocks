@@ -346,7 +346,7 @@ mod tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push((phase, units));
-            if let Some(error) = self.error
+            if let Some(error) = self.error.clone()
                 && calls
                     .iter()
                     .map(|(_, units)| u64::from(*units))
@@ -692,10 +692,10 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             for after in [0, 256] {
-                let control = Control::failing(error, after);
+                let control = Control::failing(error.clone(), after);
                 assert_eq!(
                     long.semantic_key_observed(CompilePhase::LowerProgram, &control),
-                    Err(ConstantError::Control(error))
+                    Err(ConstantError::Control(error.clone()))
                 );
                 let calls = control.calls.lock().unwrap();
                 assert!(
@@ -709,7 +709,7 @@ mod tests {
                 );
             }
             let short = value(Arc::new(Int64Array::from(vec![7])), false);
-            let control = Control::failing(error, 1);
+            let control = Control::failing(error.clone(), 1);
             assert_eq!(
                 short.semantic_key_observed(CompilePhase::Encode, &control),
                 Err(ConstantError::Control(error))

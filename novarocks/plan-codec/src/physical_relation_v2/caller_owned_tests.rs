@@ -206,7 +206,7 @@ fn run_in(
                 metadata.kind.clear();
             }
             let definitions = [raw];
-            control.arm(stop);
+            control.arm(stop.clone());
             let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
             let result = decode_relations_in(
                 &definitions,
@@ -226,7 +226,7 @@ fn run_in(
                 [0, u32::MAX, 42]
             };
             let input = inputs(sources, &ids);
-            control.arm(stop);
+            control.arm(stop.clone());
             let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
             let result = encode_relations_in(
                 &input,
@@ -255,7 +255,7 @@ fn relation_caller_owned_every_actual_success_and_ordinary_footer_prefix_three_c
                 for cause in CAUSES {
                     let control = Control::default();
                     assert!(
-                        matches!(run_in(&control, Some((at, cause)), decode, bad), Err(Error::Control(actual)) if actual == cause)
+                        matches!(run_in(&control, Some((at, cause.clone())), decode, bad), Err(Error::Control(actual)) if actual == cause)
                     );
                     assert_eq!(trace(&control), baseline[..=at]);
                 }
@@ -467,7 +467,7 @@ fn run_selected(
         let types = decode_type_table(types.as_wire(), type_limits(), control).unwrap();
         let definitions = [expected(0), expected(1)];
         let namespace = decode_relations(&definitions, &reads, &types, SOURCE, limits())?;
-        control.arm(stop);
+        control.arm(stop.clone());
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
         let mut last = None;
         let mut admit = |next: &RelationProjectionFacts| {
@@ -511,7 +511,7 @@ fn relation_selected_materialization_uses_original_loans_and_every_control_prefi
             for cause in CAUSES {
                 let control = Control::default();
                 assert!(
-                    matches!(run_selected(&control, Some((at, cause)), missing), Err(Error::Control(actual)) if actual == cause)
+                    matches!(run_selected(&control, Some((at, cause.clone())), missing), Err(Error::Control(actual)) if actual == cause)
                 );
                 assert_eq!(trace(&control), baseline[..=at]);
             }
@@ -561,7 +561,7 @@ fn relation_caller_owned_actual_wide_guarantees_keep_order_and_sample_real_quant
             .expect("actual guarantee walk quantum");
         for at in [0, quantum, baseline.len() - 1] {
             for cause in CAUSES {
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 let mut work = match CompileCheckpoints::try_new(&control, CompilePhase::Encode) {
                     Ok(work) => work,
                     Err(actual) => {
@@ -632,7 +632,7 @@ fn relation_caller_owned_actual_wide_guarantees_keep_order_and_sample_real_quant
             .expect("actual receiving guarantee walk quantum");
         for at in [0, quantum, baseline.len() - 1] {
             for cause in CAUSES {
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 let mut work = match CompileCheckpoints::try_new(&control, CompilePhase::Decode) {
                     Ok(work) => work,
                     Err(actual) => {

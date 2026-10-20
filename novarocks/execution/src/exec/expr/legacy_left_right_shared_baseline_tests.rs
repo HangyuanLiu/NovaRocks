@@ -40,10 +40,18 @@ fn setup(columns: &[ArrayRef]) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
-fn call(name: &str, arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> Result<ArrayRef, String> {
+fn call(
+    name: &str,
+    arena: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     super::function::string::eval_string_function(name, arena, ExprId(usize::MAX), args, chunk)
 }
-fn raw(name: &str, columns: &[ArrayRef]) -> Result<ArrayRef, String> {
+fn raw(
+    name: &str,
+    columns: &[ArrayRef],
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, chunk) = setup(columns);
     call(name, &arena, &args, &chunk)
 }
@@ -141,10 +149,13 @@ fn original_left_right_carrier_errors_before_empty_and_null_masks() {
             let s = strings(vec![None; rows]);
             let n = ints(vec![None; rows]);
             assert_eq!(
-                raw(name, &[wrong.clone(), n]).unwrap_err(),
+                (raw(name, &[wrong.clone(), n]).unwrap_err()).to_string(),
                 "left expects string"
             );
-            assert_eq!(raw(name, &[s, wrong]).unwrap_err(), "left expects int");
+            assert_eq!(
+                (raw(name, &[s, wrong]).unwrap_err()).to_string(),
+                "left expects int"
+            );
         }
     }
 }
@@ -162,7 +173,7 @@ fn original_left_right_required_children_before_types_extra_ignored_and_missing_
             let mut bad = args.clone();
             bad[position] = missing;
             assert_eq!(
-                call(name, &arena, &bad, &chunk).unwrap_err(),
+                (call(name, &arena, &bad, &chunk).unwrap_err()).to_string(),
                 "invalid ExprId"
             );
         }
@@ -180,7 +191,7 @@ fn original_left_right_required_children_before_types_extra_ignored_and_missing_
         setup(&[Arc::new(NullArray::new(1)) as ArrayRef, ints(vec![Some(1)])]);
     for name in NAMES {
         assert_eq!(
-            call(name, &arena, &[args[0], missing], &chunk).unwrap_err(),
+            (call(name, &arena, &[args[0], missing], &chunk).unwrap_err()).to_string(),
             "invalid ExprId"
         );
     }

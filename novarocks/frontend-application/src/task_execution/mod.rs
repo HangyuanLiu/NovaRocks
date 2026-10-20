@@ -36,6 +36,7 @@
 
 pub(crate) mod abort_effect;
 pub(crate) mod actor_gate;
+pub(crate) mod attempt_convergence;
 pub(crate) mod blocking_io;
 pub(crate) mod clock;
 pub(crate) mod completion;

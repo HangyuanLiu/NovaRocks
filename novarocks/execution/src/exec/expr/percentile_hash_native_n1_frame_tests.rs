@@ -188,8 +188,7 @@ fn allocation_host() -> (
 ) {
     let tracker = crate::runtime::mem_tracker::MemTracker::new_root("hash-native-n1-frame");
     tracker.install_limit_once(8 * 1024 * 1024).unwrap();
-    let host =
-        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone());
+    let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     (tracker, host)
 }
 #[test]
@@ -214,6 +213,7 @@ fn hash_native_n1_actual_sql_source_and_frame_original_n1() {
             assert_eq!(
                 actual.value(i),
                 novarocks_functions::percentile_hash_core::encode_numeric(v)
+                    .expect("percentile hash fixture")
             );
         }
         drop(out);

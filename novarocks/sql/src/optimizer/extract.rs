@@ -1759,7 +1759,11 @@ mod tests {
         impl PureCompileControl for RefusePositive {
             fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
                 self.1.lock().unwrap().push(units);
-                if units > 0 { Err(self.0) } else { Ok(()) }
+                if units > 0 {
+                    Err(self.0.clone())
+                } else {
+                    Ok(())
+                }
             }
         }
         let column = OutputColumn {
@@ -1793,7 +1797,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let mut arena = ScalarArena::new();
-            let control = RefusePositive(error, Default::default());
+            let control = RefusePositive(error.clone(), Default::default());
             let failure = ordering_spec_to_sort_keys(
                 &mut arena,
                 &ordering,

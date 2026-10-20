@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push(units);
-        if let Some((index, error)) = self.stop
+        if let Some((index, error)) = self.stop.clone()
             && at == index
         {
             return Err(error);
@@ -251,7 +251,7 @@ fn every_constructor_checkpoint_preserves_all_three_control_causes_without_a_tai
     ] {
         for index in 1..calls {
             let control = Control {
-                stop: Some((index, cause)),
+                stop: Some((index, cause.clone())),
                 ..Default::default()
             };
             let mut work =

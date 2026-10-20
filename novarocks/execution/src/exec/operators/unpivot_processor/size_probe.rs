@@ -45,6 +45,7 @@ pub(super) enum UnpivotProbeFailure {
     Shape(ValueTypeError),
     HashMap(HashMapResourceError),
     CountOverflow,
+    RowCount { rows: usize },
     Encoding(ArrowError),
 }
 impl From<IpcConstructionError<ConstructionFailure>> for UnpivotProbeFailure {
@@ -73,26 +74,107 @@ impl UnpivotProbeFailure {
         match self {
             Self::Construction(cause) => cause.into(),
             Self::Kernel(cause) => cause.into(),
-            Self::Geometry(IpcGeometryError::Overflow)
-            | Self::CountOverflow
-            | Self::HashMap(HashMapResourceError::Arithmetic(_)) => {
-                KernelFailure::ResourceExhausted.into()
-            }
-            Self::Geometry(IpcGeometryError::SourceModel) => ConstructionFailure::InvalidSource(
-                "unpivot IPC writer construction source model is unsupported".to_owned(),
+            Self::Geometry(cause) => ExecutionFailure::from_domain(cause),
+            Self::Shape(cause) => ExecutionFailure::from_domain(cause),
+            Self::HashMap(cause) => ExecutionFailure::from_domain(cause),
+            source => ExecutionFailure::from_domain(source),
+        }
+    }
+}
+impl std::fmt::Display for UnpivotProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Construction(source) => source.fmt(f),
+            Self::Kernel(source) => source.fmt(f),
+            Self::Geometry(source) => source.fmt(f),
+            Self::Shape(source) => source.fmt(f),
+            Self::HashMap(source) => source.fmt(f),
+            Self::CountOverflow => f.write_str("unpivot IPC byte count overflow"),
+            Self::RowCount { rows } => write!(
+                f,
+                "unpivot IPC batch has {rows} rows outside its signed wire carrier"
+            ),
+            Self::Encoding(source) => write!(f, "unpivot output size encoding failed: {source}"),
+        }
+    }
+}
+impl std::error::Error for UnpivotProbeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Construction(source) => Some(source),
+            Self::Kernel(source) => Some(source),
+            Self::Geometry(source) => Some(source),
+            Self::Shape(source) => Some(source),
+            Self::HashMap(source) => Some(source),
+            Self::Encoding(source) => Some(source),
+            Self::CountOverflow | Self::RowCount { .. } => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for UnpivotProbeFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let layout = |code| RepresentationLayout {
+            domain: domain::EXECUTION,
+            code: std::num::NonZeroU16::new(code).unwrap(),
+        };
+        match self {
+            Self::Construction(source) => source.failure_fact(),
+            Self::Kernel(source) => source.failure_fact(),
+            Self::Geometry(source) => source.failure_fact(),
+            Self::Shape(source) => source.failure_fact(),
+            Self::HashMap(source) => source.failure_fact(),
+            Self::CountOverflow => FailureFact::new(
+                FailureClass::Representation,
+                ExecutionReason::UnpivotIpcBytes.reason(),
             )
-            .into(),
-            Self::Shape(cause) => ConstructionFailure::InvalidSource(format!(
-                "unpivot IPC writer carrier structure is invalid: {cause:?}"
-            ))
-            .into(),
-            Self::HashMap(HashMapResourceError::SourceModel(message)) => {
-                ConstructionFailure::InvalidSource(message.to_owned()).into()
+            .with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: layout(8),
+                required: None,
+                extent_limit: u64::try_from(usize::MAX).ok(),
+                representable_prefix: None,
+            }),
+            Self::RowCount { rows } => FailureFact::new(
+                FailureClass::Representation,
+                ExecutionReason::UnpivotIpcRows.reason(),
+            )
+            .with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: layout(9),
+                required: u64::try_from(*rows).ok(),
+                extent_limit: Some(i64::MAX as u64),
+                representable_prefix: None,
+            }),
+            Self::Encoding(ArrowError::MemoryError(_)) => FailureFact::new(
+                FailureClass::Resource,
+                ExecutionReason::UnpivotIpcMemory.reason(),
+            ),
+            Self::Encoding(ArrowError::OffsetOverflowError(required)) => FailureFact::new(
+                FailureClass::Representation,
+                ExecutionReason::UnpivotIpcOffset.reason(),
+            )
+            .with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: layout(10),
+                required: u64::try_from(*required).ok(),
+                extent_limit: None,
+                representable_prefix: None,
+            }),
+            Self::Encoding(ArrowError::IoError(..) | ArrowError::ExternalError(_)) => {
+                FailureFact::new(
+                    FailureClass::Unexpected,
+                    ExecutionReason::UnpivotIpcUnexpected.reason(),
+                )
             }
-            // This is the explicit existing whole-call data channel. Only this
-            // nominal encoding variant projects Arrow's diagnostic; text never
-            // reclassifies a creator, control, memory or transport failure.
-            Self::Encoding(cause) => format!("unpivot output size encoding failed: {cause}").into(),
+            Self::Encoding(_) => FailureFact::new(
+                FailureClass::Invariant,
+                ExecutionReason::UnpivotIpcShape.reason(),
+            ),
         }
     }
 }
@@ -157,7 +239,9 @@ pub(super) fn output_size_with_construction(
     let batch = chunk.record_batch();
     // The actual wire length is signed i64. This is representability, not a
     // new row quota; a Null batch can have huge legal rows and tiny payload.
-    i64::try_from(batch.num_rows()).map_err(|_| UnpivotProbeFailure::CountOverflow)?;
+    i64::try_from(batch.num_rows()).map_err(|_| UnpivotProbeFailure::RowCount {
+        rows: batch.num_rows(),
+    })?;
     let (encoded_bytes, batch_facts) = {
         let owner = factory.begin_input_construction(chunk)?;
         let mut request = |layout| owner.request(layout);
@@ -275,6 +359,16 @@ mod tests {
             writer_failure(ArrowError::from(cause)),
             UnpivotProbeFailure::CountOverflow
         ));
+        use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+        let mut counter = CountingWrite { bytes: usize::MAX };
+        let cause =
+            writer_failure(ArrowError::from(counter.write(&[1]).unwrap_err())).into_execution();
+        let fact = cause.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        let rep = fact.representation().unwrap();
+        assert_eq!(rep.boundary, RepresentationBoundary::SingleOutput);
+        assert_eq!(rep.required, None);
+        assert_eq!(rep.extent_limit, u64::try_from(usize::MAX).ok());
         let cause = io::Error::from(io::ErrorKind::BrokenPipe);
         match writer_failure(ArrowError::from(cause)) {
             UnpivotProbeFailure::Encoding(ArrowError::IoError(_, cause)) => {

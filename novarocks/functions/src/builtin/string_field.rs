@@ -174,28 +174,21 @@ pub(super) fn evaluate<'a>(
                         Observation::Step => work.step(),
                         Observation::OpaqueBoundary => work.flush(),
                     }),
-                )?
-                .map_err(|_| {
-                    invalid("FIELD checked ABI violated its original initialization guard")
-                })?;
+                )??;
                 for (index, arg) in args[1..].iter().enumerate() {
                     let actual = arg.value_row(ordinal, row);
                     work.step()?;
                     work.flush()?;
                     let candidate = arg.array().slice(actual, 1);
                     work.flush()?;
-                    state
-                        .step_observed(
-                            index,
-                            &candidate,
-                            Some(&mut |event| match event {
-                                Observation::Step => work.step(),
-                                Observation::OpaqueBoundary => work.flush(),
-                            }),
-                        )?
-                        .map_err(|_| {
-                            invalid("FIELD checked ABI violated its original comparison guard")
-                        })?;
+                    state.step_observed(
+                        index,
+                        &candidate,
+                        Some(&mut |event| match event {
+                            Observation::Step => work.step(),
+                            Observation::OpaqueBoundary => work.flush(),
+                        }),
+                    )??;
                 }
                 let output = state.finish_observed(Some(&mut |event| match event {
                     Observation::Step => work.step(),

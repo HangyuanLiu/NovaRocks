@@ -42,7 +42,7 @@ fn decimal128_to_i64(value: i128, scale: i8) -> Option<i64> {
         let divisor = pow10_i128(scale as u32)?;
         value / divisor
     } else {
-        let factor = pow10_i128((-scale) as u32)?;
+        let factor = pow10_i128((-i32::from(scale)) as u32)?;
         value.checked_mul(factor)?
     };
     i64::try_from(integral).ok()
@@ -67,49 +67,44 @@ pub(super) fn legacy_int32_interval_at(values: &Int32Array, row: usize) -> Optio
 pub fn legacy_extract_calendar_intervals(
     array: &ArrayRef,
     func_name: &str,
-) -> Result<Vec<Option<i64>>, String> {
+) -> Result<Vec<Option<i64>>, crate::KernelFailure> {
     match array.data_type() {
         DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                super::calendar_parts_shared::part_contract("failed to downcast to Int8Array")
+            })?;
             Ok((0..arr.len())
                 .map(|i| (!arr.is_null(i)).then(|| arr.value(i) as i64))
                 .collect())
         }
         DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                super::calendar_parts_shared::part_contract("failed to downcast to Int16Array")
+            })?;
             Ok((0..arr.len())
                 .map(|i| (!arr.is_null(i)).then(|| arr.value(i) as i64))
                 .collect())
         }
         DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                super::calendar_parts_shared::part_contract("failed to downcast to Int32Array")
+            })?;
             Ok((0..arr.len())
                 .map(|i| legacy_int32_interval_at(arr, i))
                 .collect())
         }
         DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                super::calendar_parts_shared::part_contract("failed to downcast to Int64Array")
+            })?;
             Ok((0..arr.len())
                 .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
                 .collect())
         }
         DataType::UInt8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| "failed to downcast to UInt8Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
+                super::calendar_parts_shared::part_contract("failed to downcast to UInt8Array")
+            })?;
             Ok((0..arr.len())
                 .map(|i| (!arr.is_null(i)).then(|| arr.value(i) as i64))
                 .collect())
@@ -118,7 +113,9 @@ pub fn legacy_extract_calendar_intervals(
             let arr = array
                 .as_any()
                 .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| "failed to downcast to UInt16Array".to_string())?;
+                .ok_or_else(|| {
+                    super::calendar_parts_shared::part_contract("failed to downcast to UInt16Array")
+                })?;
             Ok((0..arr.len())
                 .map(|i| (!arr.is_null(i)).then(|| arr.value(i) as i64))
                 .collect())
@@ -127,7 +124,9 @@ pub fn legacy_extract_calendar_intervals(
             let arr = array
                 .as_any()
                 .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| "failed to downcast to UInt32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::calendar_parts_shared::part_contract("failed to downcast to UInt32Array")
+                })?;
             Ok((0..arr.len())
                 .map(|i| (!arr.is_null(i)).then(|| arr.value(i) as i64))
                 .collect())
@@ -136,7 +135,9 @@ pub fn legacy_extract_calendar_intervals(
             let arr = array
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| "failed to downcast to UInt64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::calendar_parts_shared::part_contract("failed to downcast to UInt64Array")
+                })?;
             Ok((0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -151,7 +152,11 @@ pub fn legacy_extract_calendar_intervals(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::calendar_parts_shared::part_contract(
+                        "failed to downcast to Float32Array",
+                    )
+                })?;
             Ok((0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -166,7 +171,11 @@ pub fn legacy_extract_calendar_intervals(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::calendar_parts_shared::part_contract(
+                        "failed to downcast to Float64Array",
+                    )
+                })?;
             Ok((0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -181,7 +190,11 @@ pub fn legacy_extract_calendar_intervals(
             let arr = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    super::calendar_parts_shared::part_contract(
+                        "failed to downcast to Decimal128Array",
+                    )
+                })?;
             Ok((0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -196,7 +209,9 @@ pub fn legacy_extract_calendar_intervals(
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                .ok_or_else(|| {
+                    super::calendar_parts_shared::part_contract("failed to downcast to StringArray")
+                })?;
             Ok((0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -208,7 +223,9 @@ pub fn legacy_extract_calendar_intervals(
                 .collect())
         }
         DataType::Null => Ok(vec![None; array.len()]),
-        _ => Err(format!("{func_name} expects int")),
+        _ => Err(super::calendar_parts_shared::part_contract(format_args!(
+            "{func_name} expects int"
+        ))),
     }
 }
 
@@ -234,6 +251,17 @@ mod legacy_goldens {
         assert_eq!(
             legacy_extract_calendar_intervals(&values, "date_add").unwrap(),
             vec![Some(0), Some(i64::MAX), None]
+        );
+        // Arrow admits negative scales across the full i8 domain. The real
+        // value 10^128 cannot be an i64 interval and follows the NULL rule.
+        let values: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(1), None])
+                .with_precision_and_scale(38, i8::MIN)
+                .unwrap(),
+        );
+        assert_eq!(
+            legacy_extract_calendar_intervals(&values, "date_add").unwrap(),
+            vec![None, None]
         );
     }
 }

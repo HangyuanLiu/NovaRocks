@@ -27,14 +27,22 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use crate::exec::chunk::Chunk;
 
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel, TransformStart},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
+#[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -77,30 +85,23 @@ impl OperatorFactory for LimitProcessorFactory {
         // A zero row budget is complete before any upstream input exists,
         // including when OFFSET is nonzero. The driver observes this terminal
         // state and stands down the input without waiting for its first chunk.
-        let finished = self.state.lock().expect("limit state lock").remaining_limit == Some(0);
-        Box::new(LimitProcessorOperator {
+        Box::new(Transform::hydrating(LimitProcessorKernel {
             name: self.name.clone(),
             state: Arc::clone(&self.state),
-            pending_output: None,
-            finishing: false,
-            finished,
             construction_factory: None,
             prepared: false,
-        })
+        }))
     }
 }
 
-struct LimitProcessorOperator {
+struct LimitProcessorKernel {
     name: String,
     state: Arc<Mutex<LimitState>>,
-    pending_output: Option<Chunk>,
-    finishing: bool,
-    finished: bool,
     construction_factory: Option<Arc<dyn InputConstructionFactory>>,
     prepared: bool,
 }
 
-impl Operator for LimitProcessorOperator {
+impl OperatorLifecycle for LimitProcessorKernel {
     fn name(&self) -> &str {
         &self.name
     }
@@ -120,54 +121,37 @@ impl Operator for LimitProcessorOperator {
         self.prepared = true;
         Ok(())
     }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
 
-impl ProcessorOperator for LimitProcessorOperator {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending_output.is_none()
+impl InputEncodingPolicy for LimitProcessorKernel {}
+impl TransformKernel for LimitProcessorKernel {
+    fn start(&self) -> TransformStart {
+        if self.state.lock().expect("limit state lock").remaining_limit == Some(0) {
+            TransformStart::Finished
+        } else {
+            TransformStart::NeedInput
+        }
     }
-
-    fn has_output(&self) -> bool {
-        self.pending_output.is_some()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    fn apply(
+        &mut self,
+        _ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
         if !self.prepared {
             return Err(ConstructionFailure::MissingOwner.into());
         }
-        if self.finished {
-            return Ok(());
-        }
-        if self.pending_output.is_some() {
-            return Err("limit received input while output buffer is full"
-                .to_string()
-                .into());
-        }
         let chunk_rows = chunk.len();
         if chunk_rows == 0 {
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
-
         let (skip_rows, take_rows, exhausted_limit) = {
             let mut state = self.state.lock().expect("limit state lock");
             if state.remaining_limit == Some(0) {
-                (0usize, 0usize, true)
+                (0, 0, true)
             } else {
                 let skip_rows = state.remaining_offset.min(chunk_rows);
                 state.remaining_offset -= skip_rows;
-
                 let available_rows = chunk_rows - skip_rows;
                 let take_rows = match state.remaining_limit {
                     Some(remaining) => {
@@ -177,57 +161,40 @@ impl ProcessorOperator for LimitProcessorOperator {
                     }
                     None => available_rows,
                 };
-                let exhausted_limit = state.remaining_limit == Some(0);
-                (skip_rows, take_rows, exhausted_limit)
+                (skip_rows, take_rows, state.remaining_limit == Some(0))
             }
         };
-
-        if take_rows > 0 {
+        let output = if take_rows > 0 {
             let factory = self
                 .construction_factory
                 .as_deref()
                 .ok_or(ConstructionFailure::MissingOwner)?;
             let owner = factory.begin_input_construction(&chunk)?;
-            self.pending_output = Some(chunk.slice_typed_observed::<ConstructionFailure, _>(
+            Some(chunk.slice_typed_observed::<ConstructionFailure, _>(
                 skip_rows,
                 take_rows,
                 owner.storage_lifetime(),
                 |step| owner.observe(0, &[], step),
-            )?);
-        }
-
-        if exhausted_limit && self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let out = self.pending_output.take();
-        if self.pending_output.is_none() {
-            let exhausted_limit = {
-                let state = self.state.lock().expect("limit state lock");
-                state.remaining_limit == Some(0)
-            };
-            if self.finishing || exhausted_limit {
-                self.finished = true;
-            }
-        }
-        Ok(out)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        if self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+            )?)
+        } else {
+            None
+        };
+        Ok(StepResult::new(
+            output,
+            if exhausted_limit {
+                NextStep::Finished
+            } else {
+                NextStep::NeedInput
+            },
+            u64::try_from(chunk_rows).expect("supported row count fits u64"),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::pipeline::test_driver::TestDriver;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -286,7 +253,7 @@ mod tests {
             })
             .collect();
         let schema = Arc::new(crate::exec::chunk::ChunkSchema::try_new_typed(slots, pure).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
             schema,
             batch.columns().to_vec(),
             rows,
@@ -317,27 +284,73 @@ mod tests {
     }
 
     #[test]
+    fn production_steps_keep_deferred_input_raw_and_emit_the_last_batch_with_finished() {
+        use crate::exec::pipeline::{input::RawInput, step::InputResult, step_context::TurnWork};
+        use crate::runtime::runtime_state::RuntimeErrorState;
+        let factory = LimitProcessorFactory::new(1, Some(4), 3);
+        let mut op = factory.create(1, 0);
+        prepare_limit(op.as_mut());
+        let step = op.as_mut();
+        let control = RuntimeErrorState::default();
+        let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 10);
+        let mut ctx = StepContext::new(&control, &mut turn);
+        assert!(matches!(step.initial_step(), NextStep::NeedInput));
+        assert!(matches!(
+            step.try_push(&mut ctx, RawInput::for_test(make_chunk(0, 5))),
+            InputResult::Accepted(Ok(_))
+        ));
+        let second = make_chunk(5, 5);
+        let original_array = Arc::clone(&second.columns()[0]);
+        let InputResult::Deferred { input, .. } =
+            step.try_push(&mut ctx, RawInput::for_test(second))
+        else {
+            panic!("an accepted receiver must defer another raw input");
+        };
+        assert!(Arc::ptr_eq(
+            &original_array,
+            &input.original_for_test().columns()[0]
+        ));
+        {
+            let shared = factory.state.lock().unwrap();
+            assert_eq!(
+                shared.remaining_offset, 3,
+                "admission cannot consume the row budget"
+            );
+            assert_eq!(shared.remaining_limit, Some(4));
+        }
+        let first = step.drive(&mut ctx).unwrap();
+        assert_eq!(first.committed_rows, 5);
+        assert_eq!(chunk_values(&first.output.unwrap()), vec![3, 4]);
+        assert!(matches!(first.next, NextStep::NeedInput));
+        assert!(matches!(
+            step.try_push(&mut ctx, input),
+            InputResult::Accepted(Ok(_))
+        ));
+        let last = step.drive(&mut ctx).unwrap();
+        assert_eq!(last.committed_rows, 5);
+        assert_eq!(chunk_values(&last.output.unwrap()), vec![5, 6]);
+        assert!(matches!(last.next, NextStep::Finished));
+        let ended = step.drive(&mut ctx).unwrap();
+        assert!(ended.output.is_none());
+        assert!(matches!(ended.next, NextStep::Finished));
+        assert_eq!(factory.state.lock().unwrap().remaining_limit, Some(0));
+    }
+
+    #[test]
     fn zero_limit_is_finished_without_upstream_input_even_with_offset() {
         for offset in [0, 7, usize::MAX] {
             let mut op = LimitProcessorFactory::new(1, Some(0), offset).create(1, 0);
             assert!(
-                op.is_finished(),
+                matches!(op.initial_step(), NextStep::Finished),
                 "zero limit must not wait for offset {offset}"
             );
-            let processor = op.as_processor_mut().expect("processor op");
-            assert!(!processor.need_input());
-            assert!(!processor.has_output());
-            assert!(
-                processor
-                    .pull_chunk(&RuntimeState::default())
-                    .unwrap()
-                    .is_none()
-            );
+            let ended = op.drive_for_test(&RuntimeState::default()).unwrap();
+            assert!(matches!(ended.next, NextStep::Finished));
+            assert!(ended.output.is_none());
         }
         for limit in [None, Some(1), Some(4)] {
             let op = LimitProcessorFactory::new(1, limit, 7).create(1, 0);
-            assert!(!op.is_finished());
-            assert!(op.as_processor_ref().unwrap().need_input());
+            assert!(matches!(op.initial_step(), NextStep::NeedInput));
         }
     }
 
@@ -345,10 +358,9 @@ mod tests {
     fn limit_refuses_unprepared_input_before_consuming_row_budget() {
         let factory = LimitProcessorFactory::new(1, Some(2), 1);
         let mut op = factory.create(1, 0);
-        let error = op
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&RuntimeState::default(), make_chunk(0, 4))
+        let state = RuntimeState::default();
+        let error = TestDriver::new(op.as_mut(), &state)
+            .input_and_collect(make_chunk(0, 4))
             .unwrap_err();
         assert!(matches!(
             error.cause(),
@@ -356,10 +368,14 @@ mod tests {
                 ConstructionFailure::MissingOwner
             )
         ));
-        let state = factory.state.lock().unwrap();
-        assert_eq!(state.remaining_offset, 1);
-        assert_eq!(state.remaining_limit, Some(2));
-        assert!(!op.as_processor_ref().unwrap().has_output());
+        let limit_state = factory.state.lock().unwrap();
+        assert_eq!(limit_state.remaining_offset, 1);
+        assert_eq!(limit_state.remaining_limit, Some(2));
+        assert!(
+            op.drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error)
+        );
     }
 
     #[test]
@@ -367,25 +383,23 @@ mod tests {
         let state = RuntimeState::default();
         let mut op = LimitProcessorFactory::new(1, Some(4), 3).create(1, 0);
         prepare_limit(op.as_mut());
-        let p = op.as_processor_mut().expect("processor op");
+        let mut p = TestDriver::new(op.as_mut(), &state);
 
-        p.push_chunk(&state, make_chunk(0, 5))
-            .expect("push chunk #1");
-        let out1 = p
-            .pull_chunk(&state)
-            .expect("pull chunk #1")
-            .expect("chunk #1 exists");
+        let mut output = p
+            .input_and_collect(make_chunk(0, 5))
+            .expect("complete input #1");
+        assert_eq!(output.len(), 1);
+        let out1 = output.pop().unwrap();
         assert_eq!(chunk_values(&out1), vec![3, 4]);
 
-        p.push_chunk(&state, make_chunk(5, 5))
-            .expect("push chunk #2");
-        let out2 = p
-            .pull_chunk(&state)
-            .expect("pull chunk #2")
-            .expect("chunk #2 exists");
+        let mut output = p
+            .input_and_collect(make_chunk(5, 5))
+            .expect("complete input #2");
+        assert_eq!(output.len(), 1);
+        let out2 = output.pop().unwrap();
         assert_eq!(chunk_values(&out2), vec![5, 6]);
 
-        assert!(op.is_finished());
+        assert!(matches!(p.next(), NextStep::Finished));
     }
 
     #[test]
@@ -393,23 +407,21 @@ mod tests {
         let state = RuntimeState::default();
         let mut op = LimitProcessorFactory::new(2, None, 2).create(1, 0);
         prepare_limit(op.as_mut());
-        let p = op.as_processor_mut().expect("processor op");
+        let mut p = TestDriver::new(op.as_mut(), &state);
 
-        p.push_chunk(&state, make_chunk(0, 3))
-            .expect("push chunk #1");
-        let out1 = p
-            .pull_chunk(&state)
-            .expect("pull chunk #1")
-            .expect("chunk #1 exists");
+        let mut output = p
+            .input_and_collect(make_chunk(0, 3))
+            .expect("complete input #1");
+        assert_eq!(output.len(), 1);
+        let out1 = output.pop().unwrap();
         assert_eq!(chunk_values(&out1), vec![2]);
 
-        p.push_chunk(&state, make_chunk(3, 2))
-            .expect("push chunk #2");
-        let out2 = p
-            .pull_chunk(&state)
-            .expect("pull chunk #2")
-            .expect("chunk #2 exists");
+        let mut output = p
+            .input_and_collect(make_chunk(3, 2))
+            .expect("complete input #2");
+        assert_eq!(output.len(), 1);
+        let out2 = output.pop().unwrap();
         assert_eq!(chunk_values(&out2), vec![3, 4]);
-        assert!(!op.is_finished());
+        assert!(matches!(p.next(), NextStep::NeedInput));
     }
 }

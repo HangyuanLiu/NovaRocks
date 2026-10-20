@@ -28,9 +28,12 @@ use crate::exec::hash_table::key_builder::{
     encode_group_key_row_tracked,
 };
 use crate::exec::hash_table::key_column::{KeyColumn, key_column_from_type_in};
-use crate::exec::hash_table::key_layout::{CompressedKeyContext, build_compressed_key_context};
+use crate::exec::hash_table::key_layout::{
+    CompressedKeyContext, build_compressed_key_context, compressed_key_contract,
+};
 use crate::exec::hash_table::key_storage::{RowKey, RowStorage};
 use crate::exec::hash_table::key_strategy::{GroupKeyStrategy, pick_group_key_strategy};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use hashbrown::hash_map::DefaultHashBuilder;
 
@@ -38,6 +41,28 @@ use hashbrown::hash_map::DefaultHashBuilder;
 struct KeyEntry {
     group_id: usize,
     hash: u64,
+}
+
+#[derive(Debug)]
+struct KeyTableContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for KeyTableContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for KeyTableContract {}
+impl novarocks_failure_contract::FailureProjection for KeyTableContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::KeyTableContract.reason(),
+        )
+    }
+}
+fn key_table_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(KeyTableContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
 }
 
 struct DictKeyMap {
@@ -53,18 +78,19 @@ impl DictKeyMap {
         }
     }
 
-    fn reset_for(&mut self, values_ptr: usize, values_len: usize) -> Result<(), String> {
+    fn reset_for(&mut self, values_ptr: usize, values_len: usize) -> Result<(), ExecutionFailure> {
         if self.values_ptr != Some(values_ptr) {
             self.values_ptr = Some(values_ptr);
             self.code_to_group.clear();
         }
         if self.code_to_group.len() < values_len {
             let additional = values_len - self.code_to_group.len();
-            if self.code_to_group.try_reserve(additional).is_err() {
+            if let Err(source) = self.code_to_group.try_reserve(additional) {
                 return Err(self
                     .code_to_group
                     .allocator()
-                    .allocation_error("reserve dictionary group-key map"));
+                    .allocation_error("reserve dictionary group-key map", source)
+                    .into());
             }
             self.code_to_group.resize(values_len, None);
         }
@@ -91,13 +117,16 @@ pub struct KeyTable {
     varlen_keys: AggregateVec<RowKey>,
     compressed_ctx: Option<CompressedKeyContext>,
     key_columns_retained_bytes: usize,
-    memory_limit_exceeded: bool,
+    failure: Option<ExecutionFailure>,
     hash_seed: u64,
 }
 
 impl KeyTable {
     #[cfg(test)]
-    pub fn new(key_types: Vec<DataType>, enable_optimizations: bool) -> Result<Self, String> {
+    pub fn new(
+        key_types: Vec<DataType>,
+        enable_optimizations: bool,
+    ) -> Result<Self, ExecutionFailure> {
         let tracker = MemTracker::new_child(
             "KeyTableTest",
             &crate::runtime::mem_tracker::process_mem_tracker(),
@@ -109,7 +138,7 @@ impl KeyTable {
         key_types: Vec<DataType>,
         enable_optimizations: bool,
         tracker: Arc<MemTracker>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         let mut key_strategy = pick_group_key_strategy(&key_types);
         if !enable_optimizations {
             key_strategy = GroupKeyStrategy::Serialized;
@@ -118,12 +147,12 @@ impl KeyTable {
         let mut tracked_key_types = AggregateVec::new_in(allocator.clone());
         tracked_key_types
             .try_reserve_exact(key_types.len())
-            .map_err(|_| allocator.allocation_error("reserve group-key types"))?;
+            .map_err(|source| allocator.allocation_error("reserve group-key types", source))?;
         tracked_key_types.extend(key_types);
         let mut key_columns = AggregateVec::new_in(allocator.clone());
         key_columns
             .try_reserve_exact(tracked_key_types.len())
-            .map_err(|_| allocator.allocation_error("reserve group-key columns"))?;
+            .map_err(|source| allocator.allocation_error("reserve group-key columns", source))?;
         for data_type in &tracked_key_types {
             key_columns.push(key_column_from_type_in(data_type, allocator.clone())?);
         }
@@ -148,7 +177,7 @@ impl KeyTable {
             varlen_keys: AggregateVec::new_in(allocator),
             compressed_ctx: None,
             key_columns_retained_bytes,
-            memory_limit_exceeded: false,
+            failure: None,
             hash_seed: seed_from_hasher(&DefaultHashBuilder::default()),
         })
     }
@@ -178,12 +207,12 @@ impl KeyTable {
         self.varlen_keys.len()
     }
 
-    pub fn ensure_compressed_ctx(&mut self, views: &[GroupKeyArrayView<'_>]) -> Result<(), String> {
+    pub fn ensure_compressed_ctx(
+        &mut self,
+        views: &[GroupKeyArrayView<'_>],
+    ) -> ExecutionResult<()> {
         self.ensure_memory_available()?;
-        if self.key_strategy != GroupKeyStrategy::CompressedFixed {
-            return Ok(());
-        }
-        if self.compressed_ctx.is_some() {
+        if self.key_strategy != GroupKeyStrategy::CompressedFixed || self.compressed_ctx.is_some() {
             return Ok(());
         }
         match build_compressed_key_context(
@@ -191,17 +220,17 @@ impl KeyTable {
             &self.key_types,
             self.compressed_table.allocator().clone(),
         ) {
-            Ok(ctx) => {
+            Ok(Some(ctx)) => {
                 self.compressed_ctx = Some(ctx);
                 Ok(())
             }
-            Err(error) if error.contains("ResourceExhausted") => {
-                self.memory_limit_exceeded = true;
-                Err(error)
-            }
-            Err(_) => {
+            Ok(None) => {
                 self.key_strategy = GroupKeyStrategy::Serialized;
                 Ok(())
+            }
+            Err(error) => {
+                self.failure = Some(error.clone());
+                Err(error)
             }
         }
     }
@@ -209,7 +238,7 @@ impl KeyTable {
     pub(crate) fn build_rows_fallback(
         &self,
         arrays: &[ArrayRef],
-    ) -> Result<AggregateVec<AggregateVec<u8>>, String> {
+    ) -> Result<AggregateVec<AggregateVec<u8>>, ExecutionFailure> {
         let allocator = self.varlen_table.allocator().clone();
         let Some(first) = arrays.first() else {
             return Ok(AggregateVec::new_in(allocator));
@@ -217,38 +246,40 @@ impl KeyTable {
         let num_rows = first.len();
         for (idx, array) in arrays.iter().enumerate() {
             if array.len() != num_rows {
-                return Err(format!(
+                return Err(key_table_contract(format_args!(
                     "group key column row count mismatch in fallback row encoding: idx={} expected_rows={} actual_rows={}",
                     idx,
                     num_rows,
                     array.len()
-                ));
+                )));
             }
         }
         let mut rows = AggregateVec::new_in(allocator.clone());
-        rows.try_reserve_exact(num_rows)
-            .map_err(|_| allocator.allocation_error("reserve fallback group-key rows"))?;
+        rows.try_reserve_exact(num_rows).map_err(|source| {
+            allocator.allocation_error("reserve fallback group-key rows", source)
+        })?;
         for row in 0..num_rows {
             let mut encoded = AggregateVec::new_in(allocator.clone());
             for array in arrays {
                 match encode_group_key_row_tracked(array, row, allocator.clone())? {
                     None => {
-                        encoded.try_reserve(1).map_err(|_| {
-                            allocator.allocation_error("grow fallback group-key row")
+                        encoded.try_reserve(1).map_err(|source| {
+                            allocator.allocation_error("grow fallback group-key row", source)
                         })?;
                         encoded.push(0);
                     }
                     Some(value) => {
                         let additional = 5usize
                             .checked_add(value.len())
-                            .ok_or_else(|| "fallback group row length overflow".to_string())?;
-                        encoded.try_reserve(additional).map_err(|_| {
-                            allocator.allocation_error("grow fallback group-key row")
+                            .ok_or_else(|| super::key_builder::group_key_request_arithmetic())?;
+                        encoded.try_reserve(additional).map_err(|source| {
+                            allocator.allocation_error("grow fallback group-key row", source)
                         })?;
                         encoded.push(1);
-                        let len = u32::try_from(value.len()).map_err(|_| {
-                            "fallback group row encoded value length overflow".to_string()
-                        })?;
+                        let len = super::key_builder::group_key_component_len(
+                            value.len(),
+                            "fallback value frame",
+                        )?;
                         encoded.extend_from_slice(&len.to_le_bytes());
                         encoded.extend_from_slice(&value);
                     }
@@ -301,12 +332,10 @@ impl KeyTable {
             .saturating_add(compressed)
     }
 
-    fn ensure_memory_available(&self) -> Result<(), String> {
-        if self.memory_limit_exceeded {
-            Err("key table memory limit was previously exceeded".to_string())
-        } else {
-            Ok(())
-        }
+    fn ensure_memory_available(&self) -> Result<(), ExecutionFailure> {
+        self.failure
+            .as_ref()
+            .map_or(Ok(()), |error| Err(error.clone()))
     }
 
     fn push_column_value(
@@ -314,18 +343,18 @@ impl KeyTable {
         column_index: usize,
         view: &GroupKeyArrayView<'_>,
         row: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         self.ensure_memory_available()?;
         let column = self
             .key_columns
             .get_mut(column_index)
-            .ok_or_else(|| "group key column missing".to_string())?;
+            .ok_or_else(|| key_table_contract("group key column missing"))?;
         // Capture the cached baseline before reserve: a successful reserve may
         // grow one of the tracked backing vectors even though the logical push
         // has not happened yet.
         let before = column.retained_bytes();
         if let Err(error) = column.try_reserve_value_from_view(view, row) {
-            self.memory_limit_exceeded = true;
+            self.failure = Some(error.clone());
             return Err(error);
         }
         let result = column.push_value_from_view(view, row);
@@ -338,11 +367,12 @@ impl KeyTable {
         result
     }
 
-    fn alloc_row_copy(&mut self, bytes: &[u8]) -> Result<RowKey, String> {
+    fn alloc_row_copy(&mut self, bytes: &[u8]) -> Result<RowKey, ExecutionFailure> {
         match self.row_storage.alloc_copy(bytes) {
             Ok(key) => Ok(key),
-            Err(error) => {
-                self.memory_limit_exceeded = true;
+            Err(source) => {
+                let error = ExecutionFailure::from(source);
+                self.failure = Some(error.clone());
                 Err(error)
             }
         }
@@ -354,11 +384,11 @@ impl KeyTable {
         row: usize,
         row_bytes: &[u8],
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         if let Err(error) = reserve_raw_table(&mut self.varlen_table, "serialized group-key table")
         {
-            self.memory_limit_exceeded = true;
+            self.failure = Some(error.clone());
             return Err(error);
         }
         let mut error = None;
@@ -370,7 +400,7 @@ impl KeyTable {
                 |entry| match keys.get(entry.group_id) {
                     Some(stored) => stored.as_slice() == row_bytes,
                     None => {
-                        error = Some("group key index out of bounds".to_string());
+                        error = Some(key_table_contract("group key index out of bounds"));
                         false
                     }
                 },
@@ -395,7 +425,7 @@ impl KeyTable {
                 if let Some(slot_key) = self.varlen_keys.get_mut(group_id) {
                     *slot_key = stored_key;
                 } else {
-                    return Err("group key index out of bounds".to_string());
+                    return Err(key_table_contract("group key index out of bounds"));
                 }
                 let entry = KeyEntry { group_id, hash };
                 unsafe {
@@ -414,12 +444,12 @@ impl KeyTable {
         view: &GroupKeyArrayView<'_>,
         row: usize,
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         if let Err(error) =
             reserve_raw_table(&mut self.one_number_table, "one-number group-key table")
         {
-            self.memory_limit_exceeded = true;
+            self.failure = Some(error.clone());
             return Err(error);
         }
         let mut error = None;
@@ -439,7 +469,7 @@ impl KeyTable {
                             }
                         },
                         None => {
-                            error = Some("one number key column missing".to_string());
+                            error = Some(key_table_contract("one number key column missing"));
                             false
                         }
                     }
@@ -458,7 +488,7 @@ impl KeyTable {
             }),
             Err(slot) => {
                 if self.key_columns.is_empty() {
-                    return Err("one number key column missing".to_string());
+                    return Err(key_table_contract("one number key column missing"));
                 }
                 self.push_column_value(0, view, row)?;
                 let group_id = self.alloc_group()?;
@@ -481,10 +511,10 @@ impl KeyTable {
         row: usize,
         key: Option<&str>,
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         if !matches!(view, GroupKeyArrayView::Utf8(_)) {
-            return Err("one string key expects Utf8 view".to_string());
+            return Err(key_table_contract("one string key expects Utf8 view"));
         }
         self.find_or_insert_one_string_value(view, row, key, hash)
     }
@@ -494,7 +524,7 @@ impl KeyTable {
         view: &GroupKeyArrayView<'_>,
         row: usize,
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         match view {
             GroupKeyArrayView::Utf8(arr) => {
@@ -509,14 +539,14 @@ impl KeyTable {
                     .dict_key_map
                     .reset_for(dict.values_ptr(), dict.values_len())
                 {
-                    self.memory_limit_exceeded = true;
+                    self.failure = Some(error.clone());
                     return Err(error);
                 }
                 if let Some(Some(group_id)) = self.dict_key_map.code_to_group.get(code).copied() {
                     let col = self
                         .key_columns
                         .first()
-                        .ok_or_else(|| "one string key column missing".to_string())?;
+                        .ok_or_else(|| key_table_contract("one string key column missing"))?;
                     if col.value_equals(group_id, view, row)? {
                         return Ok(KeyLookup {
                             group_id,
@@ -530,11 +560,13 @@ impl KeyTable {
                     .dict_key_map
                     .code_to_group
                     .get_mut(code)
-                    .ok_or_else(|| "dictionary group key code out of bounds".to_string())?;
+                    .ok_or_else(|| key_table_contract("dictionary group key code out of bounds"))?;
                 *slot = Some(lookup.group_id);
                 Ok(lookup)
             }
-            _ => Err("one string key expects Utf8 or Dictionary view".to_string()),
+            _ => Err(key_table_contract(
+                "one string key expects Utf8 or Dictionary view",
+            )),
         }
     }
 
@@ -544,23 +576,27 @@ impl KeyTable {
         row: usize,
         key: Option<&str>,
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         let row_is_null = match view {
             GroupKeyArrayView::Utf8(arr) => arr.is_null(row),
             GroupKeyArrayView::Dictionary(dict) => dict.is_null(row),
-            _ => return Err("one string key expects Utf8 or Dictionary view".to_string()),
+            _ => {
+                return Err(key_table_contract(
+                    "one string key expects Utf8 or Dictionary view",
+                ));
+            }
         };
         match key {
             Some(key) => {
                 if row_is_null {
-                    return Err("one string key requires non-null row".to_string());
+                    return Err(key_table_contract("one string key requires non-null row"));
                 }
                 self.find_or_insert_one_string_non_null(view, row, key, hash)
             }
             None => {
                 if !row_is_null {
-                    return Err("one string key null requires null row".to_string());
+                    return Err(key_table_contract("one string key null requires null row"));
                 }
                 if let Some(group_id) = self.one_string_null {
                     return Ok(KeyLookup {
@@ -569,7 +605,7 @@ impl KeyTable {
                     });
                 }
                 if self.key_columns.is_empty() {
-                    return Err("one string key column missing".to_string());
+                    return Err(key_table_contract("one string key column missing"));
                 }
                 self.push_column_value(0, view, row)?;
                 let group_id = self.alloc_group()?;
@@ -588,10 +624,10 @@ impl KeyTable {
         row: usize,
         key: &str,
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         if let Err(error) = reserve_raw_table(&mut self.varlen_table, "string group-key table") {
-            self.memory_limit_exceeded = true;
+            self.failure = Some(error.clone());
             return Err(error);
         }
         let mut error = None;
@@ -604,7 +640,7 @@ impl KeyTable {
                 |entry| match keys.get(entry.group_id) {
                     Some(stored) => stored.as_slice() == key_bytes,
                     None => {
-                        error = Some("group key index out of bounds".to_string());
+                        error = Some(key_table_contract("group key index out of bounds"));
                         false
                     }
                 },
@@ -621,7 +657,7 @@ impl KeyTable {
             }),
             Err(slot) => {
                 if self.key_columns.is_empty() {
-                    return Err("one string key column missing".to_string());
+                    return Err(key_table_contract("one string key column missing"));
                 }
                 self.push_column_value(0, view, row)?;
                 let group_id = self.alloc_group()?;
@@ -629,7 +665,7 @@ impl KeyTable {
                 if let Some(slot_key) = self.varlen_keys.get_mut(group_id) {
                     *slot_key = stored_key;
                 } else {
-                    return Err("group key index out of bounds".to_string());
+                    return Err(key_table_contract("group key index out of bounds"));
                 }
                 let entry = KeyEntry { group_id, hash };
                 unsafe {
@@ -648,12 +684,12 @@ impl KeyTable {
         views: &[GroupKeyArrayView<'_>],
         row: usize,
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         if let Err(error) =
             reserve_raw_table(&mut self.fixed_size_table, "fixed-size group-key table")
         {
-            self.memory_limit_exceeded = true;
+            self.failure = Some(error.clone());
             return Err(error);
         }
         let mut error = None;
@@ -704,12 +740,12 @@ impl KeyTable {
         views: &[GroupKeyArrayView<'_>],
         row: usize,
         hash: u64,
-    ) -> Result<KeyLookup, String> {
+    ) -> Result<KeyLookup, ExecutionFailure> {
         self.ensure_memory_available()?;
         if let Err(error) =
             reserve_raw_table(&mut self.compressed_table, "compressed group-key table")
         {
-            self.memory_limit_exceeded = true;
+            self.failure = Some(error.clone());
             return Err(error);
         }
         let mut error = None;
@@ -755,7 +791,11 @@ impl KeyTable {
         }
     }
 
-    pub fn lookup_serialized(&self, row_bytes: &[u8], hash: u64) -> Result<Option<usize>, String> {
+    pub fn lookup_serialized(
+        &self,
+        row_bytes: &[u8],
+        hash: u64,
+    ) -> Result<Option<usize>, ExecutionFailure> {
         let keys = &self.varlen_keys;
         let mut error = None;
         let entry = self
@@ -763,7 +803,7 @@ impl KeyTable {
             .get(hash, |entry| match keys.get(entry.group_id) {
                 Some(stored) => stored.as_slice() == row_bytes,
                 None => {
-                    error = Some("group key index out of bounds".to_string());
+                    error = Some(key_table_contract("group key index out of bounds"));
                     false
                 }
             });
@@ -773,7 +813,11 @@ impl KeyTable {
         Ok(entry.map(|entry| entry.group_id))
     }
 
-    pub fn lookup_one_string(&self, key: &str, hash: u64) -> Result<Option<usize>, String> {
+    pub fn lookup_one_string(
+        &self,
+        key: &str,
+        hash: u64,
+    ) -> Result<Option<usize>, ExecutionFailure> {
         let keys = &self.varlen_keys;
         let key_bytes = key.as_bytes();
         let mut error = None;
@@ -782,7 +826,7 @@ impl KeyTable {
             .get(hash, |entry| match keys.get(entry.group_id) {
                 Some(stored) => stored.as_slice() == key_bytes,
                 None => {
-                    error = Some("group key index out of bounds".to_string());
+                    error = Some(key_table_contract("group key index out of bounds"));
                     false
                 }
             });
@@ -801,7 +845,7 @@ impl KeyTable {
         view: &GroupKeyArrayView<'_>,
         row: usize,
         hash: u64,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<Option<usize>, ExecutionFailure> {
         let mut error = None;
         let entry = self.one_number_table.get(hash, |entry| {
             let col = self.key_columns.first();
@@ -814,7 +858,7 @@ impl KeyTable {
                     }
                 },
                 None => {
-                    error = Some("one number key column missing".to_string());
+                    error = Some(key_table_contract("one number key column missing"));
                     false
                 }
             }
@@ -830,7 +874,7 @@ impl KeyTable {
         views: &[GroupKeyArrayView<'_>],
         row: usize,
         hash: u64,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<Option<usize>, ExecutionFailure> {
         let mut error = None;
         let entry = self.fixed_size_table.get(hash, |entry| {
             match keys_equal(&self.key_columns, views, entry.group_id, row) {
@@ -852,7 +896,7 @@ impl KeyTable {
         views: &[GroupKeyArrayView<'_>],
         row: usize,
         hash: u64,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<Option<usize>, ExecutionFailure> {
         let mut error = None;
         let entry = self.compressed_table.get(hash, |entry| {
             match keys_equal(&self.key_columns, views, entry.group_id, row) {
@@ -873,11 +917,11 @@ impl KeyTable {
         &self,
         views: &[GroupKeyArrayView<'_>],
         num_rows: usize,
-    ) -> Result<Vec<bool>, String> {
+    ) -> ExecutionResult<Vec<bool>> {
         let ctx = self
             .compressed_ctx
             .as_ref()
-            .ok_or_else(|| "compressed key context missing".to_string())?;
+            .ok_or_else(|| compressed_key_contract("compressed key context missing"))?;
         build_compressed_flags(ctx, views, num_rows)
     }
 
@@ -885,7 +929,7 @@ impl KeyTable {
         &self,
         views: &[GroupKeyArrayView<'_>],
         num_rows: usize,
-    ) -> Result<Vec<u64>, String> {
+    ) -> ExecutionResult<Vec<u64>> {
         build_group_key_hashes(views, num_rows, self.hash_seed)
     }
 
@@ -893,18 +937,20 @@ impl KeyTable {
         &self,
         view: &GroupKeyArrayView<'_>,
         num_rows: usize,
-    ) -> Result<Vec<u64>, String> {
+    ) -> ExecutionResult<Vec<u64>> {
         build_one_number_hashes(view, num_rows, self.hash_seed)
     }
 
-    fn alloc_group(&mut self) -> Result<usize, String> {
+    fn alloc_group(&mut self) -> Result<usize, ExecutionFailure> {
         let group_id = self.varlen_keys.len();
-        if self.varlen_keys.try_reserve(1).is_err() {
-            self.memory_limit_exceeded = true;
-            return Err(self
-                .varlen_keys
-                .allocator()
-                .allocation_error("reserve group-key row pointers"));
+        if let Err(source) = self.varlen_keys.try_reserve(1) {
+            let error = ExecutionFailure::from(
+                self.varlen_keys
+                    .allocator()
+                    .allocation_error("reserve group-key row pointers", source),
+            );
+            self.failure = Some(error.clone());
+            return Err(error);
         }
         self.varlen_keys.push(RowKey::empty());
         Ok(group_id)
@@ -928,11 +974,11 @@ fn compressed_context_retained_bytes(ctx: &CompressedKeyContext) -> usize {
 fn reserve_raw_table(
     table: &mut RawTable<KeyEntry, AggregateAllocator>,
     owner: &str,
-) -> Result<(), String> {
+) -> Result<(), ExecutionFailure> {
     let allocator = table.allocator().clone();
     table
         .try_reserve(1, |entry| entry.hash)
-        .map_err(|_| allocator.allocation_error(&format!("reserve {owner}")))
+        .map_err(|source| ExecutionFailure::from(allocator.allocation_error(owner, source)))
 }
 
 #[cfg(test)]
@@ -993,9 +1039,9 @@ fn keys_equal(
     views: &[GroupKeyArrayView<'_>],
     group_id: usize,
     row: usize,
-) -> Result<bool, String> {
+) -> Result<bool, ExecutionFailure> {
     if key_columns.len() != views.len() {
-        return Err("group key length mismatch".to_string());
+        return Err(key_table_contract("group key length mismatch"));
     }
     for (col, view) in key_columns.iter().zip(views.iter()) {
         if !col.value_equals(group_id, view, row)? {
@@ -1013,6 +1059,7 @@ mod tests {
     use arrow::compute::take;
     use arrow::datatypes::{DataType, Field, Int32Type};
     use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
     use std::sync::Arc;
 
     fn dict_utf8(values: Vec<Option<&str>>) -> ArrayRef {
@@ -1169,7 +1216,7 @@ mod tests {
                 .find_or_insert_one_number(&views[0], 0, hashes[0])
                 .err()
                 .expect("raw table allocation must cross the limit");
-            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(error.failure_fact().class(), FailureClass::Resource);
 
             assert_eq!(table.retained_bytes(), baseline);
             assert_eq!(query.current(), baseline as i64);
@@ -1180,7 +1227,7 @@ mod tests {
                 .find_or_insert_one_number(&views[0], 0, hashes[0])
                 .err()
                 .expect("limit failure must be latched");
-            assert!(retry_error.contains("previously exceeded"), "{retry_error}");
+            assert!(retry_error.same_occurrence(&error));
             assert_eq!(query.current(), current);
         }
         assert_eq!(query.current(), 0);
@@ -1204,14 +1251,14 @@ mod tests {
             let error = table
                 .push_column_value(0, &views[0], 0)
                 .expect_err("key-column vector growth must cross the limit");
-            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(error.failure_fact().class(), FailureClass::Resource);
             assert_eq!(table.retained_bytes(), baseline);
             assert_eq!(query.current(), baseline as i64);
 
             let retry = table
                 .push_column_value(0, &views[0], 0)
                 .expect_err("limit rejection must latch the key table");
-            assert!(retry.contains("previously exceeded"), "{retry}");
+            assert!(retry.same_occurrence(&error));
             assert_eq!(query.current(), baseline as i64);
         }
         assert_eq!(query.current(), 0);
@@ -1237,7 +1284,7 @@ mod tests {
                 .find_or_insert_one_string_like(&views[0], 0, hashes[0])
                 .err()
                 .expect("dictionary cache growth must cross the limit");
-            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(error.failure_fact().class(), FailureClass::Resource);
             assert_eq!(table.dict_key_map.code_to_group.capacity(), 0);
             assert_eq!(table.group_count(), 0);
             assert_eq!(query.current(), table.retained_bytes() as i64);
@@ -1368,9 +1415,37 @@ mod tests {
             let error = table
                 .build_rows_fallback(&[array])
                 .expect_err("fallback scratch must be rejected before allocation");
-            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(error.failure_fact().class(), FailureClass::Resource);
             assert_eq!(query.current(), baseline);
         }
         assert_eq!(query.current(), 0);
+    }
+}
+
+#[cfg(test)]
+mod typed_compression_owner_tests {
+    use super::super::key_builder::build_group_key_views;
+    use super::*;
+    use arrow::array::Int64Array;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn actual_compression_refusal_never_changes_strategy_or_replaces_the_original_cause() {
+        let tracker = MemTracker::new_root("compressed-table-owner-refusal");
+        let mut table =
+            KeyTable::new_with_tracker(vec![DataType::Int64; 3], true, tracker.clone()).unwrap();
+        assert_eq!(table.key_strategy(), GroupKeyStrategy::CompressedFixed);
+        let baseline = tracker.current();
+        tracker.install_limit_once(baseline).unwrap();
+        let arrays = vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef; 3];
+        let views = build_group_key_views(&arrays).unwrap();
+        let error = table.ensure_compressed_ctx(&views).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(table.key_strategy(), GroupKeyStrategy::CompressedFixed);
+        assert!(table.compressed_ctx().is_none());
+        let retry = table.ensure_compressed_ctx(&views).unwrap_err();
+        assert!(retry.same_occurrence(&error));
+        assert_eq!(tracker.current(), baseline);
+        drop(table);
+        assert_eq!(tracker.current(), 0);
     }
 }

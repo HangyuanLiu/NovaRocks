@@ -112,7 +112,7 @@ fn legacy(
     right: ArrayRef,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let result = arithmetic_result_value_type_with_op(left_type, right_type, op).unwrap();
     let chunk = chunk(left_type, right_type, left, right);
     let mut arena = ExprArena::default();
@@ -308,7 +308,9 @@ fn legacy_legal_largeint_division_and_float64_mixed_profiles_expose_the_arrow_ca
         )
         .unwrap_err();
         assert!(
-            error.contains("Casting from FixedSizeBinary(16) to Int64 not supported"),
+            error
+                .to_string()
+                .contains("Casting from FixedSizeBinary(16) to Int64 not supported"),
             "{error}"
         );
     }
@@ -329,7 +331,9 @@ fn legacy_legal_largeint_division_and_float64_mixed_profiles_expose_the_arrow_ca
         )
         .unwrap_err();
         assert!(
-            error.contains("Casting from FixedSizeBinary(16) to Float64 not supported"),
+            error
+                .to_string()
+                .contains("Casting from FixedSizeBinary(16) to Float64 not supported"),
             "{error}"
         );
     }

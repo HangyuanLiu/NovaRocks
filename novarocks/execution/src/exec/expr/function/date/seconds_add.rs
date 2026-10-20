@@ -16,7 +16,7 @@
 // under the License.
 use super::common::extract_i64_array;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -31,27 +31,31 @@ fn eval_add_duration<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     operation: CalendarDurationShift,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let output_type = super::common::frozen_type(arena.arena(), expr)?.clone();
     let date = arena.eval(args[0], chunk)?;
     let interval = arena.eval(args[1], chunk)?;
     legacy_validate_datetime_source(&date)?;
     let intervals = extract_i64_array(&interval, "duration add")?;
     // Preserve the original malformed-caller length error before all-row selection.
     if date.len() != intervals.len() && date.len() != 1 && intervals.len() != 1 {
-        return Err(("duration add argument length mismatch".to_string()).into());
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "duration add argument length mismatch",
+            )
+            .into(),
+        );
     }
     let rows = date.len().max(intervals.len());
     let interval: ArrayRef = Arc::new(Int64Array::from(intervals));
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    Ok((evaluate_legacy_calendar(
+
+    evaluate_legacy_calendar(
         CalendarOperation::DurationShift(operation),
         &[date, interval],
         &output_type,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }
 
 pub fn eval_seconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -59,8 +63,8 @@ pub fn eval_seconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsAdd))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsAdd)
 }
 
 pub fn eval_seconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -68,8 +72,8 @@ pub fn eval_seconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsSub))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsSub)
 }
 
 pub fn eval_minutes_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -77,8 +81,8 @@ pub fn eval_minutes_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesAdd))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesAdd)
 }
 
 pub fn eval_minutes_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -86,8 +90,8 @@ pub fn eval_minutes_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesSub))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesSub)
 }
 
 pub fn eval_hours_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -95,8 +99,8 @@ pub fn eval_hours_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursAdd))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursAdd)
 }
 
 pub fn eval_hours_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -104,8 +108,8 @@ pub fn eval_hours_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursSub))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursSub)
 }
 
 pub fn eval_milliseconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -113,14 +117,14 @@ pub fn eval_milliseconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MillisecondsAdd,
-    ))?)
+    )
 }
 
 pub fn eval_milliseconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -128,14 +132,14 @@ pub fn eval_milliseconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MillisecondsSub,
-    ))?)
+    )
 }
 
 pub fn eval_microseconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -143,14 +147,14 @@ pub fn eval_microseconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MicrosecondsAdd,
-    ))?)
+    )
 }
 
 pub fn eval_microseconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -158,12 +162,12 @@ pub fn eval_microseconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_add_duration(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MicrosecondsSub,
-    ))?)
+    )
 }

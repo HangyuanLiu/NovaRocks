@@ -41,7 +41,7 @@ impl Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, _phase: CompilePhase, _units: u32) -> Result<(), CompileControlError> {
         let ordinal = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some((stop, error)) = self.stop
+        if let Some((stop, error)) = self.stop.clone()
             && ordinal == stop
         {
             return Err(error);
@@ -533,7 +533,7 @@ fn observer_control_refusals_and_retained_child_last_exit() {
         for stop in 2..checkpoints {
             let control = Control {
                 calls: AtomicUsize::new(0),
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             let error = decode_execution_type_table_observed(

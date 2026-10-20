@@ -39,7 +39,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -1204,13 +1204,16 @@ fn aggregate_extrema_compile_every_actual_callback_success_and_ordinary_refusal(
             ] {
                 let ctrl = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 let out = action(&ctrl);
-                assert!(
-                    matches!(out,Err(FunctionSpecializationFailure::Control(actual)) if actual==cause)
-                        || matches!(out,Err(FunctionSpecializationFailure::Kernel(ref actual)) if matches!((cause,actual),(CompileControlError::Cancelled,KernelFailure::Cancelled)|(CompileControlError::DeadlineExceeded,KernelFailure::DeadlineExceeded)|(CompileControlError::ResourceExhausted,KernelFailure::ResourceExhausted)))
-                );
+                match &out {
+                    Err(FunctionSpecializationFailure::Control(actual))
+                    | Err(FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(
+                        actual,
+                    ))) => assert_eq!(actual, &cause),
+                    other => panic!("original compile control source changed: {other:?}"),
+                }
                 assert_eq!(*ctrl.trace.lock().unwrap(), trace[..=stop]);
             }
         }

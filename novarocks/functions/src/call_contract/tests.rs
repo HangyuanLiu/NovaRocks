@@ -251,19 +251,26 @@ impl PureCompileControl for Observe {
             Stop::ProjectionWork => entries == 2 && units > 0,
             Stop::Quantum => units == MAX_UNOBSERVED_COMPILE_WORK,
         };
-        if stop { Err(self.failure) } else { Ok(()) }
+        if stop {
+            Err(self.failure.clone())
+        } else {
+            Ok(())
+        }
     }
 }
 fn failures() -> [(CompileControlError, KernelFailure); 3] {
     [
-        (CompileControlError::Cancelled, KernelFailure::Cancelled),
+        (
+            CompileControlError::Cancelled,
+            KernelFailure::CompileControl(CompileControlError::Cancelled),
+        ),
         (
             CompileControlError::DeadlineExceeded,
-            KernelFailure::DeadlineExceeded,
+            KernelFailure::CompileControl(CompileControlError::DeadlineExceeded),
         ),
         (
             CompileControlError::ResourceExhausted,
-            KernelFailure::ResourceExhausted,
+            KernelFailure::CompileControl(CompileControlError::ResourceExhausted),
         ),
     ]
 }
@@ -319,7 +326,7 @@ fn constructor_and_projection_entries_preserve_all_typed_control_failures() {
     let receipt = refine_call_effects(&fixture, input, &Allow).unwrap();
     for (failure, expected) in failures() {
         for entry in [1, 2] {
-            let observer = Observe::new(Stop::Entry(entry), failure);
+            let observer = Observe::new(Stop::Entry(entry), failure.clone());
             assert_eq!(
                 FunctionCallContract::from_refined(
                     input,

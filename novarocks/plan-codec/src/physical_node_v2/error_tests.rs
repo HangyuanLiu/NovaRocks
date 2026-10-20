@@ -37,29 +37,29 @@ fn dependency_refusals_preserve_the_first_cause_without_an_enclosing_tail() {
         CompileControlError::ResourceExhausted,
     ] {
         for error in [
-            NodeCodecError::from(ExpressionCodecError::Control(cause)),
-            NodeCodecError::from(BindingCodecError::Control(cause)),
-            NodeCodecError::from(TypeCodecError::Control(cause)),
+            NodeCodecError::from(ExpressionCodecError::Control(cause.clone())),
+            NodeCodecError::from(BindingCodecError::Control(cause.clone())),
+            NodeCodecError::from(TypeCodecError::Control(cause.clone())),
             NodeCodecError::from(
                 crate::physical_writer_schema_v2::WriterSchemaCodecError::Type(
-                    TypeCodecError::Control(cause),
+                    TypeCodecError::Control(cause.clone()),
                 ),
             ),
             NodeCodecError::from(
                 crate::physical_writer_schema_v2::WriterSchemaCodecError::Resources(
-                    NodeCodecError::Control(cause),
+                    NodeCodecError::Control(cause.clone()),
                 ),
             ),
-            NodeCodecError::from(RelationCodecError::Control(cause)),
-            NodeCodecError::from(ConnectorPayloadCodecError::Control(cause)),
+            NodeCodecError::from(RelationCodecError::Control(cause.clone())),
+            NodeCodecError::from(ConnectorPayloadCodecError::Control(cause.clone())),
             NodeCodecError::from(RelationCodecError::from(
                 crate::physical_provider_read_v2::ProviderReadCodecError::from(
-                    ConnectorPayloadCodecError::Control(cause),
+                    ConnectorPayloadCodecError::Control(cause.clone()),
                 ),
             )),
-            NodeCodecError::from(p::ConstantReferenceError::Control(cause)),
+            NodeCodecError::from(p::ConstantReferenceError::Control(cause.clone())),
             NodeCodecError::from(p::ConstantReferenceError::Constant(ConstantError::Control(
-                cause,
+                cause.clone(),
             ))),
         ] {
             let control = Control(Mutex::new(Vec::new()));
@@ -154,7 +154,7 @@ fn complete_numeric_model_rejects_all_known_axes_before_pending_quantum() {
             if trace.len() == 1 {
                 Ok(())
             } else {
-                Err(self.cause)
+                Err(self.cause.clone())
             }
         }
     }
@@ -191,7 +191,7 @@ fn complete_numeric_model_rejects_all_known_axes_before_pending_quantum() {
         for axis in 0..12 {
             let control = LateControl {
                 trace: Mutex::new(Vec::new()),
-                cause,
+                cause: cause.clone(),
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             for _ in 0..255 {

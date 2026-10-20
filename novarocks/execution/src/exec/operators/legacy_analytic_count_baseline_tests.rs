@@ -66,7 +66,7 @@ fn legacy_analytic_count_original_frame_errors_stay_whole_and_exact() {
         frames_by_partition: vec![],
     };
     assert_eq!(
-        compute_count(&[], &ctx, 1).unwrap_err(),
+        (compute_count(&[], &ctx, 1).unwrap_err()).to_string(),
         "window partition index out of range: 0"
     );
 }

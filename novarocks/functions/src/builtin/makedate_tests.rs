@@ -77,7 +77,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -573,7 +573,7 @@ fn makedate_null_inactive_empty_and_required_errors_preserve_protocol() {
         let mut kernel = instance(&[source(true), source(true)]);
         assert!(matches!(
             kernel.evaluate(Selection::all(1), &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let good = [
             EvaluatedArgument::Column(&year),
@@ -604,7 +604,7 @@ fn makedate_null_inactive_empty_and_required_errors_preserve_protocol() {
                 &args,
                 &Control::default()
             ),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
 }
@@ -638,7 +638,7 @@ fn makedate_every_compile_callback_preserves_three_original_causes_and_ordinary_
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared_for_test_with_control(
                     "makedate",

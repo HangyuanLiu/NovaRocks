@@ -110,20 +110,27 @@ pub fn check_root_result_reply(raw: &[u8]) -> Result<(), ResourcePreflightError>
     let mut body_bytes = 0usize;
     let mut data_objects = 0usize;
     finish(for_fields(raw, |field, value| {
-        if field == 9
-            && let Value::Bytes(data) = value
+        if field == 4
+            && let Value::Bytes(receipt) = value
         {
-            checked_increment(&mut data_objects, 1, "root reply repeats Data objects")?;
-            for_fields(data, |field, value| {
-                if field == 2
-                    && let Value::Bytes(body) = value
+            for_fields(receipt, |field, value| {
+                if field == 6
+                    && let Value::Bytes(data) = value
                 {
-                    body_bytes = body_bytes
-                        .checked_add(body.len())
-                        .ok_or_else(|| limit("root body size overflow"))?;
-                    if body_bytes > RootProfileV1::SEGMENT_BYTES {
-                        return Err(limit("root reply body exceeds segment"));
-                    }
+                    checked_increment(&mut data_objects, 1, "root reply repeats Data objects")?;
+                    for_fields(data, |field, value| {
+                        if field == 2
+                            && let Value::Bytes(body) = value
+                        {
+                            body_bytes = body_bytes
+                                .checked_add(body.len())
+                                .ok_or_else(|| limit("root body size overflow"))?;
+                            if body_bytes > RootProfileV1::SEGMENT_BYTES {
+                                return Err(limit("root reply body exceeds segment"));
+                            }
+                        }
+                        Ok(())
+                    })?;
                 }
                 Ok(())
             })?;
@@ -1258,8 +1265,11 @@ mod root_preflight_tests {
             end_after_data: None,
         };
         let response = novarocks::FetchRootResultResponse {
-            outcome: Some(novarocks::fetch_root_result_response::Outcome::Data(
-                data.clone(),
+            result: Some(novarocks::fetch_root_result_response::Result::Reply(
+                novarocks::RootReadReceipt {
+                    outcome: Some(novarocks::root_read_receipt::Outcome::Data(data.clone())),
+                    ..Default::default()
+                },
             )),
             ..Default::default()
         };
@@ -1267,7 +1277,12 @@ mod root_preflight_tests {
         let mut large = data;
         large.body = vec![0; RootProfileV1::SEGMENT_BYTES + 1].into();
         let response = novarocks::FetchRootResultResponse {
-            outcome: Some(novarocks::fetch_root_result_response::Outcome::Data(large)),
+            result: Some(novarocks::fetch_root_result_response::Result::Reply(
+                novarocks::RootReadReceipt {
+                    outcome: Some(novarocks::root_read_receipt::Outcome::Data(large)),
+                    ..Default::default()
+                },
+            )),
             ..Default::default()
         };
         assert!(check_root_result_reply(&response.encode_to_vec()).is_err());
@@ -1279,8 +1294,10 @@ mod root_preflight_tests {
     #[test]
     fn repeated_singular_data_and_schema_columns_are_bounded_before_prost() {
         let mut repeated = Vec::new();
-        bytes_field(&mut repeated, 9, &[]);
-        bytes_field(&mut repeated, 9, &[]);
+        let mut receipt = Vec::new();
+        bytes_field(&mut receipt, 6, &[]);
+        bytes_field(&mut repeated, 4, &receipt);
+        bytes_field(&mut repeated, 4, &receipt);
         assert!(check_root_result_reply(&repeated).is_err());
         let mut columns = Vec::new();
         for _ in 0..RootProfileV1::MAX_COLUMNS {

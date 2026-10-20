@@ -91,7 +91,7 @@ impl std::error::Error for BindingCodecError {
         match self {
             Self::Control(error) => Some(error),
             Self::Type(error) => Some(error),
-            Self::Resource(_) => None,
+            Self::Resource(source) => Some(source),
             Self::InvalidShape(_) => None,
         }
     }
@@ -331,7 +331,7 @@ pub fn encode_function_bindings<'loan, 'source>(
         &mut work,
     );
     if let Err(BindingCodecError::Control(cause)) = &result {
-        return Err(BindingCodecError::Control(*cause));
+        return Err(BindingCodecError::Control(cause.clone()));
     }
     work.finish()?;
     let (definitions, facts) = result?;

@@ -179,13 +179,15 @@ fn compiled_ordered_page_source_first_whole_charge_refusal_precedes_live_queries
     assert!(original.upgrade().is_none());
     assert_eq!(source.source.claims.load(Ordering::SeqCst), 1);
     assert_eq!(source.source.pages.consumed.load(Ordering::SeqCst), 0);
-    source.operator.close().unwrap();
+    source.operator.retire_data().unwrap();
+    source.poll_exit();
     assert!(stop_observed.load(Ordering::SeqCst));
     assert!(matches!(
         source.operator.pending_finish(),
         Some(FinishWatch::Notify(_))
     ));
-    ticket.end(Ok(()));
+    ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+    source.poll_exit();
     assert!(source.operator.pending_finish().is_none());
     source.finish();
 }

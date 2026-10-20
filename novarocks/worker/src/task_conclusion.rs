@@ -1,0 +1,181 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Task conclusion storage owned by the status transaction, never another lock.
+//! Projection and foreign diagnostic work happen before entering that lock.
+//! A losing candidate is returned so its source is dropped after unlocking.
+
+use crate::failure_reason::WorkerFailureReason;
+use crate::task_diagnostics::TaskSecondaryDiagnostic;
+use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_execution_contract::{
+    AcceptedConclusion, AcceptedTaskConclusion, ConclusionAcceptance, ConclusionDecision,
+    TaskConclusion, TaskConclusionProposal, TaskFailure, TaskIdentity, TerminationDetail,
+    decide_conclusion, decide_reported_failure,
+    failure::{FailureClass, FailureEvidence, FailureFact, FailureProjection},
+};
+use std::{num::NonZeroU64, sync::Arc};
+
+#[derive(Debug)]
+struct UnownedStopReport(ExecutionFailure);
+impl std::fmt::Display for UnownedStopReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Task failure reporting received a stop observation without an accepted cause")
+    }
+}
+impl std::error::Error for UnownedStopReport {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl FailureProjection for UnownedStopReport {
+    fn failure_fact(&self) -> FailureFact {
+        FailureFact::new(
+            FailureClass::Unexpected,
+            WorkerFailureReason::UnownedStopReport.reason(),
+        )
+    }
+}
+
+/// An owned local proposal with its boundary projection already evaluated.
+/// Only the accepting transaction may install it as the Task's receipt.
+pub(crate) struct PreparedTaskConclusion {
+    conclusion: TaskConclusion,
+    origin: Option<ExecutionFailure>,
+    reported_evidence: Option<FailureEvidence>,
+    late_diagnostic: Option<Arc<TaskSecondaryDiagnostic>>,
+}
+impl PreparedTaskConclusion {
+    pub(crate) fn new(proposal: TaskConclusionProposal<ExecutionFailure>) -> Self {
+        let mut reported_evidence = None;
+        let mut late_diagnostic = None;
+        let (conclusion, origin) = match proposal {
+            TaskConclusionProposal::Succeeded => (TaskConclusion::Succeeded, None),
+            TaskConclusionProposal::Canceled(reason) => (
+                TaskConclusion::Terminated(TerminationDetail::Canceled(reason)),
+                None,
+            ),
+            TaskConclusionProposal::Aborted(cause) => (
+                TaskConclusion::Terminated(TerminationDetail::Aborted(cause)),
+                None,
+            ),
+            TaskConclusionProposal::Failed { cause, phase } => {
+                let fact = cause.failure_fact();
+                let evidence = fact.evidence();
+                reported_evidence = Some(evidence);
+                if evidence == FailureEvidence::Originating {
+                    late_diagnostic =
+                        Some(TaskSecondaryDiagnostic::late_failure(&cause, phase, fact));
+                }
+                // If another cause has already won this prepared candidate
+                // loses. Otherwise it describes the reporting contract breach,
+                // preserving the actual observation rather than inventing a
+                // normal cancellation or refining a peer placeholder.
+                let (cause, fact) = if evidence == FailureEvidence::StopObservation {
+                    let cause = ExecutionFailure::from_domain(UnownedStopReport(cause));
+                    let fact = cause.failure_fact();
+                    (cause, fact)
+                } else {
+                    (cause, fact)
+                };
+                (
+                    TaskConclusion::Terminated(TerminationDetail::Failed(
+                        TaskFailure::new_in_phase(fact, cause.safe_detail_for_fact(fact), phase),
+                    )),
+                    Some(cause),
+                )
+            }
+        };
+        Self {
+            conclusion,
+            origin,
+            reported_evidence,
+            late_diagnostic,
+        }
+    }
+    pub(crate) fn conclusion(&self) -> &TaskConclusion {
+        &self.conclusion
+    }
+    pub(crate) fn late_diagnostic_mut(&mut self) -> &mut Option<Arc<TaskSecondaryDiagnostic>> {
+        &mut self.late_diagnostic
+    }
+}
+
+/// This member has no mutex or notifications. TaskStatusOwner's transaction
+/// serializes it together with the immutable lifecycle/status projection.
+#[derive(Debug, Default)]
+pub(crate) struct TaskConclusionState {
+    accepted: Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>>,
+}
+impl TaskConclusionState {
+    pub(crate) fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
+        self.accepted.clone()
+    }
+    pub(crate) fn current(&self) -> Option<&TaskConclusion> {
+        self.accepted.as_ref().map(|r| r.neutral().conclusion())
+    }
+    pub(crate) fn generation(&self) -> Option<NonZeroU64> {
+        self.accepted.as_ref().map(|r| r.neutral().generation())
+    }
+    pub(crate) fn accept(
+        &mut self,
+        identity: TaskIdentity,
+        candidate: PreparedTaskConclusion,
+        sealed: bool,
+    ) -> (
+        ConclusionAcceptance<ExecutionFailure>,
+        Option<PreparedTaskConclusion>,
+    ) {
+        let decision = if sealed {
+            assert!(
+                self.accepted.is_some(),
+                "terminal Task has its accepted receipt"
+            );
+            ConclusionDecision::Keep
+        } else if let Some(evidence) = candidate.reported_evidence {
+            decide_reported_failure(self.current(), &candidate.conclusion, evidence)
+        } else {
+            decide_conclusion(self.current(), &candidate.conclusion)
+        };
+        if decision == ConclusionDecision::Keep {
+            return (
+                ConclusionAcceptance {
+                    decision,
+                    accepted: self.accepted().expect("kept Task conclusion exists"),
+                },
+                Some(candidate),
+            );
+        }
+        let generation = self.generation().map_or(NonZeroU64::MIN, |g| {
+            NonZeroU64::new(
+                g.get()
+                    .checked_add(1)
+                    .expect("Task conclusion generation fits u64"),
+            )
+            .expect("Task conclusion generation remains nonzero")
+        });
+        let accepted = Arc::new(
+            AcceptedTaskConclusion::new(
+                AcceptedConclusion::new(identity, generation, candidate.conclusion),
+                candidate.origin,
+            )
+            .expect("prepared Task receipt keeps its originating source"),
+        );
+        self.accepted = Some(Arc::clone(&accepted));
+        (ConclusionAcceptance { decision, accepted }, None)
+    }
+}

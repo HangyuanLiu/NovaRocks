@@ -48,7 +48,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -327,7 +327,12 @@ fn check(
         .collect::<Vec<_>>();
     let actual = run_window(window, values, frames);
     match expected.iter().find_map(|value| value.as_ref().err()) {
-        Some(error) => assert_eq!(actual.as_ref().unwrap_err(), error, "{frames:?}"),
+        Some(error) => {
+            use novarocks_failure_contract::FailureProjection;
+            let actual = actual.as_ref().unwrap_err();
+            assert_eq!(actual.failure_fact(), error.failure_fact(), "{frames:?}");
+            assert_eq!(actual.to_string(), error.to_string(), "{frames:?}");
+        }
         None => {
             let actual = actual.as_ref().unwrap();
             assert_eq!(actual.len(), frames.len());
@@ -585,17 +590,40 @@ fn sum_min_max_over_any_frame_equal_the_plain_aggregate_of_that_frame() {
     assert!(!outcomes.contains_key(&("min", "largeint", false)));
 }
 
+fn assert_same_numeric_failure(actual: KernelFailure, expected: &KernelFailure) {
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    assert_eq!(
+        actual.failure_fact(),
+        DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    assert_eq!(actual.failure_fact(), expected.failure_fact());
+    assert_eq!(actual.to_string(), expected.to_string());
+    let mut source = actual.source();
+    let mut conversion = false;
+    while let Some(error) = source {
+        conversion |= error.is::<std::num::TryFromIntError>();
+        source = error.source();
+    }
+    assert!(conversion);
+}
+
 #[test]
 fn sum_overflow_fails_only_a_frame_whose_own_result_overflows() {
     let values = int64s(&[Some(i64::MAX), Some(1), Some(-1)]);
     let fixture = Fixture::new("sum", nullable(&values), DecimalOverflowPolicy::ReportError);
     let window = fixture.window();
-    let overflow = KernelFailure::Operational(KernelDiagnostic::new("sum result overflows BIGINT"));
+    let overflow = oracle(
+        &fixture.aggregate(),
+        &values,
+        WindowRowRange { start: 0, end: 2 },
+    )
+    .unwrap_err();
     // The running frame [0, 2) holds MAX + 1.
     let running = ranges(&[(0, 1), (0, 2), (0, 3)]);
-    assert_eq!(
+    assert_same_numeric_failure(
         check(&fixture, &window, &values, &running).unwrap_err(),
-        overflow
+        &overflow,
     );
     // The same exact running state passes MAX + 1 between two frames; no
     // frame ends there, so nothing overflows.
@@ -610,11 +638,11 @@ fn sum_overflow_fails_only_a_frame_whose_own_result_overflows() {
     // The overflow is required partition work, not an output-demand effect.
     let arguments = [EvaluatedArgument::Column(&values)];
     let peers = whole(3);
-    assert_eq!(
+    assert_same_numeric_failure(
         begin(&window, &arguments, &peers, &running, &Control::default())
             .map(|_| ())
             .unwrap_err(),
-        overflow
+        &overflow,
     );
 
     // DECIMAL follows the frozen policy for that frame alone.
@@ -628,10 +656,13 @@ fn sum_overflow_fails_only_a_frame_whose_own_result_overflows() {
             .unwrap()
     );
     let fixture = Fixture::new("sum", nullable(&values), DecimalOverflowPolicy::ReportError);
+    let actual = check(&fixture, &fixture.window(), &values, &running).unwrap_err();
+    use novarocks_failure_contract::FailureProjection;
     assert_eq!(
-        check(&fixture, &fixture.window(), &values, &running).unwrap_err(),
-        KernelFailure::Operational(KernelDiagnostic::new("sum result overflows DECIMAL(38)"))
+        actual.failure_fact(),
+        DataFailureReason::NumericOutOfRange.failure_fact()
     );
+    assert_eq!(actual.to_string(), "sum result overflows DECIMAL(38)");
 }
 
 #[test]
@@ -780,10 +811,11 @@ fn every_preparation_callback_keeps_the_original_compile_cause() {
                 CompileControlError::Cancelled,
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
+                CompileControlError::from_domain(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
             ] {
                 let control = CompileControl {
                     trace: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     compile_cause(

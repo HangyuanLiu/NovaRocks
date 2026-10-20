@@ -50,7 +50,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after originating refusal");
         }
         trace.push(units);
-        if let Some((stop, cause)) = self.stop
+        if let Some((stop, cause)) = self.stop.clone()
             && at == stop
         {
             return Err(cause);
@@ -118,7 +118,7 @@ fn assert_prefixes(input: &ConnectorWriteInputRef<'_>) {
     for stop in 0..baseline.len() {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
                 ..Default::default()
             };
             assert!(

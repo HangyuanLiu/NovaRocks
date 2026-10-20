@@ -32,7 +32,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         let mut events = self.events.lock().unwrap();
         events.push((phase, units));
-        if let Some((at, error)) = self.fail
+        if let Some((at, error)) = self.fail.clone()
             && at == events.len()
         {
             return Err(error);
@@ -865,7 +865,7 @@ fn original_control_covers_real_wide_type_work_entry_256_tail_and_final_publicat
     ] {
         for at in 1..=encode_trace.len() {
             let stop = Control {
-                fail: Some((at, error)),
+                fail: Some((at, error.clone())),
                 events: Mutex::default(),
             };
             assert!(
@@ -875,7 +875,7 @@ fn original_control_covers_real_wide_type_work_entry_256_tail_and_final_publicat
         }
         for at in 1..=decode_trace.len() {
             let stop = Control {
-                fail: Some((at, error)),
+                fail: Some((at, error.clone())),
                 events: Mutex::default(),
             };
             assert!(
@@ -906,7 +906,7 @@ fn malformed_tail_still_observes_original_control_without_publishing_a_prefix() 
     ] {
         for at in 1..=trace.len() {
             let stop = Control {
-                fail: Some((at, error)),
+                fail: Some((at, error.clone())),
                 events: Mutex::default(),
             };
             assert!(
@@ -934,7 +934,7 @@ fn malformed_tail_still_observes_original_control_without_publishing_a_prefix() 
     ] {
         for at in 1..=trace.len() {
             let stop = Control {
-                fail: Some((at, error)),
+                fail: Some((at, error.clone())),
                 events: Mutex::default(),
             };
             assert!(
@@ -1134,7 +1134,7 @@ fn composing_value_clone_observes_each_original_dictionary_request_boundary() {
     ] {
         for at in 1..=expected.len() {
             let control = Control {
-                fail: Some((at, cause)),
+                fail: Some((at, cause.clone())),
                 events: Mutex::default(),
             };
             assert!(matches!(run(&control), Err(TypeCodecError::Control(got)) if got==cause));
@@ -1180,7 +1180,7 @@ fn schema_field_lookup_preserves_every_actual_opaque_boundary_control_cause() {
     ] {
         for at in [2, 3] {
             let control = Control {
-                fail: Some((at, cause)),
+                fail: Some((at, cause.clone())),
                 ..Default::default()
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -1261,7 +1261,7 @@ fn captured_root_known_refusal_precedes_matched_completed_quantum() {
         CompileControlError::ResourceExhausted,
     ] {
         let control = Control {
-            fail: Some((2, cause)),
+            fail: Some((2, cause.clone())),
             ..Control::default()
         };
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
@@ -1288,7 +1288,7 @@ fn captured_root_known_refusal_precedes_matched_completed_quantum() {
             [(CompilePhase::LowerProgram, 0)]
         );
         let control = Control {
-            fail: Some((2, cause)),
+            fail: Some((2, cause.clone())),
             ..Control::default()
         };
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();

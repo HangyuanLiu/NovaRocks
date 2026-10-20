@@ -221,7 +221,7 @@ mod tests {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut events = self.events.lock().unwrap();
             events.push(units);
-            if let Some((at, error)) = self.fail
+            if let Some((at, error)) = self.fail.clone()
                 && at == events.len()
             {
                 return Err(error);
@@ -450,7 +450,7 @@ mod tests {
             ] {
                 for at in 1..=trace.len() {
                     let stop = Control {
-                        fail: Some((at, error)),
+                        fail: Some((at, error.clone())),
                         events: Mutex::default(),
                     };
                     assert!(matches!(run(&stop),Err(E::Control(actual)) if actual==error));
@@ -558,12 +558,12 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let stop = Control {
-                fail: Some((1, error)),
+                fail: Some((1, error.clone())),
                 events: Mutex::default(),
             };
             assert!(matches!(skip_all(&raw,0,&stop),Err(E::Control(actual)) if actual==error));
             let stop = Control {
-                fail: Some((2, error)),
+                fail: Some((2, error.clone())),
                 events: Mutex::default(),
             };
             assert!(

@@ -355,12 +355,7 @@ impl Md5sumOwner {
             // a static pure implementation and needs no live resolver or authority.
             Ok(Arc::new(PreparedMd5sum { contract }) as Arc<dyn PreparedScalarKernel>)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish().map_err(compile_failure)?;

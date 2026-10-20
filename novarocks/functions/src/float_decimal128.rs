@@ -17,6 +17,7 @@
 
 //! Original actual Types Float64/Float32 -> Decimal128 value and array author.
 //! Preserve relaxed precision, signed-abs and i8-negation bugs; no cast policy is inferred here.
+use crate::decimal128_rescale::DecimalCastFailure;
 use arrow_array::{ArrayRef, Decimal128Array};
 use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,8 +120,8 @@ pub fn evaluate_legacy(
     mut value_at: impl FnMut(usize) -> Option<f64>,
     precision: u8,
     scale: i8,
-) -> Result<ArrayRef, String> {
-    let factors = Factors::try_new(precision, scale).map_err(|e| e.to_string())?;
+) -> Result<ArrayRef, DecimalCastFailure> {
+    let factors = Factors::try_new(precision, scale).map_err(DecimalCastFailure::FloatFactor)?;
     let mut values: Vec<Option<i128>> = Vec::with_capacity(len);
     for row in 0..len {
         let Some(v) = value_at(row) else {
@@ -131,6 +132,8 @@ pub fn evaluate_legacy(
     }
     let wide = Decimal128Array::from(values)
         .with_precision_and_scale(38, scale)
-        .map_err(|e| e.to_string())?;
+        .map_err(DecimalCastFailure::Arrow)?;
     crate::decimal128_rescale::retag_legacy(&wide, precision, scale)
 }
+
+impl std::error::Error for FactorFailure {}

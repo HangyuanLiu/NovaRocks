@@ -163,34 +163,22 @@ fn decimal_text_oracle_slice_empty_and_unselected_min_preserve_v1_visitation() {
     }
 }
 #[test]
-fn decimal_text_oracle_original_decimal128_min_panic_or_wrapping_is_not_row_error_translation() {
+fn decimal_text_oracle_decimal128_minimum_formats_without_profile_dependent_overflow() {
     let input = raw(false, 38, 2, vec![Some(i128::MIN)]);
     let r = recipe(&input, DecimalOverflowPolicy::OutputNull, false);
-    let old = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cast_with_special_rules(&input, &DataType::Utf8).unwrap()
-    }));
-    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let expected = "-1701411834604692317316873037158841057.28";
+    let old = cast_with_special_rules(&input, &DataType::Utf8).unwrap();
+    assert_eq!(
+        old.as_any().downcast_ref::<StringArray>().unwrap().value(0),
+        expected
+    );
+    assert_eq!(
         r.evaluate_row(EvaluatedArgument::Column(&input), 0, 0, &Control)
-            .unwrap()
-    }));
-    if cfg!(debug_assertions) {
-        assert!(old.is_err());
-        assert!(prepared.is_err());
-    } else {
-        assert_eq!(
-            old.unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "--1701411834604692317316873037158841057.28"
-        );
-        assert_eq!(
-            prepared.unwrap(),
-            CastRowResult::Text("--1701411834604692317316873037158841057.28".into())
-        );
-    }
+            .unwrap(),
+        CastRowResult::Text(expected.into())
+    );
 }
+
 #[test]
 fn decimal_text_oracle_original_full_width_decimal256_min_double_sign() {
     let minimum = i256::from_string(

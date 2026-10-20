@@ -56,7 +56,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -479,7 +479,7 @@ fn installed_compile_success_and_unsupported_exclusion_preserve_every_original_c
                 ] {
                     let control = CompileControl {
                         trace: Mutex::default(),
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                     };
                     assert_eq!(
                         compile_cause(fixture.prepare(options, &control).unwrap_err()),

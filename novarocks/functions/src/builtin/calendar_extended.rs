@@ -18,6 +18,7 @@
 //! Selected calendar truncation, duration differences and timestamp projection.
 //! These bodies preserve the original date helper algorithms and invalid-value NULLs.
 
+use super::calendar_timestamp::timestamp_value;
 use crate::{
     FunctionArgumentType, FunctionValueType, KernelEvaluationControl, KernelFailure, RowDataError,
     ScalarCallInput, SelectedValues,
@@ -61,6 +62,9 @@ pub(super) enum CalendarCarrierError<'a> {
     Downcast(&'static str),
 }
 impl CalendarCarrierError<'_> {
+    pub(super) fn into_kernel(self) -> KernelFailure {
+        super::calendar_parts_failure::carrier(self)
+    }
     pub(super) fn legacy_message(self) -> String {
         match self {
             Self::UnsupportedDatetime(data_type) => {
@@ -107,20 +111,20 @@ impl<'a> DateInput<'a> {
         }
         .ok_or_else(|| internal("extended calendar selected source cannot be downcast"))
     }
-    pub(super) fn for_input(
+    pub(super) fn for_input<E>(
         source: &FunctionValueType,
         array: &'a dyn Array,
-        input: super::calendar_extended_shared::CalendarInput<'_, '_>,
+        input: super::calendar_extended_shared::CalendarInput<'_, '_, E>,
     ) -> Result<Self, KernelFailure> {
         if !input.legacy {
             return Self::checked(source, array);
         }
         Self::raw(array).map_err(|error| input.carrier_error(error))
     }
-    pub(super) fn date_for_input(
+    pub(super) fn date_for_input<E>(
         source: &FunctionValueType,
         array: &'a dyn Array,
-        input: super::calendar_extended_shared::CalendarInput<'_, '_>,
+        input: super::calendar_extended_shared::CalendarInput<'_, '_, E>,
     ) -> Result<Self, KernelFailure> {
         if input.legacy
             && !matches!(
@@ -325,35 +329,6 @@ fn truncate(dt: NaiveDateTime, unit: TruncUnit) -> NaiveDateTime {
             .unwrap(),
     }
 }
-pub(super) fn timestamp_value_for_type(
-    dt: NaiveDateTime,
-    output_type: &DataType,
-) -> Result<i64, String> {
-    if !(0..=9999).contains(&dt.year()) {
-        return Err("timestamp out of StarRocks DATETIME year range".to_string());
-    }
-    let micros = dt.and_utc().timestamp_micros();
-    let julian = 2_440_588_i64
-        .checked_add(micros.div_euclid(86_400_000_000))
-        .ok_or_else(|| "timestamp out of StarRocks DATETIME encoding range".to_string())?;
-    if julian < 0 {
-        return Err("timestamp out of StarRocks DATETIME encoding range".to_string());
-    }
-    let packed = ((julian as u64) << 40) | micros.rem_euclid(86_400_000_000) as u64;
-    if i64::try_from(packed).is_err() {
-        return Err("timestamp out of StarRocks DATETIME encoding range".to_string());
-    }
-    match output_type {
-        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(micros),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(dt.and_utc().timestamp_millis()),
-        DataType::Timestamp(TimeUnit::Second, _) => Ok(dt.and_utc().timestamp()),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => dt
-            .and_utc()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| "timestamp out of range".to_string()),
-        _ => Err("expected timestamp output type".to_string()),
-    }
-}
 
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     let values = Layout::array::<Option<i64>>(rows)
@@ -369,34 +344,40 @@ fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 
-pub(super) fn evaluate_calendar_input<'a>(
+pub(super) fn evaluate_calendar_input<'a, E>(
     op: CalendarExtendedOp,
-    input: super::calendar_extended_shared::CalendarInput<'_, 'a>,
+    input: super::calendar_extended_shared::CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
+) -> Result<SelectedValues<'a>, super::calendar_extended_shared::CalendarFailure<E>> {
     if op == CalendarExtendedOp::TimestampDiff {
         return super::calendar_extended_timestampdiff::evaluate_timestampdiff(input, control);
     }
     if let CalendarExtendedOp::DaysShift(factor) = op {
-        return super::calendar_add::evaluate_day_shift(factor, input, control);
+        return super::calendar_add::evaluate_day_shift(factor, input, control)
+            .map_err(super::calendar_extended_shared::CalendarFailure::Outer);
     }
     if let CalendarExtendedOp::MonthsShift(factor) = op {
-        return super::calendar_month::evaluate_month_shift(factor, input, control);
+        return super::calendar_month::evaluate_month_shift(factor, input, control)
+            .map_err(super::calendar_extended_shared::CalendarFailure::Outer);
     }
     if let CalendarExtendedOp::DurationShift(operation) = op {
-        return super::calendar_duration::evaluate_duration_shift(operation, input, control);
+        return super::calendar_duration::evaluate_duration_shift(operation, input, control)
+            .map_err(super::calendar_extended_shared::CalendarFailure::Outer);
     }
     if op == CalendarExtendedOp::EpochNtz {
-        return super::calendar_epoch_ntz::evaluate_epoch_ntz(input, control);
+        return super::calendar_epoch_ntz::evaluate_epoch_ntz(input, control)
+            .map_err(super::calendar_extended_shared::CalendarFailure::Outer);
     }
     if op == CalendarExtendedOp::ConvertTz {
-        return super::calendar_convert_tz::evaluate_convert_tz(input, control);
+        return super::calendar_convert_tz::evaluate_convert_tz(input, control)
+            .map_err(super::calendar_extended_shared::CalendarFailure::Outer);
     }
     if let CalendarExtendedOp::Parse(operation) = op {
         return super::calendar_extended_parse::evaluate_calendar_parse(operation, input, control);
     }
     if op == CalendarExtendedOp::DateFormat {
-        return super::calendar_extended_format::evaluate_date_format(input, control);
+        return super::calendar_extended_format::evaluate_date_format(input, control)
+            .map_err(super::calendar_extended_shared::CalendarFailure::Outer);
     }
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
@@ -405,9 +386,7 @@ pub(super) fn evaluate_calendar_input<'a>(
         let types = input.types;
         let target = input.target;
         if target.logical_type() != ValueLogicalType::Physical || !target.nullable() {
-            return Err(invalid(
-                "extended calendar requires its nullable Physical result",
-            ));
+            return Err(invalid("extended calendar requires its nullable Physical result").into());
         }
         let arity = if matches!(
             op,
@@ -418,9 +397,9 @@ pub(super) fn evaluate_calendar_input<'a>(
             2
         };
         if arguments.len() != arity || types.len() != arity {
-            return Err(invalid(
-                "extended calendar requires its exact value argument count",
-            ));
+            return Err(
+                invalid("extended calendar requires its exact value argument count").into(),
+            );
         }
         let mut sources = Vec::new();
         sources
@@ -428,14 +407,12 @@ pub(super) fn evaluate_calendar_input<'a>(
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         for (ty, arg) in types.iter().zip(arguments) {
             let FunctionArgumentType::Value(ty) = ty else {
-                return Err(invalid("extended calendar requires exact value arguments"));
+                return Err(invalid("extended calendar requires exact value arguments").into());
             };
             if ty.logical_type() != ValueLogicalType::Physical
                 || ty.data_type() != arg.array().data_type()
             {
-                return Err(invalid(
-                    "extended calendar selected argument carrier mismatch",
-                ));
+                return Err(invalid("extended calendar selected argument carrier mismatch").into());
             }
             sources.push(ty);
             work.step()?;
@@ -458,7 +435,8 @@ pub(super) fn evaluate_calendar_input<'a>(
             {
                 return Err(invalid(
                     "calendar difference requires homogeneous sources and Int64 result",
-                ));
+                )
+                .into());
             }
             Some(DateInput::for_input(
                 sources[1],
@@ -480,9 +458,9 @@ pub(super) fn evaluate_calendar_input<'a>(
                 DataType::Timestamp(TimeUnit::Microsecond, None)
             };
             if !input.legacy && *target.data_type() != expected {
-                return Err(invalid(
-                    "date_trunc result differs from its exact source profile",
-                ));
+                return Err(
+                    invalid("date_trunc result differs from its exact source profile").into(),
+                );
             }
             Some(units)
         } else {
@@ -492,12 +470,12 @@ pub(super) fn evaluate_calendar_input<'a>(
             && !input.legacy
             && target.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None)
         {
-            return Err(invalid("timestamp requires microsecond output"));
+            return Err(invalid("timestamp requires microsecond output").into());
         }
         if op == CalendarExtendedOp::UnixTimestamp && target.data_type() != &DataType::Int64 {
-            return Err(invalid(
-                "unix_timestamp argument form requires its exact Int64 result",
-            ));
+            return Err(
+                invalid("unix_timestamp argument form requires its exact Int64 result").into(),
+            );
         }
         let selection = input.selection();
         output_capacity(selection.len())?;
@@ -519,13 +497,13 @@ pub(super) fn evaluate_calendar_input<'a>(
                 rows[index] = argument.value_row(ordinal, batch_row);
                 work.step()?;
                 if rows[index] >= argument.array().len() {
-                    return Err(internal("extended calendar selected row is out of bounds"));
+                    return Err(internal("extended calendar selected row is out of bounds").into());
                 }
                 nulls[index] = argument.array().is_null(rows[index]);
                 if nulls[index] && !sources[index].nullable() {
-                    return Err(internal(
-                        "extended calendar non-null source contains SQL NULL",
-                    ));
+                    return Err(
+                        internal("extended calendar non-null source contains SQL NULL").into(),
+                    );
                 }
                 work.step()?;
             }
@@ -548,9 +526,7 @@ pub(super) fn evaluate_calendar_input<'a>(
                                 as i64
                         })
                     } else {
-                        truncated.and_then(|date| {
-                            timestamp_value_for_type(date, target.data_type()).ok()
-                        })
+                        truncated.and_then(|date| timestamp_value(date, TimeUnit::Microsecond).ok())
                     }
                 } else {
                     work.flush()?;
@@ -587,9 +563,7 @@ pub(super) fn evaluate_calendar_input<'a>(
                     if op == CalendarExtendedOp::UnixTimestamp {
                         left.map(super::calendar_extended_shared::calendar_unix_seconds)
                     } else {
-                        left.and_then(|date| {
-                            timestamp_value_for_type(date, target.data_type()).ok()
-                        })
+                        left.and_then(|date| timestamp_value(date, TimeUnit::Microsecond).ok())
                     }
                 }
             };
@@ -622,8 +596,9 @@ pub(super) fn evaluate_calendar_input<'a>(
             errors.into_boxed_slice(),
             || work.step(),
         )
+        .map_err(super::calendar_extended_shared::CalendarFailure::Outer)
     })();
-    work.finish_result(result)
+    super::calendar_extended_shared::finish_calendar_result(work, result)
 }
 
 #[cfg(test)]
@@ -640,4 +615,5 @@ pub(super) fn evaluate_calendar_extended<'a>(
         super::calendar_extended_shared::CalendarInput::owner(input),
         control,
     )
+    .map_err(super::calendar_extended_shared::CalendarFailure::into_kernel)
 }

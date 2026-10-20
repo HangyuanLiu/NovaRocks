@@ -28,6 +28,12 @@ pub enum BTreeResourceError {
     SourceModel(&'static str),
     Arithmetic(&'static str),
 }
+impl std::fmt::Display for BTreeResourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for BTreeResourceError {}
 impl BTreeResourceError {
     pub const fn message(self) -> &'static str {
         match self {

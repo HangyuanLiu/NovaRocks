@@ -75,7 +75,7 @@ fn float64_decimal128_actual_compiler_complete_physical_profiles_and_constant_au
             assert_eq!(out.errors().len(), expected_errors.len());
             for (error, (ordinal, message)) in out.errors().iter().zip(expected_errors) {
                 assert_eq!(error.selected_ordinal(), ordinal);
-                assert_eq!(error.message(), message);
+                assert_eq!(error.message(), (message).detail());
             }
             assert_eq!(out.values().data_type(), &target);
             let empty = instance(&program)

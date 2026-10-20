@@ -74,7 +74,7 @@ pub(in crate::exec::runtime_filter) enum RuntimeInFilterValues {
 }
 
 impl RuntimeInFilterValues {
-    fn new(data_type: &DataType) -> Result<Self, String> {
+    fn new(data_type: &DataType) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
         match data_type {
             DataType::Int8 => Ok(Self::Int8(HashSet::new())),
             DataType::Int16 => Ok(Self::Int16(HashSet::new())),
@@ -105,7 +105,9 @@ impl RuntimeInFilterValues {
                 precision: *precision,
                 scale: *scale,
             }),
-            other => Err(format!("unsupported runtime in-filter type: {:?}", other)),
+            other => Err(crate::exec::runtime_filter::failure::contract(
+                format_args!("unsupported runtime in-filter type: {:?}", other),
+            )),
         }
     }
 
@@ -163,13 +165,17 @@ impl RuntimeInFilterValues {
         }
     }
 
-    fn insert_array(&mut self, array: &ArrayRef) -> Result<(), String> {
+    fn insert_array(
+        &mut self,
+        array: &ArrayRef,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         match self {
             RuntimeInFilterValues::Int8(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int8".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int8",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -179,10 +185,11 @@ impl RuntimeInFilterValues {
                 Ok(())
             }
             RuntimeInFilterValues::Int16(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int16".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int16",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -192,10 +199,11 @@ impl RuntimeInFilterValues {
                 Ok(())
             }
             RuntimeInFilterValues::Int32(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int32".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int32",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -205,10 +213,11 @@ impl RuntimeInFilterValues {
                 Ok(())
             }
             RuntimeInFilterValues::Int64(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int64".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int64",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -221,9 +230,15 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for LargeInt".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for LargeInt",
+                        )
+                    })?;
                 if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
-                    return Err("runtime in-filter type mismatch for LargeInt".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for LargeInt",
+                    ));
                 }
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -237,7 +252,11 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Float32".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Float32",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -250,7 +269,11 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Float64".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Float64",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -263,7 +286,11 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Boolean".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Boolean",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -276,7 +303,11 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Utf8".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Utf8",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -289,7 +320,11 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Date32".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Date32",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -303,7 +338,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampSecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampSecond",
+                        )
                     })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -318,7 +355,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampMillisecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampMillisecond",
+                        )
                     })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -333,7 +372,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampMicrosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampMicrosecond",
+                        )
                     })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -348,7 +389,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampNanosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampNanosecond",
+                        )
                     })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -366,12 +409,20 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Decimal128".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Decimal128",
+                        )
+                    })?;
                 let DataType::Decimal128(arr_precision, arr_scale) = arr.data_type() else {
-                    return Err("runtime in-filter type mismatch for Decimal128".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Decimal128",
+                    ));
                 };
                 if *arr_precision != *precision || *arr_scale != *scale {
-                    return Err("runtime in-filter decimal type mismatch".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter decimal type mismatch",
+                    ));
                 }
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -384,43 +435,57 @@ impl RuntimeInFilterValues {
         }
     }
 
-    fn contains(&self, array: &ArrayRef, row: usize) -> Result<bool, String> {
+    fn contains(
+        &self,
+        array: &ArrayRef,
+        row: usize,
+    ) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
         match self {
             RuntimeInFilterValues::Int8(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int8".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int8",
+                    )
+                })?;
                 Ok(values.contains(&arr.value(row)))
             }
             RuntimeInFilterValues::Int16(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int16".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int16",
+                    )
+                })?;
                 Ok(values.contains(&arr.value(row)))
             }
             RuntimeInFilterValues::Int32(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int32".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int32",
+                    )
+                })?;
                 Ok(values.contains(&arr.value(row)))
             }
             RuntimeInFilterValues::Int64(values) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Int64".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Int64",
+                    )
+                })?;
                 Ok(values.contains(&arr.value(row)))
             }
             RuntimeInFilterValues::LargeInt(values) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for LargeInt".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for LargeInt",
+                        )
+                    })?;
                 if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
-                    return Err("runtime in-filter type mismatch for LargeInt".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for LargeInt",
+                    ));
                 }
                 let value = largeint::i128_from_be_bytes(arr.value(row))?;
                 Ok(values.contains(&value))
@@ -429,35 +494,55 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Float32".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Float32",
+                        )
+                    })?;
                 Ok(values.contains(&arr.value(row).to_bits()))
             }
             RuntimeInFilterValues::Float64(values) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Float64".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Float64",
+                        )
+                    })?;
                 Ok(values.contains(&arr.value(row).to_bits()))
             }
             RuntimeInFilterValues::Bool(values) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Boolean".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Boolean",
+                        )
+                    })?;
                 Ok(values.contains(&arr.value(row)))
             }
             RuntimeInFilterValues::Utf8(values) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Utf8".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Utf8",
+                        )
+                    })?;
                 Ok(values.contains(arr.value(row)))
             }
             RuntimeInFilterValues::Date32(values) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Date32".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Date32",
+                        )
+                    })?;
                 Ok(values.contains(&arr.value(row)))
             }
             RuntimeInFilterValues::TimestampSecond(values) => {
@@ -465,7 +550,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampSecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampSecond",
+                        )
                     })?;
                 Ok(values.contains(&arr.value(row)))
             }
@@ -474,7 +561,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampMillisecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampMillisecond",
+                        )
                     })?;
                 Ok(values.contains(&arr.value(row)))
             }
@@ -483,7 +572,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampMicrosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampMicrosecond",
+                        )
                     })?;
                 Ok(values.contains(&arr.value(row)))
             }
@@ -492,7 +583,9 @@ impl RuntimeInFilterValues {
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
-                        "runtime in-filter type mismatch for TimestampNanosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for TimestampNanosecond",
+                        )
                     })?;
                 Ok(values.contains(&arr.value(row)))
             }
@@ -504,19 +597,30 @@ impl RuntimeInFilterValues {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "runtime in-filter type mismatch for Decimal128".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter type mismatch for Decimal128",
+                        )
+                    })?;
                 let DataType::Decimal128(arr_precision, arr_scale) = arr.data_type() else {
-                    return Err("runtime in-filter type mismatch for Decimal128".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter type mismatch for Decimal128",
+                    ));
                 };
                 if *arr_precision != *precision || *arr_scale != *scale {
-                    return Err("runtime in-filter decimal type mismatch".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter decimal type mismatch",
+                    ));
                 }
                 Ok(values.contains(&arr.value(row)))
             }
         }
     }
 
-    fn merge_from(&mut self, other: &RuntimeInFilterValues) -> Result<(), String> {
+    fn merge_from(
+        &mut self,
+        other: &RuntimeInFilterValues,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         match (self, other) {
             (RuntimeInFilterValues::Int8(lhs), RuntimeInFilterValues::Int8(rhs)) => {
                 lhs.extend(rhs.iter().copied());
@@ -599,18 +703,25 @@ impl RuntimeInFilterValues {
                 },
             ) => {
                 if lp != rp || ls != rs {
-                    return Err("runtime in-filter decimal type mismatch".to_string());
+                    return Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime in-filter decimal type mismatch",
+                    ));
                 }
                 lhs.extend(rhs.iter().copied());
                 Ok(())
             }
-            _ => Err("runtime in-filter type mismatch".to_string()),
+            _ => Err(crate::exec::runtime_filter::failure::contract(
+                "runtime in-filter type mismatch",
+            )),
         }
     }
 
     fn min_max_predicate_values(
         &self,
-    ) -> Result<Option<(MinMaxPredicateValue, MinMaxPredicateValue)>, String> {
+    ) -> Result<
+        Option<(MinMaxPredicateValue, MinMaxPredicateValue)>,
+        crate::runtime::fragment::ExecutionFailure,
+    > {
         match self {
             RuntimeInFilterValues::Int8(values) => Ok(min_max_i32(
                 values.iter().map(|v| i32::from(*v)),
@@ -664,11 +775,14 @@ impl RuntimeInFilterValues {
             RuntimeInFilterValues::TimestampSecond(values)
             | RuntimeInFilterValues::TimestampMillisecond(values)
             | RuntimeInFilterValues::TimestampMicrosecond(values) => {
-                let map_unit = |v: &i64| -> Result<i64, String> {
-                    timestamp_to_microseconds(*v, self.timestamp_unit()).ok_or_else(|| {
-                        "runtime in-filter timestamp conversion overflow".to_string()
-                    })
-                };
+                let map_unit =
+                    |v: &i64| -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
+                        timestamp_to_microseconds(*v, self.timestamp_unit()).ok_or_else(|| {
+                            crate::exec::runtime_filter::failure::contract(
+                                "runtime in-filter timestamp conversion overflow",
+                            )
+                        })
+                    };
                 let mut converted = Vec::with_capacity(values.len());
                 for v in values {
                     converted.push(map_unit(v)?);
@@ -747,7 +861,7 @@ impl RuntimeInFilterValues {
     fn scan_predicate_values(
         &self,
         max_values: usize,
-    ) -> Result<Option<Vec<MinMaxPredicateValue>>, String> {
+    ) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::fragment::ExecutionFailure> {
         if max_values == 0 {
             return Ok(None);
         }
@@ -788,7 +902,9 @@ impl RuntimeInFilterValues {
                 let mut converted = Vec::with_capacity(values.len());
                 for value in values {
                     let micros = timestamp_to_microseconds(*value, unit).ok_or_else(|| {
-                        "runtime in-filter timestamp conversion overflow".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter timestamp conversion overflow",
+                        )
                     })?;
                     converted.push(MinMaxPredicateValue::DateTimeMicros(micros));
                 }
@@ -833,7 +949,7 @@ fn bounded_values<T, F>(
     values: &HashSet<T>,
     max_values: usize,
     convert: F,
-) -> Result<Option<Vec<MinMaxPredicateValue>>, String>
+) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::fragment::ExecutionFailure>
 where
     T: Eq + std::hash::Hash,
     F: Fn(&T) -> MinMaxPredicateValue,
@@ -1016,7 +1132,11 @@ impl RuntimeInFilter {
         }
     }
 
-    pub fn empty(filter_id: i32, slot_id: SlotId, data_type: &DataType) -> Result<Self, String> {
+    pub fn empty(
+        filter_id: i32,
+        slot_id: SlotId,
+        data_type: &DataType,
+    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
         let values = RuntimeInFilterValues::new(data_type)?;
         Ok(Self {
             filter_id,
@@ -1039,14 +1159,17 @@ impl RuntimeInFilter {
 
     pub fn min_max_predicate_values(
         &self,
-    ) -> Result<Option<(MinMaxPredicateValue, MinMaxPredicateValue)>, String> {
+    ) -> Result<
+        Option<(MinMaxPredicateValue, MinMaxPredicateValue)>,
+        crate::runtime::fragment::ExecutionFailure,
+    > {
         self.values.min_max_predicate_values()
     }
 
     pub fn scan_predicate_values(
         &self,
         max_values: usize,
-    ) -> Result<Option<Vec<MinMaxPredicateValue>>, String> {
+    ) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::fragment::ExecutionFailure> {
         self.values.scan_predicate_values(max_values)
     }
 
@@ -1058,7 +1181,7 @@ impl RuntimeInFilter {
         &self,
         array: &ArrayRef,
         row: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
         self.values.contains(array, row)
     }
 }
@@ -1069,7 +1192,7 @@ impl RuntimeInFilter {
         filter_id: i32,
         slot_id: novarocks_types::SlotId,
         data_type: &arrow::datatypes::DataType,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
         Ok(Self {
             filter_id,
             slot_id,
@@ -1077,15 +1200,23 @@ impl RuntimeInFilter {
         })
     }
 
-    pub fn insert_array_for_test(&mut self, array: &arrow::array::ArrayRef) -> Result<(), String> {
+    pub fn insert_array_for_test(
+        &mut self,
+        array: &arrow::array::ArrayRef,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         self.values.insert_array(array)
     }
 }
 
 impl RuntimeInFilter {
-    pub fn merge_from(&mut self, other: &RuntimeInFilter) -> Result<(), String> {
+    pub fn merge_from(
+        &mut self,
+        other: &RuntimeInFilter,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if self.filter_id != other.filter_id || self.slot_id != other.slot_id {
-            return Err("runtime in-filter metadata mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime in-filter metadata mismatch",
+            ));
         }
         self.values.merge_from(&other.values)
     }
@@ -1113,7 +1244,7 @@ impl RuntimeInFilter {
         &self,
         array: &ArrayRef,
         row: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
         if array.is_null(row) {
             return Ok(false);
         }
@@ -1124,7 +1255,7 @@ impl RuntimeInFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, String> {
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -1132,7 +1263,9 @@ impl RuntimeInFilter {
             return Ok(Some(chunk));
         }
         if array.len() != chunk.len() {
-            return Err("runtime in-filter array length mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime in-filter array length mismatch",
+            ));
         }
         let len = chunk.len();
         let mut keep = vec![true; len];
@@ -1156,7 +1289,9 @@ impl RuntimeInFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+                crate::exec::runtime_filter::failure::arrow("filter batch", source)
+            })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 }

@@ -63,7 +63,7 @@ impl PureCompileControl for Control {
             );
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((at, error)) if trace.len() == at => Err(error),
             _ => Ok(()),
         }
@@ -372,7 +372,7 @@ fn trace_case(
             // Exercise both the first and last real quantum without quadratic replay of the long spelling.
             (!trace[..at-1].iter().any(|(_,units)| *units == 256) || !trace[*at..].iter().any(|(_,units)| *units == 256))).collect();
         for at in positions {
-            let control = Control::new(Some((at, cause)));
+            let control = Control::new(Some((at, cause.clone())));
             assert!(
                 matches!(admit_syntax_constant(value,declared,caps,&control),Err(ConstantError::Control(actual)) if actual == cause)
             );

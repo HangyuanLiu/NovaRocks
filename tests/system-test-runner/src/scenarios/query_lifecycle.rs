@@ -357,8 +357,9 @@ impl DistributedBaseline {
                         match connection.query_drop(&sql) {
                             Err(mysql::Error::MySqlError(error)) => {
                                 ensure!(
-                                    error.message.contains("unsupported")
-                                        && error.message.contains("novarocks_imv_stateless_rebuild"),
+                                    error.code == 1105
+                                        && error.state == "HY000"
+                                        && error.message == "MV test CALL requires explicit authorization",
                                     "ordinary test-only CALL returned another SQL failure: {error}"
                                 );
                             }
@@ -700,6 +701,12 @@ impl Scenario for NoEffectReadAfterBackendExit {
         let terminal = context
             .handle()
             .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+        std::fs::write(
+            context
+                .scenario_root()
+                .join("no-effect-recovery-terminal.txt"),
+            format!("{terminal:#?}\n"),
+        )?;
         context
             .handle()
             .drain_query_lifecycle_statement_observation(&observation)?;

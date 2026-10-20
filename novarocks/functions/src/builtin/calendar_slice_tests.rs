@@ -67,7 +67,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop);
         }
         trace.push(n);
-        if let Some((stop, cause)) = self.refusal
+        if let Some((stop, cause)) = self.refusal.clone()
             && at == stop
         {
             return Err(cause);
@@ -515,7 +515,7 @@ fn slice_all_seven_runtime_and_three_compile_causes_survive_every_prefix() {
             CompileControlError::ResourceExhausted,
         ] {
             let c = CompileControl {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Default::default()
             };
             let error = prepare(false, true, true, &c).err().unwrap();
@@ -539,4 +539,54 @@ fn slice_all_seven_runtime_and_three_compile_causes_survive_every_prefix() {
             assert_eq!(c.trace.lock().unwrap().len(), stop + 1);
         }
     }
+}
+
+// Raw required evaluation shares the selected row implementation but has no
+// error journal or String sentinel. These independent boundaries exercise the
+// actual caller: SQL-invalid controls and the existing NULL-on-range value rule.
+#[test]
+fn slice_raw_first_control_cause_keeps_null_range_policy_and_bounded_detail() {
+    use super::{CalendarFailure, evaluate_legacy_slice};
+    use crate::DataFailureReason;
+    let date = NaiveDate::from_ymd_opt(9999, 12, 31)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    let units = StringArray::from(vec!["year"]);
+    let boundary = StringArray::from(vec!["ceil"]);
+    let output = evaluate_legacy_slice(
+        CalendarSliceDomain::Time,
+        &[Some(date)],
+        &[Some(1)],
+        &units,
+        Some(&boundary),
+    )
+    .unwrap();
+    assert!(
+        output.is_null(0),
+        "slice has an explicit NULL-on-year-overflow policy"
+    );
+    let oversized = "大UNIT".repeat(100_000);
+    let units = StringArray::from(vec!["day", oversized.as_str(), "day"]);
+    let error = evaluate_legacy_slice(
+        CalendarSliceDomain::Time,
+        &[None, Some(date), Some(date)],
+        &[Some(1), Some(1), None],
+        &units,
+        None,
+    )
+    .unwrap_err();
+    let CalendarFailure::Row(error) = error else {
+        panic!("unit is an actual row cause")
+    };
+    assert_eq!(error.reason(), DataFailureReason::InvalidValue);
+    assert_eq!(error.selected_ordinal(), 1);
+    assert!(
+        error
+            .message()
+            .starts_with("time_slice unsupported unit: 大unit")
+    );
+    assert!(error.message().len() <= 512);
+    // A later missing interval cannot replace the originating bad unit.
+    assert!(!error.message().contains("non-null interval"));
 }

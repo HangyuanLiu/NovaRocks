@@ -54,7 +54,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -685,7 +685,7 @@ fn window_and_table_journal_foreign_missing_and_all_small_control_prefixes_are_e
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -737,7 +737,7 @@ fn window_and_table_journal_foreign_missing_and_all_small_control_prefixes_are_e
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -788,7 +788,7 @@ fn window_and_table_actual_capture_recording_preserve_every_lowering_control_pre
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

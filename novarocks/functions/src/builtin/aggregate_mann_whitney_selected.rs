@@ -21,7 +21,8 @@ use super::aggregate_mann_whitney_emission::{MannEmissionAccess, emit_mann};
 use super::aggregate_mann_whitney_operation::{MannDataDomain, call_input, call_unit};
 use super::aggregate_mann_whitney_resources::MannSourceParams;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::scalar_resources::ScalarResourceError;
@@ -111,10 +112,8 @@ impl MannEmissionAccess for MannState {
     }
     fn with_core(
         &self,
-        operation: impl FnOnce(
-            &mut MannWhitneyState<HostAggregateAllocator>,
-        ) -> Result<(), ScalarStateError>,
-    ) -> Result<(), ScalarStateError> {
+        operation: impl FnOnce(&mut MannWhitneyState<HostAggregateAllocator>) -> Result<(), MannFailure>,
+    ) -> Result<(), MannFailure> {
         if self.failed.get() {
             return Err(KernelFailure::InstanceFailed.into());
         }
@@ -203,7 +202,7 @@ fn mapping_copy(
     target: &mut HostVec<usize, HostAggregateAllocator>,
     allocator: &HostAggregateAllocator,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<usize, ScalarStateError> {
+) -> Result<usize, MannFailure> {
     if mapping.len() != selection.len() {
         return Err(invalid("Mann-Whitney group mapping differs from its selected domain").into());
     }

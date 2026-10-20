@@ -52,7 +52,7 @@ fn merge_unweighted_payload_array(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     context: ApproxPercentileDiagnostic,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     for (row, &base) in state_ptrs.iter().enumerate() {
         let Some(payload) = approx_core::payload_for_merge(array, row, context)? else {
             continue;
@@ -69,7 +69,7 @@ fn merge_weighted_payload_array(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     context: ApproxPercentileDiagnostic,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     merge_unweighted_payload_array(array, offset, state_ptrs, context)
 }
 
@@ -78,7 +78,7 @@ fn update_unweighted_struct(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     context: ApproxPercentileDiagnostic,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let input = approx_core::UnweightedInput::try_new(array, context)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         let ptr = unsafe { (base as *mut u8).add(offset) };
@@ -93,7 +93,7 @@ fn update_weighted_struct(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     context: ApproxPercentileDiagnostic,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let input = approx_core::WeightedInput::try_new(array, context)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         let ptr = unsafe { (base as *mut u8).add(offset) };
@@ -109,21 +109,24 @@ impl AggregateFunction for PercentileAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let sig = func
-            .types
-            .as_ref()
-            .ok_or_else(|| "aggregate type signature is required".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let sig = func.types.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "aggregate type signature is required",
+            )
+        })?;
 
         let kind = match canonical_agg_name(func.name.as_str()) {
             "percentile_union" => AggKind::PercentileUnion,
             "percentile_approx" => AggKind::PercentileApprox,
             "percentile_approx_weighted" => AggKind::PercentileApproxWeighted,
             other => {
-                return Err(format!(
-                    "unsupported percentile aggregate function: {}",
-                    other
-                ));
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "unsupported percentile aggregate function: {}",
+                        other
+                    )),
+                );
             }
         };
 
@@ -152,10 +155,12 @@ impl AggregateFunction for PercentileAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "percentile aggregate input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "percentile aggregate input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -163,10 +168,12 @@ impl AggregateFunction for PercentileAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "percentile aggregate merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "percentile aggregate merge input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -179,9 +186,11 @@ impl AggregateFunction for PercentileAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked percentile requires an aggregate memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked percentile requires an aggregate memory tracker",
+            )
         })?;
         unsafe {
             std::ptr::write(
@@ -215,9 +224,11 @@ impl AggregateFunction for PercentileAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("percentile aggregate input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "percentile aggregate input type mismatch",
+            ));
         };
         match &spec.kind {
             AggKind::PercentileApproxWeighted => {
@@ -254,7 +265,10 @@ impl AggregateFunction for PercentileAgg {
                     )
                 }
             }
-            other => Err(format!("unexpected percentile aggregate kind: {:?}", other)),
+            other => Err(super::aggregate_binding_contract(format_args!(
+                "unexpected percentile aggregate kind: {:?}",
+                other
+            ))),
         }
     }
 
@@ -264,9 +278,11 @@ impl AggregateFunction for PercentileAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("percentile aggregate merge input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "percentile aggregate merge input type mismatch",
+            ));
         };
         match &spec.kind {
             AggKind::PercentileApproxWeighted => merge_weighted_payload_array(
@@ -290,7 +306,7 @@ impl AggregateFunction for PercentileAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let output_type = if output_intermediate {
             &spec.intermediate_type
         } else {
@@ -298,12 +314,12 @@ impl AggregateFunction for PercentileAgg {
         };
         match output_type {
             DataType::Binary => {
-                let mut builder = BinaryBuilder::new();
+                let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
-                    builder.append_value(percentile::encode_state(unsafe { state_ref(ptr) }));
+                    builder.append_value(percentile::encode_state(unsafe { state_ref(ptr) })?)?;
                 }
-                Ok(Arc::new(builder.finish()))
+                Ok(Arc::new(builder.finish()?))
             }
             DataType::Float64 | DataType::List(_) => {
                 let output = if matches!(output_type, DataType::Float64) {
@@ -323,15 +339,15 @@ impl AggregateFunction for PercentileAgg {
             }
             other => {
                 if matches!(&spec.kind, AggKind::PercentileApproxWeighted) {
-                    Err(format!(
+                    Err(super::aggregate_binding_contract(format_args!(
                         "weighted percentile aggregate output type must be Binary/Float64/List, got {:?}",
                         other
-                    ))
+                    )))
                 } else {
-                    Err(format!(
+                    Err(super::aggregate_binding_contract(format_args!(
                         "percentile aggregate output type must be Binary/Float64/List, got {:?}",
                         other
-                    ))
+                    )))
                 }
             }
         }

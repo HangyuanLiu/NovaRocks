@@ -22,12 +22,14 @@ use crate::{
     native::data_runtime::FrontendDataRuntime, task_execution::status_intake::StatusIntakeWake,
 };
 use novarocks_execution_contract::{
-    TaskIdentity,
+    SafeDetail, TaskIdentity,
+    failure::FailureProjection,
     root_result::{RootResultEnd, RootResultRead},
 };
 use novarocks_query_application::{
     api::{BoundedRootReadPort, RetainedRootReply, RootReplyView},
-    coordination::{RootRelayFrontier, RootRelayStep, RootResultFetchFailure},
+    coordination::{RootRelayFrontier, RootRelayStep, RootResultFetchFailure, paced_root_read},
+    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_result_contract::{RootOutputKind, RootProfileId};
 use novarocks_workload_control::ResultWindowAlias;
@@ -37,19 +39,34 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn local_failure(
+    root: TaskIdentity,
+    reason: QueryFailureReason,
+    detail: &'static str,
+) -> RelayedRootAnswer {
+    let site = if reason == QueryFailureReason::DeadlineExceeded {
+        ExecutionFailureSite::Coordinator
+    } else {
+        ExecutionFailureSite::RootRead { root }
+    };
+    RelayedRootAnswer::FetchFailure(RootResultFetchFailure::from_input(
+        ExecutionFailureInput::new(reason.failure_fact(), SafeDetail::truncating(detail), site),
+    ))
+}
+
 pub(super) enum RelayedRootAnswer {
     Data(RetainedRootReply),
     End(RootResultEnd),
     NotReady,
     AwaitTerminalControl,
     FetchFailure(RootResultFetchFailure),
-    Refused(String),
 }
 
 pub(super) struct RelayedRootPolls {
     answers: tokio::sync::mpsc::Receiver<RelayedRootAnswer>,
-    receipts: tokio::sync::mpsc::Sender<NonZeroU64>,
-    task: tokio::task::JoinHandle<()>,
+    receipts: Option<tokio::sync::mpsc::Sender<NonZeroU64>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    closed: Option<Result<(), Arc<tokio::task::JoinError>>>,
 }
 impl RelayedRootPolls {
     pub(super) fn start(
@@ -73,23 +90,90 @@ impl RelayedRootPolls {
         ));
         Ok(Self {
             answers,
-            receipts,
-            task,
+            receipts: Some(receipts),
+            task: Some(task),
+            closed: None,
         })
     }
     pub(super) fn take(&mut self) -> Option<RelayedRootAnswer> {
+        self.receipts.as_ref()?;
         self.answers.try_recv().ok()
+    }
+
+    /// Close local admission and cancel the original poll, retaining its only
+    /// join receipt. This does not prove transport-owned network jobs exited.
+    pub(super) fn begin_close(&mut self) {
+        if self.receipts.take().is_some() {
+            self.answers.close();
+            if let Some(task) = &self.task {
+                task.abort();
+            }
+        }
+        while let Ok(unclaimed) = self.answers.try_recv() {
+            drop(unclaimed);
+        }
+    }
+
+    /// A JoinError remains in this owner. In particular, task cancellation is
+    /// not a proof about lower-level transport/reaper ownership.
+    pub(super) fn poll_closed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), &tokio::task::JoinError>> {
+        use std::{future::Future, pin::Pin, task::Poll};
+        self.begin_close();
+        if self.closed.is_none() {
+            let result = std::task::ready!(
+                Pin::new(self.task.as_mut().expect("original root poll join")).poll(cx)
+            );
+            self.closed = Some(result.map_err(Arc::new));
+            self.task.take();
+        }
+        // A send already committed before close may have become visible while
+        // joining. Retire that bounded queue before publishing local closure.
+        self.begin_close();
+        Poll::Ready(
+            self.closed
+                .as_ref()
+                .expect("root poll joined")
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| error.as_ref()),
+        )
+    }
+
+    /// Shares the same original join error with health custody. The task's
+    /// result was moved into this Arc once; no failure is reconstructed.
+    pub(super) fn join_failure(&self) -> Option<Arc<tokio::task::JoinError>> {
+        self.closed
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .map(Arc::clone)
+    }
+
+    pub(super) async fn join_closed(&mut self) -> Result<(), &tokio::task::JoinError> {
+        std::future::poll_fn(|cx| self.poll_closed(cx).map(|_| ())).await;
+        self.closed
+            .as_ref()
+            .expect("root poll joined")
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.as_ref())
     }
     /// Caller has validated the domain facts and dropped the retained body.
     pub(super) fn acknowledge(&self, sequence: NonZeroU64) -> Result<(), String> {
         self.receipts
+            .as_ref()
+            .ok_or("root reader is closing")?
             .try_send(sequence)
             .map_err(|error| format!("root receipt refused: {error}"))
     }
 }
 impl Drop for RelayedRootPolls {
     fn drop(&mut self) {
-        self.task.abort();
+        // Fallback only. A caller requiring exit proof must retain this owner
+        // and observe the original join through poll_closed/join_closed.
+        self.begin_close();
     }
 }
 
@@ -118,8 +202,10 @@ async fn drive(
         }
         let now = Instant::now();
         if now >= deadline {
-            let _ = send(RelayedRootAnswer::Refused(
-                "root read deadline expired".into(),
+            let _ = send(local_failure(
+                frontier.root(),
+                QueryFailureReason::DeadlineExceeded,
+                "root read deadline expired",
             ))
             .await;
             return;
@@ -135,15 +221,19 @@ async fn drive(
         );
         if wait.is_zero() {
             tokio::time::sleep_until(deadline.into()).await;
-            let _ = send(RelayedRootAnswer::Refused(
-                "root read deadline expired".into(),
+            let _ = send(local_failure(
+                frontier.root(),
+                QueryFailureReason::DeadlineExceeded,
+                "root read deadline expired",
             ))
             .await;
             return;
         }
         let Some(read) = frontier.next_read() else {
-            let _ = send(RelayedRootAnswer::Refused(
-                "root reader has no next frontier".into(),
+            let _ = send(local_failure(
+                frontier.root(),
+                QueryFailureReason::ResultProtocol,
+                "root reader has no next frontier",
             ))
             .await;
             return;
@@ -158,12 +248,18 @@ async fn drive(
         ) {
             Ok(request) => request,
             Err(error) => {
-                let _ = send(RelayedRootAnswer::Refused(error.to_string())).await;
+                tracing::debug!(error = %error, "internal root protocol failed");
+                let _ = send(local_failure(
+                    frontier.root(),
+                    QueryFailureReason::ResultProtocol,
+                    "root result protocol failed",
+                ))
+                .await;
                 return;
             }
         };
         frontier.sent(read);
-        let reply = match port.read(request, window.clone()).await {
+        let reply = match paced_root_read(port.as_ref(), request, window.clone()).await {
             Ok(reply) => reply,
             Err(error) => {
                 let _ = send(RelayedRootAnswer::FetchFailure(error)).await;
@@ -174,10 +270,16 @@ async fn drive(
             RootReplyView::Data { body, .. } => Some(body),
             _ => None,
         };
-        let step = match frontier.accept(reply.reply(), body) {
+        let step = match frontier.accept(reply.response(), body) {
             Ok(step) => step,
             Err(error) => {
-                let _ = send(RelayedRootAnswer::Refused(error.to_string())).await;
+                tracing::debug!(error = %error, "internal root protocol failed");
+                let _ = send(local_failure(
+                    frontier.root(),
+                    QueryFailureReason::ResultProtocol,
+                    "root result protocol failed",
+                ))
+                .await;
                 return;
             }
         };
@@ -189,13 +291,20 @@ async fn drive(
                 match receipts.recv().await {
                     Some(actual) if actual == sequence => {
                         if let Err(error) = frontier.receipt(actual) {
-                            let _ = send(RelayedRootAnswer::Refused(error.to_string())).await;
+                            let _ = send(local_failure(
+                                frontier.root(),
+                                QueryFailureReason::ResultProtocol,
+                                "root result protocol failed",
+                            ))
+                            .await;
                             return;
                         }
                     }
                     Some(_) => {
-                        let _ = send(RelayedRootAnswer::Refused(
-                            "root receipt sequence mismatch".into(),
+                        let _ = send(local_failure(
+                            frontier.root(),
+                            QueryFailureReason::ResultProtocol,
+                            "root receipt sequence mismatch",
                         ))
                         .await;
                         return;
@@ -206,12 +315,23 @@ async fn drive(
             RootRelayStep::EndKnown(_) | RootRelayStep::Acknowledged => {
                 drop(reply);
             }
-            RootRelayStep::NotReady => {
+            RootRelayStep::NotReady | RootRelayStep::Deferred(_) => {
                 drop(reply);
                 if send(RelayedRootAnswer::NotReady).await.is_err() {
                     return;
                 }
-                tokio::task::yield_now().await;
+            }
+            RootRelayStep::Refused(refusal) => {
+                let failure = RootResultFetchFailure::from_input(ExecutionFailureInput::new(
+                    refusal.fact(),
+                    refusal.detail().clone(),
+                    ExecutionFailureSite::RootRead {
+                        root: frontier.root(),
+                    },
+                ));
+                drop(reply);
+                let _ = send(RelayedRootAnswer::FetchFailure(failure)).await;
+                return;
             }
             RootRelayStep::AwaitTerminalControl => {
                 drop(reply);
@@ -303,14 +423,20 @@ mod tests {
                 outcome,
             };
             Box::pin(async move {
-                RetainedRootReply::try_new(reply, guard, 1024).map_err(|error| {
-                    RootResultFetchFailure::new(
-                        AttemptFailureClass::ContractViolation,
-                        QueryExecutionError::new(
-                            QueryExecutionErrorKind::InvalidRequest,
-                            error.to_string(),
-                        ),
-                    )
+                RetainedRootReply::try_new(
+                    novarocks_execution_contract::root_result::RootReadResponse::Reply(reply),
+                    guard,
+                    1024,
+                )
+                .map_err(|error| {
+                    let _ = error;
+                    RootResultFetchFailure::from_input(ExecutionFailureInput::new(
+                        QueryFailureReason::ResultProtocol.failure_fact(),
+                        SafeDetail::truncating("test root carrier conflicts with its window"),
+                        ExecutionFailureSite::RootRead {
+                            root: request.root_task(),
+                        },
+                    ))
                 })
             })
         }
@@ -494,10 +620,11 @@ mod tests {
             FrontendDataRuntime::new(tokio::runtime::Handle::current()),
         )
         .unwrap();
-        let RelayedRootAnswer::Refused(message) = next(&mut polls).await else {
+        let RelayedRootAnswer::FetchFailure(failure) = next(&mut polls).await else {
             panic!("deadline tail must expire");
         };
-        assert_eq!(message, "root read deadline expired");
+        assert_eq!(failure.error().message(), "root read deadline expired");
+        assert_eq!(failure.class(), AttemptFailureClass::DeadlineExceeded);
         assert!(Instant::now() >= deadline);
         assert!(port.reads.lock().unwrap().is_empty());
     }
@@ -516,10 +643,11 @@ mod tests {
             panic!("data");
         };
         polls.acknowledge(NonZeroU64::new(2).unwrap()).unwrap();
-        let RelayedRootAnswer::Refused(message) = next(&mut polls).await else {
+        let RelayedRootAnswer::FetchFailure(failure) = next(&mut polls).await else {
             panic!("wrong receipt must refuse");
         };
-        assert!(message.contains("sequence"));
+        assert!(failure.error().message().contains("sequence"));
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
         drop((polls, window, work));
         tokio::task::yield_now().await;
         assert_eq!(capacity.snapshot().held_positions[2], 1);
@@ -547,9 +675,14 @@ mod tests {
         close_failed_root_reads(&mut reader, &mut polls, root);
         assert!(port.sealed.load(Ordering::Acquire));
         assert!(reader.is_none());
-        assert!(polls.is_none());
+        assert!(
+            polls.is_some(),
+            "the closing owner retains its original join"
+        );
+        let joined = polls.as_mut().unwrap().0.join_closed().await;
+        assert!(joined.is_ok() || joined.is_err_and(|error| error.is_cancelled()));
+        drop(polls);
         drop((window, work));
-        tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(port.reads.lock().unwrap().len(), 1);
         assert_eq!(capacity.snapshot().held_positions[2], 1);
         drop(delivery);
@@ -560,28 +693,43 @@ mod tests {
     fn fetch_verdict_keeps_kind_class_and_topology_without_retry_authority() {
         use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
         use novarocks_query_application::api::NativeAttemptTopologyRequirement;
-        for (class, kind, result_kind) in [
+        let root = root();
+        for (reason, class, result_kind) in [
             (
+                QueryFailureReason::TransportCapacity,
                 AttemptFailureClass::ResourceGovernance,
-                QueryExecutionErrorKind::Rejected,
                 DistributedQueryErrorKind::Rejected,
             ),
             (
+                QueryFailureReason::PreparationProtocol,
                 AttemptFailureClass::ContractViolation,
-                QueryExecutionErrorKind::InvalidRequest,
                 DistributedQueryErrorKind::ContractViolation,
             ),
             (
+                QueryFailureReason::BackendLost,
                 AttemptFailureClass::RecoverableInfrastructure,
-                QueryExecutionErrorKind::Failed,
                 DistributedQueryErrorKind::Failed,
             ),
         ] {
-            let failure =
-                RootResultFetchFailure::new(class, QueryExecutionError::new(kind, "typed verdict"))
-                    .with_topology_requirement(NativeAttemptTopologyRequirement::ExcludeProcess(
-                        root().backend_process_id(),
-                    ));
+            let site = if reason == QueryFailureReason::BackendLost {
+                ExecutionFailureSite::Backend {
+                    process: root.backend_process_id(),
+                }
+            } else {
+                ExecutionFailureSite::RootRead { root }
+            };
+            let failure = RootResultFetchFailure::from_input(ExecutionFailureInput::new(
+                reason.failure_fact(),
+                SafeDetail::truncating("typed verdict"),
+                site,
+            ));
+            assert_eq!(failure.class(), class);
+            let expected = if reason == QueryFailureReason::BackendLost {
+                NativeAttemptTopologyRequirement::ExcludeProcess(root.backend_process_id())
+            } else {
+                NativeAttemptTopologyRequirement::LiveSnapshot
+            };
+            assert_eq!(failure.topology_requirement(), expected);
             let error =
                 DistributedQueryError::new(DistributedQueryErrorKind::Failed, "attempt failed")
                     .with_root_fetch_failure(failure.clone());
@@ -589,5 +737,152 @@ mod tests {
             assert_eq!(error.root_fetch_failure(), Some(&failure));
             assert!(error.pre_ready_topology_outcome().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod actual_close_tests {
+    use super::*;
+    use novarocks_execution_contract::root_lifetime::RootReadSealed;
+    use novarocks_query_application::api::QueryExecutionError;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        task::{Context, Poll},
+    };
+
+    struct ReadBody {
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+        window: Option<ResultWindowAlias>,
+        exited: Arc<AtomicBool>,
+    }
+    impl Future for ReadBody {
+        type Output = Result<RetainedRootReply, RootResultFetchFailure>;
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+    impl Drop for ReadBody {
+        fn drop(&mut self) {
+            let _ = self.entered.take().unwrap().send(());
+            let _ = self.release.recv();
+            drop(self.window.take());
+            self.exited.store(true, Ordering::Release);
+        }
+    }
+    struct PendingPort(Mutex<Option<ReadBody>>, Arc<AtomicBool>);
+    impl BoundedRootReadPort for PendingPort {
+        fn read(
+            &self,
+            _: RootResultRead,
+            window: ResultWindowAlias,
+        ) -> Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>
+        {
+            let mut body = self.0.lock().unwrap().take().unwrap();
+            body.window = Some(window);
+            self.1.store(true, Ordering::Release);
+            Box::pin(body)
+        }
+        fn seal(&self, _: RootReadSealed) -> Result<(), QueryExecutionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_ack_but_retains_original_poll_join_through_capture_drop() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let (entered, dropping) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let read_started = Arc::new(AtomicBool::new(false));
+        let body_exited = Arc::new(AtomicBool::new(false));
+        let port = Arc::new(PendingPort(
+            Mutex::new(Some(ReadBody {
+                entered: Some(entered),
+                release: blocked,
+                window: None,
+                exited: Arc::clone(&body_exited),
+            })),
+            Arc::clone(&read_started),
+        ));
+        let root_task = novarocks_execution_contract::TaskIdentity::new(
+            novarocks_types::QueryExecutionId::new(
+                novarocks_types::QueryId::new(81, 2),
+                novarocks_types::AttemptId::new(1).unwrap(),
+            )
+            .unwrap(),
+            novarocks_types::StageId::new(1).unwrap(),
+            novarocks_types::TaskId::new(1).unwrap(),
+            novarocks_types::BackendProcessId::new_v7(),
+        );
+        let mut polls = RelayedRootPolls::start(
+            port.clone(),
+            root_task,
+            RootOutputKind::CountOnly,
+            binding.window_alias(),
+            Instant::now() + Duration::from_secs(5),
+            Arc::new(crate::task_execution::status_intake::CondvarWake::default()),
+            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+        )
+        .unwrap();
+        root.owner.complete();
+        root.business.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !read_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        polls.begin_close();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dropping.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ack_refused =
+            polls.acknowledge(NonZeroU64::MIN).unwrap_err() == "root reader is closing";
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(polls.poll_closed(cx).is_pending())).await;
+        let held = !body_exited.load(Ordering::Acquire)
+            && capacity.snapshot().held_positions == [0, 0, 1, 0];
+        release.send(()).unwrap();
+        let original_cancelled = tokio::time::timeout(Duration::from_secs(5), polls.join_closed())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled();
+        let same_result = std::future::poll_fn(|cx| {
+            Poll::Ready(
+                matches!(polls.poll_closed(cx), Poll::Ready(Err(error)) if error.is_cancelled()),
+            )
+        })
+        .await;
+        let original_error = polls.join_failure().expect("original cancelled join");
+        let health_error = polls.join_failure().expect("same join for health custody");
+        let same_error = Arc::ptr_eq(&original_error, &health_error);
+        assert!(original_error.is_cancelled());
+        let actual_exited = body_exited.load(Ordering::Acquire);
+        drop(polls);
+        drop(port);
+        drop(binding);
+        assert!(
+            ack_refused
+                && pending
+                && held
+                && original_cancelled
+                && same_result
+                && actual_exited
+                && same_error
+        );
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 }

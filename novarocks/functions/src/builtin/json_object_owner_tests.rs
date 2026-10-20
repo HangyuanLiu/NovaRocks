@@ -288,9 +288,14 @@ fn json_object_actual_whole_data_preserves_original_text_under_both_policies_and
         DecimalOverflowPolicy::ReportError,
     ] {
         let host = Arc::new(Host::default());
-        let mut kernel = instance(&[DataType::Utf8, DataType::UInt32], policy, &host);
+        let mut kernel = instance(&[DataType::Utf8, DataType::Date32], policy, &host);
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["guard", "a", "guard", "b"]));
-        let value: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 2, 3]));
+        let value: ArrayRef = Arc::new(arrow_array::Date32Array::from(vec![
+            0,
+            -1_000_000_000,
+            0,
+            -1_000_000_000,
+        ]));
         let control = Control::default();
         let error = kernel
             .evaluate(
@@ -306,7 +311,11 @@ fn json_object_actual_whole_data_preserves_original_text_under_both_policies_and
         let ScalarInvocationFailure::Data(data) = error else {
             panic!("original whole-call Data");
         };
-        assert_eq!(data.message(), "unsupported scalar type: UInt32");
+        assert_eq!(
+            data.message(),
+            "json_object invalid date32 day value: -1000000000"
+        );
+        assert_eq!(data.reason(), crate::DataFailureReason::NumericOutOfRange);
         assert_eq!(data.batch_rows(), 4);
         assert_eq!(data.source_row(0), Some(1));
         assert_eq!(data.source_row(1), Some(3));
@@ -327,7 +336,10 @@ fn json_object_actual_whole_data_preserves_original_text_under_both_policies_and
         assert_eq!(control.trace.lock().unwrap().len(), callbacks);
         drop(kernel);
         assert!(host.ledger.lock().unwrap().opaque_bytes > 0);
-        assert_eq!(alias.message(), "unsupported scalar type: UInt32");
+        assert_eq!(
+            alias.message(),
+            "json_object invalid date32 day value: -1000000000"
+        );
         drop(alias);
         empty(&host);
     }
@@ -432,7 +444,12 @@ fn json_object_actual_every_small_control_boundary_preserves_seven_primary_cause
             ScalarInvocationActivation::Activated,
             &control,
         );
-        assert!(baseline.is_ok() || matches!(&baseline, Err(ScalarInvocationFailure::Data(_))));
+        assert!(
+            baseline.is_ok()
+                || matches!(&baseline, Err(ScalarInvocationFailure::Kernel(cause))
+            if novarocks_failure_contract::FailureProjection::failure_fact(cause).class()
+                == novarocks_failure_contract::FailureClass::Invariant)
+        );
         let trace = control.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());
         drop(baseline);
@@ -753,7 +770,7 @@ fn json_object_actual_constant_pool_uses_its_real_nonzero_ordinal() {
 }
 
 #[test]
-fn json_object_actual_original_date_error_and_raw_panic_frontier_are_preserved() {
+fn json_object_actual_date_range_is_data_under_both_policies_without_arithmetic_panic() {
     for policy in [
         DecimalOverflowPolicy::OutputNull,
         DecimalOverflowPolicy::ReportError,
@@ -807,22 +824,20 @@ fn json_object_actual_original_date_error_and_raw_panic_frontier_are_preserved()
                     EvaluatedArgument::Column(&overflow),
                 ]
             };
-            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                kernel.evaluate(
-                    Selection::all(1),
-                    &arguments,
-                    ScalarInvocationActivation::Activated,
-                    &Control::default(),
-                )
-            }))
-            .unwrap_err();
-            let message = panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                .unwrap();
-            assert_eq!(message, "attempt to add with overflow");
-            drop(panic);
+            let Err(ScalarInvocationFailure::Data(data)) = kernel.evaluate(
+                Selection::all(1),
+                &arguments,
+                ScalarInvocationActivation::Activated,
+                &Control::default(),
+            ) else {
+                panic!("date32 range has an actual numeric cause")
+            };
+            assert_eq!(
+                data.message(),
+                "json_object invalid date32 day value: 2147483647"
+            );
+            assert_eq!(data.reason(), crate::DataFailureReason::NumericOutOfRange);
+            drop(data);
             drop(kernel);
             empty(&host);
         }
@@ -1034,4 +1049,55 @@ fn json_object_checked_creator_keeps_original_owner_and_primary_refusals() {
             ))
         ))
     ));
+}
+
+#[test]
+fn json_object_admitted_complex_key_is_nominal_value_data_with_the_original_selected_domain() {
+    use arrow_array::ListArray;
+    use arrow_array::types::Int64Type;
+    let host = Arc::new(Host::default());
+    let keys: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(0)]),
+        Some(vec![Some(1)]),
+        Some(vec![Some(2)]),
+        Some(vec![Some(3)]),
+    ]));
+    let values: ArrayRef = Arc::new(StringArray::from(vec!["guard", "a", "guard", "b"]));
+    let mut kernel = instance(
+        &[keys.data_type().clone(), DataType::Utf8],
+        DecimalOverflowPolicy::OutputNull,
+        &host,
+    );
+    let control = Control::default();
+    let failure = kernel
+        .evaluate(
+            Selection::try_sparse(4, &[1, 3]).unwrap(),
+            &[
+                EvaluatedArgument::Column(&keys),
+                EvaluatedArgument::Column(&values),
+            ],
+            ScalarInvocationActivation::Activated,
+            &control,
+        )
+        .unwrap_err();
+    let ScalarInvocationFailure::Data(data) = failure else {
+        panic!("the JSON key rule must keep its nominal value domain");
+    };
+    assert_eq!(data.reason(), crate::DataFailureReason::InvalidValue);
+    assert_eq!(
+        data.message(),
+        "json_object key does not support complex type"
+    );
+    assert_eq!(data.source_row(0), Some(1));
+    assert_eq!(data.source_row(1), Some(3));
+    replay_is_latched(&mut kernel, Selection::all(0), &[], &control);
+    let alias = data.clone();
+    drop(data);
+    drop(kernel);
+    assert_eq!(
+        alias.message(),
+        "json_object key does not support complex type"
+    );
+    drop(alias);
+    empty(&host);
 }

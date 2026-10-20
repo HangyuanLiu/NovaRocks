@@ -87,7 +87,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -369,7 +369,7 @@ fn string_reverse_child_error_is_refused_before_the_ordinary_body() {
     let mut kernel = instance("reverse", true);
     assert!(matches!(
         kernel.evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let after = Control::default();
     assert_eq!(
@@ -659,7 +659,7 @@ fn string_reverse_compile_success_and_ordinary_tail_preserve_all_callback_causes
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "reverse",

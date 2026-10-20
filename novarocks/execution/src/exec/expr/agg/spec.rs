@@ -30,7 +30,8 @@ pub(super) fn build_spec_from_type(
     input_type: Option<&DataType>,
     input_is_intermediate: bool,
 ) -> Result<AggSpec, String> {
-    let mut spec = functions::build_spec_from_type(func, input_type, input_is_intermediate)?;
+    let mut spec = functions::build_spec_from_type(func, input_type, input_is_intermediate)
+        .map_err(|source| source.to_string())?;
 
     if !input_is_intermediate && let Some(data_type) = input_type {
         spec.input_arg_type = Some(data_type.clone());

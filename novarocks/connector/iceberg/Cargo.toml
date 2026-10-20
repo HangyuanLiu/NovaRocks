@@ -61,6 +61,7 @@ uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 zstd = "=0.13.3"
 novarocks-fs.workspace = true
 novarocks-connector-contract.workspace = true
+novarocks-failure-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true

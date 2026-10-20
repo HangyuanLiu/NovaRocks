@@ -14,6 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use super::construction_failure::{
+    ChunkConstructionFailure, ChunkObservationFailure, ChunkSchemaViolation,
+};
+use super::construction_failure::{SchemaContractSite, schema_contract, schema_type_mismatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,7 +25,7 @@ use super::typed_array_normalization::{
     ArrayNormalizationStep, execution_field_is_normalized, execution_field_is_normalized_observed,
     normalize_execution_field_observed,
 };
-use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
+use crate::exec::chunk::type_compatibility::check_exact;
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -65,10 +69,10 @@ impl ChunkFieldSchema {
 
     /// Explicit external import retained only for the expansion adapter.
     /// Execution type authors must supply `from_value_type` instead.
-    pub fn from_field(field: &Field) -> Result<Self, String> {
+    pub fn from_field(field: &Field) -> Result<Self, ChunkConstructionFailure> {
         ValueTypeRef::try_from_external_field(field, ValueTypeStorageLifetime::pure())
             .map(Self::from_value_type)
-            .map_err(|error| error.to_string())
+            .map_err(ChunkConstructionFailure::from)
     }
 
     pub fn logical_type(&self) -> Option<ValueLogicalType> {
@@ -180,7 +184,7 @@ impl ChunkSlotSchema {
     fn legacy_semantics(
         field: &Field,
         supplied: Option<ChunkFieldSchema>,
-    ) -> Result<ChunkFieldSchema, String> {
+    ) -> Result<ChunkFieldSchema, ChunkConstructionFailure> {
         let schema = match supplied {
             Some(schema) => schema,
             None => ChunkFieldSchema::from_field(field)?,
@@ -193,11 +197,11 @@ impl ChunkSlotSchema {
         schema: &ChunkFieldSchema,
         field: &Field,
         storage: ValueTypeStorageLifetime,
-    ) -> Result<TypedValueBinding, String> {
-        let layout =
-            ValueLayout::try_new(field.data_type(), storage).map_err(|error| error.to_string())?;
+    ) -> Result<TypedValueBinding, ChunkConstructionFailure> {
+        let layout = ValueLayout::try_new(field.data_type(), storage)
+            .map_err(ChunkConstructionFailure::from)?;
         TypedValueBinding::try_new(schema.value_type().clone(), layout)
-            .map_err(|error| error.to_string())
+            .map_err(ChunkConstructionFailure::from)
     }
 
     /// Bind explicit semantics to a metadata-free actual field representation.
@@ -208,7 +212,7 @@ impl ChunkSlotSchema {
         binding: TypedValueBinding,
         unique_id: Option<i32>,
         storage: ValueTypeStorageLifetime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_typed_observed(slot_id, field, binding, unique_id, storage, |_| Ok(()))
     }
 
@@ -221,13 +225,16 @@ impl ChunkSlotSchema {
         mut observe: F,
     ) -> Result<Self, E>
     where
-        E: From<String>,
+        E: From<ChunkConstructionFailure>,
         F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     {
         validate_chunk_carrier_encoding_observed(field.data_type(), &mut |carrier| {
             observe(ArrayNormalizationStep::InspectType(carrier))
         })?;
-        let field = normalize_execution_field_observed(&field, &mut observe)?;
+        let field = normalize_execution_field_observed(&field, |step| {
+            observe(step).map_err(ChunkObservationFailure::Caller)
+        })
+        .map_err(ChunkObservationFailure::into_caller)?;
         if field.is_nullable() != binding.nullable()
             || !execution_carrier_matches_layout_observed(
                 binding.data_type(),
@@ -235,9 +242,9 @@ impl ChunkSlotSchema {
                 &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
             )?
         {
-            return Err(E::from(
-                "typed chunk field does not match its explicit value binding".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::contract(
+                ChunkSchemaViolation::FieldBinding,
+            )));
         }
         Ok(Self {
             slot_id,
@@ -268,14 +275,14 @@ impl ChunkSlotSchema {
         &self,
         nullable: bool,
         storage: ValueTypeStorageLifetime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         if self.nullable() == nullable {
             return Ok(self.clone());
         }
         let binding = self
             .typed_binding
             .with_nullable(nullable, storage.clone())
-            .map_err(|error| error.to_string())?;
+            .map_err(ChunkConstructionFailure::from)?;
         let field = Arc::new(self.field().clone().with_nullable(nullable));
         Self::try_new_typed(self.slot_id, field, binding, self.unique_id, storage)
     }
@@ -284,7 +291,7 @@ impl ChunkSlotSchema {
         &self,
         field: FieldRef,
         storage: ValueTypeStorageLifetime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_typed(
             self.slot_id,
             field,
@@ -309,7 +316,7 @@ impl ChunkSlotSchema {
         field: Field,
         field_schema: Option<ChunkFieldSchema>,
         unique_id: Option<i32>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_owned_field(
             slot_id,
             OriginalFieldMaterialization::Plain(field),
@@ -323,7 +330,7 @@ impl ChunkSlotSchema {
         field: OriginalFieldMaterialization,
         field_schema: Option<ChunkFieldSchema>,
         unique_id: Option<i32>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         let field_schema = Self::legacy_semantics(field.field(), field_schema)?;
         let typed_binding = Self::bind_carrier(
             &field_schema,
@@ -348,7 +355,7 @@ impl ChunkSlotSchema {
         field: FieldRef,
         field_schema: Option<ChunkFieldSchema>,
         unique_id: Option<i32>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         let field_schema = Self::legacy_semantics(&field, field_schema)?;
         let typed_binding =
             Self::bind_carrier(&field_schema, &field, ValueTypeStorageLifetime::pure())?;
@@ -370,11 +377,12 @@ impl ChunkSlotSchema {
         metadata_origins: FieldMetadataOrigins,
         field_schema: Option<ChunkFieldSchema>,
         unique_id: Option<i32>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         if metadata_origins.metadata_bytes_for(&field).is_none() {
-            return Err(
-                "chunk slot metadata receipt does not match the exact field owner".to_string(),
-            );
+            return Err(schema_contract(
+                SchemaContractSite::Metadata,
+                "chunk slot metadata receipt does not match the exact field owner",
+            ));
         }
         let field_schema = Self::legacy_semantics(&field, field_schema)?;
         let typed_binding =
@@ -403,19 +411,25 @@ impl ChunkSlotSchema {
         &self,
         data_type: DataType,
         nullable: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         if &data_type == self.field.field().data_type()
             && nullable == self.field.field().is_nullable()
         {
             return Ok(self.clone());
         }
         if self.is_typed() {
-            return Err("typed slot changes require an explicit replacement binding and construction lifetime".into());
+            return Err(schema_contract(
+                SchemaContractSite::Mutation,
+                "typed slot changes require an explicit replacement binding and construction lifetime",
+            ));
         }
         if let Some(origins) = &self.metadata_origins {
-            let original = origins
-                .owner_for(self.field.field_ref())
-                .ok_or("chunk field metadata origin is missing")?;
+            let original = origins.owner_for(self.field.field_ref()).ok_or_else(|| {
+                schema_contract(
+                    SchemaContractSite::Mutation,
+                    "chunk field metadata origin is missing",
+                )
+            })?;
             let replacement = original
                 .derive_field(
                     data_type,
@@ -425,11 +439,11 @@ impl ChunkSlotSchema {
                         construction_bytes: 96 * 1024 * 1024,
                     },
                 )
-                .map_err(|_| "chunk field metadata derivation exceeds its source profile")?;
+                .map_err(ChunkConstructionFailure::from)?;
             let field = Arc::clone(replacement.field());
             let origins = origins
                 .replacing_root(self.field.field_ref(), replacement, 65536)
-                .map_err(|_| "chunk field metadata origins exceed the node profile")?;
+                .map_err(ChunkConstructionFailure::from)?;
             if let Ok(scoped) = origins.for_field_tree(&field, 65536, 64) {
                 Self::try_new_with_metadata_origins(
                     self.slot_id,
@@ -465,7 +479,7 @@ impl ChunkSlotSchema {
         &self,
         actual: &DataType,
         nullable: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         let Some(origins) = &self.metadata_origins else {
             let field = reconcile_chunk_field_to_data_type(self.field(), actual, nullable)?;
             return self.with_type_and_nullable(field.data_type().clone(), field.is_nullable());
@@ -474,7 +488,7 @@ impl ChunkSlotSchema {
         // metadata remains a separate, unproven owner; it is never normalized.
         let scoped = origins
             .for_field_tree(self.field.field_ref(), 65536, 64)
-            .map_err(|_| "chunk field metadata tree is incomplete or exceeds its profile")?;
+            .map_err(ChunkConstructionFailure::from)?;
         let mut derived = Vec::new();
         let field = reconcile_owned_field(
             self.field.field_ref(),
@@ -487,7 +501,7 @@ impl ChunkSlotSchema {
             return Ok(self.clone());
         }
         let origins = FieldMetadataOrigins::try_new(derived, 65536)
-            .map_err(|_| "chunk field metadata derivation exceeds its node profile")?;
+            .map_err(ChunkConstructionFailure::from)?;
         Self::try_new_with_metadata_origins(
             self.slot_id,
             field,
@@ -524,18 +538,19 @@ impl ChunkSlotSchema {
         slot_id: SlotId,
         field: &Field,
         unique_id: Option<i32>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_with_field(slot_id, field.clone(), None, unique_id)
     }
 
-    pub fn with_field(&self, field: Field) -> Result<Self, String> {
+    pub fn with_field(&self, field: Field) -> Result<Self, ChunkConstructionFailure> {
         if self.is_typed() {
             if self.field() == &field {
                 return Ok(self.clone());
             }
-            return Err(
-                "typed field replacement requires with_field_typed and a creation lifetime".into(),
-            );
+            return Err(schema_contract(
+                SchemaContractSite::Mutation,
+                "typed field replacement requires with_field_typed and a creation lifetime",
+            ));
         }
         Self::try_new_with_field(
             self.slot_id,
@@ -547,23 +562,23 @@ impl ChunkSlotSchema {
 
     /// Rename a validated channel while sharing its complete immutable owner.
     /// Slot identity changes neither value semantics nor encoding facts.
-    pub fn with_slot_id_typed_observed<E: From<String>>(
+    pub fn with_slot_id_typed_observed<E: From<ChunkConstructionFailure>>(
         &self,
         slot_id: SlotId,
         mut observe: impl FnMut() -> Result<(), E>,
     ) -> Result<Self, E> {
         observe()?;
         if !self.is_typed() {
-            return Err(E::from(
-                "typed slot rename requires its complete declaration".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::contract(
+                ChunkSchemaViolation::SlotRename,
+            )));
         }
         let mut slot = self.clone();
         slot.slot_id = slot_id;
         Ok(slot)
     }
 
-    pub fn with_slot_id(&self, slot_id: SlotId) -> Result<Self, String> {
+    pub fn with_slot_id(&self, slot_id: SlotId) -> Result<Self, ChunkConstructionFailure> {
         if self.field.shares_original_reference() {
             let mut slot = self.clone();
             slot.slot_id = slot_id;
@@ -577,7 +592,11 @@ impl ChunkSlotSchema {
         )
     }
 
-    pub fn with_field_and_slot_id(&self, slot_id: SlotId, field: Field) -> Result<Self, String> {
+    pub fn with_field_and_slot_id(
+        &self,
+        slot_id: SlotId,
+        field: Field,
+    ) -> Result<Self, ChunkConstructionFailure> {
         if self.is_typed() {
             return self.with_field(field)?.with_slot_id(slot_id);
         }
@@ -650,7 +669,7 @@ impl novarocks_type_contract::ClientInputTypeBindings for ChunkSchema {
     }
 }
 
-fn request_array<T, E: From<String>>(
+fn request_array<T, E: From<ChunkConstructionFailure>>(
     count: usize,
     request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
 ) -> Result<(), E> {
@@ -658,24 +677,25 @@ fn request_array<T, E: From<String>>(
         return Ok(());
     }
     request(
-        std::alloc::Layout::array::<T>(count)
-            .map_err(|_| E::from("typed schema array request overflow".into()))?,
+        std::alloc::Layout::array::<T>(count).map_err(|source| {
+            E::from(ChunkConstructionFailure::array_request::<T>(count, source))
+        })?,
     )
 }
 
-pub(super) fn request_arc_payload<E: From<String>>(
+pub(super) fn request_arc_payload<E: From<ChunkConstructionFailure>>(
     payload: std::alloc::Layout,
     request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
 ) -> Result<(), E> {
     request(
         novarocks_type_contract::owned_resources::layout::arc_layout(payload)
-            .map_err(|error| E::from(format!("typed schema Arc request: {error:?}")))?,
+            .map_err(|error| E::from(ChunkConstructionFailure::from(error)))?,
     )
 }
 
 /// Retain reused backing without retaining its former whole Chunk or context.
 /// A distinct composite holder is requested before its actual Arc allocation.
-pub(super) fn retain_storage_observed<E: From<String>>(
+pub(super) fn retain_storage_observed<E: From<ChunkConstructionFailure>>(
     storage: ValueTypeStorageLifetime,
     original: &ValueTypeStorageLifetime,
     request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
@@ -699,9 +719,7 @@ pub(super) fn retain_storage_observed<E: From<String>>(
         })
         .map_err(|error| match error {
             RetentionError::Request(error) => error,
-            RetentionError::Model(error) => {
-                E::from(format!("typed storage retention request: {error:?}"))
-            }
+            RetentionError::Model(error) => E::from(ChunkConstructionFailure::from(error)),
         })
 }
 
@@ -712,7 +730,7 @@ fn legacy_retarget_nullable(
     value: &ValueTypeRef,
     carrier: &DataType,
     nullable: bool,
-) -> Result<ValueTypeRef, String> {
+) -> Result<ValueTypeRef, ChunkConstructionFailure> {
     let carrier = match carrier {
         DataType::Dictionary(_, values) => {
             return legacy_retarget_nullable(value, values, nullable);
@@ -769,16 +787,22 @@ fn legacy_retarget_nullable(
                             storage.clone(),
                         ))
                     })
-                    .collect::<Result<Vec<_>, String>>()?
+                    .collect::<Result<Vec<_>, ChunkConstructionFailure>>()?
                     .into_boxed_slice(),
             )
         }
         (ValueKind::Map { key, value }, DataType::Map(entries, _)) => {
             let DataType::Struct(fields) = entries.data_type() else {
-                return Err("legacy nullable author Map entries are not a Struct".into());
+                return Err(schema_contract(
+                    SchemaContractSite::Reconciliation,
+                    "legacy nullable author Map entries are not a Struct",
+                ));
             };
             if fields.len() != 2 {
-                return Err("legacy nullable author Map entries have invalid arity".into());
+                return Err(schema_contract(
+                    SchemaContractSite::Reconciliation,
+                    "legacy nullable author Map entries have invalid arity",
+                ));
             }
             ValueKind::Map {
                 key: legacy_retarget_nullable(key, fields[0].data_type(), fields[0].is_nullable())?,
@@ -822,7 +846,7 @@ fn legacy_retarget_nullable(
                             ),
                         })
                     })
-                    .collect::<Result<Vec<_>, String>>()?
+                    .collect::<Result<Vec<_>, ChunkConstructionFailure>>()?
                     .into_boxed_slice(),
             )
         }
@@ -832,14 +856,14 @@ fn legacy_retarget_nullable(
             } else {
                 value
                     .with_nullable(nullable, storage)
-                    .map_err(|error| error.to_string())
+                    .map_err(ChunkConstructionFailure::from)
             };
         }
     };
     if &kind == value.kind() && nullable == value.nullable() {
         Ok(value.clone())
     } else {
-        ValueTypeRef::try_new(kind, nullable, storage).map_err(|error| error.to_string())
+        ValueTypeRef::try_new(kind, nullable, storage).map_err(ChunkConstructionFailure::from)
     }
 }
 
@@ -900,12 +924,7 @@ fn legacy_nullable_matches(value: &ValueTypeRef, carrier: &DataType, nullable: b
 
 /// Compare the already-authored plain layout to an actual encoding by borrow.
 /// This performs no type import, layout allocation, value decoding or widening.
-pub(crate) fn execution_carrier_matches_layout(expected: &DataType, actual: &DataType) -> bool {
-    execution_carrier_matches_layout_observed::<String>(expected, actual, &mut |_| Ok(()))
-        .unwrap_or(false)
-}
-
-pub(crate) fn execution_carrier_matches_layout_observed<E: From<String>>(
+pub(crate) fn execution_carrier_matches_layout_observed<E: From<ChunkConstructionFailure>>(
     expected: &DataType,
     actual: &DataType,
     work: &mut impl FnMut(usize) -> Result<(), E>,
@@ -924,21 +943,21 @@ pub(crate) fn execution_carrier_matches_layout_observed<E: From<String>>(
     })
     .map_err(|error| match error {
         MatchError::Caller(error) => error,
-        MatchError::Source(error) => E::from(format!("typed carrier layout validation: {error}")),
+        MatchError::Source(error) => E::from(ChunkConstructionFailure::from(error)),
     })
 }
 
 /// The current engine's encoding set is independent of the pure vocabulary.
-fn validate_chunk_carrier_encoding(carrier: &DataType) -> Result<(), String> {
+fn validate_chunk_carrier_encoding(carrier: &DataType) -> Result<(), ChunkConstructionFailure> {
     validate_chunk_carrier_encoding_observed(carrier, &mut |_| Ok(()))
 }
-pub(crate) fn validate_chunk_carrier_encoding_observed<E: From<String>>(
+pub(crate) fn validate_chunk_carrier_encoding_observed<E: From<ChunkConstructionFailure>>(
     carrier: &DataType,
     observe: &mut impl FnMut(&DataType) -> Result<(), E>,
 ) -> Result<(), E> {
     validate_chunk_carrier_encoding_at(carrier, 1, &mut 0, observe)
 }
-fn validate_chunk_carrier_encoding_at<E: From<String>>(
+fn validate_chunk_carrier_encoding_at<E: From<ChunkConstructionFailure>>(
     carrier: &DataType,
     depth: usize,
     nodes: &mut usize,
@@ -946,41 +965,42 @@ fn validate_chunk_carrier_encoding_at<E: From<String>>(
 ) -> Result<(), E> {
     observe(carrier)?;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(
-            "typed chunk carrier exceeds its nesting profile".into(),
-        ));
+        return Err(E::from(ChunkConstructionFailure::from(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
-    *nodes = nodes
-        .checked_add(1)
-        .ok_or_else(|| E::from("typed chunk carrier node count overflow".into()))?;
+    *nodes = nodes.checked_add(1).ok_or_else(|| {
+        E::from(ChunkConstructionFailure::from(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        ))
+    })?;
     if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(E::from(
-            "typed chunk carrier exceeds its node profile".into(),
-        ));
+        return Err(E::from(ChunkConstructionFailure::from(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        )));
     }
     match carrier {
         DataType::Dictionary(keys, values) => {
             if keys.as_ref() != &DataType::Int32
                 || !matches!(values.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
             {
-                return Err(E::from(
-                    "typed chunk dictionary encoding requires Int32 keys and Utf8/LargeUtf8 values"
-                        .into(),
-                ));
+                return Err(E::from(ChunkConstructionFailure::contract(
+                    ChunkSchemaViolation::DictionaryEncoding,
+                )));
             }
         }
         DataType::RunEndEncoded(_, _) => {
-            return Err(E::from(
-                "run-end encoding is not supported by the current execution engine".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::contract(
+                ChunkSchemaViolation::RunEndUnsupported,
+            )));
         }
         DataType::Utf8View
         | DataType::BinaryView
         | DataType::ListView(_)
         | DataType::LargeListView(_) => {
-            return Err(E::from(
-                "view carriers are not supported by the current execution engine".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::contract(
+                ChunkSchemaViolation::ViewUnsupported,
+            )));
         }
         DataType::List(field)
         | DataType::LargeList(field)
@@ -1007,23 +1027,15 @@ fn check_chunk_data_type(
     expected: &DataType,
     actual: &DataType,
     root_label: &str,
-) -> Result<(), String> {
-    check_exact(expected, actual).map_err(|m| {
-        format!(
-            "chunk schema type mismatch at {}: expected {:?}, got {:?} ({:?})",
-            nested_path_label(root_label, &m.nested_path),
-            expected,
-            actual,
-            m.kind
-        )
-    })
+) -> Result<(), ChunkConstructionFailure> {
+    check_exact(expected, actual).map_err(|source| schema_type_mismatch(root_label, source))
 }
 
 fn reconcile_chunk_field_to_data_type(
     expected: &Field,
     actual: &DataType,
     actual_nullable: bool,
-) -> Result<Arc<Field>, String> {
+) -> Result<Arc<Field>, ChunkConstructionFailure> {
     let data_type = reconcile_chunk_data_type(expected.data_type(), actual)?;
     let nullable = expected.is_nullable() || actual_nullable;
     if &data_type == expected.data_type() && nullable == expected.is_nullable() {
@@ -1039,7 +1051,10 @@ fn rebuild_chunk_field(expected: &Field, data_type: DataType, nullable: bool) ->
     )
 }
 
-fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<DataType, String> {
+fn reconcile_chunk_data_type(
+    expected: &DataType,
+    actual: &DataType,
+) -> Result<DataType, ChunkConstructionFailure> {
     reconcile_chunk_data_type_core(expected, actual, &mut ReconcileMetadataSources::None)
 }
 
@@ -1047,7 +1062,7 @@ fn reconcile_chunk_data_type_core(
     expected: &DataType,
     actual: &DataType,
     sources: &mut ReconcileMetadataSources<'_>,
-) -> Result<DataType, String> {
+) -> Result<DataType, ChunkConstructionFailure> {
     if expected == actual {
         return Ok(expected.clone());
     }
@@ -1090,7 +1105,7 @@ fn reconcile_nested_chunk_field(
     expected: &Arc<Field>,
     actual: &Arc<Field>,
     sources: &mut ReconcileMetadataSources<'_>,
-) -> Result<Arc<Field>, String> {
+) -> Result<Arc<Field>, ChunkConstructionFailure> {
     let data_type =
         reconcile_chunk_data_type_core(expected.data_type(), actual.data_type(), sources)?;
     let nullable = expected.is_nullable() || actual.is_nullable();
@@ -1142,7 +1157,7 @@ fn reconcile_owned_chunk_field(
     actual: &DataType,
     actual_nullable: bool,
     sources: &mut ReconcileMetadataSources<'_>,
-) -> Result<OriginalFieldMaterialization, String> {
+) -> Result<OriginalFieldMaterialization, ChunkConstructionFailure> {
     let data_type = reconcile_chunk_data_type_core(expected.field().data_type(), actual, sources)?;
     let nullable = expected.field().is_nullable() || actual_nullable;
     let field = if &data_type == expected.field().data_type()
@@ -1170,12 +1185,15 @@ fn reconcile_owned_field(
     actual_nullable: bool,
     origins: &FieldMetadataOrigins,
     derived: &mut Vec<novarocks_types::arrow_metadata_owner::MetadataOwnedField>,
-) -> Result<FieldRef, String> {
+) -> Result<FieldRef, ChunkConstructionFailure> {
     let data_type = reconcile_owned_type(expected.data_type(), actual, origins, derived)?;
     let nullable = expected.is_nullable() || actual_nullable;
-    let owner = origins
-        .owner_for(expected)
-        .ok_or("nested chunk field metadata origin is missing")?;
+    let owner = origins.owner_for(expected).ok_or_else(|| {
+        schema_contract(
+            SchemaContractSite::Reconciliation,
+            "nested chunk field metadata origin is missing",
+        )
+    })?;
     let owner = if &data_type == expected.data_type() && nullable == expected.is_nullable() {
         owner.clone()
     } else {
@@ -1188,10 +1206,12 @@ fn reconcile_owned_field(
                     construction_bytes: 96 * 1024 * 1024,
                 },
             )
-            .map_err(|_| "nested chunk metadata derivation exceeds its source profile")?
+            .map_err(ChunkConstructionFailure::from)?
     };
     if derived.len() >= 65536 {
-        return Err("nested chunk metadata derivation exceeds its node profile".into());
+        return Err(ChunkConstructionFailure::from(
+            novarocks_types::arrow_metadata_owner::MetadataOwnerError::CapacityExceeded,
+        ));
     }
     let field = Arc::clone(owner.field());
     derived.push(owner);
@@ -1203,7 +1223,7 @@ fn reconcile_owned_type(
     actual: &DataType,
     origins: &FieldMetadataOrigins,
     derived: &mut Vec<novarocks_types::arrow_metadata_owner::MetadataOwnedField>,
-) -> Result<DataType, String> {
+) -> Result<DataType, ChunkConstructionFailure> {
     // Validate the complete expected tree once per subtree before copying any
     // metadata. The index walk is bounded and does not inspect unknown tables.
     check_chunk_data_type(expected, actual, "column")?;
@@ -1255,7 +1275,7 @@ impl ChunkSchema {
     pub fn try_new_typed(
         slots: Vec<ChunkSlotSchema>,
         storage: ValueTypeStorageLifetime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_typed_observed(slots, storage, |_| Ok(()), |_| Ok(()))
     }
 
@@ -1263,7 +1283,7 @@ impl ChunkSchema {
     /// port. The caller has already covered the input slot Vec before creating
     /// it. Every request describes this constructor's concrete allocation, not
     /// retained bytes or capacity inferred from a foreign collection.
-    pub fn try_new_typed_observed<E: From<String>>(
+    pub fn try_new_typed_observed<E: From<ChunkConstructionFailure>>(
         slots: Vec<ChunkSlotSchema>,
         storage: ValueTypeStorageLifetime,
         mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
@@ -1273,9 +1293,9 @@ impl ChunkSchema {
         for slot in &slots {
             work(1)?;
             if !slot.is_typed() {
-                return Err(E::from(
-                    "typed chunk schema contains a legacy imported slot".into(),
-                ));
+                return Err(E::from(ChunkConstructionFailure::contract(
+                    ChunkSchemaViolation::LegacySlot,
+                )));
             }
         }
         let count = slots.len();
@@ -1283,7 +1303,7 @@ impl ChunkSchema {
             SlotId,
             usize,
         >(count)
-        .map_err(|error| E::from(format!("typed schema slot index request: {error:?}")))?;
+        .map_err(|error| E::from(ChunkConstructionFailure::from(error)))?;
         if let Some(layout) = table.layout {
             request(layout)?;
         }
@@ -1295,17 +1315,21 @@ impl ChunkSchema {
         for (index, slot) in slots.iter().enumerate() {
             work(3)?;
             if index_by_slot.insert(slot.slot_id(), index).is_some() {
-                return Err(E::from(format!(
-                    "duplicate slot id {} in typed chunk schema",
-                    slot.slot_id()
+                return Err(E::from(ChunkConstructionFailure::contract(
+                    ChunkSchemaViolation::DuplicateSlot {
+                        slot: slot.slot_id(),
+                    },
                 )));
             }
             slot_ids.push(slot.slot_id());
             fields.push(Arc::clone(slot.field_ref()));
         }
         request_arc_payload(
-            std::alloc::Layout::array::<FieldRef>(count)
-                .map_err(|_| E::from("typed schema FieldRef slice request overflow".into()))?,
+            std::alloc::Layout::array::<FieldRef>(count).map_err(|source| {
+                E::from(ChunkConstructionFailure::array_request::<FieldRef>(
+                    count, source,
+                ))
+            })?,
             &mut request,
         )?;
         let fields: arrow::datatypes::Fields = fields.into();
@@ -1325,7 +1349,7 @@ impl ChunkSchema {
 
     /// Import explicit compiled bindings through the same occurrence author
     /// used by derived runtime declarations. No legacy importer is attempted.
-    pub fn from_compiled_layout_owned_observed<E: From<String>>(
+    pub fn from_compiled_layout_owned_observed<E: From<ChunkConstructionFailure>>(
         layout: &novarocks_local_program::StaticLayout,
         storage: ValueTypeStorageLifetime,
         request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
@@ -1344,7 +1368,10 @@ impl ChunkSchema {
     /// Names, slot IDs and unique IDs keep their original occurrence role;
     /// replacement types never come from format annotations or Arrow inference.
     /// Each newly authored Field and schema scaffold is admitted before creation.
-    pub(crate) fn from_compiled_layout_with_bindings_owned_observed<'a, E: From<String>>(
+    pub(crate) fn from_compiled_layout_with_bindings_owned_observed<
+        'a,
+        E: From<ChunkConstructionFailure>,
+    >(
         layout: &'a novarocks_local_program::StaticLayout,
         storage: ValueTypeStorageLifetime,
         mut binding_at: impl FnMut(usize) -> Option<&'a TypedValueBinding>,
@@ -1356,19 +1383,22 @@ impl ChunkSchema {
             || layout.schema().fields().len() != layout.slots().len()
             || layout.schema().metadata().capacity() != 0
         {
-            return Err(E::from(
-                "typed layout does not have a canonical execution schema".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::contract(
+                ChunkSchemaViolation::CanonicalLayout,
+            )));
         }
         for (index, field) in layout.schema().fields().iter().enumerate() {
             work(2)?;
             if layout.value_binding_at(index).is_none()
                 || binding_at(index).is_none()
                 || layout.slot_metadata_at(index).is_none()
-                || !execution_field_is_normalized_observed(field, &mut work)?
+                || !execution_field_is_normalized_observed(field, &mut |units| {
+                    work(units).map_err(ChunkObservationFailure::Caller)
+                })
+                .map_err(ChunkObservationFailure::into_caller)?
             {
-                return Err(E::from(format!(
-                    "typed layout occurrence {index} is not completely bound"
+                return Err(E::from(ChunkConstructionFailure::contract(
+                    ChunkSchemaViolation::IncompleteOccurrence { index },
                 )));
             }
         }
@@ -1385,8 +1415,8 @@ impl ChunkSchema {
             work(3)?;
             let original = layout.value_binding_at(index).expect("validated binding");
             let binding = binding_at(index).ok_or_else(|| {
-                E::from(format!(
-                    "derived schema occurrence {index} has no complete binding"
+                E::from(ChunkConstructionFailure::contract(
+                    ChunkSchemaViolation::MissingDerivedBinding { index },
                 ))
             })?;
             let field = if std::ptr::eq(original, binding) {
@@ -1410,7 +1440,9 @@ impl ChunkSchema {
             slots.push(ChunkSlotSchema::try_new_typed_observed(
                 *slot,
                 field,
-                binding.clone_observed(|| work(1))?,
+                binding
+                    .clone_observed(|| work(1).map_err(ChunkObservationFailure::Caller))
+                    .map_err(ChunkObservationFailure::into_caller)?,
                 unique_id,
                 storage.clone(),
                 |step| match step {
@@ -1434,12 +1466,15 @@ impl ChunkSchema {
 
     pub(crate) fn from_static_layout(
         layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<ChunkSchemaRef, String> {
+    ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
         if layout.is_typed() {
             return Self::from_typed_layout(layout);
         }
         if !layout.has_exact_slot_metadata() {
-            return Err("local program layout has no exact slot metadata".to_string());
+            return Err(schema_contract(
+                SchemaContractSite::Layout,
+                "local program layout has no exact slot metadata",
+            ));
         }
         if layout.field_metadata_origins().is_some() {
             return Self::from_layout_with_shared_origins(layout, true);
@@ -1451,9 +1486,13 @@ impl ChunkSchema {
             .zip(layout.slots())
             .enumerate()
             .map(|(index, (field, slot))| {
-                let (field_schema, unique_id) = layout
-                    .slot_metadata_at(index)
-                    .ok_or_else(|| format!("local program slot {index} lacks metadata"))?;
+                let (field_schema, unique_id) =
+                    layout.slot_metadata_at(index).ok_or_else(|| {
+                        schema_contract(
+                            SchemaContractSite::Layout,
+                            format_args!("local program slot {index} lacks metadata"),
+                        )
+                    })?;
                 ChunkSlotSchema::try_new_owned_field(
                     *slot,
                     OriginalFieldMaterialization::clone_from_source(
@@ -1466,7 +1505,7 @@ impl ChunkSchema {
                     unique_id,
                 )
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, ChunkConstructionFailure>>()?;
         let metadata = match layout.metadata_materializations() {
             Some(source) => {
                 ChunkMetadataSource::Original(source.schema_owner().clone_metadata_original())
@@ -1486,7 +1525,7 @@ impl ChunkSchema {
     /// Arrow annotation import remains only in the explicit expansion adapter.
     pub fn from_compiled_layout(
         layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<ChunkSchemaRef, String> {
+    ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
         if layout.is_typed() {
             return Self::from_typed_layout(layout);
         }
@@ -1509,9 +1548,12 @@ impl ChunkSchema {
                     None,
                 )
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, ChunkConstructionFailure>>()?;
         if slots.len() != layout.schema().fields().len() {
-            return Err("compiled layout slot and field counts differ".to_string());
+            return Err(schema_contract(
+                SchemaContractSite::Layout,
+                "compiled layout slot and field counts differ",
+            ));
         }
         let metadata = match layout.metadata_materializations() {
             Some(source) => {
@@ -1530,11 +1572,14 @@ impl ChunkSchema {
 
     fn from_typed_layout(
         layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<ChunkSchemaRef, String> {
+    ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
         if layout.schema().fields().len() != layout.slots().len()
             || layout.schema().metadata().capacity() != 0
         {
-            return Err("typed layout does not have a canonical execution schema".into());
+            return Err(schema_contract(
+                SchemaContractSite::Layout,
+                "typed layout does not have a canonical execution schema",
+            ));
         }
         let storage = layout.storage_lifetime();
         let mut slots = Vec::with_capacity(layout.slots().len());
@@ -1546,15 +1591,22 @@ impl ChunkSchema {
             .enumerate()
         {
             let binding = layout.value_binding_at(index).ok_or_else(|| {
-                format!("typed layout occurrence {index} has no explicit value binding")
+                schema_contract(
+                    SchemaContractSite::Layout,
+                    format_args!("typed layout occurrence {index} has no explicit value binding"),
+                )
             })?;
             if !execution_field_is_normalized(field)? {
-                return Err(format!(
-                    "typed layout occurrence {index} has a noncanonical actual field"
+                return Err(schema_contract(
+                    SchemaContractSite::Layout,
+                    format_args!("typed layout occurrence {index} has a noncanonical actual field"),
                 ));
             }
             let (_, unique_id) = layout.slot_metadata_at(index).ok_or_else(|| {
-                format!("typed layout occurrence {index} has no exact slot declaration")
+                schema_contract(
+                    SchemaContractSite::Layout,
+                    format_args!("typed layout occurrence {index} has no exact slot declaration"),
+                )
             })?;
             slots.push(ChunkSlotSchema::try_new_typed(
                 *slot_id,
@@ -1570,7 +1622,7 @@ impl ChunkSchema {
     fn from_layout_with_shared_origins(
         layout: &novarocks_local_program::StaticLayout,
         legacy: bool,
-    ) -> Result<ChunkSchemaRef, String> {
+    ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
         let origins = layout
             .field_metadata_origins()
             .expect("actual source route");
@@ -1582,9 +1634,13 @@ impl ChunkSchema {
             .enumerate()
             .map(|(index, (field, slot))| {
                 let (metadata, unique_id) = if legacy {
-                    let (metadata, unique_id) = layout
-                        .slot_metadata_at(index)
-                        .ok_or_else(|| format!("local program slot {index} lacks metadata"))?;
+                    let (metadata, unique_id) =
+                        layout.slot_metadata_at(index).ok_or_else(|| {
+                            schema_contract(
+                                SchemaContractSite::Mutation,
+                                format_args!("local program slot {index} lacks metadata"),
+                            )
+                        })?;
                     (
                         Some(crate::exec::expr::static_program::thaw_field_schema(
                             metadata,
@@ -1599,7 +1655,7 @@ impl ChunkSchema {
                     Arc::clone(field),
                     origins
                         .for_field_tree(field, 65536, 64)
-                        .map_err(|_| "local program field metadata origins are incomplete")?,
+                        .map_err(ChunkConstructionFailure::from)?,
                     metadata,
                     unique_id,
                 )?;
@@ -1609,9 +1665,12 @@ impl ChunkSchema {
                 );
                 Ok(result)
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, ChunkConstructionFailure>>()?;
         if slots.len() != layout.schema().fields().len() {
-            return Err("compiled layout slot and field counts differ".into());
+            return Err(schema_contract(
+                SchemaContractSite::Mutation,
+                "compiled layout slot and field counts differ",
+            ));
         }
         let metadata = match layout.metadata_materializations() {
             Some(source) => {
@@ -1628,7 +1687,10 @@ impl ChunkSchema {
         )?;
         if let Some(origin) = layout.schema_metadata_origin() {
             if origin.backing_bytes_for(layout.schema()).is_none() {
-                return Err("local program schema metadata owner conflicts with its layout".into());
+                return Err(schema_contract(
+                    SchemaContractSite::Mutation,
+                    "local program schema metadata owner conflicts with its layout",
+                ));
             }
             schema.arrow_schema = Arc::clone(layout.schema());
             schema.schema_metadata_origin = Some(origin.clone());
@@ -1637,7 +1699,7 @@ impl ChunkSchema {
         Ok(Arc::new(schema))
     }
 
-    pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, String> {
+    pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, ChunkConstructionFailure> {
         let metadata = ArrowMetadataOwner::try_new(
             Vec::new(),
             MetadataOwnerLimits {
@@ -1645,14 +1707,14 @@ impl ChunkSchema {
                 construction_bytes: 0,
             },
         )
-        .map_err(|_| "empty schema metadata construction failed")?;
+        .map_err(ChunkConstructionFailure::from)?;
         Self::try_new_with_owned_schema_metadata(slots, metadata)
     }
 
     pub fn try_new_with_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         metadata: HashMap<String, String>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_with_metadata_source(slots, ChunkMetadataSource::Foreign(metadata), None)
     }
 
@@ -1661,7 +1723,7 @@ impl ChunkSchema {
     pub(crate) fn try_new_with_original_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         source: &SchemaMetadataMaterializations,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_with_metadata_source(
             slots,
             ChunkMetadataSource::Original(source.schema_owner().clone_metadata_original()),
@@ -1672,13 +1734,13 @@ impl ChunkSchema {
     pub fn try_new_with_owned_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         metadata: ArrowMetadataOwner,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_with_metadata_source(slots, ChunkMetadataSource::Owned(metadata), None)
     }
     pub fn try_new_with_derived_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         source: &MetadataOwnedSchema,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         Self::try_new_with_metadata_source(
             slots,
             ChunkMetadataSource::Derived(source.clone()),
@@ -1689,7 +1751,7 @@ impl ChunkSchema {
         slots: Vec<ChunkSlotSchema>,
         metadata: ChunkMetadataSource,
         inherited: Option<&[MetadataFieldLoan]>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         let mut index_by_slot = HashMap::with_capacity(slots.len());
         let mut slot_ids = Vec::with_capacity(slots.len());
         let mut fields = Vec::with_capacity(slots.len());
@@ -1700,10 +1762,13 @@ impl ChunkSchema {
         });
         for (idx, slot) in slots.iter().enumerate() {
             if index_by_slot.insert(slot.slot_id(), idx).is_some() {
-                return Err(format!(
-                    "duplicate slot id {} in chunk schema contract at index {}",
-                    slot.slot_id(),
-                    idx
+                return Err(schema_contract(
+                    SchemaContractSite::Metadata,
+                    format_args!(
+                        "duplicate slot id {} in chunk schema contract at index {}",
+                        slot.slot_id(),
+                        idx
+                    ),
                 ));
             }
             slot_ids.push(slot.slot_id());
@@ -1725,14 +1790,19 @@ impl ChunkSchema {
                         .checked_add(slot.metadata_origins().unwrap().owners().len())
                         .filter(|count| *count <= 65536)
                 })
-                .ok_or("chunk schema metadata origin collection exceeds its node profile")?;
+                .ok_or_else(|| {
+                    schema_contract(
+                        SchemaContractSite::Metadata,
+                        "chunk schema metadata origin collection exceeds its node profile",
+                    )
+                })?;
             let mut owners = Vec::with_capacity(count);
             for slot in &slots {
                 owners.extend_from_slice(slot.metadata_origins().unwrap().owners());
             }
             Some(
                 FieldMetadataOrigins::try_new(owners, 65536)
-                    .map_err(|_| "chunk schema metadata origins exceed their node profile")?,
+                    .map_err(ChunkConstructionFailure::from)?,
             )
         } else {
             None
@@ -1776,7 +1846,7 @@ impl ChunkSchema {
                             construction_bytes: 96 * 1024 * 1024,
                         },
                     )
-                    .map_err(|_| "chunk schema metadata derivation exceeds its source profile")?;
+                    .map_err(ChunkConstructionFailure::from)?;
                 (Arc::clone(origin.schema()), None, Some(origin))
             }
         };
@@ -1885,19 +1955,22 @@ impl ChunkSchema {
     pub fn slot_schema_from_arrow_field(
         slot_id: SlotId,
         field: &Field,
-    ) -> Result<ChunkSlotSchema, String> {
+    ) -> Result<ChunkSlotSchema, ChunkConstructionFailure> {
         ChunkSlotSchema::from_field(slot_id, field, None)
     }
 
     pub fn try_ref_from_schema_and_slot_ids(
         schema: &Schema,
         slot_ids: &[SlotId],
-    ) -> Result<ChunkSchemaRef, String> {
+    ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
         if schema.fields().len() != slot_ids.len() {
-            return Err(format!(
-                "chunk schema slot id length mismatch: schema_fields={} slot_ids={}",
-                schema.fields().len(),
-                slot_ids.len()
+            return Err(schema_contract(
+                SchemaContractSite::Assembly,
+                format_args!(
+                    "chunk schema slot id length mismatch: schema_fields={} slot_ids={}",
+                    schema.fields().len(),
+                    slot_ids.len()
+                ),
             ));
         }
         let slots = schema
@@ -1915,9 +1988,12 @@ impl ChunkSchema {
         source: &MetadataOwnedSchema,
         origins: &FieldMetadataOrigins,
         slot_ids: &[SlotId],
-    ) -> Result<ChunkSchemaRef, String> {
+    ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
         if source.schema().fields().len() != slot_ids.len() {
-            return Err("owned chunk schema slot id length mismatch".into());
+            return Err(schema_contract(
+                SchemaContractSite::Assembly,
+                "owned chunk schema slot id length mismatch",
+            ));
         }
         let slots = source
             .schema()
@@ -1930,12 +2006,12 @@ impl ChunkSchema {
                     Arc::clone(field),
                     origins
                         .for_field_tree(field, 65536, 64)
-                        .map_err(|_| "owned chunk field metadata origins are incomplete")?,
+                        .map_err(ChunkConstructionFailure::from)?,
                     None,
                     None,
                 )
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, ChunkConstructionFailure>>()?;
         let mut schema = Self::try_new(slots)?;
         schema.arrow_schema = Arc::clone(source.schema());
         schema.schema_metadata_origin = Some(source.clone());
@@ -1956,9 +2032,12 @@ impl ChunkSchema {
         &self.index_by_slot
     }
 
-    pub fn project_by_slots(&self, slot_ids: &[SlotId]) -> Result<Self, String> {
+    pub fn project_by_slots(&self, slot_ids: &[SlotId]) -> Result<Self, ChunkConstructionFailure> {
         if self.is_typed() {
-            return Err("typed schema projection requires a supplied creation lifetime".into());
+            return Err(schema_contract(
+                SchemaContractSite::Projection,
+                "typed schema projection requires a supplied creation lifetime",
+            ));
         }
         self.project_by_slots_core(slot_ids, None)
     }
@@ -1967,9 +2046,12 @@ impl ChunkSchema {
         &self,
         slot_ids: &[SlotId],
         storage: ValueTypeStorageLifetime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         if !self.is_typed() {
-            return Err("typed schema projection requires an explicit typed source".into());
+            return Err(schema_contract(
+                SchemaContractSite::Projection,
+                "typed schema projection requires an explicit typed source",
+            ));
         }
         self.project_by_slots_core(slot_ids, Some(storage))
     }
@@ -1978,14 +2060,17 @@ impl ChunkSchema {
         &self,
         slot_ids: &[SlotId],
         storage: Option<ValueTypeStorageLifetime>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         let mut slots = Vec::with_capacity(slot_ids.len());
         for slot_id in slot_ids {
             let slot = self.slot(*slot_id).cloned().ok_or_else(|| {
-                format!(
-                    "chunk schema projection references missing slot {} (available={:?})",
-                    slot_id,
-                    self.slot_ids()
+                schema_contract(
+                    SchemaContractSite::Projection,
+                    format_args!(
+                        "chunk schema projection references missing slot {} (available={:?})",
+                        slot_id,
+                        self.slot_ids()
+                    ),
                 )
             })?;
             slots.push(slot);
@@ -2005,12 +2090,18 @@ impl ChunkSchema {
         }
     }
 
-    pub fn with_fields_in_order(&self, fields: Vec<Field>) -> Result<Self, String> {
+    pub fn with_fields_in_order(
+        &self,
+        fields: Vec<Field>,
+    ) -> Result<Self, ChunkConstructionFailure> {
         if fields.len() != self.slots.len() {
-            return Err(format!(
-                "chunk schema field length mismatch: fields={} slots={}",
-                fields.len(),
-                self.slots.len()
+            return Err(schema_contract(
+                SchemaContractSite::Projection,
+                format_args!(
+                    "chunk schema field length mismatch: fields={} slots={}",
+                    fields.len(),
+                    self.slots.len()
+                ),
             ));
         }
         let slots = self
@@ -2023,9 +2114,12 @@ impl ChunkSchema {
         Self::try_new(slots)
     }
 
-    pub fn concat(parts: &[ChunkSchemaRef]) -> Result<Self, String> {
+    pub fn concat(parts: &[ChunkSchemaRef]) -> Result<Self, ChunkConstructionFailure> {
         if parts.iter().any(|part| part.is_typed()) {
-            return Err("typed schema concatenation requires a supplied creation lifetime".into());
+            return Err(schema_contract(
+                SchemaContractSite::Projection,
+                "typed schema concatenation requires a supplied creation lifetime",
+            ));
         }
         let mut slots = Vec::new();
         let mut origins = None::<Vec<MetadataFieldLoan>>;
@@ -2052,14 +2146,17 @@ impl ChunkSchema {
     pub fn concat_typed(
         parts: &[ChunkSchemaRef],
         storage: ValueTypeStorageLifetime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkConstructionFailure> {
         if parts.iter().any(|part| !part.is_typed()) {
-            return Err("typed schema concatenation requires explicit typed sources".into());
+            return Err(schema_contract(
+                SchemaContractSite::Projection,
+                "typed schema concatenation requires explicit typed sources",
+            ));
         }
         let count = parts.iter().try_fold(0usize, |count, part| {
             count
                 .checked_add(part.slots().len())
-                .ok_or("typed schema concatenation field count overflow")
+                .ok_or_else(|| ChunkConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))
         })?;
         let mut slots = Vec::with_capacity(count);
         for part in parts {
@@ -2072,36 +2169,44 @@ impl ChunkSchema {
 pub(super) fn align_chunk_schema_to_batch(
     batch: &RecordBatch,
     chunk_schema: &ChunkSchema,
-) -> Result<ChunkSchemaRef, String> {
+) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
     if batch.num_columns() != chunk_schema.slots().len() {
-        return Err(format!(
-            "chunk schema contract length mismatch: batch_columns={} contract_slots={}",
-            batch.num_columns(),
-            chunk_schema.slots().len()
+        return Err(schema_contract(
+            SchemaContractSite::Reconciliation,
+            format_args!(
+                "chunk schema contract length mismatch: batch_columns={} contract_slots={}",
+                batch.num_columns(),
+                chunk_schema.slots().len()
+            ),
         ));
     }
     let mut sources =
         ReconcileMetadataSources::from_original(chunk_schema.metadata_materializations());
     let mut slots = Vec::with_capacity(batch.num_columns());
     for (idx, field) in batch.schema().fields().iter().enumerate() {
-        let expected = chunk_schema
-            .slots()
-            .get(idx)
-            .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
+        let expected = chunk_schema.slots().get(idx).ok_or_else(|| {
+            schema_contract(
+                SchemaContractSite::Reconciliation,
+                format_args!("missing chunk schema slot at index {}", idx),
+            )
+        })?;
         // Arrow field nullability is producer metadata here. A nullable batch
         // can flow through a non-nullable contract because source-level NOT
         // NULL enforcement happens downstream, and a non-nullable batch is a
         // valid runtime instance of a nullable contract.
         if field.name() != expected.name() {
-            return Err(format!(
-                "chunk schema field mismatch at index {}: batch=({}, {:?}, {}) contract=({}, {:?}, {})",
-                idx,
-                field.name(),
-                field.data_type(),
-                field.is_nullable(),
-                expected.name(),
-                expected.data_type(),
-                expected.nullable()
+            return Err(schema_contract(
+                SchemaContractSite::Reconciliation,
+                format_args!(
+                    "chunk schema field mismatch at index {}: batch=({}, {:?}, {}) contract=({}, {:?}, {})",
+                    idx,
+                    field.name(),
+                    field.data_type(),
+                    field.is_nullable(),
+                    expected.name(),
+                    expected.data_type(),
+                    expected.nullable()
+                ),
             ));
         }
         let root = format!("slot {} ({})", expected.slot_id(), expected.name());
@@ -2156,22 +2261,27 @@ pub(super) fn align_chunk_schema_to_batch(
 pub(super) fn align_chunk_schema_to_columns(
     columns: &[ArrayRef],
     chunk_schema: &ChunkSchema,
-) -> Result<ChunkSchemaRef, String> {
+) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
     if columns.len() != chunk_schema.slots().len() {
-        return Err(format!(
-            "chunk schema contract length mismatch: columns={} contract_slots={}",
-            columns.len(),
-            chunk_schema.slots().len()
+        return Err(schema_contract(
+            SchemaContractSite::Reconciliation,
+            format_args!(
+                "chunk schema contract length mismatch: columns={} contract_slots={}",
+                columns.len(),
+                chunk_schema.slots().len()
+            ),
         ));
     }
     let mut sources =
         ReconcileMetadataSources::from_original(chunk_schema.metadata_materializations());
     let mut slots = Vec::with_capacity(columns.len());
     for (idx, column) in columns.iter().enumerate() {
-        let expected = chunk_schema
-            .slots()
-            .get(idx)
-            .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
+        let expected = chunk_schema.slots().get(idx).ok_or_else(|| {
+            schema_contract(
+                SchemaContractSite::Reconciliation,
+                format_args!("missing chunk schema slot at index {}", idx),
+            )
+        })?;
         let root = format!("slot {} ({})", expected.slot_id(), expected.name());
         check_chunk_data_type(expected.data_type(), column.data_type(), &root)?;
         if expected.metadata_origins().is_some() {
@@ -2745,6 +2855,19 @@ mod tests {
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        #[derive(Debug)]
+        enum ProbeFailure {
+            Construction(crate::exec::chunk::construction_failure::ChunkConstructionFailure),
+            Request(usize),
+            Work,
+        }
+        impl From<crate::exec::chunk::construction_failure::ChunkConstructionFailure> for ProbeFailure {
+            fn from(
+                source: crate::exec::chunk::construction_failure::ChunkConstructionFailure,
+            ) -> Self {
+                Self::Construction(source)
+            }
+        }
         struct Control;
         impl PureCompileControl for Control {
             fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -2793,7 +2916,7 @@ mod tests {
         let restored = ChunkSchema::from_compiled_layout(&layout).unwrap();
         let static_restored = ChunkSchema::from_static_layout(&layout).unwrap();
         let mut requests = Vec::new();
-        let funded_restored = ChunkSchema::from_compiled_layout_owned_observed::<String>(
+        let funded_restored = ChunkSchema::from_compiled_layout_owned_observed::<ProbeFailure>(
             &layout,
             storage.clone(),
             |request| {
@@ -2810,34 +2933,34 @@ mod tests {
         );
         for stop in 0..requests.len() {
             let mut seen = 0;
-            let rejected = ChunkSchema::from_compiled_layout_owned_observed::<String>(
+            let rejected = ChunkSchema::from_compiled_layout_owned_observed::<ProbeFailure>(
                 &layout,
                 storage.clone(),
                 |_| {
                     let index = seen;
                     seen += 1;
                     if index == stop {
-                        Err(format!("request refused {stop}"))
+                        Err(ProbeFailure::Request(stop))
                     } else {
                         Ok(())
                     }
                 },
                 |_| Ok(()),
             );
-            assert!(matches!(rejected, Err(error) if error == format!("request refused {stop}")));
+            assert!(matches!(rejected, Err(ProbeFailure::Request(actual)) if actual == stop));
             assert_eq!(seen, stop + 1);
         }
         let mut request_count = 0;
-        let refused_work = ChunkSchema::from_compiled_layout_owned_observed::<String>(
+        let refused_work = ChunkSchema::from_compiled_layout_owned_observed::<ProbeFailure>(
             &layout,
             storage.clone(),
             |_| {
                 request_count += 1;
                 Ok(())
             },
-            |_| Err("schema control refused".into()),
+            |_| Err(ProbeFailure::Work),
         );
-        assert!(matches!(refused_work, Err(error) if error == "schema control refused"));
+        assert!(matches!(refused_work, Err(ProbeFailure::Work)));
         assert_eq!(request_count, 0);
         assert!(restored.is_typed());
         assert!(Arc::ptr_eq(restored.slots()[0].field_ref(), &field));
@@ -2880,7 +3003,7 @@ mod tests {
             ),
         ])
         .expect_err("duplicate slot ids should fail");
-        assert!(err.contains("duplicate slot id"), "err={}", err);
+        assert!(err.to_string().contains("duplicate slot id"), "err={}", err);
     }
 
     #[test]
@@ -3085,7 +3208,11 @@ mod tests {
         )) as ArrayRef;
 
         let error = super::align_chunk_schema_to_columns(&[map], &schema).unwrap_err();
-        assert_eq!(error, "map key type is nullable");
+        assert!(error.to_string().contains("map key type is nullable"));
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&error).class(),
+            novarocks_failure_contract::FailureClass::Invariant,
+        );
     }
 
     #[test]
@@ -3101,8 +3228,11 @@ mod tests {
 
         let err = super::align_chunk_schema_to_columns(&[column], &schema)
             .expect_err("runtime schema must reject Utf8/Binary descriptor drift");
-        assert!(err.contains("chunk schema type mismatch"), "err={err}");
-        assert!(err.contains("slot 9 (payload)"), "err={err}");
+        assert!(
+            err.to_string().contains("chunk schema type mismatch"),
+            "err={err}"
+        );
+        assert!(err.to_string().contains("slot 9 (payload)"), "err={err}");
     }
 
     #[test]
@@ -3120,8 +3250,11 @@ mod tests {
 
         let err = Chunk::try_new_with_columns(chunk_schema, vec![column])
             .expect_err("runtime schema must reject Utf8/Binary descriptor drift");
-        assert!(err.contains("chunk schema type mismatch"), "err={err}");
-        assert!(err.contains("slot 9 (payload)"), "err={err}");
+        assert!(
+            err.to_string().contains("chunk schema type mismatch"),
+            "err={err}"
+        );
+        assert!(err.to_string().contains("slot 9 (payload)"), "err={err}");
     }
 
     #[test]
@@ -3148,10 +3281,13 @@ mod tests {
         let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
             .expect_err("runtime schema must reject Utf8/Binary descriptor drift");
 
-        assert!(err.contains("chunk schema type mismatch"), "err={err}");
-        assert!(err.contains("slot 9 (payload)"), "err={err}");
-        assert!(err.contains("Binary"), "err={err}");
-        assert!(err.contains("Utf8"), "err={err}");
+        assert!(
+            err.to_string().contains("chunk schema type mismatch"),
+            "err={err}"
+        );
+        assert!(err.to_string().contains("slot 9 (payload)"), "err={err}");
+        assert!(err.to_string().contains("Binary"), "err={err}");
+        assert!(err.to_string().contains("Utf8"), "err={err}");
     }
 
     #[test]
@@ -3182,10 +3318,13 @@ mod tests {
         let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
             .expect_err("runtime schema must reject decimal precision drift");
 
-        assert!(err.contains("chunk schema type mismatch"), "err={err}");
-        assert!(err.contains("slot 11 (price)"), "err={err}");
-        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
-        assert!(err.contains("Decimal128(10, 2)"), "err={err}");
+        assert!(
+            err.to_string().contains("chunk schema type mismatch"),
+            "err={err}"
+        );
+        assert!(err.to_string().contains("slot 11 (price)"), "err={err}");
+        assert!(err.to_string().contains("Decimal128(38, 2)"), "err={err}");
+        assert!(err.to_string().contains("Decimal128(10, 2)"), "err={err}");
     }
 
     #[test]
@@ -3215,8 +3354,11 @@ mod tests {
         let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
             .expect_err("timestamp metadata retag should fail");
 
-        assert!(err.contains("slot 10 (ts)"), "err={err}");
-        assert!(err.contains("Timestamp(Nanosecond, None)"), "err={err}");
+        assert!(err.to_string().contains("slot 10 (ts)"), "err={err}");
+        assert!(
+            err.to_string().contains("Timestamp(Nanosecond, None)"),
+            "err={err}"
+        );
     }
 }
 

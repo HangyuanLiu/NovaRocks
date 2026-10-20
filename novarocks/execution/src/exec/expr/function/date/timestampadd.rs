@@ -16,7 +16,7 @@
 // under the License.
 use super::common::{extract_datetime_array, to_timestamp_value};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::Duration;
@@ -27,23 +27,48 @@ pub fn eval_timestampadd<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 3 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timestampadd requires three arguments",
+            )
+            .into(),
+        );
+    }
+    super::common::require_frozen_type(
+        arena.arena(),
+        expr,
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+    )?;
     let unit_arr = arena.eval(args[0], chunk)?;
     let interval_arr = arena.eval(args[1], chunk)?;
     let dt_arr = arena.eval(args[2], chunk)?;
     let unit_arr = unit_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "timestampadd expects unit string".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timestampadd expects unit string",
+            )
+        })?;
     let interval_arr = interval_arr
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "timestampadd expects int interval".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timestampadd expects int interval",
+            )
+        })?;
     let dts = extract_datetime_array(&dt_arr)?;
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
+    if unit_arr.len() != dts.len() || interval_arr.len() != dts.len() {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timestampadd argument lengths differ",
+            )
+            .into(),
+        );
+    }
     let mut out = Vec::with_capacity(dts.len());
     for (i, dt) in dts.iter().copied().enumerate() {
         if unit_arr.is_null(i) || interval_arr.is_null(i) {
@@ -71,7 +96,7 @@ pub fn eval_timestampadd<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             "microsecond" => dt + Duration::microseconds(interval),
             _ => dt,
         };
-        out.push(to_timestamp_value(new_dt, &output_type).ok());
+        out.push(to_timestamp_value(new_dt, TimeUnit::Microsecond).ok());
     }
     Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef)
 }

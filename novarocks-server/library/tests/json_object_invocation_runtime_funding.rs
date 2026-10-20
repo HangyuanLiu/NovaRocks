@@ -20,9 +20,9 @@
 #[path = "support/shift_runtime_funding.rs"]
 mod support;
 use arrow::{
-    array::{Array, ArrayRef, LargeListArray, StringArray, new_empty_array},
-    buffer::{Buffer, OffsetBuffer, ScalarBuffer},
-    datatypes::{DataType, Field},
+    array::{Array, ArrayRef, Date32Array, StringArray},
+    buffer::Buffer,
+    datatypes::DataType,
 };
 use novarocks_execution::runtime::{
     kernel_memory::KernelMemoryJournal,
@@ -137,6 +137,23 @@ enum Alias {
     Data(ScalarInvocationData),
 }
 
+fn assert_original_date32_data(data: &ScalarInvocationData, rows: &[usize]) {
+    assert_eq!(
+        data.message(),
+        "json_object invalid date32 day value: -1000000000"
+    );
+    assert_eq!(
+        data.reason(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange
+    );
+    assert_eq!(data.batch_rows(), 256);
+    assert_eq!(data.source_len(), rows.len());
+    for (ordinal, row) in rows.iter().enumerate() {
+        assert_eq!(data.source_row(ordinal), Some(*row));
+    }
+    assert_eq!(data.source_row(rows.len()), None);
+}
+
 #[test]
 fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_last_alias() {
     let _ = novarocks_server_application::memory_observation::snapshot();
@@ -144,22 +161,10 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
         let binding = json_binding();
         let runtime = runtime_for_names(&binding, &["json_object"]);
         let arrays: Vec<ArrayRef> = if data {
-            // Anonymous items use their canonical name. A named Struct member
-            // retains the original long diagnostic across layout normalization.
-            let child = DataType::Struct(
-                vec![Arc::new(Field::new(
-                    "field\0µ".repeat(100),
-                    DataType::Utf8,
-                    true,
-                ))]
-                .into(),
-            );
-            vec![Arc::new(LargeListArray::new(
-                Arc::new(Field::new("item", child.clone(), true)),
-                OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 0])),
-                new_empty_array(&child),
-                None,
-            ))]
+            // A supported carrier with an invalid date reaches the actual
+            // invocation Data channel. Unsupported Arrow shapes are contract
+            // failures and cannot stand in for retained value diagnostics.
+            vec![Arc::new(Date32Array::from(vec![-1_000_000_000]))]
         } else {
             vec![Arc::new(StringArray::from(
                 (0..4096)
@@ -203,13 +208,7 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
             let Err(RuntimeScalarEvaluationFailure::Data(data)) = result else {
                 panic!("original full Data")
             };
-            assert!(
-                data.message()
-                    .starts_with("unsupported scalar type: LargeList")
-            );
-            assert!(data.message().len() > 512);
-            assert_eq!(data.source_len(), 128);
-            assert_eq!(data.source_row(127), Some(254));
+            assert_original_date32_data(&data, &rows);
             Alias::Data(data)
         } else {
             let output = result.unwrap();
@@ -240,8 +239,22 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
         drop(runtime);
         let retained = snapshots(&records, &binding);
         let physical = live(&retained);
-        assert!(physical.0 > 0 && physical.1 >= if data { 2 } else { 3 });
+        if data {
+            // The original sparse source Vec crosses the tagging band. The
+            // short diagnostic and private holder need not do so; tagged
+            // blocks are a subset of the complete retained Data backing.
+            let source_bytes = rows.len() * std::mem::size_of::<usize>();
+            assert!(physical.0 >= i64::try_from(source_bytes).unwrap());
+            assert!(physical.1 > 0);
+        } else {
+            assert!(physical.0 > 0 && physical.1 >= 3);
+        }
         let duplicate = alias.clone();
+        if let (Alias::Data(original), Alias::Data(duplicate)) = (&alias, &duplicate) {
+            assert!(original.same_backing(duplicate));
+            assert_eq!(original.message().as_ptr(), duplicate.message().as_ptr());
+            assert_original_date32_data(duplicate, &rows);
+        }
         drop(duplicate);
         assert_eq!(
             live(&snapshots(&records, &binding)),
@@ -279,7 +292,12 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
                 std::thread::spawn(move || drop(last)).join().unwrap();
             }
             Alias::Data(data) => {
-                std::thread::spawn(move || drop(data)).join().unwrap();
+                std::thread::spawn(move || {
+                    assert_original_date32_data(&data, &rows);
+                    drop(data);
+                })
+                .join()
+                .unwrap();
             }
         }
         let freed = live(&snapshots(&records, &binding));

@@ -774,6 +774,7 @@ fn validate(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramExpressionTypeError> {
     validate_function_value_type_observed(value, work).map_err(|error| match error {
+        KernelFailure::CompileControl(cause) => ProgramExpressionTypeError::Control(cause),
         KernelFailure::Cancelled => {
             ProgramExpressionTypeError::Control(CompileControlError::Cancelled)
         }

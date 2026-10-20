@@ -22,6 +22,9 @@
 //! atomicity, no shared revision, and no batch-global success, and this codec
 //! never collapses their outcomes.
 
+use novarocks_execution_contract::operation::{
+    DomainFailureOutcome, OperationDomainFailure, OperationResult,
+};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
@@ -1341,76 +1344,122 @@ fn encode_release_outcome(value: ReleaseOutcome) -> i32 {
     encoded as i32
 }
 
-/// The outcome and identity of one receipt, without its acknowledgement body.
+/// The original result branch, without decoding an acknowledgement body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReceiptHeader {
     operation_id: TaskOperationId,
-    outcome: OperationOutcome,
-    /// The backend's own account of a refusal, already validated as safe to
-    /// leave the process.
-    ///
-    /// Kept rather than discarded: this decoder was validating the field and
-    /// then dropping it, so a refusal reached the client as an outcome name
-    /// with the reason it had in hand thrown away.
-    detail: Option<novarocks_execution_contract::task_execution::status::SafeDetail>,
+    result: OperationResult<std::convert::Infallible>,
 }
-
 impl ReceiptHeader {
     pub const fn new(operation_id: TaskOperationId, outcome: OperationOutcome) -> Self {
         Self {
-            detail: None,
             operation_id,
-            outcome,
+            result: OperationResult::Verdict {
+                outcome,
+                detail: None,
+                acknowledgement: None,
+            },
         }
     }
-
     pub const fn operation_id(&self) -> TaskOperationId {
         self.operation_id
     }
-
     pub const fn outcome(&self) -> OperationOutcome {
-        self.outcome
+        self.result.outcome()
     }
-
-    /// The backend's own reason for a refusal, if it gave one.
-    pub const fn detail(
-        &self,
-    ) -> Option<&novarocks_execution_contract::task_execution::status::SafeDetail> {
-        self.detail.as_ref()
+    pub const fn detail(&self) -> Option<&novarocks_execution_contract::SafeDetail> {
+        self.result.detail()
+    }
+    pub const fn result(&self) -> &OperationResult<std::convert::Infallible> {
+        &self.result
     }
 }
-
-/// Decodes the header of one operation receipt.
+fn decode_domain_failure_outcome(
+    value: i32,
+    path: FieldPath,
+) -> Result<DomainFailureOutcome, ProtocolError> {
+    match decode_outcome(value, path.clone())? {
+        OperationOutcome::InvalidStateOrRequest => Ok(DomainFailureOutcome::InvalidStateOrRequest),
+        OperationOutcome::ResourceExhausted => Ok(DomainFailureOutcome::ResourceExhausted),
+        OperationOutcome::DomainConflict => Ok(DomainFailureOutcome::DomainConflict),
+        _ => Err(invalid(
+            path,
+            "domain failure requires a closed refusal outcome",
+        )),
+    }
+}
+/// Decodes one operation's mandatory result. No branch is inferred from its outcome.
 pub fn decode_receipt_header(
     src: &novarocks::TaskOperationReceipt,
     path: FieldPath,
 ) -> Result<ReceiptHeader, ProtocolError> {
-    let operation_id = src.operation_id.as_ref().ok_or_else(|| {
+    let operation_id = decode_task_operation_id(
+        src.operation_id.as_ref().ok_or_else(|| {
+            missing(
+                path.clone().field("operation_id"),
+                "a receipt requires an operation id",
+            )
+        })?,
+        path.clone().field("operation_id"),
+    )?;
+    let result = match src.result.as_ref().ok_or_else(|| {
         missing(
-            path.clone().field("operation_id"),
-            "a receipt requires an operation id",
+            path.clone().field("result"),
+            "a receipt requires its result branch",
         )
-    })?;
-    let operation_id = decode_task_operation_id(operation_id, path.clone().field("operation_id"))?;
-    let outcome = decode_outcome(src.outcome, path.clone().field("outcome"))?;
-    let detail =
-        crate::status::decode_safe_detail(&src.safe_detail, path.clone().field("safe_detail"))?;
-    if let Some(field_path) = src.safe_field_path.as_deref()
-        && field_path.len()
-            > novarocks_execution_contract::task_execution::status::SAFE_FIELD_PATH_MAX_BYTES
-    {
-        return Err(out_of_range(
-            path.field("safe_field_path"),
-            "safe field path exceeds the redacted text limit",
-        ));
-    }
+    })? {
+        novarocks::task_operation_receipt::Result::Verdict(verdict) => {
+            let p = path.field("verdict");
+            let outcome = decode_outcome(verdict.outcome, p.clone().field("outcome"))?;
+            let detail = crate::status::decode_safe_detail(
+                &verdict.safe_detail,
+                p.clone().field("safe_detail"),
+            )?;
+            if let Some(field) = &verdict.safe_field_path {
+                if field.len() > novarocks_execution_contract::status::SAFE_FIELD_PATH_MAX_BYTES {
+                    return Err(out_of_range(
+                        p.field("safe_field_path"),
+                        "safe field path exceeds the redacted text limit",
+                    ));
+                }
+            }
+            OperationResult::Verdict {
+                outcome,
+                detail: (!detail.as_str().is_empty()).then_some(detail),
+                acknowledgement: None,
+            }
+        }
+        novarocks::task_operation_receipt::Result::DomainFailure(domain) => {
+            let p = path.field("domain_failure");
+            let outcome =
+                decode_domain_failure_outcome(domain.outcome, p.clone().field("outcome"))?;
+            let failure = domain.failure.as_ref().ok_or_else(|| {
+                missing(
+                    p.clone().field("failure"),
+                    "domain failure requires producer facts",
+                )
+            })?;
+            let fact = failure.fact.as_ref().ok_or_else(|| {
+                missing(
+                    p.clone().field("failure").field("fact"),
+                    "domain failure requires producer facts",
+                )
+            })?;
+            let fact =
+                crate::status::decode_failure_fact(fact, p.clone().field("failure").field("fact"))?;
+            let detail = crate::status::decode_safe_detail(
+                &failure.safe_detail,
+                p.field("failure").field("safe_detail"),
+            )?;
+            OperationResult::DomainFailure {
+                outcome,
+                failure: OperationDomainFailure::new(fact, detail),
+            }
+        }
+    };
     Ok(ReceiptHeader {
         operation_id,
-        outcome,
-        // Only a refusal has anything to explain; an applied operation's
-        // detail is empty by contract and carrying it would invite a reader
-        // to look for meaning that is not there.
-        detail: (!detail.as_str().is_empty()).then_some(detail),
+        result,
     })
 }
 
@@ -2609,19 +2658,37 @@ pub fn encode_query_context_admission_ticket_ack(
     }
 }
 
-/// Encodes one Worker operation receipt.
+/// Encodes exactly the original Worker result branch.
 pub fn encode_receipt(
     operation_id: TaskOperationId,
-    outcome: OperationOutcome,
-    safe_detail: &str,
-    ack: Option<novarocks::task_operation_receipt::Ack>,
+    result: OperationResult<novarocks::task_operation_verdict::Ack>,
 ) -> novarocks::TaskOperationReceipt {
+    let result = match result {
+        OperationResult::Verdict {
+            outcome,
+            detail,
+            acknowledgement,
+        } => novarocks::task_operation_receipt::Result::Verdict(novarocks::TaskOperationVerdict {
+            outcome: encode_outcome(outcome),
+            safe_detail: detail.map_or_else(String::new, |d| d.as_str().to_owned()),
+            safe_field_path: None,
+            ack: acknowledgement,
+        }),
+        OperationResult::DomainFailure { outcome, failure } => {
+            novarocks::task_operation_receipt::Result::DomainFailure(
+                novarocks::TaskOperationDomainFailure {
+                    outcome: encode_outcome(outcome.outcome()),
+                    failure: Some(novarocks::OperationDomainFailure {
+                        fact: Some(crate::status::encode_failure_fact(failure.fact())),
+                        safe_detail: failure.detail().as_str().to_owned(),
+                    }),
+                },
+            )
+        }
+    };
     novarocks::TaskOperationReceipt {
         operation_id: Some(encode_task_operation_id(operation_id)),
-        outcome: encode_outcome(outcome),
-        safe_detail: safe_detail.to_owned(),
-        safe_field_path: None,
-        ack,
+        result: Some(result),
     }
 }
 
@@ -3546,7 +3613,7 @@ mod canonical_assignment_size_tests {
             check_canonical_assignment_size(&assignment, 6, budget, path.clone())
                 .unwrap_err()
                 .kind(),
-            novarocks_proto_codec::ProtocolErrorKind::OutOfRange
+            &novarocks_proto_codec::ProtocolErrorKind::OutOfRange
         );
         assert!(check_canonical_assignment_size(&assignment, 5, budget, path.clone()).is_ok());
         assert!(check_canonical_assignment_size(&assignment, usize::MAX, budget, path).is_err());

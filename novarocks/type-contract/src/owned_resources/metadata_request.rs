@@ -26,7 +26,7 @@ pub struct CompleteMetadataRequestFacts {
     pub allocation_request_bytes_upper_bound: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetadataRequestError {
     Control(CompileControlError),
     Arithmetic,
@@ -45,7 +45,16 @@ impl std::fmt::Display for MetadataRequestError {
         }
     }
 }
-impl std::error::Error for MetadataRequestError {}
+impl std::error::Error for MetadataRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Metadata(source) => Some(source),
+            Self::ValueType(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl From<CompileControlError> for MetadataRequestError {
     fn from(error: CompileControlError) -> Self {

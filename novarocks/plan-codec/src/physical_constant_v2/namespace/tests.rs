@@ -418,7 +418,7 @@ fn namespace_wide_real_quantum_has_no_id_index_allocation_or_control_after_refus
     let trace = good.trace();
     let quantum = trace.iter().position(|(_, units)| *units == 256).unwrap();
     for cause in CAUSES {
-        let refusing = Control::refusing(CompilePhase::Decode, quantum, cause);
+        let refusing = Control::refusing(CompilePhase::Decode, quantum, cause.clone());
         assert!(
             matches!(prepare_constant_namespace(&records, &types, source, policy(), decode_limits(), namespace_limits(), &verifier(), &refusing),
             Err(PhysicalConstantCodecError::Control(actual)) if actual == cause)

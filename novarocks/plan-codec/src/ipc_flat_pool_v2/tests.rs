@@ -85,7 +85,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((refusal, cause)) if at == refusal => Err(cause),
             _ => Ok(()),
         }
@@ -291,7 +291,7 @@ fn assert_prefixes(
 ) {
     for at in positions {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(matches!(encode_flat_pool(pool, retention, bound, &control),
                 Err(TypeCodecError::Control(actual)) if actual == cause));
             assert_eq!(control.trace(), trace[..=at]);
@@ -1104,7 +1104,7 @@ fn pure_writer_preserves_each_original_control_refusal() {
     work.finish().unwrap();
     for at in 0..control.trace().len() {
         for cause in CAUSES {
-            let refusal = Control::refusing(at, cause);
+            let refusal = Control::refusing(at, cause.clone());
             let result = (|| {
                 let mut work = CompileCheckpoints::try_new(&refusal, CompilePhase::Encode)?;
                 let bytes =

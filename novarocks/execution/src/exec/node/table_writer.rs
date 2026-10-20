@@ -24,6 +24,7 @@
 //! "last driver finishes" protocol: only an immutable logical recipe plus the
 //! attempt-local facts a driver needs to build its own physical context.
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
 use std::sync::Arc;
 
 use arrow::compute::cast;
@@ -117,7 +118,7 @@ impl TableWriterInputProjection {
         projection: &novarocks_local_program::StaticWriterProjection,
         provider_layout: &novarocks_local_program::StaticLayout,
         runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
         let mut arena = ExprArena::from_immutable(&projection.arena)?;
         arena.bind_runtime_error(runtime_error.clone());
         let exprs: Vec<ExprId> = projection
@@ -126,10 +127,11 @@ impl TableWriterInputProjection {
             .map(|id| ExprId(id.index()))
             .collect();
         if !projection.layout.is_typed() || !provider_layout.is_typed() {
-            return Err("writer projection lacks its complete static bindings".into());
+            return Err(crate::exec::fragment::error::node_construction_failure(
+                "writer projection lacks its complete static bindings",
+            ));
         }
-        Self::validate_expressions(&arena, &exprs, provider_layout.schema())
-            .map_err(|error| error.to_string())?;
+        Self::validate_expressions(&arena, &exprs, provider_layout.schema())?;
         Ok(Self {
             arena,
             exprs,
@@ -169,8 +171,9 @@ impl TableWriterInputProjection {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids)
-                .map_err(|error| ExecPlanBuildError::new(ExecPlanInvariant::Schema, error))?;
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids).map_err(
+                |error| ExecPlanBuildError::from_domain(ExecPlanInvariant::Schema, error),
+            )?;
         Ok(Self {
             arena,
             exprs,
@@ -290,7 +293,12 @@ impl TableWriterInputProjection {
             .ok_or(ConstructionFailure::MissingOwner)?;
         let owner = factory.begin_typed_construction(schema)?;
         let layout = std::alloc::Layout::array::<arrow::array::ArrayRef>(self.exprs.len())
-            .map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+            .map_err(|source| {
+                ExecutionFailure::from_domain(WriterProjectionLayoutFailure {
+                    count: self.exprs.len(),
+                    source,
+                })
+            })?;
         owner.request(layout)?;
         let control = self
             .evaluation_control
@@ -338,12 +346,12 @@ impl TableWriterInputProjection {
     pub(crate) fn into_static(
         self,
         layout: novarocks_local_program::StaticLayout,
-    ) -> Result<novarocks_local_program::StaticWriterProjection, String> {
+    ) -> ExecutionResult<novarocks_local_program::StaticWriterProjection> {
         Ok(novarocks_local_program::StaticWriterProjection {
             arena: Arc::new(
                 self.arena
                     .into_immutable()
-                    .map_err(|error| error.to_string())?,
+                    .map_err(ExecutionFailure::from_domain)?,
             ),
             expressions: self
                 .exprs
@@ -357,21 +365,23 @@ impl TableWriterInputProjection {
     /// Evaluate the projection once and expose the exact same target-typed
     /// Arrow buffers to both the connector writer and embedded aggregates.
     #[cfg(test)]
-    pub fn project(&self, chunk: &Chunk) -> Result<Chunk, String> {
+    pub fn project(&self, chunk: &Chunk) -> ExecutionResult<Chunk> {
         if self.chunk_schema().is_typed() {
-            return Err("typed writer projection requires its actual construction owner".into());
+            return Err(crate::exec::fragment::error::node_construction_failure(
+                "typed writer projection requires its actual construction owner",
+            ));
         }
         let arrays = self.project_columns(&self.arena, chunk)?;
         let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(&self.schema), arrays)
-            .map_err(|error| format!("build table writer projected batch: {error}"))?;
+            .map_err(crate::exec::chunk::ChunkConstructionFailure::record_batch)?;
         Chunk::try_new_with_chunk_schema(batch, Arc::clone(self.chunk_schema()))
-            .map_err(|error| format!("build table writer projected chunk: {error}"))
+            .map_err(ExecutionFailure::from)
     }
     fn project_columns<E: crate::exec::expr::ExprEvaluation + ?Sized>(
         &self,
         evaluation: &E,
         chunk: &Chunk,
-    ) -> Result<Vec<arrow::array::ArrayRef>, E::Error> {
+    ) -> Result<Vec<arrow::array::ArrayRef>, crate::runtime::fragment::ExecutionFailure> {
         // Preserve the original ordering: evaluate every expression, then cast
         // each result in ordinal order. Reuse this actual output Vec rather
         // than creating a second container whose lifetime could be ambiguous.
@@ -388,30 +398,104 @@ impl TableWriterInputProjection {
             {
                 cast_with_special_rules(array, field.data_type())
             } else {
-                cast(array.as_ref(), field.data_type()).map_err(|error| error.to_string())
+                novarocks_functions::builtin::collection_arrow::cast_output(
+                    array.clone(),
+                    Some(field.data_type()),
+                    "table writer projection",
+                )
+                .map_err(ExecutionFailure::from)
             };
-            *array = casted.map_err(|error| format!(
-                "table writer projection cast failed at column {index} from {:?} to {:?}: {error}",
-                array.data_type(), field.data_type(),
-            ))?;
+            *array = casted.map_err(|source| {
+                ExecutionFailure::from_domain(WriterProjectionCastFailure {
+                    index,
+                    from: novarocks_failure_contract::BoundedDetail::truncating_display(
+                        format_args!("{:?}", array.data_type()),
+                    ),
+                    to: novarocks_failure_contract::BoundedDetail::truncating_display(
+                        format_args!("{:?}", field.data_type()),
+                    ),
+                    source,
+                })
+            })?;
         }
         Ok(arrays)
     }
 }
 
+/// Provider requiredness is a value obligation after expression guards; it is
+/// neither a schema repair nor a maskable expression-row journal entry.
 pub(crate) fn validate_writer_projection_requiredness(
     schema: &arrow::datatypes::Schema,
     columns: &[arrow::array::ArrayRef],
-) -> Result<(), String> {
-    for (field, column) in schema.fields().iter().zip(columns) {
+) -> crate::runtime::fragment::ExecutionResult<()> {
+    for (ordinal, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
         if !field.is_nullable() && column.null_count() > 0 {
-            return Err(format!(
-                "build table writer projected batch: Invalid argument error: Column '{}' is declared as non-nullable but contains null values",
-                field.name(),
+            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                WriterRequiredValue {
+                    column: ordinal,
+                    row: (0..column.len()).find(|row| column.is_null(*row)),
+                    field: novarocks_failure_contract::BoundedDetail::truncating(field.name()),
+                },
             ));
         }
     }
     Ok(())
+}
+#[derive(Debug)]
+struct WriterRequiredValue {
+    column: usize,
+    row: Option<usize>,
+    field: novarocks_failure_contract::BoundedDetail,
+}
+impl std::fmt::Display for WriterRequiredValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "build table writer projected batch: Invalid argument error: Column '{}' is declared as non-nullable but contains null values",
+            self.field
+        )
+    }
+}
+impl std::error::Error for WriterRequiredValue {}
+impl novarocks_failure_contract::FailureProjection for WriterRequiredValue {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Data,
+            crate::runtime::fragment::ExecutionReason::WriterRequiredValue.reason(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod required_value_source_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn actual_required_value_failure_keeps_its_column_and_row_without_input_owners() {
+        use arrow::array::{ArrayRef, Int32Array};
+        use arrow::datatypes::{Field, Schema};
+        let field = Arc::new(Field::new("ResourceExhausted", DataType::Int32, false));
+        let field_owner = Arc::downgrade(&field);
+        let schema = Schema::new(vec![field.clone()]);
+        let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let column_owner = Arc::downgrade(&column);
+        let failure =
+            validate_writer_projection_requiredness(&schema, &[column.clone()]).unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 498);
+        let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = failure.cause()
+        else {
+            panic!("writer value owner required")
+        };
+        let source = source.downcast_ref::<WriterRequiredValue>().unwrap();
+        assert_eq!(source.column, 0);
+        assert_eq!(source.row, Some(1));
+        drop(column);
+        drop(schema);
+        drop(field);
+        assert!(column_owner.upgrade().is_none());
+        assert!(field_owner.upgrade().is_none());
+    }
 }
 
 impl std::fmt::Debug for TableWriterInputProjection {
@@ -836,19 +920,84 @@ mod runtime_projection_tests {
                 .unwrap();
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
         assert!(projection.project_created(&chunk).is_ok());
-        first.set_error("writer fragment cancelled".to_string());
-        assert_eq!(
-            projection.project_created(&chunk).unwrap_err(),
-            crate::runtime::fragment::ExecutionFailure::from(
-                "writer fragment cancelled".to_string()
-            )
-        );
+        let cancelled = ExecutionFailure::from(novarocks_functions::KernelFailure::Cancelled);
+        first.set_error(cancelled.clone());
+        assert_eq!(projection.project_created(&chunk).unwrap_err(), cancelled);
         assert!(sibling_projection.project_created(&chunk).is_ok());
         assert!(
             projection
                 .into_static(frozen.layout.clone())
                 .unwrap_err()
+                .to_string()
                 .contains("RuntimeBoundArena")
         );
+    }
+}
+
+#[derive(Debug)]
+struct WriterProjectionCastFailure {
+    index: usize,
+    from: novarocks_failure_contract::BoundedDetail,
+    to: novarocks_failure_contract::BoundedDetail,
+    source: ExecutionFailure,
+}
+impl std::fmt::Display for WriterProjectionCastFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "table writer projection cast failed at column {} from {} to {}: {}",
+            self.index, self.from, self.to, self.source
+        )
+    }
+}
+impl std::error::Error for WriterProjectionCastFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for WriterProjectionCastFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.source)
+    }
+}
+#[derive(Debug)]
+struct WriterProjectionLayoutFailure {
+    count: usize,
+    source: std::alloc::LayoutError,
+}
+impl std::fmt::Display for WriterProjectionLayoutFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "table writer projection header layout for {} columns: {}",
+            self.count, self.source
+        )
+    }
+}
+impl std::error::Error for WriterProjectionLayoutFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for WriterProjectionLayoutFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        FailureFact::new(
+            FailureClass::Resource,
+            ExecutionReason::WriterProjectionHeaderLayout.reason(),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: None,
+            constraint_scope: None,
+            dimension: ResourceDimension::Bytes,
+            requested: u64::try_from(
+                self.count as u128 * std::mem::size_of::<arrow::array::ArrayRef>() as u128,
+            )
+            .ok(),
+            required_growth: None,
+            limit: None,
+            live: None,
+            committed: None,
+        })
     }
 }

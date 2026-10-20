@@ -89,7 +89,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         s.trace.push(units);
-        match s.stop {
+        match s.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -1059,10 +1059,10 @@ fn owned_expression_actual_prepare_emit_and_ordinary_tails_keep_all_small_contro
     f.with_tokens(&defs,&control,|e,fs,ags|{
         for ordinary in [false,true]{
             control.arm(None);let result=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,if ordinary{1}else{SOURCE},limits());assert_eq!(result.is_ok(),!ordinary);let trace=control.trace();control.disarm();
-            for at in 0..trace.len(){for cause in CAUSES{control.arm(Some((at,cause)));assert!(matches!(prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,if ordinary{1}else{SOURCE},limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
+            for at in 0..trace.len(){for cause in CAUSES{control.arm(Some((at,cause.clone())));assert!(matches!(prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,if ordinary{1}else{SOURCE},limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
         }
         let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();control.arm(None);materialize_expressions(prepared).unwrap();let trace=control.trace();control.disarm();
-        for at in 0..trace.len(){for cause in CAUSES{let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();control.arm(Some((at,cause)));assert!(matches!(materialize_expressions(prepared),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
+        for at in 0..trace.len(){for cause in CAUSES{let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();control.arm(Some((at,cause.clone())));assert!(matches!(materialize_expressions(prepared),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
     });
 }
 
@@ -1081,9 +1081,9 @@ fn owned_expression_wide_actual_source_loops_and_arena_preserve_quantum_prefixes
         .collect::<Vec<_>>();
     f.with_tokens(&defs,&control,|e,fs,ags|{
         control.arm(None);let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();let trace=control.trace();control.disarm();assert!(trace.contains(&256));
-        for at in [0,trace.iter().position(|n|*n==256).unwrap(),trace.len()-1]{for cause in CAUSES{control.arm(Some((at,cause)));assert!(matches!(prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
+        for at in [0,trace.iter().position(|n|*n==256).unwrap(),trace.len()-1]{for cause in CAUSES{control.arm(Some((at,cause.clone())));assert!(matches!(prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
         control.arm(None);let out=materialize_expressions(prepared).unwrap();assert_eq!(out.arena().len(),320);assert_eq!(out.arena().get(p::ExprId::new(u32::MAX)).unwrap().ty,FunctionValueType::new(DataType::Int64,false));let trace=control.trace();control.disarm();
-        for at in [0,trace.len()/2,trace.len()-1]{for cause in CAUSES{let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();control.arm(Some((at,cause)));assert!(matches!(materialize_expressions(prepared),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
+        for at in [0,trace.len()/2,trace.len()-1]{for cause in CAUSES{let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();control.arm(Some((at,cause.clone())));assert!(matches!(materialize_expressions(prepared),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
         for late in CAUSES{let mut under=limits();under.max_type_references=255;control.arm(Some((1,late)));assert!(matches!(prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,under),Err(Error::Control(CompileControlError::ResourceExhausted))));assert_eq!(control.trace(),[0]);control.disarm();}
     });
 }

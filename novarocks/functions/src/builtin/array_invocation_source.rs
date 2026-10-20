@@ -64,8 +64,8 @@ pub(super) fn retain_output<C: Send + Sync + 'static>(
     prepared.retain(&source, &mut reservation, work)
 }
 
-/// An original Arrow transport failure must retain its full Data text; typed
-/// control failures return immediately without any diagnostic/footer callback.
+/// Arrow transport and control failures retain their actual typed source.
+/// Neither enters the invocation Data formatter or runs a fallible footer.
 pub(super) enum ArrayInvocationSourceError {
     Kernel(KernelFailure),
     Arrow(arrow_schema::ArrowError),
@@ -82,27 +82,20 @@ impl From<crate::EvaluationContractError> for ArrayInvocationSourceError {
 }
 pub(super) fn source_failure(
     failure: ArrayInvocationSourceError,
-    contract: &Arc<crate::ScalarCallContract>,
-    actual_domain: crate::Selection<'_>,
-    allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
-    host: &Arc<dyn AggregateStateAllocator>,
-    work: &mut EvaluationCheckpoints<'_>,
+    _contract: &Arc<crate::ScalarCallContract>,
+    _actual_domain: crate::Selection<'_>,
+    _allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
+    _host: &Arc<dyn AggregateStateAllocator>,
+    _work: &mut EvaluationCheckpoints<'_>,
 ) -> crate::ScalarInvocationFailure {
-    use super::array_struct_subfield_core::ProjectionPort;
     match failure {
         ArrayInvocationSourceError::Kernel(cause) => cause.into(),
-        ArrayInvocationSourceError::Arrow(error) => {
-            match super::array_scalar_diagnostic_source::HostProjectionDiagnostics::try_new(
-                allocator,
-                Arc::clone(host),
-                Arc::clone(contract),
-                actual_domain,
-                work,
-            ) {
-                Ok(mut diagnostic) => diagnostic.arrow_error(error),
-                Err(cause) => cause.into(),
-            }
-        }
+        ArrayInvocationSourceError::Arrow(source) => super::collection_arrow::arrow_failure(
+            "array invocation source",
+            super::collection_arrow::ArrowSite::Take,
+            source,
+        )
+        .into(),
     }
 }
 

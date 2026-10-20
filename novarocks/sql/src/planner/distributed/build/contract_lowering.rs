@@ -2179,7 +2179,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
         })();
         if let Err(ContractLoweringError::Control(cause)) = &result {
-            return Err(ContractLoweringError::Control(*cause));
+            return Err(ContractLoweringError::Control(cause.clone()));
         }
         // Success and ordinary refusals complete the original lowering scope.
         // An originating control refusal must never trigger another callback.
@@ -10162,7 +10162,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.work.step()?;
         let result = novarocks_type_contract::wider_comparison_value_type(left, right);
         self.control.checkpoint(CompilePhase::Validate, 0)?;
-        result.map_err(|detail| ContractLoweringError::InvalidFunctionBinding { detail })
+        result.map_err(ContractLoweringError::ComparisonCoercion)
     }
 
     fn cast_expression_to(
@@ -12491,6 +12491,7 @@ fn metadata_relation_kind(
 
 #[derive(Debug)]
 pub(crate) enum ContractLoweringError {
+    ComparisonCoercion(novarocks_type_contract::ComparisonCoercionFailure),
     CallRequests(novarocks_physical_plan::CallRequestError),
     Control(CompileControlError),
     AggregateSource(AggregateRequestCaptureError),
@@ -12658,6 +12659,7 @@ pub(crate) enum ContractLoweringError {
 impl fmt::Display for ContractLoweringError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ComparisonCoercion(cause) => cause.fmt(formatter),
             Self::CallRequests(error) => error.fmt(formatter),
             Self::Control(error) => error.fmt(formatter),
             Self::AggregateSource(error) => error.fmt(formatter),
@@ -12835,7 +12837,14 @@ impl fmt::Display for ContractLoweringError {
     }
 }
 
-impl std::error::Error for ContractLoweringError {}
+impl std::error::Error for ContractLoweringError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ComparisonCoercion(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
 
 impl From<novarocks_constant_contract::ConstantError> for ContractLoweringError {
     fn from(error: novarocks_constant_contract::ConstantError) -> Self {
@@ -12944,6 +12953,9 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
     fn from(error: ContractLoweringError) -> Self {
         match error {
             ContractLoweringError::Control(error) => Self::from(error),
+            ContractLoweringError::ComparisonCoercion(cause) => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
+            }
             error => Self::Compilation(error.to_string()),
         }
     }
@@ -13056,7 +13068,7 @@ mod tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.observations.lock().unwrap().push((phase, units));
             if self.fail_at_entry || units > 0 {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -13222,7 +13234,7 @@ mod tests {
                 assert!(units <= 256);
                 let mut trace = self.trace.lock().unwrap();
                 trace.push((phase, units));
-                match self.refusal {
+                match self.refusal.clone() {
                     Some((at, cause)) if trace.len() == at + 1 => Err(cause),
                     _ => Ok(()),
                 }
@@ -13246,7 +13258,7 @@ mod tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 let refused = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 let result = result_fields(&source, &values, &types, &display_names, &refused);
@@ -13279,7 +13291,7 @@ mod tests {
             ),
         ] {
             let control = LoweringControl {
-                cause,
+                cause: cause.clone(),
                 fail_at_entry: true,
                 observations: Default::default(),
             };
@@ -13321,7 +13333,7 @@ mod tests {
                 // Checked source authors may flush earlier. This test observes
                 // the actual full quantum, rather than assuming the first flush.
                 if units == 256 {
-                    Err(self.cause)
+                    Err(self.cause.clone())
                 } else {
                     Ok(())
                 }
@@ -13337,7 +13349,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let control = QuantumControl {
-                cause,
+                cause: cause.clone(),
                 observations: Default::default(),
             };
             assert_eq!(
@@ -14800,7 +14812,7 @@ mod tests {
                     assert!(at <= stop, "callback after original derived-source refusal");
                 }
                 trace.push((phase, units));
-                match self.refusal {
+                match self.refusal.clone() {
                     Some((stop, cause)) if stop == at => Err(cause),
                     _ => Ok(()),
                 }
@@ -14837,7 +14849,7 @@ mod tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = PrefixControl {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..PrefixControl::default()
                 };
                 assert!(
@@ -18544,7 +18556,7 @@ fn register_constant_source_observed(
             let inserted = plan_builder.insert_constant_pool(id, pool);
             if let Err(novarocks_physical_plan::ConstantReferenceError::Control(cause)) = &inserted
             {
-                return Err(ContractLoweringError::Control(*cause));
+                return Err(ContractLoweringError::Control(cause.clone()));
             }
             work.step()?;
             work.flush()?;

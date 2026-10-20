@@ -340,7 +340,14 @@ impl fmt::Display for ExecutionValueTypeError {
         }
     }
 }
-impl std::error::Error for ExecutionValueTypeError {}
+impl std::error::Error for ExecutionValueTypeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Logical(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// A named semantic field. Anonymous containers use item/key/value roles.
 #[derive(Clone, Debug)]

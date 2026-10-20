@@ -16,10 +16,11 @@
 // under the License.
 //! The default host's exact guarded Values batch, prepared by its actual caller.
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
-};
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
+use crate::exec::pipeline::step::{NextStep, StepResult};
 use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::array::ArrayRef;
@@ -31,9 +32,14 @@ pub(crate) struct TypedValuesSourceFactory {
     values: StaticValues,
 }
 impl TypedValuesSourceFactory {
-    pub(crate) fn try_new(values: StaticValues, node_id: i32) -> Result<Self, String> {
+    pub(crate) fn try_new(
+        values: StaticValues,
+        node_id: i32,
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
         if !values.layout().is_typed() || values.batch_projection().is_none() {
-            return Err("native Values require the original complete guarded batch".into());
+            return Err(crate::exec::fragment::error::node_construction_failure(
+                "native Values require the original complete guarded batch",
+            ));
         }
         Ok(Self {
             name: if node_id >= 0 {
@@ -53,14 +59,13 @@ impl OperatorFactory for TypedValuesSourceFactory {
         true
     }
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(TypedValuesSource {
+        Box::new(Source::new(TypedValuesSource {
             name: self.name.clone(),
             values: self.values.clone(),
             driver_id: driver_id.max(0),
             output: None,
             factory: None,
-            emitted: false,
-        })
+        }))
     }
 }
 struct TypedValuesSource {
@@ -69,9 +74,8 @@ struct TypedValuesSource {
     driver_id: i32,
     output: Option<ChunkSchemaRef>,
     factory: Option<Arc<dyn InputConstructionFactory>>,
-    emitted: bool,
 }
-impl Operator for TypedValuesSource {
+impl OperatorLifecycle for TypedValuesSource {
     fn name(&self) -> &str {
         &self.name
     }
@@ -89,37 +93,26 @@ impl Operator for TypedValuesSource {
         self.output = Some(factory.create_compiled_chunk_schema(self.values.layout())?);
         Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn is_finished(&self) -> bool {
-        self.emitted
-    }
 }
-impl ProcessorOperator for TypedValuesSource {
-    fn need_input(&self) -> bool {
-        false
-    }
-    fn has_output(&self) -> bool {
-        !self.emitted
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("values source operator does not accept input".into())
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.emitted {
-            return Ok(None);
+
+impl SourceKernel for TypedValuesSource {
+    fn start(&self) -> SourceStart {
+        if self.driver_id != 0 {
+            SourceStart::Finished
+        } else {
+            SourceStart::Ready
         }
-        self.emitted = true;
+    }
+    fn poll_output(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
         let source = self.values.batch_projection().ok_or_else(|| {
             ConstructionFailure::InvalidSource("native Values batch disappeared".into())
         })?;
         let batch = source.record_batch();
         if batch.num_rows() == 0 || self.driver_id != 0 {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
         let output = self
             .output
@@ -152,19 +145,14 @@ impl ProcessorOperator for TypedValuesSource {
         columns.extend(batch.columns().iter().cloned());
         // Payload values and original source custody are unchanged. This scope
         // observes only actual new column/reference and typed Chunk scaffolds.
-        Ok(Some(Chunk::try_new_typed_with_columns_owned_observed::<
-            ConstructionFailure,
-            _,
-        >(
+        let chunk = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
             output.clone(),
             columns,
             batch.num_rows(),
             storage,
             |step| owner.observe(0, &[], step),
-        )?))
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
+        )?;
+        Ok(StepResult::new(Some(chunk), NextStep::Finished, 0))
     }
 }
 

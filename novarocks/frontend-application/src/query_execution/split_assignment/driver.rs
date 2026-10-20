@@ -148,6 +148,13 @@ pub(crate) enum SplitAssignmentDriverError {
     /// The driver was closed; a caller must not keep assigning.
     Closed,
     DeliveryInProgress,
+    /// One original source's close author projected this fact before retiring
+    /// its raw error/panic payload on the original protected job.
+    SourceClose {
+        scan: ScanNodeKey,
+        fact: novarocks_execution_contract::failure::FailureFact,
+        detail: novarocks_execution_contract::SafeDetail,
+    },
     /// No admitted task exists for this plan node, so a split has nowhere to
     /// go. Failing closed is required: silently dropping it would produce a
     /// query that returns fewer rows than it should.
@@ -178,6 +185,11 @@ pub(crate) enum SplitAssignmentDriverError {
 impl fmt::Display for SplitAssignmentDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SourceClose { scan, detail, .. } => write!(
+                formatter,
+                "closing split source at {scan}: {}",
+                detail.as_str()
+            ),
             Self::Closed => formatter.write_str("split assignment driver is closed"),
             Self::DeliveryInProgress => {
                 formatter.write_str("a split assignment delivery is already in progress")
@@ -213,6 +225,24 @@ impl fmt::Display for SplitAssignmentDriverError {
 }
 
 impl std::error::Error for SplitAssignmentDriverError {}
+
+impl SplitAssignmentDriverError {
+    pub(crate) fn execution_failure(
+        &self,
+    ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
+        };
+        match self {
+            Self::SourceClose { fact, detail, .. } => Some(ExecutionFailureInput::new(
+                *fact,
+                detail.clone(),
+                ExecutionFailureSite::Coordinator,
+            )),
+            _ => None,
+        }
+    }
+}
 
 impl From<SplitAssignmentError> for SplitAssignmentDriverError {
     fn from(error: SplitAssignmentError) -> Self {

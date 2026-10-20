@@ -14,8 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use super::super::aggregate_mann_whitney_core::MannWhitneyState;
 use super::*;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::opaque_memory::OpaqueAllocationHost;
 use crate::source_custody_resources_tests::{measured, measured_live_bytes, without_recording};
 use crate::*;
@@ -450,15 +452,19 @@ fn mann_whitney_call_loans_actual_empty_setup_and_decode_keep_original_update_me
             MannWhitneyInput::try_new_channels_with_resources([None; 4], 0, work, resources)
         },
     );
-    let Err(EvaluationFailure::InvocationData(data)) = result else {
-        panic!("original empty setup Data")
+    let Err(EvaluationFailure::Kernel(cause)) = result else {
+        panic!("empty setup violates the frozen invocation contract")
     };
     assert_eq!(
-        data.message(),
-        "update aggregate state: mann_whitney_u_test expects 2 to 4 arguments"
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+        novarocks_failure_contract::FailureClass::Invariant
     );
-    assert!(data.input_rows().is_empty());
-    drop(data);
+    assert!(
+        cause
+            .to_string()
+            .contains("mann_whitney_u_test expects 2 to 4 arguments")
+    );
+    drop(cause);
     let result = call_unit(
         &fixture.source,
         &fixture.charge,
@@ -688,7 +694,7 @@ fn mann_whitney_call_loans_borrowed_success_update_and_decode_merge_use_same_hos
         .host
         .assert_global_clear
         .store(false, Ordering::SeqCst);
-    let encoded = state.serialize();
+    let encoded = state.serialize().unwrap();
     let mut destination = MannWhitneyState::new(fixture.allocator.clone());
     fixture
         .host

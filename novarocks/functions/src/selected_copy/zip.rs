@@ -69,12 +69,13 @@ fn flat_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
         match ty {
             DataType::Boolean => add(rows / 8, usize::from(!rows.is_multiple_of(8)))?,
             DataType::FixedSizeBinary(width) => {
-                let width = usize::try_from(*width).map_err(|_| CopyError::Extent)?;
+                let width = usize::try_from(*width)
+                    .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?;
                 mul(rows, width)?
             }
             DataType::Utf8 | DataType::Binary => mul(add(rows, 1)?, 4)?,
             DataType::LargeUtf8 | DataType::LargeBinary => mul(add(rows, 1)?, 8)?,
-            other => return Err(CopyError::Unsupported(other.clone())),
+            other => return Err(CopyError::unsupported(other)),
         }
     };
     if !matches!(ty, DataType::FixedSizeBinary(_)) {
@@ -135,7 +136,11 @@ fn extend_byte_span<T: ByteArrayType>(
     let end = offset_value(offsets[end])?;
     // MutableArrayData::extend copies the whole offset span, including payload
     // under NULL source rows. Validity cannot reduce this combined byte extent.
-    buffer.extend(end.checked_sub(start).ok_or(CopyError::Extent)?, large)
+    buffer.extend(
+        end.checked_sub(start)
+            .ok_or(CopyError::Invalid("copy source offsets are not monotonic"))?,
+        large,
+    )
 }
 
 /// Preflight Arrow zip for two ordinary arrays, not scalar Datum fast paths.
@@ -213,7 +218,7 @@ pub fn preflight_zip(
         }
         Ok(())
     })();
-    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent)) {
+    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {
         return result;
     }
     work.boundary()?;

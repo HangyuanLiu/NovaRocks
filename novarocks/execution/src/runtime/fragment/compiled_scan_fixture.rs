@@ -768,7 +768,7 @@ impl ScanOp for FixtureScanOp {
         Arc::clone(&self.source) as Arc<dyn ScanStreamSource>
     }
 
-    fn terminate(&self) -> Result<(), String> {
+    fn terminate(&self) -> crate::runtime::fragment::ExecutionResult<()> {
         self.terminations.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -797,7 +797,13 @@ impl ScanStreamSource for FixtureStreamSource {
             .lock()
             .expect("fixture chunks")
             .take()
-            .ok_or_else(|| "fixture scan stream already claimed".to_string())?;
+            .ok_or_else(|| {
+                novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(
+                        "fixture scan stream already claimed",
+                    ),
+                )
+            })?;
         Ok(Box::pin(FixtureStream {
             chunks,
             endless: self.endless,
@@ -825,7 +831,23 @@ impl Stream for FixtureStream {
 }
 
 impl ScanChunkStream for FixtureStream {
-    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>> {
+    fn take_exit_observation(
+        self: Pin<&mut Self>,
+        _failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    ) -> crate::runtime::fragment::ExecutionResult<crate::exec::node::scan::ScanExitObservation>
+    {
+        Ok(crate::exec::node::scan::ScanExitObservation {
+            // This source has no asynchronous operation. Its remaining chunks
+            // are real body ownership, so successful close destruction is
+            // separately required; an immediate observer alone proves nothing.
+            body_proof: crate::exec::node::scan::ScanExitBodyProof::CloseBodyRequired,
+            actual_exit: Box::pin(async { crate::exec::node::scan::ScanExitProof::Exited }),
+        })
+    }
+    fn close(
+        self: Pin<Box<Self>>,
+        _failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    ) -> BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -835,12 +857,18 @@ impl ScanChunkStream for FixtureStream {
 pub(crate) struct FixtureScanSource(pub(crate) Arc<FixtureScanOp>);
 
 impl ScanSource for FixtureScanSource {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+    fn bind(
+        &self,
+        ranges: BoundScanRanges,
+    ) -> crate::runtime::fragment::ExecutionResult<Arc<dyn ScanOp>> {
         match ranges {
             BoundScanRanges::None => Ok(Arc::clone(&self.0) as Arc<dyn ScanOp>),
-            other => Err(format!(
-                "fixture scan expects no frozen range, got {other:?}"
-            )),
+            other => Err(novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(&format!(
+                    "fixture scan expects no frozen range, got {other:?}"
+                )),
+            )
+            .into()),
         }
     }
 }

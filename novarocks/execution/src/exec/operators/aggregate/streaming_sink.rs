@@ -30,7 +30,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::exec::pipeline::operator::OperatorLifecycle;
 
 use std::sync::Arc;
 
@@ -56,8 +56,15 @@ use crate::exec::hash_table::key_column::{
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{SinkKernel, SinkStep, Transform},
+    step::NextStep,
+    step_context::StepContext,
+};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::RuntimeFilterProducerFailure;
@@ -74,6 +81,28 @@ use super::topn_boundary::{
     AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
     validate_topn_boundary_specs,
 };
+
+#[derive(Debug)]
+struct StreamingAggregateContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for StreamingAggregateContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for StreamingAggregateContract {}
+impl novarocks_failure_contract::FailureProjection for StreamingAggregateContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::StreamingAggregateContract.reason(),
+        )
+    }
+}
+fn streaming_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(StreamingAggregateContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
 
 /// Factory that constructs streaming aggregate sink operators for Phase 1 pre-aggregation.
 pub struct AggregateStreamingSinkFactory {
@@ -112,21 +141,21 @@ impl AggregateStreamingSinkFactory {
         topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
         runtime_filter_session: Option<execution::RuntimeFilterSessionRef>,
         local_partition_count: i32,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         let name = if node_id >= 0 {
             format!("AGGREGATE_STREAMING_SINK (id={node_id})")
         } else {
             "AGGREGATE_STREAMING_SINK".to_string()
         };
-        validate_topn_boundary_specs(&topn_producers).map_err(|error| error.to_string())?;
+        validate_topn_boundary_specs(&topn_producers).map_err(ExecutionFailure::from)?;
         let native_topn_session_factory = if topn_producers.is_empty() {
             None
         } else {
             let session = runtime_filter_session.ok_or_else(|| {
-                format!(
+                streaming_contract(format_args!(
                     "native aggregate TopN producer binding_id={} requires an execution runtime-filter session",
                     topn_producers[0].binding_id()
-                )
+                ))
             })?;
             Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(
                 &topn_producers,
@@ -162,6 +191,21 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
     }
 
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        Box::new(Transform::hydrating(self.create_kernel(dop, driver_id)))
+    }
+
+    #[cfg(test)]
+    fn native_aggregate_topn_producers(&self) -> &[AggregateTopNRuntimeFilterProducerBinding] {
+        &self.runtime_filter_execution.topn_producers
+    }
+
+    fn is_sink(&self) -> bool {
+        true
+    }
+}
+
+impl AggregateStreamingSinkFactory {
+    fn create_kernel(&self, dop: i32, driver_id: i32) -> AggregateStreamingSinkOperator {
         let (native_topn_session, native_topn_bind_error) =
             match self.native_topn_session_factory.as_ref() {
                 Some(factory) => match factory.create_for_driver(dop, driver_id) {
@@ -170,7 +214,7 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
                 },
                 None => (None, None),
             };
-        Box::new(AggregateStreamingSinkOperator {
+        AggregateStreamingSinkOperator {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             group_by: self.group_by.clone(),
@@ -183,8 +227,6 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             output_intermediate: self.output_intermediate,
             initialized: false,
             data_initialized: false,
-            finishing: false,
-            finished: false,
             construction: None,
             output_schema: None,
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
@@ -200,16 +242,7 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             native_topn_session,
             native_topn_bind_error,
             streaming_state: self.streaming_state.clone(),
-        })
-    }
-
-    #[cfg(test)]
-    fn native_aggregate_topn_producers(&self) -> &[AggregateTopNRuntimeFilterProducerBinding] {
-        &self.runtime_filter_execution.topn_producers
-    }
-
-    fn is_sink(&self) -> bool {
-        true
+        }
     }
 }
 
@@ -226,8 +259,6 @@ struct AggregateStreamingSinkOperator {
     output_intermediate: bool,
     initialized: bool,
     data_initialized: bool,
-    finishing: bool,
-    finished: bool,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     output_schema: Option<SchemaRef>,
     output_chunk_schema: ChunkSchemaRef,
@@ -236,16 +267,16 @@ struct AggregateStreamingSinkOperator {
     aggregate_retained_memory: AggregateRetainedMemory,
     touched_aggregate_states: TouchedAggregateStates,
     operator_vectors_memory: AggregateOperatorVectorsMemory,
-    memory_bind_error: Option<String>,
+    memory_bind_error: Option<ExecutionFailure>,
     runtime_filter_execution: StreamingAggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
     topn_boundary_bindings: Vec<AggregateTopNBoundaryBinding>,
     native_topn_session: Option<AggregateTopNProducerSession>,
-    native_topn_bind_error: Option<String>,
+    native_topn_bind_error: Option<ExecutionFailure>,
     streaming_state: AggregateStreamingState,
 }
 
-impl Operator for AggregateStreamingSinkOperator {
+impl OperatorLifecycle for AggregateStreamingSinkOperator {
     fn creates_typed_storage(&self) -> bool {
         self.output_chunk_schema.is_typed()
     }
@@ -263,7 +294,7 @@ impl Operator for AggregateStreamingSinkOperator {
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         let arena = MemTracker::new_child("AggStateArena", &tracker);
         if let Err(error) = self.state_arena.try_set_mem_tracker(Arc::clone(&arena)) {
-            self.memory_bind_error = Some(error);
+            self.memory_bind_error = Some(error.into());
         }
 
         let key_table = MemTracker::new_child("KeyTable", &tracker);
@@ -273,20 +304,20 @@ impl Operator for AggregateStreamingSinkOperator {
             .aggregate_retained_memory
             .set_tracker(MemTracker::new_child("AggregateRetainedHeap", &tracker))
         {
-            self.memory_bind_error = Some(error);
+            self.memory_bind_error = Some(error.into());
         }
         if let Err(error) = self
             .touched_aggregate_states
             .set_tracker(MemTracker::new_child("AggregateTouchedStates", &tracker))
         {
-            self.memory_bind_error = Some(error);
+            self.memory_bind_error = Some(error.into());
         }
         if let Err(error) = self.operator_vectors_memory.set_tracker(
             &mut self.group_states,
             &mut self.state_ptrs,
             MemTracker::new_child("AggregateOperatorVectors", &tracker),
         ) {
-            self.memory_bind_error = Some(error);
+            self.memory_bind_error = Some(error.into());
         }
     }
 
@@ -304,7 +335,7 @@ impl Operator for AggregateStreamingSinkOperator {
             let kernels = self
                 .kernels
                 .as_ref()
-                .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
             validate_typed_aggregate_output(
                 &self.output_chunk_schema,
                 &self.arena,
@@ -339,32 +370,23 @@ impl Operator for AggregateStreamingSinkOperator {
     fn close(&mut self) -> ExecutionResult<()> {
         Ok(self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed)?)
     }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
 
 impl AggregateStreamingSinkOperator {
-    fn rebuild_output_schema(&mut self, group_key_nullable: Option<&[bool]>) -> Result<(), String> {
+    fn rebuild_output_schema(
+        &mut self,
+        group_key_nullable: Option<&[bool]>,
+    ) -> Result<(), ExecutionFailure> {
         if self.output_chunk_schema.is_typed() {
             if let Some(actual) = group_key_nullable {
                 for (index, has_nulls) in actual.iter().enumerate() {
-                    let slot = self
-                        .output_chunk_schema
-                        .slots()
-                        .get(index)
-                        .ok_or("aggregate group output declaration is absent")?;
+                    let slot = self.output_chunk_schema.slots().get(index).ok_or_else(|| {
+                        streaming_contract("aggregate group output declaration is absent")
+                    })?;
                     if *has_nulls && !slot.nullable() {
-                        return Err("aggregate required group output contains NULL".into());
+                        return Err(streaming_contract(
+                            "aggregate required group output contains NULL",
+                        ));
                     }
                 }
             }
@@ -373,14 +395,16 @@ impl AggregateStreamingSinkOperator {
         }
         #[cfg(not(test))]
         {
-            Err("aggregate output requires its complete value bindings".into())
+            Err(streaming_contract(
+                "aggregate output requires its complete value bindings",
+            ))
         }
         #[cfg(test)]
         {
             let kernels = self
                 .kernels
                 .as_ref()
-                .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
             let key_columns = self
                 .key_table
                 .as_ref()
@@ -397,7 +421,7 @@ impl AggregateStreamingSinkOperator {
         }
     }
 
-    fn try_submit_native_topn_bound(&mut self) -> Result<(), String> {
+    fn try_submit_native_topn_bound(&mut self) -> Result<(), ExecutionFailure> {
         let Some(session) = self.native_topn_session.as_mut() else {
             return Ok(());
         };
@@ -409,7 +433,7 @@ impl AggregateStreamingSinkOperator {
         Ok(())
     }
 
-    fn finish_native_topn_producers(&mut self) -> Result<(), String> {
+    fn finish_native_topn_producers(&mut self) -> Result<(), ExecutionFailure> {
         let Some(session) = self.native_topn_session.as_mut() else {
             return Ok(());
         };
@@ -419,17 +443,14 @@ impl AggregateStreamingSinkOperator {
     fn fail_native_topn_producers(
         &mut self,
         reason: RuntimeFilterProducerFailure,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         let Some(session) = self.native_topn_session.as_mut() else {
             return Ok(());
         };
         session.fail(reason)
     }
 
-    fn process(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
+    fn process(&mut self, ctx: &StepContext<'_>, chunk: Chunk) -> Result<(), ExecutionFailure> {
         self.aggregate_retained_memory.ensure_available()?;
         self.touched_aggregate_states.ensure_available()?;
         self.operator_vectors_memory.ensure_available()?;
@@ -444,22 +465,17 @@ impl AggregateStreamingSinkOperator {
             .as_ref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
         let owner = factory.begin_input_construction(&chunk)?;
-        let mut control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
-            state.error_state(),
-        );
-        control.bind_runtime_memory(state);
-        control.bind_construction_factory(factory.clone());
         let evaluation =
-            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), &control);
+            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), ctx);
         let group_arrays = self.eval_group_by_arrays(&evaluation, &chunk)?;
         let group_arrays =
             normalize_aggregate_group_arrays(&self.expected_group_types()?, group_arrays)?;
         let agg_arrays = self.eval_agg_arrays(&evaluation, &chunk)?;
 
         self.ensure_data_initialized(&group_arrays, &agg_arrays)
-            .map_err(|e| e.to_string())?;
+            .map_err(ExecutionFailure::from)?;
         self.refresh_output_schema_for_group_arrays(&group_arrays)
-            .map_err(|e| e.to_string())?;
+            .map_err(ExecutionFailure::from)?;
 
         if chunk.is_empty() {
             return Ok(());
@@ -467,11 +483,11 @@ impl AggregateStreamingSinkOperator {
 
         let num_rows = chunk.len();
         if self.group_by.is_empty() {
-            self.ensure_scalar_group().map_err(|e| e.to_string())?;
+            self.ensure_scalar_group().map_err(ExecutionFailure::from)?;
             let state_ptr = *self
                 .group_states
                 .first()
-                .ok_or_else(|| "aggregate scalar state missing".to_string())?;
+                .ok_or_else(|| streaming_contract("aggregate scalar state missing"))?;
             self.state_ptrs.clear();
             self.operator_vectors_memory.reserve_state_ptrs(
                 &self.group_states,
@@ -482,7 +498,7 @@ impl AggregateStreamingSinkOperator {
             let kernels = self
                 .kernels
                 .as_ref()
-                .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
             let agg_batches = build_agg_batches(&agg_arrays, num_rows)?;
             for (idx, (kernel, batch)) in kernels
                 .entries
@@ -506,91 +522,93 @@ impl AggregateStreamingSinkOperator {
             return Ok(());
         }
 
-        let key_views = build_group_key_views(&group_arrays).map_err(|e| e.to_string())?;
+        let key_views = build_group_key_views(&group_arrays).map_err(ExecutionFailure::from)?;
         let mut key_table = self
             .key_table
             .take()
-            .ok_or_else(|| "aggregate key table missing".to_string())?;
-        let result: Result<(), String> = (|| {
+            .ok_or_else(|| streaming_contract("aggregate key table missing"))?;
+        let result: Result<(), ExecutionFailure> = (|| {
             let mut group_ids = Vec::with_capacity(num_rows);
             match key_table.key_strategy() {
                 GroupKeyStrategy::Serialized => {
                     let rows = key_table
                         .build_rows_fallback(&group_arrays)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ExecutionFailure::from)?;
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ExecutionFailure::from)?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let row_bytes = rows.get(row).map(|v| v.as_slice()).ok_or_else(|| {
-                            format!(
+                            streaming_contract(format_args!(
                                 "canonical serialized group row missing at row={} (rows={})",
                                 row, num_rows
-                            )
+                            ))
                         })?;
                         let lookup = key_table
                             .find_or_insert_from_row(&key_views, row, row_bytes, hash)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         self.ensure_group_state(&lookup, &group_arrays, row)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         group_ids.push(lookup.group_id);
                     }
                 }
                 GroupKeyStrategy::Scalar => {
-                    return Err("group key strategy Scalar is invalid for group by".to_string());
+                    return Err(streaming_contract(
+                        "group key strategy Scalar is invalid for group by",
+                    ));
                 }
                 GroupKeyStrategy::OneNumber => {
                     let view = key_views
                         .first()
-                        .ok_or_else(|| "one number key view missing".to_string())?;
+                        .ok_or_else(|| streaming_contract("one number key view missing"))?;
                     let hashes = key_table
                         .build_one_number_hashes(view, num_rows)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ExecutionFailure::from)?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let lookup = key_table
                             .find_or_insert_one_number(view, row, hash)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         self.ensure_group_state(&lookup, &group_arrays, row)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         group_ids.push(lookup.group_id);
                     }
                 }
                 GroupKeyStrategy::OneString => {
                     let view = key_views
                         .first()
-                        .ok_or_else(|| "one string key view missing".to_string())?;
+                        .ok_or_else(|| streaming_contract("one string key view missing"))?;
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ExecutionFailure::from)?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let lookup = key_table
                             .find_or_insert_one_string_like(view, row, hash)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         self.ensure_group_state(&lookup, &group_arrays, row)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         group_ids.push(lookup.group_id);
                     }
                 }
                 GroupKeyStrategy::FixedSize => {
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ExecutionFailure::from)?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let lookup = key_table
                             .find_or_insert_fixed_size(&key_views, row, hash)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         self.ensure_group_state(&lookup, &group_arrays, row)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         group_ids.push(lookup.group_id);
                     }
                 }
                 GroupKeyStrategy::CompressedFixed => {
                     let keys = key_table
                         .build_compressed_flags(&key_views, num_rows)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ExecutionFailure::from)?;
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ExecutionFailure::from)?;
                     let mut rows_opt = None;
                     for (row, (key, hash)) in keys
                         .iter()
@@ -602,33 +620,33 @@ impl AggregateStreamingSinkOperator {
                         let lookup = if key {
                             key_table
                                 .find_or_insert_compressed(&key_views, row, hash)
-                                .map_err(|e| e.to_string())?
+                                .map_err(ExecutionFailure::from)?
                         } else {
                             if rows_opt.is_none() {
                                 rows_opt = Some(
                                     key_table
                                         .build_rows_fallback(&group_arrays)
-                                        .map_err(|e| e.to_string())?,
+                                        .map_err(ExecutionFailure::from)?,
                                 );
                             }
                             let rows = rows_opt.as_ref().expect("group rows");
                             let row_bytes =
                                 rows.get(row).map(|row| row.as_slice()).ok_or_else(|| {
-                                    "canonical compressed fallback row missing".to_string()
+                                    streaming_contract("canonical compressed fallback row missing")
                                 })?;
                             key_table
                                 .find_or_insert_from_row(&key_views, row, row_bytes, hash)
-                                .map_err(|e| e.to_string())?
+                                .map_err(ExecutionFailure::from)?
                         };
                         self.ensure_group_state(&lookup, &group_arrays, row)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(ExecutionFailure::from)?;
                         group_ids.push(lookup.group_id);
                     }
                 }
             }
 
             if group_ids.len() != num_rows {
-                return Err("aggregate group id count mismatch".to_string());
+                return Err(streaming_contract("aggregate group id count mismatch"));
             }
 
             self.state_ptrs.clear();
@@ -641,13 +659,13 @@ impl AggregateStreamingSinkOperator {
                 let state_ptr = *self
                     .group_states
                     .get(group_id)
-                    .ok_or_else(|| "aggregate state missing".to_string())?;
+                    .ok_or_else(|| streaming_contract("aggregate state missing"))?;
                 self.state_ptrs.push(state_ptr);
             }
             let kernels = self
                 .kernels
                 .as_ref()
-                .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
             let agg_batches = build_agg_batches(&agg_arrays, num_rows)?;
             for (idx, (kernel, batch)) in kernels
                 .entries
@@ -676,13 +694,9 @@ impl AggregateStreamingSinkOperator {
         Ok(())
     }
 
-    fn finish_to_chunks(&mut self) -> ExecutionResult<Vec<Chunk>> {
-        if self.finished {
-            return Ok(vec![]);
-        }
-
+    fn finish_output(&mut self) -> ExecutionResult<Chunk> {
         if !self.initialized {
-            return Err("aggregate operator not prepared".into());
+            return Err(streaming_contract("aggregate operator not prepared"));
         }
 
         if !self.group_by.is_empty() {
@@ -709,12 +723,12 @@ impl AggregateStreamingSinkOperator {
 
         if self.group_states.is_empty() {
             if self.group_by.is_empty() {
-                self.ensure_scalar_group().map_err(|e| e.to_string())?;
+                self.ensure_scalar_group().map_err(ExecutionFailure::from)?;
             } else if self.output_chunk_schema.is_typed() {
                 let kernels = self
                     .kernels
                     .as_ref()
-                    .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                    .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
                 let factory = self
                     .construction
                     .as_ref()
@@ -728,14 +742,14 @@ impl AggregateStreamingSinkOperator {
                     factory.as_ref(),
                 )?
                 .finish_empty()?;
-                return Ok(vec![chunk]);
+                return Ok(chunk);
             } else {
                 let schema = self
                     .output_schema
                     .clone()
                     .unwrap_or_else(|| Arc::new(Schema::new(Vec::<Field>::new())));
                 let batch = RecordBatch::new_empty(schema);
-                return Ok(vec![self.output_chunk_from_batch(batch)?]);
+                return Ok(self.output_chunk_from_batch(batch)?);
             }
         }
 
@@ -746,7 +760,7 @@ impl AggregateStreamingSinkOperator {
         let kernels = self
             .kernels
             .as_ref()
-            .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+            .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
         let key_count = self
             .key_table
             .as_ref()
@@ -754,9 +768,9 @@ impl AggregateStreamingSinkOperator {
             .unwrap_or(0);
         let output_creation = if self.output_chunk_schema.is_typed() {
             if key_count != self.group_by.len() {
-                return Err(
-                    "aggregate actual group channel count differs from its declaration".into(),
-                );
+                return Err(streaming_contract(
+                    "aggregate actual group channel count differs from its declaration",
+                ));
             }
             let factory = self
                 .construction
@@ -776,7 +790,7 @@ impl AggregateStreamingSinkOperator {
         let mut arrays = Vec::with_capacity(key_count + kernels.entries.len());
         if let Some(table) = self.key_table.as_ref() {
             for col in table.key_columns() {
-                arrays.push(col.to_array().map_err(|e| e.to_string())?);
+                arrays.push(col.to_array().map_err(ExecutionFailure::from)?);
             }
         }
         for kernel in &kernels.entries {
@@ -789,7 +803,7 @@ impl AggregateStreamingSinkOperator {
         if let Some(creation) = output_creation {
             let chunk = creation.finish(arrays, self.group_states.len())?;
             self.drop_group_states();
-            return Ok(vec![chunk]);
+            return Ok(chunk);
         }
         let schema = align_schema_with_arrays(&schema, &arrays, "aggregate streaming output")?;
 
@@ -800,19 +814,19 @@ impl AggregateStreamingSinkOperator {
         } else {
             RecordBatch::try_new(schema, arrays)
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(crate::exec::chunk::ChunkConstructionFailure::record_batch)?;
         self.drop_group_states();
-        Ok(vec![self.output_chunk_from_batch(batch)?])
+        Ok(self.output_chunk_from_batch(batch)?)
     }
 
-    fn init_from_plan(&mut self) -> Result<(), String> {
+    fn init_from_plan(&mut self) -> Result<(), ExecutionFailure> {
         if self.initialized {
             return Ok(());
         }
 
         let native_topn_producers = self.runtime_filter_execution.topn_producers.as_slice();
-        self.topn_boundary_bindings = build_topn_boundary_bindings(native_topn_producers)
-            .map_err(|error| error.to_string())?;
+        self.topn_boundary_bindings =
+            build_topn_boundary_bindings(native_topn_producers).map_err(ExecutionFailure::from)?;
 
         let expected_group_types = self.expected_group_types()?;
 
@@ -829,10 +843,9 @@ impl AggregateStreamingSinkOperator {
                 }
                 #[cfg(not(test))]
                 None => {
-                    return Err(
-                        "streaming aggregate key table memory tracker must be bound before initialization"
-                            .to_string(),
-                    );
+                    return Err(streaming_contract(
+                        "streaming aggregate key table memory tracker must be bound before initialization",
+                    ));
                 }
             };
             self.key_table = Some(key_table);
@@ -849,7 +862,7 @@ impl AggregateStreamingSinkOperator {
         &self,
         evaluation: &E,
         chunk: &Chunk,
-    ) -> Result<Vec<ArrayRef>, E::Error> {
+    ) -> Result<Vec<ArrayRef>, ExecutionFailure> {
         let mut arrays = Vec::with_capacity(self.group_by.len());
         for expr in &self.group_by {
             let array = evaluation.eval(*expr, chunk)?;
@@ -862,7 +875,7 @@ impl AggregateStreamingSinkOperator {
         &self,
         evaluation: &E,
         chunk: &Chunk,
-    ) -> Result<Vec<Option<ArrayRef>>, E::Error> {
+    ) -> Result<Vec<Option<ArrayRef>>, ExecutionFailure> {
         let mut arrays = Vec::with_capacity(self.functions.len());
         for func in &self.functions {
             let array = if func.inputs.is_empty() {
@@ -870,11 +883,11 @@ impl AggregateStreamingSinkOperator {
             } else if func.inputs.len() == 1 {
                 Some(evaluation.eval(func.inputs[0], chunk)?)
             } else {
-                return Err(format!(
+                return Err(streaming_contract(format_args!(
                     "aggregate inputs must be packed into a single struct expression: {} has {} inputs",
                     func.name,
                     func.inputs.len()
-                ).into());
+                )));
             };
             arrays.push(array);
         }
@@ -885,19 +898,19 @@ impl AggregateStreamingSinkOperator {
         &mut self,
         group_arrays: &[ArrayRef],
         agg_arrays: &[Option<ArrayRef>],
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if !self.initialized {
-            return Err("aggregate operator not prepared".to_string());
+            return Err(streaming_contract("aggregate operator not prepared"));
         }
         if self.data_initialized {
             return Ok(());
         }
 
         if !self.group_by.is_empty() && group_arrays.len() != self.group_by.len() {
-            return Err("group_by arrays length mismatch".to_string());
+            return Err(streaming_contract("group_by arrays length mismatch"));
         }
         if agg_arrays.len() != self.functions.len() {
-            return Err("aggregate arrays length mismatch".to_string());
+            return Err(streaming_contract("aggregate arrays length mismatch"));
         }
 
         let expected_group_types = self.expected_group_types()?;
@@ -906,7 +919,7 @@ impl AggregateStreamingSinkOperator {
         let kernels = self
             .kernels
             .as_ref()
-            .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+            .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
         self.validate_agg_array_types(&expected_agg_types, &kernels.entries, agg_arrays)?;
 
         if let Some(table) = self.key_table.as_mut()
@@ -926,7 +939,7 @@ impl AggregateStreamingSinkOperator {
     fn refresh_output_schema_for_group_arrays(
         &mut self,
         group_arrays: &[ArrayRef],
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if self.group_by.is_empty() {
             return Ok(());
         }
@@ -959,14 +972,14 @@ impl AggregateStreamingSinkOperator {
         self.rebuild_output_schema(Some(&observed))
     }
 
-    fn output_chunk_from_batch(&self, batch: RecordBatch) -> Result<Chunk, String> {
+    fn output_chunk_from_batch(&self, batch: RecordBatch) -> Result<Chunk, ExecutionFailure> {
         let output_len = batch.num_columns();
         if self.output_chunk_schema.slot_ids().len() < output_len {
-            return Err(format!(
+            return Err(streaming_contract(format_args!(
                 "aggregate output slot count mismatch: batch_columns={} output_slots={}",
                 output_len,
                 self.output_chunk_schema.slot_ids().len()
-            ));
+            )));
         }
         {
             let batch_schema = batch.schema();
@@ -975,36 +988,39 @@ impl AggregateStreamingSinkOperator {
                 .enumerate()
                 .map(|(idx, slot_id)| {
                     let slot_schema = self.output_chunk_schema.slot(*slot_id).ok_or_else(|| {
-                        format!(
+                        streaming_contract(format_args!(
                             "aggregate explicit output chunk schema missing slot {}",
                             slot_id
-                        )
+                        ))
                     })?;
                     let field = batch_schema.field(idx);
-                    slot_schema.with_field_and_slot_id(*slot_id, field.as_ref().clone())
+                    Ok::<_, ExecutionFailure>(
+                        slot_schema.with_field_and_slot_id(*slot_id, field.as_ref().clone())?,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::try_new(slot_schemas)?))
+                .map_err(Into::into)
         }
     }
 
-    fn expected_group_types(&self) -> Result<Vec<DataType>, String> {
+    fn expected_group_types(&self) -> Result<Vec<DataType>, ExecutionFailure> {
         let mut types = Vec::with_capacity(self.group_by.len());
         for expr in &self.group_by {
             let data_type = self
                 .arena
                 .data_type(*expr)
-                .ok_or_else(|| "group by type missing".to_string())?
+                .ok_or_else(|| streaming_contract("group by type missing"))?
                 .clone();
             if matches!(data_type, DataType::Null) {
-                return Err("group by type is null".to_string());
+                return Err(streaming_contract("group by type is null"));
             }
             types.push(data_type);
         }
         Ok(types)
     }
 
-    fn expected_agg_input_types(&self) -> Result<Vec<Option<DataType>>, String> {
+    fn expected_agg_input_types(&self) -> Result<Vec<Option<DataType>>, ExecutionFailure> {
         expected_agg_input_types(&self.arena, &self.functions)
     }
 
@@ -1012,17 +1028,17 @@ impl AggregateStreamingSinkOperator {
         &self,
         expected: &[DataType],
         arrays: &[ArrayRef],
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if expected.len() != arrays.len() {
-            return Err("group by type length mismatch".to_string());
+            return Err(streaming_contract("group by type length mismatch"));
         }
         for (idx, (expected_type, array)) in expected.iter().zip(arrays.iter()).enumerate() {
             let actual_type = array.data_type();
             if !super::is_compatible_aggregate_group_data_type(expected_type, actual_type) {
-                return Err(format!(
+                return Err(streaming_contract(format_args!(
                     "group by type mismatch at {}: expected {:?}, got {:?}",
                     idx, expected_type, actual_type
-                ));
+                )));
             }
         }
         Ok(())
@@ -1033,9 +1049,9 @@ impl AggregateStreamingSinkOperator {
         expected_input_types: &[Option<DataType>],
         kernels: &[agg::AggKernelEntry],
         arrays: &[Option<ArrayRef>],
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if expected_input_types.len() != arrays.len() || kernels.len() != arrays.len() {
-            return Err("aggregate type length mismatch".to_string());
+            return Err(streaming_contract("aggregate type length mismatch"));
         }
         for (idx, array_opt) in arrays.iter().enumerate() {
             if self
@@ -1046,7 +1062,7 @@ impl AggregateStreamingSinkOperator {
             {
                 let array = array_opt
                     .as_ref()
-                    .ok_or_else(|| "aggregate intermediate input missing".to_string())?;
+                    .ok_or_else(|| streaming_contract("aggregate intermediate input missing"))?;
                 let expected_type = kernels[idx].output_type(true);
                 let actual_type = array.data_type();
                 let is_struct_wrapped = match actual_type {
@@ -1061,17 +1077,17 @@ impl AggregateStreamingSinkOperator {
                 if !super::is_compatible_aggregate_data_type(&expected_type, actual_type)
                     && !is_struct_wrapped
                 {
-                    return Err(format!(
+                    return Err(streaming_contract(format_args!(
                         "aggregate intermediate type mismatch at {}: expected {:?}, got {:?}",
                         idx, expected_type, actual_type
-                    ));
+                    )));
                 }
                 continue;
             }
 
             if self.functions[idx].name == "count" && self.functions[idx].inputs.is_empty() {
                 if array_opt.is_some() {
-                    return Err("count input should be none".to_string());
+                    return Err(streaming_contract("count input should be none"));
                 }
                 continue;
             }
@@ -1079,23 +1095,23 @@ impl AggregateStreamingSinkOperator {
             let expected_type = expected_input_types
                 .get(idx)
                 .and_then(|t| t.as_ref())
-                .ok_or_else(|| "aggregate input type missing".to_string())?;
+                .ok_or_else(|| streaming_contract("aggregate input type missing"))?;
             let array = array_opt
                 .as_ref()
-                .ok_or_else(|| "aggregate input missing".to_string())?;
+                .ok_or_else(|| streaming_contract("aggregate input missing"))?;
             if !super::is_compatible_aggregate_data_type(expected_type, array.data_type()) {
-                return Err(format!(
+                return Err(streaming_contract(format_args!(
                     "aggregate input type mismatch at {}: expected {:?}, got {:?}",
                     idx,
                     expected_type,
                     array.data_type()
-                ));
+                )));
             }
         }
         Ok(())
     }
 
-    fn ensure_scalar_group(&mut self) -> Result<(), String> {
+    fn ensure_scalar_group(&mut self) -> Result<(), ExecutionFailure> {
         if !self.group_states.is_empty() {
             return Ok(());
         }
@@ -1108,22 +1124,22 @@ impl AggregateStreamingSinkOperator {
         lookup: &KeyLookup,
         group_arrays: &[ArrayRef],
         row: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if lookup.is_new {
             self.alloc_group_state(lookup.group_id)?;
             observe_key_table_group(&mut self.topn_boundary_bindings, lookup, group_arrays, row)
-                .map_err(|error| error.to_string())?;
+                .map_err(ExecutionFailure::from)?;
         }
         Ok(())
     }
 
-    fn alloc_group_state(&mut self, group_id: usize) -> Result<(), String> {
+    fn alloc_group_state(&mut self, group_id: usize) -> Result<(), ExecutionFailure> {
         let kernels = self
             .kernels
             .as_ref()
-            .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+            .ok_or_else(|| streaming_contract("aggregate kernels not initialized"))?;
         if group_id != self.group_states.len() {
-            return Err("aggregate group id out of bounds".to_string());
+            return Err(streaming_contract("aggregate group id out of bounds"));
         }
         let align = kernels
             .entries
@@ -1174,67 +1190,8 @@ impl AggregateStreamingSinkOperator {
     }
 }
 
-impl ProcessorOperator for AggregateStreamingSinkOperator {
-    fn input_construction_factory(
-        &self,
-    ) -> Option<&dyn crate::exec::pipeline::operator::InputConstructionFactory> {
-        self.construction.as_deref()
-    }
-
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        let result: ExecutionResult<()> = (|| {
-            if self.finished {
-                return Ok(());
-            }
-            if self.finishing {
-                return Err("aggregate streaming sink received input after set_finishing".into());
-            }
-            let num_rows = chunk.len();
-            self.process(_state, chunk)?;
-            self.topn_rf_rows_since_publish += num_rows;
-            self.try_submit_native_topn_bound()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
-        }
-        Ok(result?)
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        let result = (|| {
-            if self.finished {
-                return Ok(());
-            }
-            self.finishing = true;
-            let chunks = self.finish_to_chunks()?;
-            self.finish_native_topn_producers()?;
-            for chunk in chunks {
-                self.streaming_state.offer_chunk(chunk);
-            }
-            self.streaming_state.mark_sink_finished();
-            self.finished = true;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
-        }
-        result
-    }
-
-    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+impl InputEncodingPolicy for AggregateStreamingSinkOperator {
+    fn retains_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
         super::aggregate_accepts_encoded_group_column(
             &self.arena,
             &self.group_by,
@@ -1242,6 +1199,46 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
             slot_id,
             data_type,
         )
+    }
+}
+impl SinkKernel for AggregateStreamingSinkOperator {
+    fn consume(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let chunk = input.into_uncovered_chunk()?;
+        let num_rows = chunk.len();
+        let result: ExecutionResult<()> = (|| {
+            self.process(ctx, chunk)?;
+            self.topn_rf_rows_since_publish += num_rows;
+            self.try_submit_native_topn_bound()?;
+            Ok(())
+        })();
+        if let Err(failure) = result {
+            ctx.report_failure(failure.clone());
+            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
+            return Err(failure);
+        }
+        Ok(SinkStep::new(
+            NextStep::NeedInput,
+            u64::try_from(num_rows).expect("supported row count fits u64"),
+        ))
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        let result: ExecutionResult<()> = (|| {
+            let output = self.finish_output()?;
+            self.finish_native_topn_producers()?;
+            self.streaming_state.offer_chunk(output);
+            self.streaming_state.mark_sink_finished();
+            Ok(())
+        })();
+        if let Err(failure) = result {
+            ctx.report_failure(failure.clone());
+            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
+            return Err(failure);
+        }
+        Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }
 
@@ -1283,6 +1280,8 @@ pub(super) fn aggregate_streaming_topn_test_operator(
 
 #[cfg(test)]
 mod retained_memory_tests {
+    use crate::exec::pipeline::operator::OperatorLifecycle;
+    use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, BinaryArray, Int64Array};
@@ -1303,7 +1302,9 @@ mod retained_memory_tests {
     const INTERMEDIATE_SLOT: SlotId = SlotId::new(102);
     const FINAL_SLOT: SlotId = SlotId::new(103);
 
-    fn install_input_creator(operator: &mut dyn crate::exec::pipeline::operator::Operator) {
+    fn install_input_creator<T: crate::exec::pipeline::operator::OperatorLifecycle + ?Sized>(
+        operator: &mut T,
+    ) {
         // This real construction host is distinct from the aggregate heap
         // tracker whose retained-state/failed-mutation behavior is the oracle.
         let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
@@ -1443,11 +1444,9 @@ mod retained_memory_tests {
         operator: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
         state: &AggregateStreamingState,
     ) -> Chunk {
-        operator
-            .as_processor_mut()
-            .expect("streaming aggregate processor")
-            .set_finishing(&RuntimeState::default())
-            .expect("finish streaming aggregate");
+        let mut calls = TestDriver::new(operator.as_mut(), &RuntimeState::default());
+        calls.signal_eos().unwrap();
+        assert!(calls.collect_until_finished().unwrap().is_empty());
         state.poll_chunk().expect("streaming aggregate output")
     }
 
@@ -1482,14 +1481,15 @@ mod retained_memory_tests {
                 operator.set_mem_tracker(tracker.clone());
                 operator.set_construction_factory(declaration.construction);
                 operator.prepare().unwrap();
-                let processor = operator.as_processor_mut().unwrap();
                 let runtime = RuntimeState::default();
+                let mut processor = TestDriver::new(operator.as_mut(), &runtime);
                 if populated {
-                    processor.push_chunk(&runtime, all_null_group()).unwrap();
+                    processor.input_without_output(all_null_group()).unwrap();
                 }
-                processor.set_finishing(&runtime).unwrap();
-                processor.set_finishing(&runtime).unwrap();
-                assert!(processor.is_finished());
+                processor.signal_eos().unwrap();
+                processor.signal_eos().unwrap();
+                assert!(processor.collect_until_finished().unwrap().is_empty());
+                assert!(matches!(processor.next(), NextStep::Finished));
                 let output = state.poll_chunk();
                 if grouped && !populated {
                     assert!(
@@ -1530,10 +1530,8 @@ mod retained_memory_tests {
         operator.set_mem_tracker(Arc::clone(&tracker));
         install_input_creator(operator.as_mut());
         operator.prepare().expect("prepare streaming aggregate");
-        operator
-            .as_processor_mut()
-            .expect("streaming aggregate processor")
-            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, 0..256))
+        TestDriver::new(operator.as_mut(), &RuntimeState::default())
+            .input_without_output(int64_chunk(VALUE_SLOT, 0..256))
             .expect("update streaming aggregate");
         let before_finish = tracker.current();
         assert!(before_finish > 0, "state growth must be query-accounted");
@@ -1561,10 +1559,8 @@ mod retained_memory_tests {
         update.set_mem_tracker(Arc::clone(&update_tracker));
         install_input_creator(update.as_mut());
         update.prepare().expect("prepare partial aggregate");
-        update
-            .as_processor_mut()
-            .expect("partial aggregate processor")
-            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, 0..256))
+        TestDriver::new(update.as_mut(), &RuntimeState::default())
+            .input_without_output(int64_chunk(VALUE_SLOT, 0..256))
             .expect("build partial distinct state");
         let intermediate =
             typed_distinct_intermediate(finish_and_take_output(&mut update, &update_state));
@@ -1585,10 +1581,8 @@ mod retained_memory_tests {
         merge.set_mem_tracker(Arc::clone(&merge_tracker));
         install_input_creator(merge.as_mut());
         merge.prepare().expect("prepare merge aggregate");
-        merge
-            .as_processor_mut()
-            .expect("merge aggregate processor")
-            .push_chunk(&RuntimeState::default(), intermediate)
+        TestDriver::new(merge.as_mut(), &RuntimeState::default())
+            .input_without_output(intermediate)
             .expect("merge distinct state");
         let before_finish = merge_tracker.current();
         assert!(before_finish > 0, "merge growth must be query-accounted");
@@ -1605,37 +1599,73 @@ mod retained_memory_tests {
 
     #[test]
     fn streaming_update_oom_fails_before_distinct_state_mutation() {
+        use crate::exec::pipeline::{operator::Operator, shape::SinkKernel};
         let (factory, state) =
             scalar_distinct_factory(VALUE_SLOT, DataType::Int64, FINAL_SLOT, false, false);
         let tracker = MemTracker::new_root("streaming-oom");
-        let mut operator = factory.create(1, 0);
+        let mut operator = factory.create_kernel(1, 0);
         operator.set_mem_tracker(Arc::clone(&tracker));
-        install_input_creator(operator.as_mut());
+        install_input_creator(&mut operator);
         operator.prepare().expect("prepare streaming aggregate");
-        operator
-            .as_processor_mut()
-            .expect("streaming aggregate processor")
-            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, [1, 2, 3]))
-            .expect("seed distinct state");
+        SinkKernel::consume_for_test(
+            &mut operator,
+            &RuntimeState::default(),
+            int64_chunk(VALUE_SLOT, [1, 2, 3]),
+        )
+        .expect("seed distinct state");
         let before_oom = tracker.current();
         tracker
             .install_limit_once(before_oom)
             .expect("freeze memory limit at live usage");
 
-        let error = operator
-            .as_processor_mut()
-            .expect("streaming aggregate processor")
-            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, [4]))
-            .expect_err("new distinct value must require tracked allocation");
-        assert!(error.detail().contains("ResourceExhausted"), "{error}");
+        let error = SinkKernel::consume_for_test(
+            &mut operator,
+            &RuntimeState::default(),
+            int64_chunk(VALUE_SLOT, [4]),
+        )
+        .expect_err("new distinct value must require tracked allocation");
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
+        assert_eq!(
+            fact.class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
+        assert_eq!(fact.reason().code(), 169);
+        assert_eq!(
+            fact.resource().unwrap().limit,
+            None,
+            "the container erased the specific allocator refusal"
+        );
+        let mut source: &dyn std::error::Error = &error;
+        loop {
+            if let Some(original) = source
+                .downcast_ref::<novarocks_functions::allocation_failure::AllocationRefusal<
+                    hashbrown::TryReserveError,
+                >>()
+            {
+                assert!(matches!(
+                    original.original(),
+                    hashbrown::TryReserveError::AllocError { .. }
+                ));
+                break;
+            }
+            source = source
+                .source()
+                .expect("the actual distinct collection reserve cause");
+        }
         assert_eq!(tracker.current(), before_oom);
 
-        let output = finish_and_take_output(&mut operator, &state);
+        // Probe the private update boundary. A failed production receiver may
+        // not finalize; this view publishes nothing to the streaming queue.
+        let output = operator
+            .finish_output()
+            .expect("inspect unchanged distinct state");
+        assert!(state.poll_chunk().is_none());
         let count = output.columns()[0]
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("distinct count output");
         assert_eq!(count.value(0), 3, "failed allocation must not mutate state");
+        drop(output);
         drop(operator);
         assert_eq!(tracker.current(), 0);
     }

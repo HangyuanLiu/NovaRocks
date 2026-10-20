@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, BooleanArray, ListArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -25,7 +27,12 @@ pub fn eval_array_contains_all<__Eval: crate::exec::expr::ExprEvaluation + ?Size
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_contains_all requires exactly 2 prepared argument(s)",
+        ));
+    }
     let left_arr = arena.eval(args[0], chunk)?;
     let right_arr = arena.eval(args[1], chunk)?;
     if left_arr.data_type() == &DataType::Null || right_arr.data_type() == &DataType::Null {
@@ -35,19 +42,19 @@ pub fn eval_array_contains_all<__Eval: crate::exec::expr::ExprEvaluation + ?Size
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_contains_all expects ListArray, got {:?}",
                 left_arr.data_type()
-            )
+            ))
         })?;
     let right = right_arr
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_contains_all expects ListArray, got {:?}",
                 right_arr.data_type()
-            )
+            ))
         })?;
 
     let mut left_values = left.values().clone();
@@ -55,20 +62,25 @@ pub fn eval_array_contains_all<__Eval: crate::exec::expr::ExprEvaluation + ?Size
     if left_values.data_type() != right_values.data_type() {
         let left_type = left_values.data_type().clone();
         let right_type = right_values.data_type().clone();
-        if let Ok(casted) =
-            super::common::cast_with_special_rules(&right_values, &left_type, "array_contains_all")
-        {
-            right_values = casted;
-        } else if let Ok(casted) =
-            super::common::cast_with_special_rules(&left_values, &right_type, "array_contains_all")
-        {
-            left_values = casted;
+        // Match the metadata direction already chosen by the catalogue's
+        // admitted type profile. A selected cast failure never triggers another
+        // conversion and cannot hide resource or value failures.
+        if arrow::compute::can_cast_types(&right_type, &left_type) {
+            right_values = super::common::cast_with_special_rules(
+                &right_values,
+                &left_type,
+                "array_contains_all",
+            )?;
+        } else if arrow::compute::can_cast_types(&left_type, &right_type) {
+            left_values = super::common::cast_with_special_rules(
+                &left_values,
+                &right_type,
+                "array_contains_all",
+            )?;
         } else {
-            return Err((format!(
-                "array_contains_all type mismatch after coercion attempts: {:?} vs {:?}",
-                left_type, right_type
-            ))
-            .into());
+            return Err(expression_contract(format_args!(
+                "array_contains_all has no admitted coercion: {left_type:?} vs {right_type:?}"
+            )));
         }
     }
     let left_offsets = left.value_offsets();

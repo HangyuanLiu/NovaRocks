@@ -123,14 +123,11 @@ impl Work<'_, '_> {
         Ok(())
     }
     fn finish<T>(&mut self, result: Result<T, KernelFailure>) -> Result<T, KernelFailure> {
-        if self.control.refused.load(Ordering::Relaxed)
+        // Every originating failure is final for fallible completion work.
+        // Resource settlement remains the responsibility of its actual scope.
+        if result.is_err()
+            || self.control.refused.load(Ordering::Relaxed)
             || self.control.operation_aborted.load(Ordering::Relaxed)
-            || matches!(
-                &result,
-                Err(KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted)
-            )
         {
             return result;
         }
@@ -1237,14 +1234,7 @@ fn gather(
     novarocks_functions::selected_copy::preflight_take(array.as_ref(), indices, |boundary| {
         if boundary { work.flush() } else { work.step() }
     })
-    .map_err(|error| match error {
-        novarocks_functions::selected_copy::CopyError::Control(error) => error,
-        novarocks_functions::selected_copy::CopyError::Extent => KernelFailure::ResourceExhausted,
-        novarocks_functions::selected_copy::CopyError::Invalid(_)
-        | novarocks_functions::selected_copy::CopyError::Unsupported(_) => {
-            invalid("selected Arrow copy requires a different carrier protocol")
-        }
-    })?;
+    .map_err(novarocks_functions::selected_copy::CopyError::into_kernel)?;
     work.flush()?;
     let indices = UInt64Array::from_iter(indices.iter().copied());
     work.flush()?;
@@ -1290,3 +1280,178 @@ mod runtime_scalar_memory_tests;
 pub(crate) mod input_source;
 #[cfg(test)]
 pub(crate) mod input_source_tests;
+
+#[cfg(test)]
+mod compile_interruption_footer_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_type_contract::{
+        CompileControlError, owned_resources::layout::LayoutResourceError,
+    };
+    use std::sync::atomic::AtomicUsize;
+    struct Footer(AtomicUsize);
+    impl KernelEvaluationControl for Footer {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(KernelFailure::Cancelled)
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("a synchronous footer cannot wait")
+        }
+    }
+    #[test]
+    fn every_originating_failure_skips_fallible_tail_but_success_observes_it() {
+        let raw = LayoutResourceError::SourceModel;
+        let expected = raw.failure_fact();
+        let cause = CompileControlError::from_domain(raw);
+        let footer = Footer(AtomicUsize::new(0));
+        let control = ObservedControl {
+            original: &footer,
+            refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
+        };
+        let mut work = Work {
+            control: &control,
+            pending: 1,
+            scalar_scope: None,
+        };
+        let result: Result<(), _> = work.finish(Err(KernelFailure::CompileControl(cause.clone())));
+        let KernelFailure::CompileControl(actual) = result.unwrap_err() else {
+            panic!("original interruption")
+        };
+        assert_eq!(actual, cause);
+        assert_eq!(actual.failure_fact(), expected);
+        assert_eq!(footer.0.load(Ordering::SeqCst), 0);
+        let expected = invalid("ordinary validation");
+        let result: Result<(), _> = work.finish(Err(expected.clone()));
+        assert_eq!(result.unwrap_err(), expected);
+        assert_eq!(footer.0.load(Ordering::SeqCst), 0);
+        let result = work.finish(Ok(()));
+        assert_eq!(result.unwrap_err(), KernelFailure::Cancelled);
+        assert_eq!(footer.0.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod first_cause_settlement_footer_tests {
+    use super::*;
+    use crate::exec::operators::compiled_expression::RuntimeKernelControl;
+    use crate::runtime::{
+        fragment::ExecutionFailure,
+        kernel_memory::{KernelMemoryAdmission, KernelMemoryJournal, request_complete_operation},
+        query_memory::QueryMemoryBinding,
+        runtime_state::{RuntimeErrorState, RuntimeState},
+    };
+    use novarocks_memory::attribution::{
+        AttributingAllocator,
+        scope::{AmbientEntryObservation, AmbientExitObservation},
+    };
+    use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    use novarocks_types::{
+        QueryId,
+        identity::{AttemptId, QueryExecutionId},
+    };
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    #[test]
+    fn original_occurrence_survives_late_cancel_after_real_charged_resource_settlement() {
+        struct Release<'a> {
+            pointer: &'a Cell<*mut u8>,
+            allocator: &'a AttributingAllocator<System>,
+            layout: Layout,
+        }
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                let pointer = self.pointer.replace(std::ptr::null_mut());
+                if !pointer.is_null() {
+                    // SAFETY: the one actual block is released exactly once
+                    // through its original allocator and original Layout.
+                    unsafe {
+                        self.allocator.dealloc(pointer, self.layout);
+                    }
+                }
+            }
+        }
+        let mut config = AuthorityConfig::new(131072, 65536, 65536);
+        config.max_accounts = 32;
+        config.max_active_owners = 4;
+        config.metadata_budget_bytes = 16 * 1024;
+        config.top_up = novarocks_memory::TopUpPolicy::uniform(1024);
+        let authority = Arc::new(MemoryAuthority::new(config).unwrap());
+        let account = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let execution =
+            QueryExecutionId::new(QueryId::new(37, 301), AttemptId::new(1).unwrap()).unwrap();
+        let binding = QueryMemoryBinding::try_new(execution, authority, account).unwrap();
+        let stopped = Arc::new(RuntimeErrorState::default());
+        let mut runtime = RuntimeKernelControl::new(stopped.clone());
+        runtime
+            .bind_runtime_memory(&RuntimeState::default().with_query_memory(Some(binding.clone())));
+        let KernelMemoryAdmission::Granted(ready) = request_complete_operation(Some(&binding), 608)
+        else {
+            panic!("the exact original body requires a real grant");
+        };
+        let domain = ready.domain().clone();
+        let allocator = AttributingAllocator::new(System);
+        let layout = Layout::from_size_align(600, 8).unwrap();
+        let pointer = Cell::new(std::ptr::null_mut());
+        let release = Release {
+            pointer: &pointer,
+            allocator: &allocator,
+            layout,
+        };
+        let expected: ExecutionFailure =
+            KernelFailure::from_domain(LayoutResourceError::SourceModel).into();
+        let late_cancel: ExecutionFailure = KernelFailure::Cancelled.into();
+        let mut journal = KernelMemoryJournal::default();
+        let result = ready
+            .run(&mut journal, || {
+                // SAFETY: valid nonzero Layout; Release owns the matching free.
+                pointer.set(unsafe { allocator.alloc(layout) });
+                assert!(!pointer.get().is_null());
+                stopped.set_error(late_cancel.clone());
+                Err::<(), _>(expected.clone())
+            })
+            .unwrap();
+        // The actual writer has exited before the ordinary Frame footer.
+        assert_eq!(journal.observation.entry(), AmbientEntryObservation::Bound);
+        assert_eq!(journal.observation.exit(), AmbientExitObservation::Restored);
+        assert_eq!(journal.settlement.as_ref().unwrap().accepted_live, 608);
+        assert_eq!(journal.settlement.as_ref().unwrap().next_step, Ok(()));
+        assert_eq!(journal.stopped, Some(Ok(())));
+        assert!(!domain.snapshot().active);
+        assert!(domain.snapshot().sealed);
+        assert_eq!(domain.snapshot().live, 608);
+        let observed = ObservedControl {
+            original: &runtime,
+            refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
+        };
+        let mut work = Work {
+            control: &observed,
+            pending: 1,
+            scalar_scope: None,
+        };
+        let actual =
+            <ExecutionFailure as scalar_invocation::FrameFailure>::finish(&mut work, result)
+                .unwrap_err();
+        assert!(actual.same_occurrence(&expected));
+        assert!(!observed.refused.load(Ordering::Relaxed));
+        // Cancellation remains independently observable; it never rewrites
+        // the already originating occurrence or the completed settlement.
+        assert!(stopped.error().unwrap().same_occurrence(&late_cancel));
+        assert_eq!(
+            KernelEvaluationControl::checkpoint(&runtime, 0),
+            Err(KernelFailure::Cancelled)
+        );
+        drop(ready);
+        drop(release);
+        assert_eq!(domain.snapshot().live, 0);
+        assert!(!domain.snapshot().active);
+    }
+}

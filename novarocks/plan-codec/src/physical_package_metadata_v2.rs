@@ -62,7 +62,16 @@ impl fmt::Display for Error {
         }
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for PackageMetadataCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Identity(source) => Some(source),
+            Self::Projection(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub struct EncodedPackageMetadata {
     pub plan_version: Vec<u8>,

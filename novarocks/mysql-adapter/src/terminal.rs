@@ -177,12 +177,11 @@ async fn write_success<'writer, W: AsyncWrite + Unpin>(
 ) -> io::Result<crate::MysqlStatementWriteOutcome<'writer, W>> {
     match protocol.seal_success_visibility() {
         GovernedStatementVisibilitySealOutcome::Sealed => (),
-        GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
-            return write_closing(
+        GovernedStatementVisibilitySealOutcome::Cancelled(reason) => {
+            return write_typed_error(
+                novarocks_query_application::session_outcome::governed_cancellation_error(reason),
                 protocol,
                 writer,
-                ErrorKind::ER_QUERY_INTERRUPTED,
-                b"query cancelled before terminal OK",
             )
             .await;
         }
@@ -244,23 +243,34 @@ fn ok_payload(capabilities: CapabilityFlags, more_results: bool) -> Vec<u8> {
     }
     payload
 }
+fn cancellation_overrides_error(
+    error: &QueryServiceError,
+    reason: Option<QueryCancellationReason>,
+) -> bool {
+    error.execution_failure().is_none() && cancellation_overrides_typed_error(reason)
+}
 async fn write_typed_error<'writer, W: AsyncWrite + Unpin>(
     error: QueryServiceError,
     protocol: GovernedProtocolOwner,
     writer: TerminalWriter<'writer, W>,
 ) -> io::Result<crate::MysqlStatementWriteOutcome<'writer, W>> {
-    let (kind, message) = if cancellation_overrides_typed_error(protocol.cancellation().reason()) {
-        (
-            ErrorKind::ER_QUERY_INTERRUPTED,
-            b"query cancelled".as_slice(),
-        )
+    let reason = protocol.cancellation().reason();
+    let cancellation = if cancellation_overrides_error(&error, reason.clone()) {
+        reason.map(novarocks_query_application::session_outcome::cancellation_error)
     } else {
-        (mysql_error_kind(&error), error.message().as_bytes())
+        None
     };
-    let prepared = prepare_closing(protocol, writer, kind, message);
+    let selected = cancellation.as_ref().unwrap_or(&error);
+    let prepared = prepare_closing(
+        protocol,
+        writer,
+        mysql_error_kind(selected),
+        selected.message().as_bytes(),
+    );
     // The bounded copy now has complete capacity, while this original service
     // diagnostic still has its ordinary owner. Retire it before transferring
     // that owner or entering a potentially slow closing future.
+    drop(cancellation);
     drop(error);
     match prepared {
         Ok(prepared) => finish_prepared_closing(prepared).await,
@@ -410,6 +420,47 @@ mod tests {
     use novarocks_user_error::{
         ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
     };
+
+    #[test]
+    fn late_local_cancel_does_not_replace_a_selected_execution_error() {
+        use novarocks_execution_contract::{
+            SafeDetail,
+            failure::{FailureClass, FailureFact, FailureReason},
+        };
+        use novarocks_query_application::api::{ExecutionFailureInput, ExecutionFailureSite};
+        use std::num::NonZeroU16;
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Resource,
+                FailureReason::new(
+                    NonZeroU16::new(u16::MAX).unwrap(),
+                    NonZeroU16::new(7).unwrap(),
+                ),
+            ),
+            SafeDetail::new("accepted resource cause").unwrap(),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryServiceError::from_execution_failure(input.clone());
+        assert!(!cancellation_overrides_error(
+            &error,
+            Some(QueryCancellationReason::ClientDisconnected)
+        ));
+        assert!(!cancellation_overrides_error(
+            &error,
+            Some(QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 7
+            })
+        ));
+        assert_eq!(error.execution_failure(), Some(&input));
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_OUT_OF_RESOURCES);
+        assert!(cancellation_overrides_error(
+            &QueryServiceError::new(
+                novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+                "old application error"
+            ),
+            Some(QueryCancellationReason::ClientDisconnected)
+        ));
+    }
 
     #[test]
     fn typed_user_error_overrides_the_legacy_session_error_kind() {

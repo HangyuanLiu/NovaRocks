@@ -32,10 +32,17 @@ pub mod chunk_buffer_memory_manager;
 pub mod dependency;
 pub mod distribution;
 pub mod driver;
+pub(crate) mod driver_failure;
 pub mod executor;
 pub mod fragment_context;
 pub mod global_driver_executor;
+pub mod input;
+mod instance;
+#[cfg(test)]
+pub(crate) use instance::OperatorInstance;
+mod driver_retirement;
 pub mod operator;
+mod operator_exit;
 pub mod operator_factory;
 #[expect(
     clippy::module_inception,
@@ -43,3 +50,13 @@ pub mod operator_factory;
 )]
 pub mod pipeline;
 pub mod schedule;
+pub mod shape;
+pub mod step;
+pub mod step_context;
+pub mod writer_failure;
+
+#[cfg(test)]
+pub(crate) mod test_driver;
+
+#[cfg(test)]
+mod step_contract_tests;

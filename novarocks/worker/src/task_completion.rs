@@ -27,28 +27,188 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use novarocks_execution::runtime::fragment::FragmentTerminalFact;
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc};
 
 const COMPLETION_STATE_LOCK: &str = "task completion supervisor state lock";
 const COMPLETION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub type TaskCompletionAction = Box<dyn FnOnce(FragmentTerminalFact) + Send + 'static>;
+/// Refusal at the exact-slot admission owner, before any task can start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompletionReservationError {
+    ShuttingDown,
+    Unavailable(novarocks_execution_contract::failure::BoundedDetail),
+    Duplicate(TaskIdentity),
+    StatusIdentity {
+        reserved: TaskIdentity,
+        reporter: TaskIdentity,
+    },
+    SlotCapacity {
+        committed: usize,
+        limit: usize,
+    },
+}
+impl fmt::Display for CompletionReservationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShuttingDown => f.write_str("task completion owner is shutting down"),
+            Self::Unavailable(detail) => {
+                write!(f, "task completion owner is unavailable: {detail}")
+            }
+            Self::Duplicate(identity) => write!(f, "task {identity} already has a completion slot"),
+            Self::StatusIdentity { reserved, reporter } => write!(
+                f,
+                "completion slot for {reserved} cannot publish status for {reporter}"
+            ),
+            Self::SlotCapacity { limit, .. } => write!(
+                f,
+                "task completion owner reached its {limit} exact-slot bound"
+            ),
+        }
+    }
+}
+impl std::error::Error for CompletionReservationError {}
+impl novarocks_execution_contract::failure::FailureProjection for CompletionReservationError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        match self {
+            Self::ShuttingDown => FailureFact::stop_observation(R::CompletionShuttingDown.reason()),
+            Self::Unavailable(_) => {
+                FailureFact::new(FailureClass::Unexpected, R::CompletionUnavailable.reason())
+            }
+            Self::Duplicate(_) => {
+                FailureFact::new(FailureClass::Invariant, R::CompletionDuplicate.reason())
+            }
+            Self::StatusIdentity { .. } => FailureFact::new(
+                FailureClass::Invariant,
+                R::CompletionStatusIdentity.reason(),
+            ),
+            Self::SlotCapacity { committed, limit } => {
+                FailureFact::new(FailureClass::Resource, R::CompletionSlotCapacity.reason())
+                    .with_resource(ResourceFacts {
+                        request_scope: Some(ResourceScope::Task),
+                        constraint_scope: Some(ResourceScope::Process),
+                        dimension: ResourceDimension::Positions,
+                        requested: Some(1),
+                        required_growth: Some(1),
+                        limit: u64::try_from(*limit).ok(),
+                        live: None,
+                        committed: u64::try_from(*committed).ok(),
+                    })
+            }
+        }
+    }
+}
 
-struct CompletionSlot {
-    expected_fragment: novarocks_types::UniqueId,
+/// Called at most once, borrowing the slot's fact and its captured owners.
+/// The slot retains the action until its separately supervised destruction.
+pub type TaskCompletionAction = Box<dyn FnMut(&FragmentTerminalFact) + Send + 'static>;
+type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionPhase {
+    Waiting,
+    Queued,
+    Running,
+    Unresolved,
+}
+
+struct CompletionWork {
     action: Option<TaskCompletionAction>,
     fact: Option<FragmentTerminalFact>,
+    reporter: Option<crate::TaskStatusReporter>,
+    // At most one secondary payload per foreign invocation/destruction phase.
+    // These are work custody, never accepted Task causes or wire diagnostics.
+    unresolved_payloads: [Option<PanicPayload>; 5],
+}
+
+impl CompletionWork {
+    fn dispose_panic(&mut self, payload: PanicPayload) {
+        if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            let entry = self
+                .unresolved_payloads
+                .iter_mut()
+                .find(|entry| entry.is_none())
+                .expect("one unresolved payload per completion phase");
+            *entry = Some(secondary);
+        }
+    }
+
+    fn run(&mut self, withdrawn: bool) -> bool {
+        let mut failed = false;
+        if !withdrawn {
+            let Self { action, fact, .. } = self;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                action.as_mut().expect("one completion action")(
+                    fact.as_ref().expect("a committed completion has its fact"),
+                );
+            }));
+            if let Err(payload) = result {
+                failed = true;
+                self.dispose_panic(payload);
+            }
+        }
+        // Each holder is taken exactly once. A failed destructor is never retried.
+        if let Some(action) = self.action.take() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(action))) {
+                failed = true;
+                self.dispose_panic(payload);
+            }
+        }
+        if let Some(fact) = self.fact.take() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(fact))) {
+                failed = true;
+                self.dispose_panic(payload);
+            }
+        }
+        if !failed && !withdrawn {
+            if let Some(reporter) = self.reporter.as_ref() {
+                // The executable action and its original fact have actually
+                // exited. Notification remains supervised by this same slot.
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    reporter.note_actual_stopped();
+                    reporter.note_resources_converged();
+                }));
+                if let Err(payload) = result {
+                    failed = true;
+                    self.dispose_panic(payload);
+                }
+            }
+        }
+        if let Some(reporter) = self.reporter.take() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(reporter))) {
+                failed = true;
+                self.dispose_panic(payload);
+            }
+        }
+        !failed
+    }
+}
+
+struct CompletionSlot {
+    ticket: Arc<()>,
+    expected_fragment: novarocks_types::UniqueId,
+    work: Arc<Mutex<CompletionWork>>,
     creation_committed: bool,
-    queued: bool,
+    fact_received: bool,
+    withdrawn: bool,
+    phase: CompletionPhase,
+    dispatch_panic: Option<std::mem::ManuallyDrop<PanicPayload>>,
 }
 
 struct CompletionState {
     accepting: bool,
     slots: HashMap<TaskIdentity, CompletionSlot>,
     failure: Option<String>,
+    // Explicit bounded custody if the runtime dies before it can drain. This
+    // process owner releases its pin only after every accepted holder exits.
+    // Unresolved slots retain the same capacity; timeout never drops them.
+    custody: Option<Arc<CompletionShared>>,
+    owner_panic: Option<std::mem::ManuallyDrop<PanicPayload>>,
 }
 
 struct CompletionShared {
@@ -64,40 +224,38 @@ impl CompletionShared {
         }
     }
 
-    fn publish(&self, identity: TaskIdentity, fact: FragmentTerminalFact) {
+    fn publish(&self, identity: TaskIdentity, ticket: &Arc<()>, fact: FragmentTerminalFact) {
         let enqueue = {
             let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
             let Some(slot) = state.slots.get_mut(&identity) else {
-                // A stopped observer is one-shot. Reaching a missing exact
-                // slot means the owner has already processed it, or process
-                // shutdown has withdrawn it; neither can create new work.
                 return;
             };
+            if !Arc::ptr_eq(&slot.ticket, ticket) {
+                return;
+            }
             if fact.query_id() != identity.query_execution_id().query_id()
                 || fact.fragment_instance_id() != slot.expected_fragment
             {
                 Self::fail_locked(
                     &mut state,
-                    format!(
-                        "task {identity} published a stopped fact for query {:?} fragment {}",
-                        fact.query_id(),
-                        fact.fragment_instance_id()
-                    ),
+                    format!("task {identity} published a stopped fact for another fragment"),
                 );
-                self.changed.notify_one();
+                self.changed.notify_waiters();
                 return;
             }
-            if slot.fact.is_some() {
-                // The kernel contract is one-shot. Keep the first immutable
-                // fact if an implementation wakes the same slot twice.
+            if slot.fact_received || slot.withdrawn {
                 return;
             }
-            slot.fact = Some(fact);
-            if !slot.creation_committed || slot.queued {
-                false
-            } else {
-                slot.queued = true;
+            // Only Waiting can install a first fact. No job can hold this work
+            // lock yet, and duplicate/reentrant publication never takes it.
+            assert_eq!(slot.phase, CompletionPhase::Waiting);
+            slot.work.lock().expect(COMPLETION_STATE_LOCK).fact = Some(fact);
+            slot.fact_received = true;
+            if slot.creation_committed {
+                slot.phase = CompletionPhase::Queued;
                 true
+            } else {
+                false
             }
         };
         if enqueue {
@@ -105,7 +263,7 @@ impl CompletionShared {
         }
     }
 
-    fn commit_creation(&self, identity: TaskIdentity) {
+    fn commit_creation(&self, identity: TaskIdentity, ticket: &Arc<()>) {
         let enqueue = {
             let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
             let Some(slot) = state.slots.get_mut(&identity) else {
@@ -113,19 +271,44 @@ impl CompletionShared {
                     &mut state,
                     format!("task {identity} committed without a completion slot"),
                 );
-                self.changed.notify_one();
+                self.changed.notify_waiters();
                 return;
             };
+            if !Arc::ptr_eq(&slot.ticket, ticket) {
+                return;
+            }
             if slot.creation_committed {
                 return;
             }
+            assert!(!slot.withdrawn, "a withdrawn creation cannot commit");
             slot.creation_committed = true;
-            if slot.fact.is_none() || slot.queued {
-                false
-            } else {
-                slot.queued = true;
+            if slot.fact_received {
+                slot.phase = CompletionPhase::Queued;
                 true
+            } else {
+                false
             }
+        };
+        if enqueue {
+            self.enqueue(identity);
+        }
+    }
+
+    fn withdraw_creation(&self, identity: TaskIdentity, ticket: &Arc<()>) {
+        let enqueue = {
+            let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
+            let Some(slot) = state.slots.get_mut(&identity) else {
+                return;
+            };
+            if !Arc::ptr_eq(&slot.ticket, ticket) {
+                return;
+            }
+            if slot.creation_committed || slot.withdrawn {
+                return;
+            }
+            slot.withdrawn = true;
+            slot.phase = CompletionPhase::Queued;
+            true
         };
         if enqueue {
             self.enqueue(identity);
@@ -139,79 +322,135 @@ impl CompletionShared {
                 &mut state,
                 format!("task {identity} completion ready queue rejected its exact slot: {error}"),
             );
-            self.changed.notify_one();
+            if let Some(slot) = state.slots.get_mut(&identity) {
+                slot.phase = CompletionPhase::Unresolved;
+            }
+            self.changed.notify_waiters();
         }
     }
 
-    fn take_ready(
-        &self,
-        identity: TaskIdentity,
-    ) -> Option<(TaskCompletionAction, FragmentTerminalFact)> {
+    fn start_ready(&self, identity: TaskIdentity) -> Option<(Arc<Mutex<CompletionWork>>, bool)> {
         let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
-        let Some(mut slot) = state.slots.remove(&identity) else {
-            Self::fail_locked(
-                &mut state,
-                format!("task {identity} completion ready queue named no exact slot"),
-            );
-            self.changed.notify_one();
+        let slot = state.slots.get_mut(&identity)?;
+        if slot.phase != CompletionPhase::Queued {
             return None;
-        };
-        let Some(action) = slot.action.take() else {
-            Self::fail_locked(
-                &mut state,
-                format!("task {identity} completion slot had no action"),
-            );
-            self.changed.notify_one();
-            return None;
-        };
-        let Some(fact) = slot.fact.take() else {
-            Self::fail_locked(
-                &mut state,
-                format!("task {identity} completion slot was ready without a stopped fact"),
-            );
-            self.changed.notify_one();
-            return None;
-        };
-        self.changed.notify_one();
-        Some((action, fact))
+        }
+        slot.phase = CompletionPhase::Running;
+        Some((Arc::clone(&slot.work), slot.withdrawn))
     }
 
-    fn note_owner_panic(&self, identity: TaskIdentity) {
+    fn finish(&self, identity: TaskIdentity, exited: bool) {
+        let (removed, custody) = {
+            let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
+            if exited {
+                let removed = state.slots.remove(&identity);
+                let custody = state
+                    .slots
+                    .is_empty()
+                    .then(|| state.custody.take())
+                    .flatten();
+                (removed, custody)
+            } else {
+                if let Some(slot) = state.slots.get_mut(&identity) {
+                    slot.phase = CompletionPhase::Unresolved;
+                }
+                Self::fail_locked(
+                    &mut state,
+                    format!("task {identity} completion work did not exit successfully"),
+                );
+                (None, None)
+            }
+        };
+        // Exited work has no remaining foreign holders. Even metadata removal
+        // and custody release occur outside the supervisor state lock.
+        drop(removed);
+        drop(custody);
+        self.changed.notify_waiters();
+    }
+
+    fn owner_exited(&self) {
         let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
-        Self::fail_locked(
-            &mut state,
-            format!("task {identity} completion owner panicked"),
-        );
-        self.changed.notify_one();
+        if state.accepting
+            || state
+                .slots
+                .values()
+                .any(|slot| slot.phase != CompletionPhase::Unresolved)
+        {
+            Self::fail_locked(
+                &mut state,
+                "task completion runtime exited before its accepted work drained",
+            );
+        }
+        state.accepting = false;
+        self.changed.notify_waiters();
     }
 }
 
-/// The exact one-shot publisher attached to a running fragment.
+/// A publisher carries identity and no ownership of completion work.
 #[derive(Clone)]
 pub struct TaskCompletionSignal {
+    ticket: Arc<()>,
     identity: TaskIdentity,
-    shared: Arc<CompletionShared>,
+    shared: std::sync::Weak<CompletionShared>,
 }
-
 impl TaskCompletionSignal {
     pub fn publish(&self, fact: FragmentTerminalFact) {
-        self.shared.publish(self.identity, fact);
-    }
-
-    pub fn commit_creation(&self) {
-        self.shared.commit_creation(self.identity);
+        if let Some(shared) = self.shared.upgrade() {
+            shared.publish(self.identity, &self.ticket, fact);
+        }
     }
 }
 
-/// One fixed async owner and its bounded set of exact task slots.
+/// Creation owns this reservation until commit or explicit rollback disposal.
+/// It cannot be cloned; dropping an uncommitted creation invokes no action and
+/// fabricates no stopped fact.
+pub struct TaskCompletionReservation {
+    ticket: Arc<()>,
+    identity: TaskIdentity,
+    shared: Arc<CompletionShared>,
+    committed: std::sync::atomic::AtomicBool,
+}
+impl TaskCompletionReservation {
+    pub fn signal(&self) -> TaskCompletionSignal {
+        TaskCompletionSignal {
+            ticket: Arc::clone(&self.ticket),
+            identity: self.identity,
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+    pub fn publish(&self, fact: FragmentTerminalFact) {
+        self.signal().publish(fact);
+    }
+    pub fn commit_creation(&self) -> TaskCompletionSignal {
+        self.shared.commit_creation(self.identity, &self.ticket);
+        self.committed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.signal()
+    }
+}
+impl Drop for TaskCompletionReservation {
+    fn drop(&mut self) {
+        if !self.committed.load(std::sync::atomic::Ordering::Acquire) {
+            self.shared.withdraw_creation(self.identity, &self.ticket);
+        }
+    }
+}
+
+struct CompletionOwnerExit(Arc<CompletionShared>);
+impl Drop for CompletionOwnerExit {
+    fn drop(&mut self) {
+        self.0.owner_exited();
+    }
+}
+
+/// One async owner, with at most one existing-runtime blocking job per exact
+/// slot. Running, destruction and unresolved work all occupy that same bound.
 pub struct TaskCompletionSupervisor {
     runtime: Handle,
     capacity: usize,
     shared: Arc<CompletionShared>,
-    stop: watch::Sender<bool>,
     join: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
-
 impl fmt::Debug for TaskCompletionSupervisor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
@@ -223,7 +462,6 @@ impl fmt::Debug for TaskCompletionSupervisor {
             .finish()
     }
 }
-
 impl TaskCompletionSupervisor {
     pub fn start(runtime: Handle, capacity: usize) -> Arc<Self> {
         assert!(capacity > 0, "task completion capacity must be positive");
@@ -233,36 +471,68 @@ impl TaskCompletionSupervisor {
                 accepting: true,
                 slots: HashMap::new(),
                 failure: None,
+                custody: None,
+                owner_panic: None,
             }),
             ready,
             changed: Notify::new(),
         });
-        let (stop, mut stopped) = watch::channel(false);
         let owner_shared = Arc::clone(&shared);
+        let work_runtime = runtime.clone();
         let join = runtime.spawn(async move {
+            let _exit = CompletionOwnerExit(Arc::clone(&owner_shared));
+            let mut jobs = FuturesUnordered::<
+                futures::future::BoxFuture<'static, (TaskIdentity, Result<bool, tokio::task::JoinError>)>,
+            >::new();
             loop {
-                let identity = tokio::select! {
-                    biased;
-                    changed = stopped.changed() => {
-                        if changed.is_err() || *stopped.borrow() {
-                            return;
-                        }
-                        continue;
+                let changed = owner_shared.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let state = owner_shared.state.lock().expect(COMPLETION_STATE_LOCK);
+                    if !state.accepting && state.slots.values().all(|slot| slot.phase == CompletionPhase::Unresolved) {
+                        return;
                     }
-                    ready = receiver.recv() => match ready {
-                        Some(identity) => identity,
-                        None => return,
-                    },
-                };
-                let Some((action, fact)) = owner_shared.take_ready(identity) else {
-                    return;
-                };
-                if catch_unwind(AssertUnwindSafe(|| action(fact))).is_err() {
-                    // No later convergence fact is fabricated. The task stays
-                    // live and charged, and application supervision observes
-                    // this owner failure.
-                    owner_shared.note_owner_panic(identity);
-                    return;
+                }
+                tokio::select! {
+                    Some((identity, result)) = jobs.next(), if !jobs.is_empty() => {
+                        match result {
+                            Ok(exited) => owner_shared.finish(identity, exited),
+                            Err(error) => {
+                                if error.is_panic() {
+                                    let payload = std::mem::ManuallyDrop::new(error.into_panic());
+                                    let mut state = owner_shared.state.lock().expect(COMPLETION_STATE_LOCK);
+                                    state.slots.get_mut(&identity).expect("a failed join retains its exact slot").dispatch_panic = Some(payload);
+                                }
+                                owner_shared.finish(identity, false);
+                            }
+                        }
+                    }
+                    ready = receiver.recv() => {
+                        let Some(identity) = ready else { return; };
+                        let Some((work, withdrawn)) = owner_shared.start_ready(identity) else { continue; };
+                        // The job never owns the sole foreign holder. A runtime
+                        // refusal/cancellation leaves it in the charged slot.
+                        let spawned = catch_unwind(AssertUnwindSafe(|| {
+                            work_runtime.spawn_blocking(move || work.lock().expect(COMPLETION_STATE_LOCK).run(withdrawn))
+                        }));
+                        match spawned {
+                            Ok(job) => jobs.push(async move { (identity, job.await) }.boxed()),
+                            Err(payload) => {
+                                // Spawn can panic after enqueueing the job. No
+                                // JoinHandle proves its exit; retain the opaque
+                                // dispatch payload in this exact unresolved slot.
+                                let payload = std::mem::ManuallyDrop::new(payload);
+                                let mut state = owner_shared.state.lock().expect(COMPLETION_STATE_LOCK);
+                                let slot = state.slots.get_mut(&identity).expect("a dispatch retains its exact slot");
+                                slot.dispatch_panic = Some(payload);
+                                slot.phase = CompletionPhase::Unresolved;
+                                CompletionShared::fail_locked(&mut state, format!("task {identity} completion dispatch panicked"));
+                                owner_shared.changed.notify_waiters();
+                            }
+                        }
+                    }
+                    _ = &mut changed => {}
                 }
             }
         });
@@ -270,7 +540,6 @@ impl TaskCompletionSupervisor {
             runtime,
             capacity,
             shared,
-            stop,
             join: Mutex::new(Some(join)),
         })
     }
@@ -280,36 +549,78 @@ impl TaskCompletionSupervisor {
         identity: TaskIdentity,
         expected_fragment: novarocks_types::UniqueId,
         action: TaskCompletionAction,
-    ) -> Result<TaskCompletionSignal, String> {
+    ) -> Result<TaskCompletionReservation, CompletionReservationError> {
+        self.reserve_with_status(identity, expected_fragment, action, None)
+    }
+
+    /// The status port contains metadata, not the task's executable owners.
+    pub fn reserve_with_status(
+        &self,
+        identity: TaskIdentity,
+        expected_fragment: novarocks_types::UniqueId,
+        action: TaskCompletionAction,
+        reporter: Option<crate::TaskStatusReporter>,
+    ) -> Result<TaskCompletionReservation, CompletionReservationError> {
+        if let Some(reporter) = reporter.as_ref() {
+            if reporter.identity() != identity {
+                return Err(CompletionReservationError::StatusIdentity {
+                    reserved: identity,
+                    reporter: reporter.identity(),
+                });
+            }
+        }
         let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
-        if !state.accepting {
-            return Err("task completion owner is shutting down".to_string());
+        if state.accepting && self.shared.ready.is_closed() {
+            CompletionShared::fail_locked(
+                &mut state,
+                "task completion runtime is no longer available",
+            );
+            state.accepting = false;
         }
-        if state.failure.is_some() {
-            return Err("task completion owner is unavailable".to_string());
-        }
-        if state.slots.contains_key(&identity) {
-            return Err(format!("task {identity} already has a completion slot"));
-        }
-        if state.slots.len() >= self.capacity {
-            return Err(format!(
-                "task completion owner reached its {} exact-slot bound",
-                self.capacity
+        if let Some(detail) = &state.failure {
+            return Err(CompletionReservationError::Unavailable(
+                novarocks_execution_contract::failure::BoundedDetail::truncating(detail),
             ));
         }
+        if !state.accepting {
+            return Err(CompletionReservationError::ShuttingDown);
+        }
+        if state.slots.contains_key(&identity) {
+            return Err(CompletionReservationError::Duplicate(identity));
+        }
+        if state.slots.len() >= self.capacity {
+            return Err(CompletionReservationError::SlotCapacity {
+                committed: state.slots.len(),
+                limit: self.capacity,
+            });
+        }
+        let ticket = Arc::new(());
         state.slots.insert(
             identity,
             CompletionSlot {
+                ticket: Arc::clone(&ticket),
                 expected_fragment,
-                action: Some(action),
-                fact: None,
+                work: Arc::new(Mutex::new(CompletionWork {
+                    action: Some(action),
+                    fact: None,
+                    reporter,
+                    unresolved_payloads: std::array::from_fn(|_| None),
+                })),
                 creation_committed: false,
-                queued: false,
+                fact_received: false,
+                withdrawn: false,
+                phase: CompletionPhase::Waiting,
+                dispatch_panic: None,
             },
         );
-        Ok(TaskCompletionSignal {
+        if state.custody.is_none() {
+            state.custody = Some(Arc::clone(&self.shared));
+        }
+        Ok(TaskCompletionReservation {
+            ticket,
             identity,
             shared: Arc::clone(&self.shared),
+            committed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -323,22 +634,40 @@ impl TaskCompletionSupervisor {
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
-        {
-            let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
-            state.accepting = false;
+        if Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+        }) {
+            return Err(
+                "task completion shutdown must be awaited inside a current-thread runtime"
+                    .to_string(),
+            );
         }
+        self.block_on(self.shutdown_async())
+    }
+
+    pub async fn shutdown_async(&self) -> Result<(), String> {
+        self.shared
+            .state
+            .lock()
+            .expect(COMPLETION_STATE_LOCK)
+            .accepting = false;
+        self.shared.changed.notify_waiters();
         let shared = Arc::clone(&self.shared);
-        let drain_result = self.block_on(async move {
+        let result = async move {
             tokio::time::timeout(COMPLETION_SHUTDOWN_TIMEOUT, async {
                 loop {
                     let changed = shared.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
                     {
                         let state = shared.state.lock().expect(COMPLETION_STATE_LOCK);
-                        if let Some(failure) = state.failure.as_ref() {
-                            return Err(failure.clone());
-                        }
-                        if state.slots.is_empty() {
-                            return Ok(());
+                        // An earlier failure never skips an accepted sibling.
+                        if state
+                            .slots
+                            .values()
+                            .all(|slot| slot.phase == CompletionPhase::Unresolved)
+                        {
+                            return state.failure.clone().map_or(Ok(()), Err);
                         }
                     }
                     changed.await;
@@ -348,20 +677,39 @@ impl TaskCompletionSupervisor {
             .map_err(|_| {
                 "task completion owner did not drain its exact slots within 5000 ms".to_string()
             })?
-        });
-        let _ = self.stop.send(true);
-        let join = self.join.lock().expect(COMPLETION_STATE_LOCK).take();
-        let join_result = if let Some(join) = join {
-            self.block_on(async move { join.await })
-                .map_err(|error| format!("task completion owner stopped unexpectedly: {error}"))
-        } else {
-            Ok(())
-        };
-        match (drain_result, join_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(error), Err(join_error)) => Err(format!("{error}; {join_error}")),
         }
+        .await;
+        // A timeout is an observation, not permission to cancel accepted work.
+        if result.is_ok()
+            || self
+                .shared
+                .state
+                .lock()
+                .expect(COMPLETION_STATE_LOCK)
+                .slots
+                .values()
+                .all(|slot| slot.phase == CompletionPhase::Unresolved)
+        {
+            let join = self.join.lock().expect(COMPLETION_STATE_LOCK).take();
+            if let Some(join) = join {
+                if let Err(error) = join.await {
+                    if error.is_panic() {
+                        let payload = std::mem::ManuallyDrop::new(error.into_panic());
+                        let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
+                        state.owner_panic = Some(payload);
+                        if state.custody.is_none() {
+                            state.custody = Some(Arc::clone(&self.shared));
+                        }
+                        CompletionShared::fail_locked(
+                            &mut state,
+                            "task completion owner panicked before a trustworthy drain",
+                        );
+                    }
+                    return Err("task completion owner stopped unexpectedly".to_string());
+                }
+            }
+        }
+        result
     }
 
     fn block_on<F>(&self, future: F) -> F::Output
@@ -374,6 +722,18 @@ impl TaskCompletionSupervisor {
         } else {
             self.runtime.block_on(future)
         }
+    }
+}
+impl Drop for TaskCompletionSupervisor {
+    fn drop(&mut self) {
+        self.shared
+            .state
+            .lock()
+            .expect(COMPLETION_STATE_LOCK)
+            .accepting = false;
+        self.shared.changed.notify_waiters();
+        // Dropping JoinHandle detaches the existing owner. Never abort work or
+        // implicitly destroy its holders because application shutdown timed out.
     }
 }
 
@@ -391,6 +751,7 @@ mod tests {
     };
 
     use super::TaskCompletionSupervisor;
+    use novarocks_execution_contract::TaskConclusionPort;
 
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -471,16 +832,43 @@ mod tests {
         let first = identity(92_001, 1);
         let second = identity(92_011, 1);
         let first_fragment = UniqueId::new(92_003, 92_004);
-        supervisor
+        let first_reservation = supervisor
             .reserve(first, first_fragment, Box::new(|_| {}))
             .expect("first slot fits");
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, ResourceDimension,
+        };
+        let duplicate = supervisor
+            .reserve(first, first_fragment, Box::new(|_| {}))
+            .err()
+            .expect("duplicate must refuse before capacity");
         assert!(
-            supervisor
-                .reserve(second, UniqueId::new(92_013, 92_014), Box::new(|_| {}))
-                .is_err()
+            matches!(duplicate, super::CompletionReservationError::Duplicate(actual) if actual == first)
         );
-        // This fixture deliberately leaves an uncommitted slot; Drop stops
-        // the owner without claiming that its action converged.
+        assert_eq!(duplicate.failure_fact().class(), FailureClass::Invariant);
+        let refused = supervisor
+            .reserve(second, UniqueId::new(92_013, 92_014), Box::new(|_| {}))
+            .err()
+            .expect("second exact slot exceeds the bound");
+        assert_eq!(refused.failure_fact().class(), FailureClass::Resource);
+        let resource = refused.failure_fact().resource().unwrap();
+        assert_eq!(resource.dimension, ResourceDimension::Positions);
+        assert_eq!(
+            (
+                resource.requested,
+                resource.required_growth,
+                resource.committed,
+                resource.limit
+            ),
+            (Some(1), Some(1), Some(1), Some(1))
+        );
+        assert_eq!(resource.live, None);
+        assert_eq!(supervisor.shared.state.lock().unwrap().slots.len(), 1);
+        // Uncommitted creation withdraws through the same actual disposal owner.
+        drop(first_reservation);
+        supervisor
+            .shutdown()
+            .expect("withdrawn creation actually disposes");
     }
 
     #[test]
@@ -541,14 +929,704 @@ mod tests {
             .shutdown()
             .expect("completion owner drains from the runtime");
         assert_eq!(completions.load(Ordering::Acquire), 1);
+        let refused = supervisor
+            .reserve(
+                self::identity(94_011, 1),
+                UniqueId::new(94_013, 94_014),
+                Box::new(|_| {}),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(refused, super::CompletionReservationError::ShuttingDown);
+        assert!(
+            supervisor.poll_failure().is_none(),
+            "normal shutdown is not a runtime failure"
+        );
     }
-}
 
-impl Drop for TaskCompletionSupervisor {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
-        if let Some(join) = self.join.get_mut().expect(COMPLETION_STATE_LOCK).take() {
-            join.abort();
+    #[derive(Default)]
+    struct CompletionExitGate {
+        state: std::sync::Mutex<(bool, bool)>,
+        changed: std::sync::Condvar,
+    }
+    impl CompletionExitGate {
+        fn enter_and_wait(&self) {
+            let mut state = self.state.lock().expect("completion exit gate lock");
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).expect("completion exit gate wait");
+            }
         }
+        fn wait_entered(&self) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut state = self.state.lock().expect("completion exit gate lock");
+            while !state.0 {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                let (next, timeout) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .expect("completion exit gate observation");
+                state = next;
+                if timeout.timed_out() && !state.0 {
+                    return false;
+                }
+            }
+            true
+        }
+        fn release(&self) {
+            self.state.lock().expect("completion exit gate lock").1 = true;
+            self.changed.notify_all();
+        }
+    }
+    struct ReleaseCompletionExitGate(Arc<CompletionExitGate>);
+    impl ReleaseCompletionExitGate {
+        fn release(&self) {
+            self.0.release();
+        }
+    }
+    impl Drop for ReleaseCompletionExitGate {
+        fn drop(&mut self) {
+            // A failed positive observation must not strand the actual owner
+            // inside the action or its capture destructor during runtime Drop.
+            self.0.release();
+        }
+    }
+    struct CompletionCaptureExit {
+        gate: Option<Arc<CompletionExitGate>>,
+        body_entries: Arc<AtomicUsize>,
+        exited: Arc<AtomicUsize>,
+    }
+    impl CompletionCaptureExit {
+        fn observe_body(&self) {
+            // Borrow the whole captured owner. Its Drop stays part of the real
+            // FnOnce invocation's exit, rather than a separate fake callback.
+            self.body_entries.fetch_add(1, Ordering::Release);
+        }
+    }
+    impl Drop for CompletionCaptureExit {
+        fn drop(&mut self) {
+            if let Some(gate) = self.gate.as_ref() {
+                gate.enter_and_wait();
+            }
+            self.exited.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn running_action_and_capture_drop_retain_the_exact_slot_until_actual_exit() {
+        let runtime = test_runtime();
+        let mut observations = Vec::new();
+        // The same one-position contract applies both while the real action
+        // runs and while its actual closure capture is being destroyed.
+        for capture_drop in [false, true] {
+            let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
+            let gate = Arc::new(CompletionExitGate::default());
+            let release = ReleaseCompletionExitGate(Arc::clone(&gate));
+            let body_entries = Arc::new(AtomicUsize::new(0));
+            let capture_exits = Arc::new(AtomicUsize::new(0));
+            let captured = CompletionCaptureExit {
+                gate: capture_drop.then(|| Arc::clone(&gate)),
+                body_entries: Arc::clone(&body_entries),
+                exited: Arc::clone(&capture_exits),
+            };
+            let action_gate = Arc::clone(&gate);
+            let task = identity(95_001 + i64::from(capture_drop) * 100, 1);
+            let fragment = UniqueId::new(95_003, 95_004);
+            let signal = supervisor
+                .reserve(
+                    task,
+                    fragment,
+                    Box::new(move |_| {
+                        captured.observe_body();
+                        if !capture_drop {
+                            action_gate.enter_and_wait();
+                        }
+                    }),
+                )
+                .expect("reserve actual action slot");
+            signal.commit_creation();
+            signal.publish(terminal(task, fragment));
+            let entered = gate.wait_entered();
+
+            // Probe the real admission port while the selected owner is
+            // blocked. If the current implementation wrongly accepts, make
+            // that real admitted completion drainable before releasing A.
+            let probe_task = identity(95_011 + i64::from(capture_drop) * 100, 1);
+            let probe_fragment = UniqueId::new(95_013, 95_014);
+            let probe = supervisor.reserve(probe_task, probe_fragment, Box::new(|_| {}));
+            let reservation = match probe {
+                Ok(probe) => {
+                    probe.commit_creation();
+                    probe.publish(terminal(probe_task, probe_fragment));
+                    Ok(())
+                }
+                Err(refusal) => Err(refusal),
+            };
+            release.release();
+            // shutdown joins the existing owner. No negative assertion runs
+            // with either real action/destructor still behind its gate.
+            let joined = supervisor.shutdown();
+            observations.push((
+                capture_drop,
+                entered,
+                reservation,
+                body_entries.load(Ordering::Acquire),
+                capture_exits.load(Ordering::Acquire),
+                joined,
+            ));
+        }
+        for (capture_drop, entered, reservation, entries, exits, joined) in observations {
+            assert!(
+                joined.is_ok(),
+                "the actual completion owner must join: {joined:?}"
+            );
+            assert!(
+                entered,
+                "the real exit gate must be reached (capture_drop={capture_drop})"
+            );
+            assert_eq!(entries, 1);
+            assert_eq!(exits, 1, "the original closure capture must really exit");
+            assert!(
+                matches!(
+                    reservation,
+                    Err(super::CompletionReservationError::SlotCapacity {
+                        committed: 1,
+                        limit: 1
+                    })
+                ),
+                "the running action/capture still owns its sole position (capture_drop={capture_drop}); observed {reservation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_panicked_completion_keeps_its_unresolved_slot_and_drains_an_accepted_sibling() {
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 2);
+        let gate = Arc::new(CompletionExitGate::default());
+        let release = ReleaseCompletionExitGate(Arc::clone(&gate));
+        let action_gate = Arc::clone(&gate);
+        let failed = identity(96_001, 1);
+        let failed_fragment = UniqueId::new(96_003, 96_004);
+        let failed_signal = supervisor
+            .reserve(
+                failed,
+                failed_fragment,
+                Box::new(move |_| {
+                    action_gate.enter_and_wait();
+                    injected_owner_failure();
+                }),
+            )
+            .expect("reserve the actual failing action");
+        failed_signal.commit_creation();
+        failed_signal.publish(terminal(failed, failed_fragment));
+        let entered = gate.wait_entered();
+
+        let sibling = identity(96_011, 1);
+        let sibling_fragment = UniqueId::new(96_013, 96_014);
+        let sibling_exits = Arc::new(AtomicUsize::new(0));
+        let completed_sibling = Arc::clone(&sibling_exits);
+        let sibling_signal = supervisor
+            .reserve(
+                sibling,
+                sibling_fragment,
+                Box::new(move |_| {
+                    completed_sibling.fetch_add(1, Ordering::Release);
+                }),
+            )
+            .expect("the sibling is accepted before the first action can panic");
+        sibling_signal.commit_creation();
+        sibling_signal.publish(terminal(sibling, sibling_fragment));
+
+        release.release();
+        // The real action panic is caught by the real supervisor. Its shutdown
+        // joins that owner before either negative ownership assertion below.
+        let joined = supervisor.shutdown();
+        let failure = supervisor.poll_failure();
+        let (failed_slot_retained, sibling_slot_retained) = {
+            let state = supervisor
+                .shared
+                .state
+                .lock()
+                .expect("actual completion slots");
+            (
+                state.slots.contains_key(&failed),
+                state.slots.contains_key(&sibling),
+            )
+        };
+        let sibling_exits = sibling_exits.load(Ordering::Acquire);
+        assert!(
+            entered,
+            "the actual action must have started before sibling admission"
+        );
+        assert!(
+            joined.is_err(),
+            "unknown work is not a successful drain receipt"
+        );
+        assert!(
+            failure.is_some(),
+            "the actual captured owner panic remains observable"
+        );
+        assert!(
+            failed_slot_retained && !sibling_slot_retained && sibling_exits == 1,
+            "an unresolved action retains responsibility while the accepted sibling really exits: failed_slot_retained={failed_slot_retained}, sibling_slot_retained={sibling_slot_retained}, sibling_exits={sibling_exits}"
+        );
+    }
+
+    #[test]
+    fn uncommitted_creation_disposes_its_capture_without_invoking_the_action() {
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
+        let gate = Arc::new(CompletionExitGate::default());
+        let release = ReleaseCompletionExitGate(Arc::clone(&gate));
+        let entries = Arc::new(AtomicUsize::new(0));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let captured = CompletionCaptureExit {
+            gate: Some(Arc::clone(&gate)),
+            body_entries: Arc::clone(&entries),
+            exited: Arc::clone(&exits),
+        };
+        let task = identity(97_001, 1);
+        let reserved = supervisor
+            .reserve(
+                task,
+                UniqueId::new(97_003, 97_004),
+                Box::new(move |_| captured.observe_body()),
+            )
+            .expect("reserve a real uncommitted creation");
+        drop(reserved);
+        let disposing = gate.wait_entered();
+        let refused = supervisor
+            .reserve(
+                identity(97_011, 1),
+                UniqueId::new(97_013, 97_014),
+                Box::new(|_| {}),
+            )
+            .err();
+        release.release();
+        let joined = supervisor.shutdown();
+        assert!(
+            disposing,
+            "withdrawal must reach the actual capture destructor"
+        );
+        assert!(joined.is_ok(), "actual withdrawal must drain: {joined:?}");
+        assert_eq!(
+            entries.load(Ordering::Acquire),
+            0,
+            "withdrawal never invokes completion"
+        );
+        assert_eq!(exits.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            refused,
+            Some(super::CompletionReservationError::SlotCapacity {
+                committed: 1,
+                limit: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn blocking_completion_does_not_stall_an_accepted_sibling_on_one_async_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 2);
+        let gate = Arc::new(CompletionExitGate::default());
+        let release = ReleaseCompletionExitGate(Arc::clone(&gate));
+        let action_gate = Arc::clone(&gate);
+        let task = identity(98_001, 1);
+        let fragment = UniqueId::new(98_003, 98_004);
+        let first = supervisor
+            .reserve(
+                task,
+                fragment,
+                Box::new(move |_| action_gate.enter_and_wait()),
+            )
+            .unwrap();
+        first.commit_creation();
+        first.publish(terminal(task, fragment));
+        let entered = gate.wait_entered();
+        let sibling = identity(98_011, 1);
+        let sibling_fragment = UniqueId::new(98_013, 98_014);
+        let exits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&exits);
+        let second = supervisor
+            .reserve(
+                sibling,
+                sibling_fragment,
+                Box::new(move |_| {
+                    observed.fetch_add(1, Ordering::Release);
+                }),
+            )
+            .unwrap();
+        second.commit_creation();
+        second.publish(terminal(sibling, sibling_fragment));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while exits.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let sibling_exited_while_blocked = exits.load(Ordering::Acquire);
+        release.release();
+        let joined = supervisor.shutdown();
+        assert!(entered);
+        assert!(joined.is_ok(), "both real actions must join: {joined:?}");
+        assert_eq!(
+            sibling_exited_while_blocked, 1,
+            "a blocked cleanup cannot hold the sole async worker"
+        );
+    }
+
+    #[test]
+    fn old_publisher_cannot_fill_a_reused_exact_task_reservation() {
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
+        let task = identity(99_001, 1);
+        let fragment = UniqueId::new(99_003, 99_004);
+        let old = supervisor
+            .reserve(
+                task,
+                fragment,
+                Box::new(|_| panic!("withdrawn action must never run")),
+            )
+            .unwrap();
+        let old_signal = old.signal();
+        drop(old);
+        // Wait for actual disposal and join, rather than merely dropping the
+        // reservation and presuming its capacity has already returned.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let next = loop {
+            match supervisor.reserve(task, fragment, Box::new(|_| {})) {
+                Ok(next) => break next,
+                Err(super::CompletionReservationError::Duplicate(_))
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::yield_now()
+                }
+                Err(error) => panic!("actual withdrawal did not release its position: {error}"),
+            }
+        };
+        next.commit_creation();
+        old_signal.publish(terminal(task, fragment));
+        let old_filled_new_slot = supervisor
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .slots
+            .get(&task)
+            .unwrap()
+            .fact_received;
+        next.publish(terminal(task, fragment));
+        let joined = supervisor.shutdown();
+        assert!(
+            joined.is_ok(),
+            "the current exact reservation drains: {joined:?}"
+        );
+        assert!(
+            !old_filled_new_slot,
+            "a withdrawn publisher cannot target a later reservation of the same identity"
+        );
+    }
+
+    #[test]
+    fn dropping_the_application_handle_does_not_abort_accepted_completion() {
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 2);
+        let gate = Arc::new(CompletionExitGate::default());
+        let release = ReleaseCompletionExitGate(Arc::clone(&gate));
+        let action_gate = Arc::clone(&gate);
+        let task = identity(100_001, 1);
+        let fragment = UniqueId::new(100_003, 100_004);
+        let first = supervisor
+            .reserve(
+                task,
+                fragment,
+                Box::new(move |_| action_gate.enter_and_wait()),
+            )
+            .unwrap();
+        let signal = first.commit_creation();
+        drop(first);
+        signal.publish(terminal(task, fragment));
+        let entered = gate.wait_entered();
+        let sibling = identity(100_011, 1);
+        let sibling_fragment = UniqueId::new(100_013, 100_014);
+        let exits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&exits);
+        let second = supervisor
+            .reserve(
+                sibling,
+                sibling_fragment,
+                Box::new(move |_| {
+                    observed.fetch_add(1, Ordering::Release);
+                }),
+            )
+            .unwrap();
+        let sibling_signal = second.commit_creation();
+        drop(second);
+        sibling_signal.publish(terminal(sibling, sibling_fragment));
+        let shared = Arc::downgrade(&supervisor.shared);
+        drop(supervisor);
+        release.release();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.upgrade().is_some() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(entered);
+        assert!(
+            shared.upgrade().is_none(),
+            "the existing owner must finish real work and release custody"
+        );
+        assert_eq!(exits.load(Ordering::Acquire), 1);
+    }
+
+    fn status_owner(task: TaskIdentity) -> Arc<crate::TaskStatusOwner> {
+        Arc::new(crate::TaskStatusOwner::new(
+            task,
+            Arc::new(crate::TaskStatusSource::new()),
+            Arc::new(crate::ManualClock::new()),
+            Duration::from_millis(250),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        ))
+    }
+
+    #[test]
+    fn native_exit_evidence_follows_the_actual_action_capture_destruction() {
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
+        let task = identity(101_001, 1);
+        let fragment = UniqueId::new(101_003, 101_004);
+        let owner = status_owner(task);
+        let reporter = crate::TaskStatusReporter::new(Arc::clone(&owner));
+        reporter.canceling(novarocks_execution_contract::task_execution::status::CancelReason::UpstreamNoLongerNeeded);
+        let accepted = owner.accepted().unwrap();
+        let gate = Arc::new(CompletionExitGate::default());
+        let release = ReleaseCompletionExitGate(Arc::clone(&gate));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let captured = CompletionCaptureExit {
+            gate: Some(Arc::clone(&gate)),
+            body_entries: Arc::new(AtomicUsize::new(0)),
+            exited: Arc::clone(&exits),
+        };
+        let reservation = supervisor
+            .reserve_with_status(
+                task,
+                fragment,
+                Box::new(move |_| captured.observe_body()),
+                Some(reporter),
+            )
+            .unwrap();
+        reservation.commit_creation();
+        reservation.publish(terminal(task, fragment));
+        let disposing = gate.wait_entered();
+        let before = owner.convergence();
+        release.release();
+        let joined = supervisor.shutdown();
+        assert!(
+            joined.is_ok(),
+            "the original work must really join: {joined:?}"
+        );
+        assert!(disposing);
+        assert!(
+            !before.actual_stopped() && !before.resources_converged(),
+            "logical control cannot cover a live capture destructor"
+        );
+        assert_eq!(exits.load(Ordering::Acquire), 1);
+        assert!(owner.convergence().actual_stopped() && owner.convergence().resources_converged());
+        assert!(
+            Arc::ptr_eq(&accepted, &owner.accepted().unwrap()),
+            "exit publication never accepts another Task conclusion"
+        );
+    }
+
+    #[test]
+    fn an_exit_reporter_for_another_task_is_refused_before_admission() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
+        let reserved = identity(102_001, 1);
+        let foreign = identity(102_011, 1);
+        let owner = status_owner(foreign);
+        let reporter = crate::TaskStatusReporter::new(Arc::clone(&owner));
+        let refusal = supervisor
+            .reserve_with_status(
+                reserved,
+                UniqueId::new(102_003, 102_004),
+                Box::new(|_| panic!("refused work cannot run")),
+                Some(reporter),
+            )
+            .err()
+            .unwrap();
+        assert!(
+            matches!(refusal, super::CompletionReservationError::StatusIdentity { reserved: actual, reporter: other } if actual == reserved && other == foreign)
+        );
+        assert_eq!(refusal.failure_fact().class(), FailureClass::Invariant);
+        assert!(supervisor.shared.state.lock().unwrap().slots.is_empty());
+        assert!(!owner.convergence().actual_stopped());
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_runtime_that_never_polled_its_owner_cannot_admit_a_task() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
+        drop(runtime);
+        let refusal = supervisor
+            .reserve(
+                identity(103_001, 1),
+                UniqueId::new(103_003, 103_004),
+                Box::new(|_| panic!("unavailable runtime cannot run work")),
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(
+            refusal,
+            super::CompletionReservationError::Unavailable(_)
+        ));
+        assert!(supervisor.poll_failure().is_some());
+        assert!(supervisor.shared.state.lock().unwrap().slots.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_callers_await_the_same_actual_drain() {
+        let supervisor = TaskCompletionSupervisor::start(tokio::runtime::Handle::current(), 1);
+        let task = identity(104_001, 1);
+        let fragment = UniqueId::new(104_003, 104_004);
+        let exits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&exits);
+        let reserved = supervisor
+            .reserve(
+                task,
+                fragment,
+                Box::new(move |_| {
+                    observed.fetch_add(1, Ordering::Release);
+                }),
+            )
+            .unwrap();
+        reserved.commit_creation();
+        reserved.publish(terminal(task, fragment));
+        assert!(
+            supervisor
+                .shutdown()
+                .unwrap_err()
+                .contains("must be awaited")
+        );
+        supervisor
+            .shutdown_async()
+            .await
+            .expect("the original owner and action actually join");
+        assert_eq!(exits.load(Ordering::Acquire), 1);
+    }
+
+    struct CompletionOpaquePayload {
+        gate: Arc<CompletionExitGate>,
+        exits: Arc<AtomicUsize>,
+        secondary_exits: Arc<AtomicUsize>,
+    }
+    struct CompletionSecondaryPayload(Arc<AtomicUsize>);
+    impl Drop for CompletionSecondaryPayload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+    impl Drop for CompletionOpaquePayload {
+        fn drop(&mut self) {
+            self.gate.enter_and_wait();
+            self.exits.fetch_add(1, Ordering::Release);
+            std::panic::panic_any(CompletionSecondaryPayload(Arc::clone(
+                &self.secondary_exits,
+            )));
+        }
+    }
+
+    #[test]
+    fn opaque_panic_disposal_keeps_custody_and_cannot_replace_the_accepted_task() {
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 2);
+        let task = identity(105_001, 1);
+        let fragment = UniqueId::new(105_003, 105_004);
+        let owner = status_owner(task);
+        let reporter = crate::TaskStatusReporter::new(Arc::clone(&owner));
+        reporter.canceling(novarocks_execution_contract::task_execution::status::CancelReason::UpstreamNoLongerNeeded);
+        let accepted = owner.accepted().unwrap();
+        let gate = Arc::new(CompletionExitGate::default());
+        let release = ReleaseCompletionExitGate(Arc::clone(&gate));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let secondary_exits = Arc::new(AtomicUsize::new(0));
+        let mut payload = Some(CompletionOpaquePayload {
+            gate: Arc::clone(&gate),
+            exits: Arc::clone(&exits),
+            secondary_exits: Arc::clone(&secondary_exits),
+        });
+        let action = supervisor
+            .reserve_with_status(
+                task,
+                fragment,
+                Box::new(move |_| {
+                    std::panic::panic_any(payload.take().expect("one original opaque payload"));
+                }),
+                Some(reporter),
+            )
+            .unwrap();
+        action.commit_creation();
+        action.publish(terminal(task, fragment));
+        let disposing = gate.wait_entered();
+        let during = owner.convergence();
+        // A is inside the original payload destructor, not an async readiness
+        // callback. An independently accepted sibling must still really exit.
+        let sibling = identity(105_011, 1);
+        let sibling_fragment = UniqueId::new(105_013, 105_014);
+        let sibling_exits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&sibling_exits);
+        let sibling_work = supervisor
+            .reserve(
+                sibling,
+                sibling_fragment,
+                Box::new(move |_| {
+                    observed.fetch_add(1, Ordering::Release);
+                }),
+            )
+            .unwrap();
+        sibling_work.commit_creation();
+        sibling_work.publish(terminal(sibling, sibling_fragment));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sibling_exits.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let sibling_exited_before_release = sibling_exits.load(Ordering::Acquire);
+        release.release();
+        let joined = supervisor.shutdown();
+        assert!(disposing);
+        assert_eq!(sibling_exited_before_release, 1);
+        assert!(
+            joined.is_err(),
+            "an opaque secondary destruction failure cannot prove drain"
+        );
+        assert_eq!(
+            exits.load(Ordering::Acquire),
+            1,
+            "never retry a partially destroyed payload"
+        );
+        assert_eq!(
+            secondary_exits.load(Ordering::Acquire),
+            0,
+            "the secondary opaque holder stays in its original bounded custody"
+        );
+        assert!(!during.actual_stopped() && !during.resources_converged());
+        assert!(
+            !owner.convergence().actual_stopped() && !owner.convergence().resources_converged()
+        );
+        assert!(
+            Arc::ptr_eq(&accepted, &owner.accepted().unwrap()),
+            "cleanup does not accept or refine a Task conclusion"
+        );
+        assert!(supervisor.poll_failure().is_some());
     }
 }

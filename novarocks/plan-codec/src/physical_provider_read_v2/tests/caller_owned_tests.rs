@@ -188,7 +188,7 @@ fn caller_owned_success_and_ordinary_refusal_preserve_every_actual_prefix() {
                 let c = Control::default();
                 let result = run_read(
                     &c,
-                    Some((at, cause)),
+                    Some((at, cause.clone())),
                     decode,
                     malformed,
                     1,
@@ -273,7 +273,7 @@ fn caller_owned_known_namespace_headers_precede_pending_quantum_and_late_causes(
     for pending in [0, 254, 255] {
         for cause in CAUSES {
             let c = Control::default();
-            c.arm(Some((1, cause)));
+            c.arm(Some((1, cause.clone())));
             let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
             for _ in 0..pending {
                 w.step().unwrap();
@@ -364,7 +364,7 @@ fn caller_owned_wide_actual_read_work_and_foreign_controller_are_not_namespace_g
             for cause in CAUSES {
                 let c = Control::default();
                 assert!(
-                    matches!(run_read(&c, Some((at, cause)), decode, false, 320, limits(), &mut Vec::new()), Err(Error::Control(actual)) if actual == cause)
+                    matches!(run_read(&c, Some((at, cause.clone())), decode, false, 320, limits(), &mut Vec::new()), Err(Error::Control(actual)) if actual == cause)
                 );
                 assert_eq!(trace(&c), baseline[..=at]);
             }

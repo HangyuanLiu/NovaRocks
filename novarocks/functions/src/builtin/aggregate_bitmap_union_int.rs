@@ -18,7 +18,6 @@
 use crate::aggregate_format::AggregateFailureStage;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::ScalarStateError;
 use crate::bitmap_aggregate_core::{self as core, BitmapAggregatePort, InputFailure};
 use crate::bitmap_decode_resources::BitmapDecodeResources;
 use crate::bitmap_value::{BitmapAggregateEncodePort, BitmapDecodePort};
@@ -128,6 +127,14 @@ impl Port<'_, '_, '_> {
 }
 impl BitmapDecodePort for Port<'_, '_, '_> {
     type Error = Failure;
+    fn failure(&mut self, source: crate::bitmap_value::BitmapValueFailure) -> Failure {
+        match source.classify() {
+            crate::bitmap_value::ClassifiedBitmapFailure::Value(source) => self.diagnostic(&source),
+            crate::bitmap_value::ClassifiedBitmapFailure::Outer(source) => {
+                Failure::Kernel(KernelFailure::from_domain(source))
+            }
+        }
+    }
     fn data(&mut self, message: fmt::Arguments<'_>) -> Failure {
         self.diagnostic(&message)
     }
@@ -184,6 +191,9 @@ struct Mutation<'a, 'w, 'c> {
 }
 impl BitmapDecodePort for Mutation<'_, '_, '_> {
     type Error = Failure;
+    fn failure(&mut self, source: crate::bitmap_value::BitmapValueFailure) -> Failure {
+        self.port.failure(source)
+    }
     fn data(&mut self, m: fmt::Arguments<'_>) -> Failure {
         self.port.data(m)
     }
@@ -214,24 +224,14 @@ impl BitmapDecodePort for Mutation<'_, '_, '_> {
 }
 impl BitmapAggregatePort for Mutation<'_, '_, '_> {
     fn input_failure(&mut self, recipe: InputFailure<'_>) -> Failure {
-        // Carrier failures escape update; only decoder-format Data is ignored there.
-        let previous = self.port.stage;
-        self.port.stage = Some(AggregateFailureStage::Update);
-        let failure = self.port.diagnostic(&recipe);
-        self.port.stage = previous;
-        failure
+        Failure::Kernel(KernelFailure::from_domain(recipe.into_failure()))
     }
     fn observe(&mut self, _: usize) -> Result<(), Failure> {
         self.state.observe();
         Ok(())
     }
     fn insert(&mut self, _: usize, value: u64) -> Result<(), Failure> {
-        self.state.insert(value).map_err(|error| match error {
-            ScalarStateError::Kernel(cause) => Failure::Kernel(cause),
-            _ => Failure::Kernel(internal(
-                "bitmap real host emitted a foreign allocation failure",
-            )),
-        })
+        self.state.insert(value).map_err(Failure::Kernel)
     }
 }
 fn observed<T>(
@@ -295,13 +295,14 @@ fn publish_mutation(
         Failure::IgnoredDecoderData => {
             internal("bitmap ignored decoder Data escaped its original update fallback").into()
         }
-        Failure::DecoderData(message) => match InvocationData::prepare_aggregate(
+        Failure::DecoderData(message) => match InvocationData::prepare_aggregate_with_reason(
             allocator,
             Arc::clone(contract),
             phase,
             selection,
             mapping,
             message,
+            crate::DataFailureReason::InvalidEncoding,
             work,
         ) {
             Ok(data) => data.into(),
@@ -321,7 +322,13 @@ fn publish_emission(
             internal("bitmap emission discarded its original Data recipe").into()
         }
         Failure::DecoderData(message) => {
-            match InvocationData::prepare_emission(allocator, context, message, work) {
+            match InvocationData::prepare_emission_with_reason(
+                allocator,
+                context,
+                message,
+                crate::DataFailureReason::InvalidEncoding,
+                work,
+            ) {
                 Ok(data) => data.into(),
                 Err(cause) => cause.into(),
             }

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Original decimal text computation shared by cast, hash and aggregate callers.
-//! Preserve original MIN overflow and Decimal256 sign behavior.
+//! Decimal128 magnitudes include the full signed range without negation overflow.
 
 use arrow_buffer::i256;
 
@@ -25,7 +25,7 @@ pub fn format_decimal_with_scale(unscaled: i128, scale: i8) -> String {
         return unscaled.to_string();
     }
     let scale = scale as usize;
-    let abs = unscaled.abs().to_string();
+    let abs = unscaled.unsigned_abs().to_string();
     if abs.len() <= scale {
         let frac = format!("{:0>width$}", abs, width = scale);
         if unscaled < 0 {
@@ -73,5 +73,26 @@ pub fn format_decimal256_with_scale(unscaled: i256, scale: i8) -> String {
         } else {
             format!("{}.{}", int_part, frac_part)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_decimal_with_scale;
+    #[test]
+    fn signed_minimum_formats_at_the_real_scale_without_negation_overflow() {
+        assert_eq!(
+            format_decimal_with_scale(i128::MIN, 2),
+            "-1701411834604692317316873037158841057.28"
+        );
+        assert_eq!(
+            format_decimal_with_scale(i128::MIN, 0),
+            "-170141183460469231731687303715884105728"
+        );
+        assert_eq!(
+            format_decimal_with_scale(i128::MIN, 38),
+            "-1.70141183460469231731687303715884105728"
+        );
+        assert_eq!(format_decimal_with_scale(-3, 2), "-0.03");
     }
 }

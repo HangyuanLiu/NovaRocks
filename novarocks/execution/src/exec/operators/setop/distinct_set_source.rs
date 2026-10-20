@@ -28,19 +28,26 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::shape::{
+    Source, SourceContractFailure, SourceKernel, SourceStart, source_contract_failure,
+};
+use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 use crate::runtime::runtime_state::RuntimeState;
-use arrow::array::{ArrayRef, UInt32Array};
+use arrow::array::{ArrayRef, UInt64Array};
+use std::num::NonZeroUsize;
 
-use super::distinct_set_shared::{DistinctSetSemantics, DistinctSetSharedState};
+use super::distinct_set_shared::{
+    DistinctSetSemantics, DistinctSetSharedState, SetSelectionCursor, SetSelectionProgress,
+};
 
 pub struct DistinctSetSourceFactory<S: DistinctSetSemantics> {
     name: String,
@@ -63,18 +70,16 @@ impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSourceFactory<S> {
         &self.name
     }
 
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(DistinctSetSourceOperator::<S> {
+    fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        Box::new(Source::new(DistinctSetSourceOperator::<S> {
             name: self.name.clone(),
             state: self.state.clone(),
             output_chunk_schema: self.state.output_chunk_schema(),
-            prepared: false,
-            finished: false,
-            arrays: Vec::new(),
-            indices: Vec::new(),
-            offset: 0,
+            output: None,
+            active: driver_id == 0,
+            chunk_size: None,
             _semantics: PhantomData,
-        })
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -86,114 +91,234 @@ struct DistinctSetSourceOperator<S: DistinctSetSemantics> {
     name: String,
     state: DistinctSetSharedState<S>,
     output_chunk_schema: ChunkSchemaRef,
-    prepared: bool,
-    finished: bool,
-    arrays: Vec<ArrayRef>,
-    indices: Vec<u32>,
-    offset: usize,
+    output: Option<OutputCursor>,
+    active: bool,
+    chunk_size: Option<NonZeroUsize>,
     _semantics: PhantomData<S>,
 }
 
-impl<S: DistinctSetSemantics> Operator for DistinctSetSourceOperator<S> {
+struct OutputCursor {
+    arrays: Vec<ArrayRef>,
+    selection: SetSelectionCursor,
+}
+
+impl<S: DistinctSetSemantics> OperatorLifecycle for DistinctSetSourceOperator<S> {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.chunk_size = Some(NonZeroUsize::new(state.chunk_size()).ok_or_else(|| {
+            source_contract_failure(SourceContractFailure::MissingRuntimeBinding)
+        })?);
+        Ok(())
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.output = None;
+        Ok(())
     }
-
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.output = None;
+        Ok(())
+    }
+    fn cancel(&mut self) {
+        self.output = None;
     }
 }
 
-impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSourceOperator<S> {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
-        if self.is_finished() {
-            return false;
+impl<S: DistinctSetSemantics> SourceKernel for DistinctSetSourceOperator<S> {
+    fn start(&self) -> SourceStart {
+        if self.active {
+            SourceStart::Ready
+        } else {
+            SourceStart::Finished
         }
-        let output_stage = self.state.controller().stage_total();
-        self.state.controller().is_stage_ready(output_stage)
     }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err(S::SOURCE_REJECT_INPUT_ERROR.to_string().into())
-    }
-
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.finished {
-            return Ok(None);
-        }
-
+    fn poll_output(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
+        let chunk_size = self
+            .chunk_size
+            .ok_or_else(|| source_contract_failure(SourceContractFailure::MissingRuntimeBinding))?;
+        let observable = self.state.controller().observable();
+        let observed_generation = observable.generation();
         let output_stage = self.state.controller().stage_total();
         if !self.state.controller().is_stage_ready(output_stage) {
-            return Ok(None);
+            return Ok(StepResult::new(
+                None,
+                NextStep::Wait(WaitFact {
+                    reason: WaitReason::Dependency,
+                    observable,
+                    observed_generation,
+                    deadline: None,
+                }),
+                0,
+            ));
         }
-
-        if !self.prepared {
-            let (arrays, indices) = self.state.snapshot_output()?;
-            self.arrays = arrays;
-            self.indices = indices;
-            self.prepared = true;
+        if ctx.work().remaining() == 0 {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-
-        if self.indices.is_empty() {
-            self.finished = true;
-            return Ok(None);
+        if self.output.is_none() {
+            self.output = Some(OutputCursor {
+                arrays: self.state.snapshot_arrays()?,
+                selection: SetSelectionCursor::default(),
+            });
         }
-        if self.offset >= self.indices.len() {
-            self.finished = true;
-            return Ok(None);
+        let cursor = self
+            .output
+            .as_mut()
+            .expect("the output snapshot is installed");
+        let progress = self
+            .state
+            .advance_selection(&mut cursor.selection, chunk_size, || {
+                ctx.checkpoint()?;
+                Ok(ctx.work().try_consume(1))
+            })?;
+        let SetSelectionProgress::Ready { exhausted } = progress else {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        };
+        if cursor.selection.is_empty() {
+            self.output = None;
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
-
-        let batch_size = state.chunk_size();
-        let end = (self.offset + batch_size).min(self.indices.len());
-        let slice = self.indices[self.offset..end].to_vec();
-        self.offset = end;
-
-        let indices = UInt32Array::from(slice);
-        let indices_ref = Arc::new(indices) as ArrayRef;
-
-        let mut out_arrays = Vec::with_capacity(self.arrays.len());
-        for col in &self.arrays {
-            let taken = arrow::compute::take(col.as_ref(), &indices_ref, None)
-                .map_err(|e| format!("Arrow take failed: {}", e))?;
-            out_arrays.push(taken);
+        ctx.checkpoint()?;
+        let indices_ref = Arc::new(UInt64Array::from(cursor.selection.take_indices())) as ArrayRef;
+        let mut out_arrays = Vec::with_capacity(cursor.arrays.len());
+        for column in &cursor.arrays {
+            out_arrays.push(
+                arrow::compute::take(column.as_ref(), &indices_ref, None).map_err(|source| {
+                    super::failure::fail(super::failure::SetStateFailure::Gather(source))
+                })?,
+            );
         }
-
         if self.output_chunk_schema.slot_ids().len() != out_arrays.len() {
-            return Err(format!(
-                "{}: slots={} cols={}",
-                S::SOURCE_SLOT_MISMATCH_PREFIX,
-                self.output_chunk_schema.slot_ids().len(),
-                out_arrays.len()
-            )
-            .into());
+            return Err(source_contract_failure(
+                SourceContractFailure::ColumnCount {
+                    expected: self.output_chunk_schema.slot_ids().len(),
+                    actual: out_arrays.len(),
+                },
+            ));
         }
-
-        Ok(Some(Chunk::try_new_with_columns(
-            Arc::clone(&self.output_chunk_schema),
-            out_arrays,
-        )?))
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        if self.finished {
-            return None;
+        let output =
+            Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), out_arrays)?;
+        let next = if exhausted {
+            NextStep::Finished
+        } else {
+            NextStep::Runnable
+        };
+        if matches!(next, NextStep::Finished) {
+            self.output = None;
         }
-        Some(self.state.controller().observable())
+        Ok(StepResult::new(Some(output), next, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::{
+        chunk::ChunkSchema,
+        operators::setop::{except_shared::ExceptSemantics, set_op_stage::SetOpStageController},
+        pipeline::step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::{mem_tracker::MemTracker, query_options::QueryOptions};
+    use arrow::{
+        array::Int32Array,
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use novarocks_types::SlotId;
+    use std::num::NonZeroU64;
+
+    fn chunk(values: Vec<i32>) -> Chunk {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .unwrap();
+        let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .unwrap();
+        Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
+    }
+    #[test]
+    fn selection_yields_with_one_cursor_and_emits_the_expected_rows_once() {
+        let interval = novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize;
+        let count = interval * 2 + 7;
+        let input = chunk((0..count as i32).collect());
+        let shared = DistinctSetSharedState::<ExceptSemantics>::new(
+            SetOpStageController::new("EXCEPT", vec![1, 1]).unwrap(),
+            input.chunk_schema_ref(),
+        );
+        shared
+            .ingest_build(&input, MemTracker::new_root("set source fixture"))
+            .unwrap();
+        shared.finish_stage(0).unwrap();
+        shared
+            .ingest_probe(1, &chunk((0..(interval * 2) as i32).collect()))
+            .unwrap();
+        shared.finish_stage(1).unwrap();
+        let state = RuntimeState::for_local_execution(
+            Some(QueryOptions {
+                batch_size: Some(3),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut source = DistinctSetSourceFactory::new(shared.clone(), 7).create(1, 0);
+        source.bind_runtime_state(&state).unwrap();
+        let control = state.error_state();
+        let mut rows = Vec::new();
+        let mut yields = 0;
+        let mut ended = false;
+        let expected = ((interval * 2) as i32..count as i32).collect::<Vec<_>>();
+        let max_turns = count.div_ceil(interval) + expected.len().div_ceil(3);
+        for turn in 1..=max_turns {
+            let mut work = TurnWork::new(NonZeroU64::new(turn as u64).unwrap(), 1);
+            let mut context = StepContext::new(&control, &mut work);
+            let step = source.as_mut().drive(&mut context).unwrap();
+            if let Some(output) = step.output {
+                assert!(output.len() <= 3);
+                let column = output.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                rows.extend(column.values().iter().copied());
+            }
+            if matches!(step.next, NextStep::Yield) {
+                yields += 1;
+            }
+            if matches!(step.next, NextStep::Finished) {
+                ended = true;
+                break;
+            }
+            if matches!(step.next, NextStep::Runnable) {
+                let spent = source.as_mut().drive(&mut context).unwrap();
+                assert!(spent.output.is_none());
+                assert!(matches!(spent.next, NextStep::Yield));
+                yields += 1;
+            }
+        }
+        assert!(ended);
+        assert!(
+            yields >= 2,
+            "the long unselected prefix must yield instead of replaying or blocking"
+        );
+        assert_eq!(rows, expected);
+        let mut inactive = DistinctSetSourceFactory::new(shared, 7).create(2, 1);
+        let mut work = TurnWork::new(NonZeroU64::MIN, 1);
+        let step = inactive
+            .as_mut()
+            .drive(&mut StepContext::new(&control, &mut work))
+            .unwrap();
+        assert!(step.output.is_none());
+        assert!(matches!(step.next, NextStep::Finished));
     }
 }

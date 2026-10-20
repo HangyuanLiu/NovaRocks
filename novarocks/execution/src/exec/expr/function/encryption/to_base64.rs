@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::function::FunctionKind;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::expr::{ExprId, ExprNode};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{ArrayRef, StringArray};
 use std::sync::Arc;
 
@@ -40,11 +42,21 @@ pub fn eval_to_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "to_base64 requires exactly 1 prepared argument(s)",
+        ));
+    }
     let _ = expr;
     let prefer_latin1 = should_prefer_latin1_bytes(arena, args[0]);
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "to_base64", 0)?;
 
+    if input.len() < chunk.len() {
+        return Err(expression_contract(
+            "to_base64 prepared input is shorter than its batch",
+        ));
+    }
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         out.push(novarocks_functions::builtin::to_base64_shared::encode_row(

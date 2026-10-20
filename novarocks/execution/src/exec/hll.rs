@@ -17,6 +17,14 @@
 
 pub use novarocks_functions::datasketches_hll::*;
 
+impl From<novarocks_functions::datasketches_hll_failure::ClassifiedHllFailure>
+    for crate::runtime::fragment::ExecutionFailure
+{
+    fn from(source: novarocks_functions::datasketches_hll_failure::ClassifiedHllFailure) -> Self {
+        Self::from_domain(source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;

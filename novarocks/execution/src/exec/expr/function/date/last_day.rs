@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -24,19 +24,23 @@ use novarocks_functions::builtin::calendar_extended_shared::{
 
 pub fn eval_last_day<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Date32)?;
     let date = arena.eval(args[0], chunk)?;
     let rows = date.len();
     let mut values = vec![date];
     if args.len() != 1 {
         let unit = arena.eval(args[1], chunk)?;
-        unit.as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| "last_day expects string".to_string())?;
+        unit.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "last_day expects string",
+            )
+        })?;
         values.push(unit);
     }
-    Ok((evaluate_legacy_calendar(CalendarOperation::LastDay, &values, &DataType::Date32, rows))?)
+    evaluate_legacy_calendar(CalendarOperation::LastDay, &values, &DataType::Date32, rows)
+        .map_err(Into::into)
 }

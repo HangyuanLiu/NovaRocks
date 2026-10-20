@@ -339,7 +339,36 @@ impl fmt::Display for PackageDecodeError {
         }
     }
 }
-impl std::error::Error for PackageDecodeError {}
+impl std::error::Error for PackageDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Wire(source) => Some(source),
+            Self::Metadata(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Schema(source) => Some(source),
+            Self::PublicSourceSchema(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::ProviderBinding(source) => Some(source),
+            Self::Payload(source) => Some(source),
+            Self::Read(source) => Some(source),
+            Self::Relation(source) => Some(source),
+            Self::Value(source) => Some(source),
+            Self::Expression(source) => Some(source),
+            Self::Node(source) => Some(source),
+            Self::CallRequests(source) => Some(source),
+            Self::ExpressionControl(source) => Some(source),
+            Self::Semantics(source) => Some(source),
+            Self::Scan(source) => Some(source),
+            Self::Writer(source) => Some(source),
+            Self::Structure(source) => Some(source),
+            Self::Requests(source) => Some(source),
+            Self::Package(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 type Error = PackageDecodeError;
 

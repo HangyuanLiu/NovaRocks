@@ -45,6 +45,7 @@ impl fmt::Display for ExecPlanInvariant {
 pub struct ExecPlanBuildError {
     invariant: ExecPlanInvariant,
     detail: String,
+    source: Option<crate::runtime::fragment::SharedDomainFailure>,
 }
 
 impl ExecPlanBuildError {
@@ -52,6 +53,19 @@ impl ExecPlanBuildError {
         Self {
             invariant,
             detail: detail.into(),
+            source: None,
+        }
+    }
+    /// Build location is independent from the domain that rejected the source.
+    pub fn from_domain<E>(invariant: ExecPlanInvariant, source: E) -> Self
+    where
+        E: Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
+    {
+        let source = crate::runtime::fragment::SharedDomainFailure::new(source);
+        Self {
+            invariant,
+            detail: source.detail().to_owned(),
+            source: Some(source),
         }
     }
 
@@ -74,7 +88,11 @@ impl fmt::Display for ExecPlanBuildError {
     }
 }
 
-impl Error for ExecPlanBuildError {}
+impl Error for ExecPlanBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_ref().map(|source| source as _)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FragmentBindingTarget {
@@ -268,5 +286,108 @@ mod tests {
         ] {
             assert_eq!(kind.to_string(), expected);
         }
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for FragmentBindingError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self.kind {
+            FragmentBindingErrorKind::MissingAssignment => {
+                ExecutionReason::BindingMissingAssignment
+            }
+            FragmentBindingErrorKind::ExtraAssignment => ExecutionReason::BindingExtraAssignment,
+            FragmentBindingErrorKind::WrongAssignmentKind => {
+                ExecutionReason::BindingWrongAssignmentKind
+            }
+            FragmentBindingErrorKind::InvalidAssignment => {
+                ExecutionReason::BindingInvalidAssignment
+            }
+            FragmentBindingErrorKind::SchemaMismatch => ExecutionReason::BindingSchemaMismatch,
+            FragmentBindingErrorKind::LayoutMismatch => ExecutionReason::BindingLayoutMismatch,
+            FragmentBindingErrorKind::ExpressionMismatch => {
+                ExecutionReason::BindingExpressionMismatch
+            }
+            FragmentBindingErrorKind::RuntimeFilterMismatch => {
+                ExecutionReason::BindingRuntimeFilterMismatch
+            }
+            FragmentBindingErrorKind::ContractVersionMismatch => {
+                ExecutionReason::BindingContractVersionMismatch
+            }
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<FragmentBindingError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(cause: FragmentBindingError) -> Self {
+        Self::from_domain(cause)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ExecPlanBuildError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        if let Some(source) = self.source.as_ref() {
+            return novarocks_failure_contract::FailureProjection::failure_fact(source);
+        }
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self.invariant {
+            ExecPlanInvariant::Node => ExecutionReason::PlanNodeInvariant,
+            ExecPlanInvariant::Expression => ExecutionReason::PlanExpressionInvariant,
+            ExecPlanInvariant::Layout => ExecutionReason::PlanLayoutInvariant,
+            ExecPlanInvariant::Schema => ExecutionReason::PlanSchemaInvariant,
+            ExecPlanInvariant::Sink => ExecutionReason::PlanSinkInvariant,
+            ExecPlanInvariant::Internal => ExecutionReason::PlanInternalInvariant,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<ExecPlanBuildError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(cause: ExecPlanBuildError) -> Self {
+        Self::from_domain(cause)
+    }
+}
+
+/// An author rejects a frozen program binding with its explicit reason kind.
+pub(crate) fn program_binding_failure(
+    kind: FragmentBindingErrorKind,
+    detail: impl std::fmt::Display,
+) -> crate::runtime::fragment::ExecutionFailure {
+    let detail = novarocks_failure_contract::BoundedDetail::truncating_display(detail);
+    FragmentBindingError::new(FragmentBindingTarget::Program, kind, detail.as_str()).into()
+}
+
+/// Explicit frozen-node guard selected by its construction owner.
+pub(crate) fn node_construction_failure(
+    detail: impl std::fmt::Display,
+) -> crate::runtime::fragment::ExecutionFailure {
+    let detail = novarocks_failure_contract::BoundedDetail::truncating_display(detail);
+    ExecPlanBuildError::new(ExecPlanInvariant::Node, detail.as_str()).into()
+}
+
+#[cfg(test)]
+mod build_source_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn build_location_preserves_actual_layout_failure_facts_and_sdk_source() {
+        let source = std::alloc::Layout::array::<u8>(usize::MAX).unwrap_err();
+        let source = novarocks_functions::array_projection::ArrayProjectionFailure::ArrayLayout {
+            count: usize::MAX,
+            width: 1,
+            source,
+        };
+        let expected = source.failure_fact();
+        let error = ExecPlanBuildError::from_domain(ExecPlanInvariant::Schema, source);
+        assert_eq!(error.invariant(), ExecPlanInvariant::Schema);
+        assert_eq!(error.failure_fact(), expected);
+        assert_eq!(error.failure_fact().class(), FailureClass::Representation);
+        let extent = error.failure_fact().representation().unwrap();
+        assert_eq!(extent.required, Some(usize::MAX as u64));
+        assert_eq!(extent.extent_limit, Some(isize::MAX as u64));
+        assert!(error.failure_fact().resource().is_none());
+        let source = error.source().unwrap().source().unwrap().source().unwrap();
+        assert!(source.downcast_ref::<std::alloc::LayoutError>().is_some());
+        assert_eq!(error.clone(), error);
     }
 }

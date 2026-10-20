@@ -43,7 +43,7 @@ impl PureCompileControl for Control {
             assert!(index <= at, "callback after primary refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if at == index => Err(cause),
             _ => Ok(()),
         }
@@ -86,7 +86,7 @@ fn check_prefixes(
         for cause in CAUSES {
             let refusal = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 phase: None,
             };
             let error = ExprArena::try_from_definitions_observed(
@@ -95,7 +95,7 @@ fn check_prefixes(
                 &refusal,
             )
             .unwrap_err();
-            assert_eq!(error, ExprArenaConstructionError::Control(cause));
+            assert_eq!(error, ExprArenaConstructionError::Control(cause.clone()));
             assert_eq!(*refusal.trace.lock().unwrap(), trace[..=at]);
             assert_eq!(
                 error
@@ -314,7 +314,7 @@ fn sparse_definition_constructor_rejects_lying_lengths_before_excess_insertion_o
                 let pulls = Cell::new(0);
                 let refusal = Control {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     phase: None,
                 };
                 assert_eq!(
@@ -388,7 +388,7 @@ fn sparse_definition_composition_lends_original_decode_scope_without_entry_or_fo
             for cause in CAUSES {
                 let c = Control {
                     phase: Some(CompilePhase::Decode),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert_eq!(

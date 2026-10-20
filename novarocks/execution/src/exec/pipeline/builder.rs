@@ -28,6 +28,35 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::fragment::error::{FragmentBindingErrorKind, program_binding_failure};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
+fn program_failure(
+    kind: crate::exec::fragment::error::FragmentBindingErrorKind,
+    detail: impl Into<String>,
+) -> ExecutionFailure {
+    crate::exec::fragment::error::FragmentBindingError::new(
+        crate::exec::fragment::error::FragmentBindingTarget::Program,
+        kind,
+        detail,
+    )
+    .into()
+}
+
+fn builder_binding_failure(
+    kind: FragmentBindingErrorKind,
+    detail: impl std::fmt::Display,
+) -> ExecutionFailure {
+    program_binding_failure(kind, detail)
+}
+fn builder_filter_contract_failure(detail: impl Into<Arc<str>>) -> ExecutionFailure {
+    crate::runtime_filter::RuntimeFilterContractViolation::new(
+        crate::runtime_filter::RuntimeFilterContractViolationKind::ContractMismatch,
+        detail,
+    )
+    .into()
+}
+
 use std::sync::Arc;
 
 mod compiled;
@@ -285,14 +314,14 @@ fn shuffle_input_slots_with_distribution(
 fn runtime_filter_session(
     execution: &PipelineRuntimeFilterExecution,
     binding_id: u32,
-) -> Result<&execution::RuntimeFilterSessionRef, String> {
+) -> ExecutionResult<&execution::RuntimeFilterSessionRef> {
     match execution {
         PipelineRuntimeFilterExecution {
             session: Some(session),
         } => Ok(session),
-        PipelineRuntimeFilterExecution { session: None } => Err(format!(
+        PipelineRuntimeFilterExecution { session: None } => Err(crate::runtime_filter::RuntimeFilterContractViolation::new(crate::runtime_filter::RuntimeFilterContractViolationKind::MissingSession, format!(
             "native runtime-filter binding_id={binding_id} requires an execution runtime-filter session"
-        )),
+        )).into()),
     }
 }
 

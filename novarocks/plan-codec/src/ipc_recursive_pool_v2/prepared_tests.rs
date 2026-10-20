@@ -161,7 +161,7 @@ fn prepared_recursive_writer_prepare_and_emit_preserve_every_primary_control_pre
         let trace = good.trace();
         for cause in CAUSES {
             for at in 0..trace.len() {
-                let refusing = Control::refusing(at, cause);
+                let refusing = Control::refusing(at, cause.clone());
                 assert!(matches!(
                     split_encode(&original, bounds, &refusing),
                     Err(TypeCodecError::Control(actual)) if actual == cause
@@ -192,7 +192,7 @@ fn prepared_recursive_writer_prepare_and_emit_preserve_every_primary_control_pre
                 &Control::good(CompilePhase::Encode),
             )
             .unwrap();
-            let refusing = Control::refusing(at, cause);
+            let refusing = Control::refusing(at, cause.clone());
             assert!(matches!(prepared.emit(&refusing),
                 Err(TypeCodecError::Control(actual)) if actual == cause));
             assert_eq!(refusing.trace(), trace[..=at]);

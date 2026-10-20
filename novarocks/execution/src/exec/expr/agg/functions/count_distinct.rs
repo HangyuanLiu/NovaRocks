@@ -28,7 +28,7 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use novarocks_functions::aggregate_scalar::ScalarWork;
 use novarocks_functions::builtin::aggregate_count_distinct_core::{
-    self as core, CountDistinctState, LegacyCountReader,
+    self as core, CountDistinctState, OwnedCountReader,
 };
 type DistinctSet = CountDistinctState<AggregateAllocator>;
 impl From<Arc<MemTracker>> for AggregateAllocator {
@@ -40,13 +40,11 @@ pub(super) struct CountDistinctAgg;
 unsafe fn get_or_init_set<'a>(ptr: *mut u8) -> &'a mut DistinctSet {
     unsafe { &mut *ptr.cast::<DistinctSet>() }
 }
-fn serialize_set(set: &DistinctSet) -> Vec<u8> {
+fn serialize_set(set: &DistinctSet) -> Result<Vec<u8>, novarocks_functions::KernelFailure> {
     core::serialize_set(set, Vec::new(), &mut ScalarWork::new(None))
-        .expect("legacy serialization uses infallible scratch")
 }
-fn deserialize_set(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+fn deserialize_set(bytes: &[u8]) -> Result<Vec<Vec<u8>>, novarocks_functions::KernelFailure> {
     core::deserialize_set(bytes, Vec::new(), &mut ScalarWork::new(None))
-        .map_err(|error| error.to_string())
 }
 impl AggregateFunction for CountDistinctAgg {
     fn build_spec_from_type(
@@ -54,9 +52,13 @@ impl AggregateFunction for CountDistinctAgg {
         _func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         if input_type.is_none() {
-            return Err("count_distinct requires 1 argument".to_string());
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "count_distinct requires 1 argument",
+                ),
+            );
         }
         // multi_distinct_count is the FE-internal name for all COUNT(DISTINCT) operations.
         // Count all non-null distinct values regardless of sign.
@@ -84,10 +86,10 @@ impl AggregateFunction for CountDistinctAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "count_distinct input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("count_distinct input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -95,14 +97,17 @@ impl AggregateFunction for CountDistinctAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "count_distinct intermediate input missing".to_string())?;
-        let binary = arr
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "count_distinct intermediate input missing",
+            )
+        })?;
+        let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "failed to downcast to BinaryArray",
+            )
+        })?;
         Ok(AggInputView::Binary(binary))
     }
 
@@ -118,9 +123,11 @@ impl AggregateFunction for CountDistinctAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked count_distinct state requires a memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked count_distinct state requires a memory tracker",
+            )
         })?;
         unsafe { ptr.cast::<DistinctSet>().write(DistinctSet::new(tracker)) };
         Ok(())
@@ -144,20 +151,21 @@ impl AggregateFunction for CountDistinctAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("count_distinct batch input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "count_distinct batch input type mismatch",
+            ));
         };
-        core::validate_legacy_array(array)?;
+        core::validate_source_array(array)?;
         for (row, &base) in state_ptrs.iter().enumerate() {
             let key = core::encode_row(
                 array,
                 row,
-                &LegacyCountReader,
+                &OwnedCountReader,
                 Vec::new(),
                 &mut ScalarWork::new(None),
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
             if let Some(key) = key {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
                 let set = unsafe { get_or_init_set(ptr) };
@@ -172,9 +180,11 @@ impl AggregateFunction for CountDistinctAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Binary(arr) = input else {
-            return Err("count_distinct merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "count_distinct merge input type mismatch",
+            ));
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             if arr.is_null(row) {
@@ -183,8 +193,7 @@ impl AggregateFunction for CountDistinctAgg {
             let values = deserialize_set(arr.value(row))?;
             let ptr = unsafe { (base as *mut u8).add(offset) };
             let set = unsafe { get_or_init_set(ptr) };
-            core::merge_decoded(set, values, &mut ScalarWork::new(None))
-                .map_err(|error| error.to_string())?;
+            core::merge_decoded(set, values, &mut ScalarWork::new(None))?;
         }
         Ok(())
     }
@@ -194,23 +203,23 @@ impl AggregateFunction for CountDistinctAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         if output_intermediate {
-            let mut builder = BinaryBuilder::new();
+            let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
             for &base in group_states {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
                 let set = unsafe { &*ptr.cast::<DistinctSet>() };
-                let bytes = serialize_set(set);
-                builder.append_value(bytes);
+                let bytes = serialize_set(set)?;
+                builder.append_value(bytes)?;
             }
-            return Ok(std::sync::Arc::new(builder.finish()));
+            return Ok(std::sync::Arc::new(builder.finish()?));
         }
 
         let mut builder = Int64Builder::new();
         for &base in group_states {
             let ptr = unsafe { (base as *mut u8).add(offset) };
-            let count = unsafe { (&*ptr.cast::<DistinctSet>()).len() };
-            builder.append_value(count as i64);
+            let set = unsafe { &*ptr.cast::<DistinctSet>() };
+            builder.append_value(core::finalize_count(set)?);
         }
         Ok(std::sync::Arc::new(builder.finish()))
     }

@@ -47,7 +47,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -319,7 +319,7 @@ fn recursive_reader_every_original_callback_and_ordinary_tail_preserves_primary_
             for cause in CAUSES {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(materialize(&checked, &field, source(&bytes), reader, &control),
@@ -395,7 +395,7 @@ fn recursive_framing_every_original_callback_and_ordinary_tail_preserves_primary
             for cause in CAUSES {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(matches!(
                     preflight_recursive_constant_stream(&input, &field, limits(), &verifier(), &control),

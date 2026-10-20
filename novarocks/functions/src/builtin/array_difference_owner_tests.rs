@@ -64,7 +64,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -278,7 +278,7 @@ fn array_difference_selected_original_decimal_float_cast_and_no_admission_wideni
     }
 }
 #[test]
-fn array_difference_selected_original_extreme_panic_or_wrapping_core_and_prepared() {
+fn array_difference_selected_numeric_overflow_is_an_explicit_parent_row_outcome() {
     use super::super::array_difference_core;
     let a = list(
         Arc::new(Int64Array::from(vec![Some(i64::MIN), Some(i64::MAX)])),
@@ -288,22 +288,24 @@ fn array_difference_selected_original_extreme_panic_or_wrapping_core_and_prepare
     let args = [EvaluatedArgument::Column(&a)];
     let mut k = instance(&a);
     let target = k.contract().result_type().data_type().clone();
-    let core = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        array_difference_core::difference(&a, Some(&target), 1)
-    }));
-    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        k.evaluate(Selection::all(1), &args, &Control::default())
-    }));
-    if cfg!(debug_assertions) {
-        assert!(core.is_err());
-        assert!(prepared.is_err());
-    } else {
-        assert_eq!(ints(&core.unwrap().unwrap()), vec![Some(0), Some(-1)]);
-        assert_eq!(
-            ints(prepared.unwrap().unwrap().values()),
-            vec![Some(0), Some(-1)]
-        );
-    }
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let error = array_difference_core::difference(&a, Some(&target), 1).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    assert_eq!(
+        error.failure_fact(),
+        crate::DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    let result = k
+        .evaluate(Selection::all(1), &args, &Control::default())
+        .unwrap();
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(result.errors()[0].selected_ordinal(), 0);
+    assert_eq!(
+        result.errors()[0].reason(),
+        crate::DataFailureReason::NumericOutOfRange
+    );
+    assert!(result.values().is_null(0));
+    assert!(ints(result.values()).is_empty());
     // A hidden parent must retain the original skip-before-subtraction behavior.
     let a = list(
         Arc::new(Int64Array::from(vec![Some(i64::MIN), Some(i64::MAX)])),
@@ -393,7 +395,7 @@ fn array_difference_compile_callbacks_preserve_primary_causes_on_success_and_rej
                 ] {
                     let control = CompileControl {
                         trace: Mutex::new(vec![]),
-                        refusal: Some((stop, cause)),
+                        refusal: Some((stop, cause.clone())),
                     };
                     let error = prepared_for_test_with_control(
                         name,
@@ -422,4 +424,123 @@ fn array_difference_compile_callbacks_preserve_primary_causes_on_success_and_rej
             }
         }
     }
+}
+
+#[test]
+fn array_difference_overflow_nulls_only_the_demanded_parent_and_keeps_selection_coordinates() {
+    let a = list(
+        Arc::new(Int64Array::from(vec![i64::MIN, i64::MAX, 2, 8, 9, 5])),
+        vec![0, 2, 4, 6],
+        None,
+    );
+    let rows = [0, 2];
+    let selection = Selection::try_sparse(3, &rows).unwrap();
+    let args = [EvaluatedArgument::Column(&a)];
+    let mut k = instance(&a);
+    let result = k.evaluate(selection, &args, &Control::default()).unwrap();
+    assert_eq!(result.selection().iter().collect::<Vec<_>>(), vec![0, 2]);
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(result.errors()[0].selected_ordinal(), 0);
+    assert_eq!(
+        result.errors()[0].reason(),
+        crate::DataFailureReason::NumericOutOfRange
+    );
+    let out = result
+        .values()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(out.is_null(0));
+    assert!(out.is_valid(1));
+    assert_eq!(out.value_offsets(), &[0, 0, 2]);
+    assert_eq!(ints(result.values()), vec![Some(0), Some(-4)]);
+    // A value outcome is not a failed invocation latch: another real evaluation works.
+    let result = k
+        .evaluate(
+            Selection::try_sparse(3, &[1]).unwrap(),
+            &args,
+            &Control::default(),
+        )
+        .unwrap();
+    assert!(result.errors().is_empty());
+    assert_eq!(ints(result.values()), vec![Some(0), Some(6)]);
+}
+#[test]
+fn array_difference_sdk_refusal_never_enters_the_row_journal_and_releases_inputs() {
+    use super::super::array_difference_core::{self, DifferenceFailure};
+    use arrow_array::StructArray;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let values: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::new(Field::new("x", DataType::Int64, false))].into(),
+        vec![Arc::new(Int64Array::from(vec![7]))],
+        None,
+    ));
+    let expected = arrow_cast::cast(&values, &DataType::Int64)
+        .unwrap_err()
+        .to_string();
+    let a: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", values.data_type().clone(), true)),
+        OffsetBuffer::new(vec![0, 1].into()),
+        values,
+        None,
+    ));
+    let weak = Arc::downgrade(&a);
+    let target = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    let mut row_callbacks = 0;
+    let error = array_difference_core::difference_observed(
+        &a,
+        Some(&target),
+        1,
+        &mut |_| Ok::<(), KernelFailure>(()),
+        &mut |_| {
+            row_callbacks += 1;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(row_callbacks, 0);
+    let DifferenceFailure::Operation(error) = error else {
+        panic!("SDK operation author")
+    };
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if let Some(arrow) = source.downcast_ref::<arrow_schema::ArrowError>() {
+            assert_eq!(arrow.to_string(), expected);
+            break;
+        }
+        source = source.source().expect("actual SDK error retained");
+    }
+    drop(a);
+    assert!(weak.upgrade().is_none());
+}
+#[test]
+fn array_difference_required_decimal_overflow_and_shape_have_distinct_facts() {
+    use super::super::array_difference_core;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let edge = 10_i128.pow(38) - 1;
+    let values: ArrayRef = Arc::new(
+        Decimal128Array::from(vec![-edge, edge])
+            .with_precision_and_scale(38, 0)
+            .unwrap(),
+    );
+    let a: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", values.data_type().clone(), true)),
+        OffsetBuffer::new(vec![0, 2].into()),
+        values,
+        None,
+    ));
+    assert_eq!(
+        array_difference_core::difference(&a, None, 1)
+            .unwrap_err()
+            .failure_fact(),
+        crate::DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    assert_eq!(
+        array_difference_core::difference(&a, Some(&DataType::Int64), 1)
+            .unwrap_err()
+            .failure_fact()
+            .class(),
+        FailureClass::Invariant
+    );
 }

@@ -67,7 +67,7 @@ fn compare(p: u8, s: i8, target: DataType, raw: Vec<Option<i128>>) {
                         Ok(array) => expected.push(values(&array)[0]),
                         Err(message) => {
                             expected.push(None);
-                            errors.push((ordinal, message));
+                            errors.push((ordinal, message.detail().to_owned()));
                         }
                     }
                 }
@@ -105,7 +105,10 @@ fn compare(p: u8, s: i8, target: DataType, raw: Vec<Option<i128>>) {
                         .iter()
                         .map(|error| (error.selected_ordinal(), error.message().to_owned()))
                         .collect::<Vec<_>>(),
-                    vec![(0, message.clone()), (1, message)]
+                    vec![
+                        (0, message.detail().to_owned()),
+                        (1, message.detail().to_owned())
+                    ]
                 );
             }
         }

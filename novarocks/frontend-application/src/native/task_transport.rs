@@ -395,35 +395,40 @@ fn decode_ack(
     receipt: &proto::TaskOperationReceipt,
 ) -> Result<AckPayload, String> {
     let path = || FieldPath::root("apply_task_operations").field("receipts");
-    let body = receipt
+    let Some(proto::task_operation_receipt::Result::Verdict(verdict)) = &receipt.result else {
+        return Err(format!(
+            "{kind} requires a protocol verdict acknowledgement"
+        ));
+    };
+    let body = verdict
         .ack
         .as_ref()
         .ok_or_else(|| format!("{kind} requires an acknowledgement body for this outcome"))?;
     match (kind, body, address) {
         (
             OperationKind::AcquireQueryContextAdmissionTicket,
-            proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ack),
+            proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(ack),
             AckAddress::Admission(expected),
         ) => codec::decode_query_context_admission_ticket_ack(ack, expected, path())
             .map(AckPayload::AdmissionTicket)
             .map_err(|error| error.to_string()),
         (
             OperationKind::CreateTask,
-            proto::task_operation_receipt::Ack::CreateTask(ack),
+            proto::task_operation_verdict::Ack::CreateTask(ack),
             AckAddress::Task(identity),
         ) => codec::decode_create_task_ack(ack, identity, path())
             .map(AckPayload::Create)
             .map_err(|error| error.to_string()),
         (
             OperationKind::UpdateTask,
-            proto::task_operation_receipt::Ack::UpdateTask(ack),
+            proto::task_operation_verdict::Ack::UpdateTask(ack),
             AckAddress::Task(identity),
         ) => codec::decode_update_task_ack(ack, identity, path())
             .map(AckPayload::Update)
             .map_err(|error| error.to_string()),
         (
             OperationKind::UpdateQueryContext | OperationKind::AbortQueryContext,
-            proto::task_operation_receipt::Ack::QueryContext(ack),
+            proto::task_operation_verdict::Ack::QueryContext(ack),
             AckAddress::Context(context),
         ) => codec::decode_query_context_ack(ack, context, path())
             .map(|(receipt, cause)| {
@@ -441,7 +446,7 @@ fn decode_ack(
             .map_err(|error| error.to_string()),
         (
             OperationKind::QuiesceQueryContext,
-            proto::task_operation_receipt::Ack::QuiesceQueryContext(ack),
+            proto::task_operation_verdict::Ack::QuiesceQueryContext(ack),
             AckAddress::Context(context),
         ) => {
             let decoded =
@@ -453,7 +458,7 @@ fn decode_ack(
         }
         (
             OperationKind::ReleaseQueryContext,
-            proto::task_operation_receipt::Ack::ReleaseQueryContext(ack),
+            proto::task_operation_verdict::Ack::ReleaseQueryContext(ack),
             AckAddress::Context(context),
         ) => {
             let decoded =
@@ -684,12 +689,77 @@ struct TaskBackendTarget {
     client: Client,
 }
 
+/// Construction facts authored before any attempt operation can be sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeTaskTransportCreationError {
+    BudgetMismatch,
+    NoBackends,
+    DuplicateBackend { process: BackendProcessId },
+    Registration(super::transport_supervisor::NativeTransportRegistrationError),
+    ZeroStatusErrorBudget,
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for NativeTaskTransportCreationError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+        };
+        let code = match self {
+            Self::BudgetMismatch => 101,
+            Self::NoBackends => 102,
+            Self::DuplicateBackend { .. } => 103,
+            Self::ZeroStatusErrorBudget => 106,
+            Self::Registration(error) => return error.failure_fact(),
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl NativeTaskTransportCreationError {
+    pub(crate) fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        let message = match self {
+            Self::BudgetMismatch => {
+                "attempt task transport budget differs from the process supervisor"
+            }
+            Self::NoBackends => "native task transport requires at least one frozen backend",
+            Self::DuplicateBackend { .. } => "native task transport repeats a backend process",
+            Self::ZeroStatusErrorBudget => {
+                "native status subscription error budget must be nonzero"
+            }
+            Self::Registration(error) => return error.safe_detail(),
+        };
+        novarocks_execution_contract::SafeDetail::truncating(message)
+    }
+}
+impl fmt::Display for NativeTaskTransportCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.safe_detail().as_str())
+    }
+}
+impl std::error::Error for NativeTaskTransportCreationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registration(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl From<super::transport_supervisor::NativeTransportRegistrationError>
+    for NativeTaskTransportCreationError
+{
+    fn from(error: super::transport_supervisor::NativeTransportRegistrationError) -> Self {
+        Self::Registration(error)
+    }
+}
+
 fn freeze_targets(
     backends: &[BackendProcessDescriptor],
     data_runtime: &FrontendDataRuntime,
-) -> Result<BTreeMap<BackendProcessId, TaskBackendTarget>, String> {
+) -> Result<BTreeMap<BackendProcessId, TaskBackendTarget>, NativeTaskTransportCreationError> {
     if backends.is_empty() {
-        return Err("the native task transport requires at least one backend".to_owned());
+        return Err(NativeTaskTransportCreationError::NoBackends);
     }
     let mut targets = BTreeMap::new();
     for descriptor in backends {
@@ -698,7 +768,9 @@ fn freeze_targets(
             client: Client::for_backend(descriptor.clone(), data_runtime.clone()),
         };
         if targets.insert(process_id, target).is_some() {
-            return Err(format!("duplicate backend process {process_id}"));
+            return Err(NativeTaskTransportCreationError::DuplicateBackend {
+                process: process_id,
+            });
         }
     }
     Ok(targets)
@@ -736,14 +808,12 @@ impl NativeTaskOperationSink {
         attempt: AttemptWireFacts,
         acks: TaskAckIntakeHandle,
         data_runtime: FrontendDataRuntime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NativeTaskTransportCreationError> {
         if !data_runtime
             .task_transport_supervisor()
             .accepts_transport_budget(transport)
         {
-            return Err(
-                "attempt task transport budget differs from the process supervisor".to_owned(),
-            );
+            return Err(NativeTaskTransportCreationError::BudgetMismatch);
         }
         let transport_waiter = data_runtime
             .task_transport_supervisor()
@@ -1272,6 +1342,19 @@ fn acknowledgement(
     header: &ReceiptHeader,
     receipt: &proto::TaskOperationReceipt,
 ) -> OperationAcknowledgement {
+    if let novarocks_execution_contract::operation::OperationResult::DomainFailure {
+        outcome,
+        failure,
+    } = header.result()
+    {
+        observe_settled(item.kind, item.lease_renewal, outcome.outcome());
+        return OperationAcknowledgement::worker_domain_failure(
+            item.operation_id,
+            item.kind,
+            *outcome,
+            failure.clone(),
+        );
+    }
     let outcome = header.outcome();
     if !consumes_ack_body_for_outcome(item.kind, outcome) {
         observe_settled(item.kind, item.lease_renewal, outcome);
@@ -1503,9 +1586,9 @@ impl TaskStatusSubscriber {
         intake: StatusIntakeHandle,
         error_budget: u32,
         data_runtime: FrontendDataRuntime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NativeTaskTransportCreationError> {
         if error_budget == 0 {
-            return Err("the status subscription error budget must be nonzero".to_owned());
+            return Err(NativeTaskTransportCreationError::ZeroStatusErrorBudget);
         }
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
@@ -1525,9 +1608,9 @@ impl TaskStatusSubscriber {
         context_convergence: ContextConvergenceIntakeHandle,
         error_budget: u32,
         data_runtime: FrontendDataRuntime,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NativeTaskTransportCreationError> {
         if error_budget == 0 {
-            return Err("the status subscription error budget must be nonzero".to_owned());
+            return Err(NativeTaskTransportCreationError::ZeroStatusErrorBudget);
         }
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
@@ -2125,9 +2208,9 @@ impl CoveredTaskStatusSubscriber {
         error_budget: u32,
         data_runtime: FrontendDataRuntime,
         work_scope: novarocks_workload_control::WorkScope,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NativeTaskTransportCreationError> {
         if error_budget == 0 {
-            return Err("the covered subscription error budget must be nonzero".to_owned());
+            return Err(NativeTaskTransportCreationError::ZeroStatusErrorBudget);
         }
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
@@ -3211,7 +3294,7 @@ mod tests {
         /// The same receipts with the last one missing.
         Truncated(Vec<OperationOutcome>),
         /// One receipt per request item, each with its own body.
-        WithAck(Vec<(OperationOutcome, Option<proto::task_operation_receipt::Ack>)>),
+        WithAck(Vec<(OperationOutcome, Option<proto::task_operation_verdict::Ack>)>),
         Reject(tonic::Code),
     }
 
@@ -3308,10 +3391,14 @@ mod tests {
                         .envelope
                         .as_ref()
                         .and_then(|envelope| envelope.operation_id.clone()),
-                    outcome: encode_operation_outcome(outcome),
-                    safe_detail: String::new(),
-                    safe_field_path: None,
-                    ack,
+                    result: Some(proto::task_operation_receipt::Result::Verdict(
+                        proto::TaskOperationVerdict {
+                            outcome: encode_operation_outcome(outcome),
+                            safe_detail: String::new(),
+                            safe_field_path: None,
+                            ack: ack,
+                        },
+                    )),
                 })
                 .collect::<Vec<_>>();
             if reversed {
@@ -4764,6 +4851,109 @@ mod tests {
             QueryContextConvergenceVersion::FIRST,
             QueryContextConvergenceState::WorkerStoppedAndContextFenced,
         )
+    }
+
+    /// Real covered HTTP/2 observation must survive logical terminal cleanup.
+    /// This scripted peer proves FE ownership/cursor behavior; the Worker Work
+    /// gate and actual exit author are covered by the native system scenario.
+    #[tokio::test]
+    async fn covered_terminal_cleanup_keeps_original_stream_until_actual_context_receipt() {
+        let (mut round, _) = crate::task_execution::tests::manifest_terminal_regression_fixture();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let mut loopback = Loopback::start().await;
+        let frame = |fact| {
+            encode_covered_status_event(&CoveredStatusStreamEvent {
+                fact,
+                source_revision: None,
+            })
+            .unwrap()
+        };
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![frame(
+                CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                    generation: 1,
+                    initial_cut: 0,
+                }),
+            )]));
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+        let wake = Arc::new(CountingWake::default());
+        let intake = Arc::new(ObservationIntake::new(8, 16, 16 * 4096, 4096, wake).unwrap());
+        let role = CoveredRoleFixture::new();
+        let subscriber = Arc::new(
+            CoveredTaskStatusSubscriber::new(
+                &[loopback.descriptor(context.backend_process_id())],
+                Arc::clone(&intake),
+                2,
+                role.runtime.clone(),
+                role.scope(),
+            )
+            .unwrap(),
+        );
+        round.install_covered_observation(Arc::clone(&subscriber), Arc::clone(&intake));
+        round.turn().unwrap();
+        subscribe_requests(&loopback.peer, 1).await;
+        round
+            .execution_mut()
+            .observe_actor_abort_context_closed(context)
+            .unwrap();
+        round.begin_terminal_cleanup();
+        round.turn().unwrap();
+        assert!(
+            subscriber.state(context).is_some(),
+            "closing ACK cannot abort residual observation"
+        );
+        assert!(
+            round
+                .execution()
+                .context_convergence_receipt(context)
+                .is_none()
+        );
+        loopback.peer.close_held_subscriptions();
+        let requests = subscribe_requests(&loopback.peer, 2).await;
+        let request = decode_covered_subscribe_task_status(
+            &requests[1],
+            FieldPath::root("cleanup_reconnect"),
+        )
+        .unwrap();
+        assert_eq!(request.context, context);
+        assert!(
+            request.context_cursor.is_none(),
+            "no unobserved proof is fabricated"
+        );
+        let receipt = convergence_receipt(context);
+        loopback
+            .peer
+            .send_held_event(frame(CoveredStatusStreamFact::ContextConvergence(receipt)))
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                round.turn().unwrap();
+                if round.execution().context_convergence_receipt(context) == Some(receipt) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original cleanup owner applies the late proof");
+        assert_eq!(
+            subscriber.state(context),
+            None,
+            "only the applied proof retires this stream"
+        );
+        let replay = round
+            .execution()
+            .covered_subscription_request(context, NonZeroU64::new(3).unwrap())
+            .unwrap();
+        assert_eq!(
+            replay.context_cursor.unwrap().current_version(),
+            Some(receipt.version())
+        );
+        role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6661,6 +6851,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn constructor_refusals_keep_their_actual_producer_facts() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        use novarocks_query_application::{
+            coordination::{AttemptFailureClass, ReplacementQualificationFailure},
+            execution_error::{ExecutionFailureInput, ExecutionFailureSite},
+        };
+        let fixture = CoveredRoleFixture::new();
+        let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
+        let descriptor = test_descriptor(
+            BackendProcessId::new_v7(),
+            RuntimeEndpoint::new("127.0.0.1", 9000).unwrap(),
+            RuntimeEndpoint::new("control.test.invalid", 19061).unwrap(),
+        );
+        let error = NativeTaskOperationSink::new(
+            &[],
+            TransportBudget::DEFAULT,
+            test_attempt_facts(),
+            acks.handle(),
+            fixture.runtime.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, NativeTaskTransportCreationError::NoBackends);
+        assert_eq!(error.failure_fact().reason().code(), 102);
+        let error = NativeTaskOperationSink::new(
+            &[descriptor.clone(), descriptor.clone()],
+            TransportBudget::DEFAULT,
+            test_attempt_facts(),
+            acks.handle(),
+            fixture.runtime.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            NativeTaskTransportCreationError::DuplicateBackend {
+                process: descriptor.process_id(),
+            }
+        );
+        assert_eq!(error.failure_fact().reason().code(), 103);
+        let other_budget =
+            TransportBudget::new(2, 1024, 512, 4, 4096, 4, 4096, 1, 2, Duration::from_secs(1))
+                .unwrap();
+        let error = NativeTaskOperationSink::new(
+            &[descriptor],
+            other_budget,
+            test_attempt_facts(),
+            acks.handle(),
+            fixture.runtime.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, NativeTaskTransportCreationError::BudgetMismatch);
+        assert_eq!(error.failure_fact().reason().code(), 101);
+        let original = error.failure_fact();
+        let refusal = ReplacementQualificationFailure::DomainRefused(original);
+        let input = ExecutionFailureInput::new(
+            refusal.failure_fact(),
+            refusal.safe_detail(),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(input.fact(), original);
+        assert_eq!(input.fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            input.detail().as_str(),
+            "owning service refused replacement qualification"
+        );
+        assert_eq!(
+            input.attempt_class(),
+            AttemptFailureClass::ContractViolation
+        );
+        // Real original process owners, including both reapers, settle before this test returns.
+        fixture.settle().await;
+    }
+
     #[test]
     fn a_subscription_needs_a_nonzero_error_budget() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -6679,7 +6942,17 @@ mod tests {
             data_runtime,
         )
         .expect_err("a zero budget cannot bound anything");
-        assert!(error.contains("nonzero"));
+        assert_eq!(
+            error,
+            NativeTaskTransportCreationError::ZeroStatusErrorBudget
+        );
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(error.failure_fact().reason().code(), 106);
+        assert_eq!(
+            error.safe_detail().as_str(),
+            "native status subscription error budget must be nonzero"
+        );
     }
 
     #[test]
@@ -6737,13 +7010,8 @@ mod tests {
         );
 
         let ticket = AdmissionTicketId::try_from_bytes([0x57; 16]).expect("the ticket is nonzero");
-        let receipt = proto::TaskOperationReceipt {
-            operation_id: None,
-            outcome: 0,
-            safe_detail: String::new(),
-            safe_field_path: None,
-            ack: Some(
-                proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(
+        let receipt = proto::TaskOperationReceipt{operation_id:None,result:Some(proto::task_operation_receipt::Result::Verdict(proto::TaskOperationVerdict{outcome:0,safe_detail:String::new(),safe_field_path:None,ack:Some(
+                proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(
                     codec::encode_query_context_admission_ticket_ack(
                         novarocks_execution::task_execution::QueryContextAdmissionTicketReceipt::new(
                             ticket,
@@ -6752,8 +7020,7 @@ mod tests {
                         ),
                     ),
                 ),
-            ),
-        };
+            )}))};
         let payload = decode_ack(
             OperationKind::AcquireQueryContextAdmissionTicket,
             AckAddress::Admission(request),
@@ -6771,11 +7038,65 @@ mod tests {
     /// task and observing it. These read the real wire bodies through the real
     /// codec.
     #[test]
+    fn native_domain_failure_reaches_the_original_ack_without_proving_task_acceptance() {
+        use novarocks_execution_contract::failure::*;
+        use novarocks_execution_contract::operation::{
+            DomainFailureOutcome, OperationDomainFailure, OperationResult,
+        };
+        let fact = FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(
+                std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                std::num::NonZeroU16::new(65001).unwrap(),
+            ),
+        )
+        .with_row_position(FailureRowPosition {
+            selected_ordinal: 0,
+            batch_row: 19,
+        });
+        let failure = OperationDomainFailure::new(
+            fact,
+            novarocks_execution_contract::SafeDetail::new("producer representation boundary")
+                .unwrap(),
+        );
+        let operation_id = TaskOperationId::new_v7();
+        let wire = codec::encode_receipt(
+            operation_id,
+            OperationResult::DomainFailure {
+                outcome: DomainFailureOutcome::InvalidStateOrRequest,
+                failure: failure.clone(),
+            },
+        );
+        let header = codec::decode_receipt_header(&wire, FieldPath::root("receipt")).unwrap();
+        let item = SentOperation {
+            operation_id,
+            kind: OperationKind::CreateTask,
+            establish_context: None,
+            lease_renewal: false,
+            address: AckAddress::None,
+        };
+        let ack = acknowledgement(&item, &header, &wire);
+        assert!(!ack.is_applied());
+        assert!(matches!(ack.payload(), AckPayload::None));
+        assert_eq!(
+            ack.worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
+        let OperationResult::DomainFailure {
+            failure: carried, ..
+        } = ack.worker_header().unwrap()
+        else {
+            panic!("domain branch")
+        };
+        assert_eq!(carried, failure);
+    }
+
+    #[test]
     fn an_applied_create_acknowledgement_carries_the_task_status() {
         let backend = BackendProcessId::new_v7();
         let mine = identity(1, backend);
         let status = TaskStatus::created(mine);
-        let ack = proto::task_operation_receipt::Ack::CreateTask(
+        let ack = proto::task_operation_verdict::Ack::CreateTask(
             codec::encode_create_task_ack(&CreateTaskReceipt::new(
                 mine,
                 Vec::new(),
@@ -6785,10 +7106,14 @@ mod tests {
         );
         let receipt = proto::TaskOperationReceipt {
             operation_id: None,
-            outcome: 0,
-            safe_detail: String::new(),
-            safe_field_path: None,
-            ack: Some(ack.clone()),
+            result: Some(proto::task_operation_receipt::Result::Verdict(
+                proto::TaskOperationVerdict {
+                    outcome: 0,
+                    safe_detail: String::new(),
+                    safe_field_path: None,
+                    ack: Some(ack.clone()),
+                },
+            )),
         };
 
         let payload = decode_ack(OperationKind::CreateTask, AckAddress::Task(mine), &receipt)
@@ -6813,9 +7138,14 @@ mod tests {
 
         // An applied create with no body at all is a protocol violation, not
         // a create that installed nothing.
-        let empty = proto::TaskOperationReceipt {
-            ack: None,
-            ..receipt.clone()
+        let empty = {
+            let mut value = receipt.clone();
+            let Some(proto::task_operation_receipt::Result::Verdict(verdict)) = &mut value.result
+            else {
+                panic!("fixture requires a protocol verdict")
+            };
+            verdict.ack = None;
+            value
         };
         assert!(
             decode_ack(OperationKind::CreateTask, AckAddress::Task(mine), &empty).is_err(),
@@ -6844,7 +7174,7 @@ mod tests {
             .peer
             .expect_apply(ApplyAnswer::WithAck(vec![(
                 OperationOutcome::Accepted,
-                Some(proto::task_operation_receipt::Ack::CreateTask(
+                Some(proto::task_operation_verdict::Ack::CreateTask(
                     codec::encode_create_task_ack(&CreateTaskReceipt::new(
                         task,
                         Vec::new(),
@@ -6886,7 +7216,7 @@ mod tests {
                 .peer
                 .expect_apply(ApplyAnswer::WithAck(vec![(
                     outcome,
-                    Some(proto::task_operation_receipt::Ack::QueryContext(
+                    Some(proto::task_operation_verdict::Ack::QueryContext(
                         encode_query_context_ack(
                             &QueryContextReceipt::new(context, state),
                             Some(AbortCause::QueryFailed),
@@ -6946,7 +7276,7 @@ mod tests {
             .peer
             .expect_apply(ApplyAnswer::WithAck(vec![(
                 OperationOutcome::Accepted,
-                Some(proto::task_operation_receipt::Ack::CancelTask(
+                Some(proto::task_operation_verdict::Ack::CancelTask(
                     novarocks_task_codec::status::encode_task_status(&TaskStatus::created(task)),
                 )),
             )]));

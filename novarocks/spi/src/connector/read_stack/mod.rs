@@ -60,12 +60,14 @@ pub use mv_target_selection::{
 };
 pub use page_source::{
     ConnectorDataCacheOptions, ConnectorPageSourceProviderOptions, ConnectorPreparationControl,
-    ConnectorPreparationProgress, ConnectorPreparationStart, ConnectorPreparedPageSource,
-    PageSourceFileMetrics, PageSourceMetrics, SourcePage,
+    ConnectorPreparationExit, ConnectorPreparationProgress, ConnectorPreparationStart,
+    ConnectorPreparedPageSource, PageSourceFileMetrics, PageSourceMetrics, SourcePage,
 };
 pub use page_stream::{
-    BudgetConsume, ConnectorOperationTicket, ConnectorPageStream, ConnectorPollBudget,
-    ConnectorSourceExit, ConnectorSourceOperations, OwnedConnectorPageStream,
+    BudgetConsume, ConnectorOperationExit, ConnectorOperationTicket, ConnectorPageStream,
+    ConnectorPollBudget, ConnectorSourceExit, ConnectorSourceExitProof, ConnectorSourceFailure,
+    ConnectorSourceFailureEvent, ConnectorSourceFailureReceiver, ConnectorSourceOperations,
+    OwnedConnectorPageStream,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,

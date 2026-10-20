@@ -24,13 +24,11 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+use novarocks_failure_contract::FailureProjection;
 use novarocks_functions::{ConstantPool, FunctionValueType};
 use novarocks_type_contract::CompilePhase;
 use novarocks_types::{SlotId, value::hll};
-use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
-};
+use std::sync::Arc;
 fn setup(a: ArrayRef) -> (ExprArena, ExprId, Chunk) {
     let slot = SlotId::new(1);
     let ty = a.data_type().clone();
@@ -46,7 +44,11 @@ fn setup(a: ArrayRef) -> (ExprArena, ExprId, Chunk) {
     let id = arena.push_typed(ExprNode::SlotId(slot), ty);
     (arena, id, chunk)
 }
-fn raw(a: ArrayRef, target: Option<DataType>, tails: usize) -> Result<ArrayRef, String> {
+fn raw(
+    a: ArrayRef,
+    target: Option<DataType>,
+    tails: usize,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, id, chunk) = setup(a);
     let mut args = vec![id];
     args.extend(std::iter::repeat_n(ExprId(usize::MAX), tails));
@@ -251,7 +253,7 @@ fn legacy_hll_hash_original_utf8_binary_and_all_fixed_widths() {
     verify(Arc::new(hidden), vec![vec![0], encoded(&[0])]);
 }
 #[test]
-fn legacy_hll_hash_original_unsupported_carrier_full_error_precedes_empty_null() {
+fn legacy_hll_hash_unsupported_carrier_bounded_error_precedes_empty_null() {
     let nested = DataType::Struct(
         (0..80)
             .map(|i| Field::new(format!("original_long_field_{i}"), DataType::Utf8, true))
@@ -266,7 +268,23 @@ fn legacy_hll_hash_original_unsupported_carrier_full_error_precedes_empty_null()
     ] {
         let expected = format!("hll_hash expects scalar input, got {ty:?}");
         for n in [0, 1, 3] {
-            assert_eq!(raw(new_null_array(&ty, n), None, 0).unwrap_err(), expected);
+            let failure = raw(new_null_array(&ty, n), None, 0).unwrap_err();
+            assert_eq!(
+                failure.failure_fact().class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            assert_eq!(
+                failure.failure_fact().reason(),
+                novarocks_failure_contract::FailureReason::new(
+                    novarocks_failure_contract::domain::KERNEL,
+                    std::num::NonZeroU16::new(390).unwrap()
+                )
+            );
+            assert!(failure.detail().len() <= 512);
+            assert!(expected.starts_with(failure.detail()));
+            if expected.len() <= 512 {
+                assert_eq!(failure.detail(), expected);
+            }
         }
         if matches!(ty, DataType::Struct(_)) {
             assert!(expected.len() > 512);
@@ -312,13 +330,13 @@ fn legacy_hll_hash_original_constant_broadcast_nonzero_pool_and_ignored_target()
         Some(DataType::Null),
     ] {
         assert_eq!(
-            payloads(raw(Arc::new(Int32Array::from(vec![1])), target, 4).unwrap()),
+            payloads(raw(Arc::new(Int32Array::from(vec![1])), target, 0).unwrap()),
             vec![encoded(&1i32.to_le_bytes())]
         );
     }
 }
 #[test]
-fn legacy_hll_hash_original_raw_first_only_and_native_arity_are_distinct() {
+fn legacy_hll_hash_raw_and_native_arity_refuse_before_child_work() {
     let (mut arena, id, chunk) = setup(Arc::new(Int32Array::from(vec![1])));
     let call = arena.push_typed(
         ExprNode::FunctionCall {
@@ -328,28 +346,42 @@ fn legacy_hll_hash_original_raw_first_only_and_native_arity_are_distinct() {
         DataType::Binary,
     );
     assert_eq!(
-        arena.eval(call, &chunk).unwrap_err(),
+        (arena.eval(call, &chunk).unwrap_err()).to_string(),
         "hll_hash expects 1 to 1 arguments, got 2"
     );
     assert_eq!(
-        eval_object_function(
+        (eval_object_function(
             "hll_hash",
             &arena,
             ExprId(usize::MAX),
             &[ExprId(usize::MAX), id],
             &chunk
         )
-        .unwrap_err(),
-        "invalid ExprId"
+        .unwrap_err())
+        .to_string(),
+        "hll_hash requires exactly one argument"
     );
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| eval_object_function(
-            "hll_hash",
-            &arena,
-            ExprId(usize::MAX),
-            &[],
-            &chunk
-        )))
-        .is_err()
+    let failure =
+        eval_object_function("hll_hash", &arena, ExprId(usize::MAX), &[], &chunk).unwrap_err();
+    assert_eq!(
+        failure.failure_fact().class(),
+        novarocks_failure_contract::FailureClass::Invariant
     );
+    assert_eq!(
+        failure.failure_fact().reason(),
+        novarocks_failure_contract::FailureReason::new(
+            novarocks_failure_contract::domain::EXECUTION,
+            std::num::NonZeroU16::new(430).unwrap()
+        )
+    );
+    assert_eq!(failure.detail(), "hll_hash requires exactly one argument");
+    let failure = eval_object_function(
+        "hll_hash",
+        &arena,
+        ExprId(usize::MAX),
+        &[ExprId(usize::MAX)],
+        &chunk,
+    )
+    .unwrap_err();
+    assert_eq!(failure.detail(), "invalid ExprId");
 }

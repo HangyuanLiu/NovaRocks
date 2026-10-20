@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use novarocks_execution::task_execution::{
     DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
-    OperationOutcome, RequestError, TaskOperationId, TaskState,
+    OperationOutcome, QueryContextRef, RequestError, TaskOperationId, TaskState,
 };
 use novarocks_query_application::coordination::{
     DispatchLane, FinalInfoDisagreement, OperationDispatchResult, ResultPacketVerdict,
@@ -56,6 +56,13 @@ impl ParticipantObservationFailure {
 /// Why the frontend task-protocol owners refuse to continue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskExecutionError {
+    /// A local owner has already projected its own fact and safe detail.
+    Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
+    /// The original logical owner refused this operation; preserve its reason
+    /// and normal stop observation instead of reconstructing it from text.
+    Actor(novarocks_query_application::coordination::LogicalExecutionActorError),
+    NativeTransport(crate::native::task_transport::NativeTaskTransportCreationError),
+    Establish(novarocks_query_application::coordination::EstablishIssueError),
     /// The static schedule cannot be turned into a legal task graph.
     Schedule(String),
     /// A descriptor built from the static schedule is not a legal value.
@@ -63,10 +70,15 @@ pub enum TaskExecutionError {
     /// A request built from the static schedule is not a legal value.
     Request(RequestError),
     /// A frozen backend process identity is missing for a scheduled backend.
-    UnknownBackend { backend_idx: usize },
+    UnknownBackend {
+        backend_idx: usize,
+    },
     /// Two tasks of one query execution derive the same kernel key, so a
     /// destination address would be ambiguous.
-    KernelKeyCollision { first: TaskId, second: TaskId },
+    KernelKeyCollision {
+        first: TaskId,
+        second: TaskId,
+    },
     /// A capacity bound of the operation transport was reached.
     Capacity(CapacityBound),
     /// A locally queued operation reached its residence deadline before any
@@ -81,14 +93,18 @@ pub enum TaskExecutionError {
     /// replay authorization while every Worker outcome remained unknown. The
     /// whole-attempt recovery owner must observe whether this exact process
     /// was replaced before deciding a successor schedule.
-    PreReadyEstablishTransportUnknown { backend: BackendProcessId },
+    PreReadyEstablishTransportUnknown {
+        backend: BackendProcessId,
+    },
     /// The Worker definitively rejected the initial Establish. The immutable
     /// attempt is unusable, but only the whole-attempt recovery owner may
     /// decide whether independently observed process replacement permits a
     /// successor schedule.
     PreReadyEstablishRejected {
-        backend: BackendProcessId,
-        outcome: OperationOutcome,
+        context: QueryContextRef,
+        operation_id: TaskOperationId,
+        rejection:
+            novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>,
     },
     /// An acknowledgement named an operation this owner never sent, or named
     /// one that is already settled.
@@ -119,17 +135,17 @@ pub enum TaskExecutionError {
     Observation(StatusObservation),
     /// A task reached a state the protocol does not allow from its current
     /// one.
-    IllegalTaskTransition { from: TaskState, to: TaskState },
+    IllegalTaskTransition {
+        from: TaskState,
+        to: TaskState,
+    },
     /// A backend answered an operation with an outcome that fails the attempt.
     OperationFailed {
+        context: QueryContextRef,
+        operation_id: TaskOperationId,
         kind: OperationKind,
-        outcome: OperationOutcome,
-        /// What the backend said, when it said anything.
-        ///
-        /// Without it a refusal reaches the client as an outcome name and the
-        /// engine's own message -- a CAST field-count mismatch, a bitmap
-        /// aggregate's argument rule -- is lost on the way out.
-        detail: Option<String>,
+        rejection:
+            novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>,
     },
     /// A settled local or native-ingress failure has no Worker receipt.
     DispatchRejected {
@@ -200,6 +216,105 @@ impl CapacityBound {
     }
 }
 
+/// Facts belong to the exact FE bound that refused this request. A numeric
+/// limit alone does not reveal the request size or the aggregate live usage.
+impl novarocks_execution_contract::failure::FailureProjection for CapacityBound {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, ResourceDimension as D, ResourceFacts,
+            ResourceScope as S, domain,
+        };
+        let (code, request_scope, constraint_scope, dimension, requested, limit) = match *self {
+            Self::QueryBackendOperations { limit } => (
+                40,
+                Some(S::Request),
+                Some(S::Query),
+                D::Items,
+                None,
+                u64::try_from(limit).ok(),
+            ),
+            Self::QueryBackendBytes { limit } => (
+                41,
+                Some(S::Request),
+                Some(S::Query),
+                D::Bytes,
+                None,
+                u64::try_from(limit).ok(),
+            ),
+            Self::BackendOperations { limit } => (
+                42,
+                Some(S::Request),
+                Some(S::Query),
+                D::Items,
+                None,
+                u64::try_from(limit).ok(),
+            ),
+            Self::BackendBytes { limit } => (
+                43,
+                Some(S::Request),
+                Some(S::Query),
+                D::Bytes,
+                None,
+                u64::try_from(limit).ok(),
+            ),
+            // Context and query-on-one-backend cardinalities have no exact
+            // ResourceScope word. They are not a Task or Process measurement.
+            Self::TasksPerContext { limit } => {
+                (44, None, None, D::Items, None, u64::try_from(limit).ok())
+            }
+            Self::ActiveTasksPerBackend { limit, .. } => {
+                (45, None, None, D::Items, None, u64::try_from(limit).ok())
+            }
+            Self::DescriptorBytes { limit, actual } => (
+                46,
+                Some(S::Request),
+                Some(S::Request),
+                D::Bytes,
+                u64::try_from(actual).ok(),
+                u64::try_from(limit).ok(),
+            ),
+            Self::OperationBytes { limit, actual } => (
+                47,
+                Some(S::Request),
+                Some(S::Request),
+                D::Bytes,
+                u64::try_from(actual).ok(),
+                u64::try_from(limit).ok(),
+            ),
+            Self::ProcessTransportQueue { bytes, .. } => (
+                48,
+                Some(S::Request),
+                Some(S::Process),
+                D::Bytes,
+                u64::try_from(bytes).ok(),
+                None,
+            ),
+            Self::EdgeOpenVersions { limit } => (
+                49,
+                Some(S::Task),
+                Some(S::Task),
+                D::Items,
+                None,
+                Some(u64::from(limit)),
+            ),
+        };
+        FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
+        )
+        .with_resource(ResourceFacts {
+            request_scope,
+            constraint_scope,
+            dimension,
+            requested,
+            limit,
+            required_growth: None,
+            live: None,
+            committed: None,
+        })
+    }
+}
+
 impl fmt::Display for CapacityBound {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -244,6 +359,19 @@ impl fmt::Display for CapacityBound {
 impl fmt::Display for TaskExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Execution(input) => formatter.write_str(input.detail().as_str()),
+            Self::NativeTransport(error) => write!(
+                formatter,
+                "native Task transport construction failed: {error}"
+            ),
+            Self::Actor(error) => write!(
+                formatter,
+                "logical execution actor refused Task protocol work: {error}"
+            ),
+            Self::Establish(error) => write!(
+                formatter,
+                "logical execution actor Establish gate failed: {error}"
+            ),
             Self::Schedule(detail) => write!(
                 formatter,
                 "static schedule is not schedulable as a task graph: {detail}"
@@ -276,9 +404,14 @@ impl fmt::Display for TaskExecutionError {
                 formatter,
                 "EstablishQueryContext for backend {backend} exhausted its exact replay budget with unknown Worker outcomes"
             ),
-            Self::PreReadyEstablishRejected { backend, outcome } => write!(
+            Self::PreReadyEstablishRejected {
+                context,
+                operation_id,
+                rejection,
+            } => write!(
                 formatter,
-                "EstablishQueryContext for backend {backend} was rejected before ControlReady with {outcome:?}"
+                "EstablishQueryContext {operation_id} for context {context:?} was rejected before ControlReady with {:?}",
+                rejection.outcome()
             ),
             Self::UnknownOperation => {
                 formatter.write_str("acknowledgement names an operation this owner did not send")
@@ -313,12 +446,14 @@ impl fmt::Display for TaskExecutionError {
                 write!(formatter, "task state {from} may not become {to}")
             }
             Self::OperationFailed {
-                kind,
-                outcome,
-                detail,
-            } => match detail {
+                kind, rejection, ..
+            } => match rejection.detail() {
                 Some(detail) => write!(formatter, "{kind} failed closed: {detail}"),
-                None => write!(formatter, "{kind} failed closed with {outcome:?}"),
+                None => write!(
+                    formatter,
+                    "{kind} failed closed with {:?}",
+                    rejection.outcome()
+                ),
             },
             Self::DispatchRejected { kind, result } => {
                 write!(
@@ -339,7 +474,16 @@ impl fmt::Display for TaskExecutionError {
     }
 }
 
-impl std::error::Error for TaskExecutionError {}
+impl std::error::Error for TaskExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NativeTransport(error) => Some(error),
+            Self::Actor(error) => Some(error),
+            Self::Establish(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<DescriptorError> for TaskExecutionError {
     fn from(error: DescriptorError) -> Self {
@@ -374,4 +518,534 @@ pub(crate) fn schedule_error(
         "fragment {} instance {}: {detail}",
         placement.fragment_id, placement.instance_index
     ))
+}
+
+/// FE-authored facts for ordinary Worker protocol verdicts. An originating
+/// DomainFailure bypasses this projection and keeps its exact producer fact.
+/// QUERY reasons 1..=13 and 27 belong to QueryFailureReason. This closed FE
+/// protocol projection owns 14..=26; 28..=32 remain unassigned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskProtocolFailureReason {
+    OperationTimedOut,
+    IdentityMismatch,
+    CompatibilityMismatch,
+    ContextNotEstablished,
+    ContextConflict,
+    DomainConflict,
+    LeaseExpired,
+    ContextTerminalReceipt,
+    InvalidStateOrRequest,
+    TerminalRejected,
+    Gone,
+    ResourceExhausted,
+    NonterminalVerdictAtFailure,
+}
+impl TaskProtocolFailureReason {
+    fn terminal_verdict(outcome: OperationOutcome) -> Self {
+        match outcome {
+            OperationOutcome::OperationTimedOut => Self::OperationTimedOut,
+            OperationOutcome::IdentityMismatch => Self::IdentityMismatch,
+            OperationOutcome::CompatibilityMismatch => Self::CompatibilityMismatch,
+            OperationOutcome::ContextNotEstablished => Self::ContextNotEstablished,
+            OperationOutcome::ContextConflict => Self::ContextConflict,
+            OperationOutcome::DomainConflict => Self::DomainConflict,
+            OperationOutcome::LeaseExpired => Self::LeaseExpired,
+            OperationOutcome::ContextTerminalReceipt => Self::ContextTerminalReceipt,
+            OperationOutcome::InvalidStateOrRequest => Self::InvalidStateOrRequest,
+            OperationOutcome::TerminalRejected => Self::TerminalRejected,
+            OperationOutcome::Gone => Self::Gone,
+            OperationOutcome::ResourceExhausted => Self::ResourceExhausted,
+            // These are success/wait facts, not failure authors. Reaching a
+            // terminal-only error branch is a local protocol invariant;
+            // it cannot manufacture Resource, Task acceptance or BackendLost.
+            OperationOutcome::Accepted
+            | OperationOutcome::Idempotent
+            | OperationOutcome::ReleaseNotReady
+            | OperationOutcome::NotReady
+            | OperationOutcome::PreparationBusy
+            | OperationOutcome::AdmissionTicketStillActive => Self::NonterminalVerdictAtFailure,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFailureReason {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let (class, code) = match self {
+            Self::OperationTimedOut => (FailureClass::Dependency, 14),
+            Self::IdentityMismatch => (FailureClass::Invariant, 15),
+            Self::CompatibilityMismatch => (FailureClass::Invariant, 16),
+            Self::ContextNotEstablished => (FailureClass::Invariant, 17),
+            Self::ContextConflict => (FailureClass::Invariant, 18),
+            Self::DomainConflict => (FailureClass::Invariant, 19),
+            Self::LeaseExpired => (FailureClass::Control, 20),
+            Self::ContextTerminalReceipt => (FailureClass::Control, 21),
+            Self::InvalidStateOrRequest => (FailureClass::Invariant, 22),
+            Self::TerminalRejected => (FailureClass::Control, 23),
+            Self::Gone => (FailureClass::Control, 24),
+            Self::ResourceExhausted => (FailureClass::Resource, 25),
+            Self::NonterminalVerdictAtFailure => (FailureClass::Invariant, 26),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
+impl TaskExecutionError {
+    /// Boundary projection, not a second Task conclusion or a recovery gate.
+    pub(crate) fn preparation_input(
+        &self,
+    ) -> novarocks_query_application::execution_error::ExecutionFailureInput {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_execution_contract::{SafeDetail, operation::OperationResult};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        match self {
+            Self::Execution(input) => return input.clone(),
+            Self::NativeTransport(error) => {
+                return ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    error.safe_detail(),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            Self::Actor(error) => {
+                return ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    error.safe_detail(),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            Self::Establish(error) => {
+                return ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    error.safe_detail(),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            _ => {}
+        }
+        let operation = match self {
+            Self::OperationFailed {
+                context,
+                operation_id,
+                kind,
+                rejection,
+            } => Some((*context, *operation_id, *kind, rejection)),
+            Self::PreReadyEstablishRejected {
+                context,
+                operation_id,
+                rejection,
+            } => Some((
+                *context,
+                *operation_id,
+                OperationKind::UpdateQueryContext,
+                rejection,
+            )),
+            _ => None,
+        };
+        if let Some((context, operation_id, kind, rejection)) = operation {
+            let site = ExecutionFailureSite::Operation {
+                context,
+                operation_id,
+                kind,
+            };
+            return match rejection {
+                OperationResult::DomainFailure { failure, .. } => {
+                    ExecutionFailureInput::new(failure.fact(), failure.detail().clone(), site)
+                }
+                OperationResult::Verdict {
+                    outcome, detail, ..
+                } => ExecutionFailureInput::new(
+                    TaskProtocolFailureReason::terminal_verdict(*outcome).failure_fact(),
+                    detail.clone().unwrap_or_else(|| {
+                        SafeDetail::truncating(&format!("{kind} returned {outcome:?}"))
+                    }),
+                    site,
+                ),
+            };
+        }
+        let (reason, site) = match self {
+            Self::Capacity(bound) => {
+                return ExecutionFailureInput::new(
+                    bound.failure_fact(),
+                    SafeDetail::truncating("frontend task protocol capacity bound was exceeded"),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            Self::Descriptor(error) => {
+                return ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    SafeDetail::truncating("task descriptor violates its frozen contract"),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            Self::Request(error) => {
+                return ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    SafeDetail::truncating("task operation request violates its frozen contract"),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            Self::DispatchRejected {
+                result: OperationDispatchResult::IngressRejected(_),
+                ..
+            } => (
+                QueryFailureReason::TransportCapacity,
+                ExecutionFailureSite::Coordinator,
+            ),
+            Self::QueueResidenceExpired { .. } => (
+                QueryFailureReason::TransportDeadline,
+                ExecutionFailureSite::Coordinator,
+            ),
+            Self::PreReadyEstablishTransportUnknown { backend }
+            | Self::ParticipantUnobservable {
+                backend,
+                state: ParticipantObservationFailure::Transport(_),
+            } => (
+                QueryFailureReason::ObservationLost,
+                ExecutionFailureSite::Backend { process: *backend },
+            ),
+            Self::DispatchRejected {
+                result: OperationDispatchResult::TransportUnknown,
+                ..
+            } => (
+                QueryFailureReason::ObservationLost,
+                ExecutionFailureSite::Coordinator,
+            ),
+            Self::DispatchRejected {
+                result: OperationDispatchResult::WorkerReceipt(receipt),
+                ..
+            } => {
+                return ExecutionFailureInput::new(
+                    TaskProtocolFailureReason::terminal_verdict(receipt.outcome()).failure_fact(),
+                    SafeDetail::truncating("frontend task protocol could not continue"),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            Self::DomainRegression { conflict, .. } => {
+                return ExecutionFailureInput::new(
+                    conflict.failure_fact(),
+                    SafeDetail::truncating("frontend task protocol could not continue"),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
+            Self::ResultStream(_) => (
+                QueryFailureReason::ResultProtocol,
+                ExecutionFailureSite::Coordinator,
+            ),
+            _ => (
+                QueryFailureReason::PreparationProtocol,
+                ExecutionFailureSite::Coordinator,
+            ),
+        };
+        ExecutionFailureInput::new(
+            reason.failure_fact(),
+            SafeDetail::truncating("frontend task protocol could not continue"),
+            site,
+        )
+    }
+}
+
+#[cfg(test)]
+mod canonical_input_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::FailureProjection;
+    use novarocks_execution_contract::{
+        SafeDetail,
+        failure::{
+            FailureClass, FailureFact, FailureReason, ResourceDimension, ResourceFacts,
+            ResourceScope, domain,
+        },
+        operation::{DomainFailureOutcome, OperationDomainFailure, OperationResult},
+    };
+    use novarocks_query_application::execution_error::{ExecutionFailureSite, QueryFailureReason};
+    fn context() -> QueryContextRef {
+        use novarocks_types::{AttemptId, FrontendProcessId, QueryExecutionId, QueryId};
+        QueryContextRef::new(
+            QueryExecutionId::new(QueryId::new(51, 52), AttemptId::new(1).unwrap()).unwrap(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        )
+    }
+    #[test]
+    fn domain_operation_keeps_original_fact_detail_and_exact_operation_identity() {
+        let context = context();
+        let operation_id = TaskOperationId::new_v7();
+        let fact = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(30).unwrap()),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Task),
+            constraint_scope: Some(ResourceScope::Process),
+            dimension: ResourceDimension::Positions,
+            requested: Some(4),
+            required_growth: None,
+            limit: Some(3),
+            live: Some(3),
+            committed: None,
+        });
+        let detail = SafeDetail::truncating("original Worker failure 申请位置");
+        let input = TaskExecutionError::OperationFailed {
+            context,
+            operation_id,
+            kind: OperationKind::CreateTask,
+            rejection: OperationResult::DomainFailure {
+                outcome: DomainFailureOutcome::InvalidStateOrRequest,
+                failure: OperationDomainFailure::new(fact, detail.clone()),
+            },
+        }
+        .preparation_input();
+        assert_eq!(input.fact(), fact);
+        assert_eq!(input.detail(), &detail);
+        assert_eq!(
+            input.site(),
+            ExecutionFailureSite::Operation {
+                context,
+                operation_id,
+                kind: OperationKind::CreateTask
+            }
+        );
+    }
+    #[test]
+    fn establish_rejection_keeps_request_context_and_operation_without_fake_task_phase() {
+        let context = context();
+        let operation_id = TaskOperationId::new_v7();
+        let input = TaskExecutionError::PreReadyEstablishRejected {
+            context,
+            operation_id,
+            rejection: OperationResult::Verdict {
+                outcome: OperationOutcome::IdentityMismatch,
+                detail: None,
+                acknowledgement: None,
+            },
+        }
+        .preparation_input();
+        assert_eq!(
+            input.site(),
+            ExecutionFailureSite::Operation {
+                context,
+                operation_id,
+                kind: OperationKind::UpdateQueryContext
+            }
+        );
+        assert_eq!(input.fact().reason().code(), 15);
+        assert_eq!(
+            input.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+    }
+    #[test]
+    fn ordinary_resource_verdict_is_a_protocol_fact_without_fabricated_resource_measurements() {
+        let input = TaskExecutionError::OperationFailed {
+            context: context(),
+            operation_id: TaskOperationId::new_v7(),
+            kind: OperationKind::CreateTask,
+            rejection: OperationResult::Verdict {
+                outcome: OperationOutcome::ResourceExhausted,
+                detail: Some(SafeDetail::truncating("capacity")),
+                acknowledgement: None,
+            },
+        }
+        .preparation_input();
+        assert_eq!(input.fact().class(), FailureClass::Resource);
+        assert_eq!(input.fact().reason().code(), 25);
+        assert!(input.fact().resource().is_none());
+    }
+    #[test]
+    fn wait_verdict_in_a_terminal_error_branch_is_an_invariant_not_a_resource_failure() {
+        for outcome in [
+            OperationOutcome::NotReady,
+            OperationOutcome::PreparationBusy,
+            OperationOutcome::ReleaseNotReady,
+            OperationOutcome::AdmissionTicketStillActive,
+        ] {
+            let input = TaskExecutionError::OperationFailed {
+                context: context(),
+                operation_id: TaskOperationId::new_v7(),
+                kind: OperationKind::CreateTask,
+                rejection: OperationResult::Verdict {
+                    outcome,
+                    detail: None,
+                    acknowledgement: None,
+                },
+            }
+            .preparation_input();
+            assert_eq!(input.fact().class(), FailureClass::Invariant);
+            assert_eq!(input.fact().reason().code(), 26);
+            assert!(input.fact().resource().is_none());
+        }
+    }
+    #[test]
+    fn unknown_establish_and_expired_local_queue_do_not_invent_backend_loss() {
+        let backend = BackendProcessId::new_v7();
+        let unknown =
+            TaskExecutionError::PreReadyEstablishTransportUnknown { backend }.preparation_input();
+        assert_eq!(
+            unknown.fact(),
+            QueryFailureReason::ObservationLost.failure_fact()
+        );
+        assert_eq!(
+            unknown.site(),
+            ExecutionFailureSite::Backend { process: backend }
+        );
+        let expired = TaskExecutionError::QueueResidenceExpired {
+            operation_id: TaskOperationId::new_v7(),
+            kind: OperationKind::CreateTask,
+            waited: Duration::from_millis(5),
+        }
+        .preparation_input();
+        assert_eq!(
+            expired.fact(),
+            QueryFailureReason::TransportDeadline.failure_fact()
+        );
+        assert_ne!(
+            unknown.fact().reason(),
+            QueryFailureReason::BackendLost.failure_fact().reason()
+        );
+        assert_ne!(
+            expired.fact().reason(),
+            QueryFailureReason::BackendLost.failure_fact().reason()
+        );
+    }
+    #[test]
+    fn existing_typed_domain_conflict_keeps_its_own_projection() {
+        let conflict = DomainConflict::AfterSeal;
+        let input = TaskExecutionError::DomainRegression {
+            domain: "splits",
+            token: "7".to_owned(),
+            conflict,
+        }
+        .preparation_input();
+        assert_eq!(input.fact(), conflict.failure_fact());
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+    }
+}
+
+#[cfg(test)]
+mod capacity_projection_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{
+        FailureClass, FailureProjection, ResourceDimension, ResourceScope,
+    };
+    #[test]
+    fn measured_request_bytes_and_known_zero_survive_the_canonical_boundary() {
+        for bound in [
+            CapacityBound::DescriptorBytes {
+                limit: 0,
+                actual: 0,
+            },
+            CapacityBound::OperationBytes {
+                limit: 7,
+                actual: 11,
+            },
+        ] {
+            let original = bound.failure_fact();
+            let input = TaskExecutionError::Capacity(bound).preparation_input();
+            assert_eq!(input.fact(), original);
+            let facts = input.fact().resource().unwrap();
+            assert_eq!(facts.dimension, ResourceDimension::Bytes);
+            let (limit, actual) = match bound {
+                CapacityBound::DescriptorBytes { limit, actual }
+                | CapacityBound::OperationBytes { limit, actual } => (limit, actual),
+                _ => unreachable!(),
+            };
+            assert_eq!(facts.limit, Some(limit as u64));
+            assert_eq!(facts.requested, Some(actual as u64));
+            assert_eq!(facts.required_growth, None);
+            assert_eq!(facts.live, None);
+            assert_eq!(facts.committed, None);
+            assert_eq!(input.fact().class(), FailureClass::Resource);
+        }
+    }
+    #[test]
+    fn cardinality_bounds_do_not_invent_context_task_scope_or_request_usage() {
+        for bound in [
+            CapacityBound::TasksPerContext { limit: 0 },
+            CapacityBound::ActiveTasksPerBackend {
+                backend: BackendProcessId::new_v7(),
+                limit: usize::MAX,
+            },
+        ] {
+            let facts = bound.failure_fact().resource().unwrap();
+            assert_eq!(facts.dimension, ResourceDimension::Items);
+            assert_eq!(facts.request_scope, None);
+            assert_eq!(facts.constraint_scope, None);
+            assert_eq!(facts.requested, None);
+            assert_eq!(facts.live, None);
+            assert_eq!(facts.required_growth, None);
+            assert_eq!(facts.committed, None);
+            assert!(facts.limit.is_some());
+        }
+        let queue = CapacityBound::QueryBackendOperations { limit: 7 }
+            .failure_fact()
+            .resource()
+            .unwrap();
+        assert_eq!(queue.constraint_scope, Some(ResourceScope::Query));
+        assert_eq!(queue.request_scope, Some(ResourceScope::Request));
+        assert_eq!(queue.requested, None);
+        assert_eq!(queue.limit, Some(7));
+    }
+    #[test]
+    fn process_queue_preserves_carrier_bytes_without_fabricating_a_limit() {
+        let input = TaskExecutionError::Capacity(CapacityBound::ProcessTransportQueue {
+            lane: DispatchLane::Create,
+            bytes: 19,
+        })
+        .preparation_input();
+        let facts = input.fact().resource().unwrap();
+        assert_eq!(input.fact().reason().code(), 48);
+        assert_eq!(facts.requested, Some(19));
+        assert_eq!(facts.limit, None);
+        assert_eq!(facts.constraint_scope, Some(ResourceScope::Process));
+        assert_eq!(facts.required_growth, None);
+        assert_eq!(facts.live, None);
+        assert_eq!(facts.committed, None);
+    }
+    #[test]
+    fn descriptor_and_request_boundaries_delegate_the_original_owner_fact() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        let descriptor = DescriptorError::SenderOrdinalOutOfRange {
+            ordinal: 1,
+            count: 1,
+        };
+        assert_eq!(
+            TaskExecutionError::Descriptor(descriptor.clone())
+                .preparation_input()
+                .fact(),
+            descriptor.failure_fact()
+        );
+        let request = RequestError::EmptyEdgeSet;
+        assert_eq!(
+            TaskExecutionError::Request(request.clone())
+                .preparation_input()
+                .fact(),
+            request.failure_fact()
+        );
+    }
+}
+
+#[cfg(test)]
+mod actor_gate_failure_carry_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+    #[test]
+    fn an_expired_actor_activation_keeps_its_original_stop_fact() {
+        let original =
+            novarocks_query_application::coordination::LogicalExecutionActorError::WrongPhase;
+        let error = TaskExecutionError::Actor(original);
+        let input = error.preparation_input();
+        assert_eq!(input.fact(), original.failure_fact());
+        assert_eq!(input.detail(), &original.safe_detail());
+        assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
+        assert_eq!(
+            input.attempt_class(),
+            novarocks_query_application::coordination::AttemptFailureClass::ExecutionFailure
+        );
+    }
 }

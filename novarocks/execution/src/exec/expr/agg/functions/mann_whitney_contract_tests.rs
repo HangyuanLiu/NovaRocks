@@ -89,7 +89,7 @@ fn evaluate(columns: Vec<ArrayRef>, groups: &[usize], count: usize, partitions: 
     let input = input(columns);
     let spec = spec(&input);
     let tracker = MemTracker::new_root("mann-whitney-contract");
-    let result = (|| -> Result<Value, String> {
+    let result = (|| -> crate::runtime::fragment::ExecutionResult<Value> {
         let mut final_states = States::new(&spec, count, &tracker);
         let final_ptrs = final_states.pointers();
         if partitions == 1 {
@@ -149,7 +149,7 @@ fn evaluate(columns: Vec<ArrayRef>, groups: &[usize], count: usize, partitions: 
     );
     match result {
         Ok(value) => json!({"ok":value,"after_drop":tracker.current()}),
-        Err(message) => json!({"error":message,"after_drop":tracker.current()}),
+        Err(cause) => json!({"error":cause.to_string(),"after_drop":tracker.current()}),
     }
 }
 fn record(
@@ -455,7 +455,7 @@ fn transcript() -> Value {
             MannWhitneyState::deserialize_in(&bytes, AggregateAllocator::new(tracker.clone()));
         let observed = match result {
             Ok(mut state) => {
-                json!({"uninitialized":state.is_uninitialized(),"text":state.build_result(),"serialized":hex::encode(state.serialize())})
+                json!({"uninitialized":state.is_uninitialized(),"text":state.build_result().unwrap(),"serialized":hex::encode(state.serialize().unwrap())})
             }
             Err(error) => json!({"error":error.to_string()}),
         };

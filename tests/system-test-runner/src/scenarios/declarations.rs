@@ -123,6 +123,32 @@ pub(super) fn for_module(
         "tests/system-test-runner/src/scenarios/declarations.rs".into(),
         "novarocks/types/**".into(),
     ]);
+    if matches!(
+        module,
+        "execution_failure"
+            | "execution_failure_prepared"
+            | "execution_failure_representation"
+            | "execution_failure_streaming"
+    ) {
+        paths.extend(
+            [
+                "novarocks/failure-contract/**",
+                "novarocks/user-error/**",
+                "novarocks/memory-failure/**",
+                "novarocks/memory/**",
+                "novarocks/function-contract/**",
+                "novarocks/functions/**",
+                "novarocks/type-contract/**",
+                "novarocks/connector-contract/**",
+                "novarocks/proto-codec/**",
+                "novarocks/task-codec/**",
+                "novarocks/local-compiler/**",
+                "novarocks/result-render/**",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
     if module == "query_lifecycle" {
         paths.push("tests/system-test-runner/src/scenarios/query_lifecycle/**".into());
     }

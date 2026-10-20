@@ -1348,7 +1348,7 @@ fn binding_type_gate_observes_original_control_before_resolver() {
             assert_eq!(phase, CompilePhase::FunctionSpecialization);
             self.observations.lock().unwrap().push(units);
             if units == 256 {
-                Err(self.error)
+                Err(self.error.clone())
             } else {
                 Ok(())
             }
@@ -1371,7 +1371,7 @@ fn binding_type_gate_observes_original_control_before_resolver() {
             declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
         );
         let control = StopAtBatch {
-            error,
+            error: error.clone(),
             observations: Default::default(),
         };
         assert_eq!(
@@ -1399,7 +1399,7 @@ fn resolver_control_failure_survives_later_wrapper_observation() {
         ) -> Result<FunctionBindingSelection, FunctionBindingError> {
             // This is the callee's first failure, after the engine flushed its tail.
             control.checkpoint(CompilePhase::FunctionSpecialization, 7)?;
-            Err(self.0.into())
+            Err(self.0.clone().into())
         }
         fn validate_selected(
             &self,
@@ -1428,7 +1428,7 @@ fn resolver_control_failure_survives_later_wrapper_observation() {
         CompileControlError::ResourceExhausted,
     ] {
         let catalog = catalog(
-            Arc::new(Owner(error)),
+            Arc::new(Owner(error.clone())),
             declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
         );
         let control = Observe(Default::default());
@@ -1464,7 +1464,7 @@ impl PureCompileControl for ConstantTraceControl {
             assert!(trace.len() < at, "no callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((at, error)) if trace.len() == at => Err(error),
             _ => Ok(()),
         }
@@ -1484,8 +1484,11 @@ fn check_constant_prefixes(
         CompileControlError::ResourceExhausted,
     ] {
         for at in 1..=trace.len() {
-            let control = ConstantTraceControl::new(Some((at, error)));
-            assert_eq!(call(&control), Err(FunctionBindingError::Control(error)));
+            let control = ConstantTraceControl::new(Some((at, error.clone())));
+            assert_eq!(
+                call(&control),
+                Err(FunctionBindingError::Control(error.clone()))
+            );
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
         }
     }
@@ -1536,7 +1539,7 @@ fn constant_arguments_compare_selected_values_without_pool_or_ordinal_identity()
     );
 }
 #[test]
-fn constant_argument_request_type_mismatch_refuses_before_resolver_and_observes_tail() {
+fn constant_argument_request_type_mismatch_refuses_before_resolver_without_a_new_tail() {
     let constant = match pooled_integer(vec![Some(42)], 0) {
         FunctionArgument::Value {
             constant: Some(value),
@@ -1567,18 +1570,28 @@ fn constant_argument_request_type_mismatch_refuses_before_resolver_and_observes_
         ));
         assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
         let trace = baseline.trace.into_inner().unwrap();
-        assert!(trace.len() >= 2, "ordinary refusal must observe completion");
+        assert_eq!(trace, [(CompilePhase::FunctionSpecialization, 0)]);
         for error in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
             for at in 1..=trace.len() {
-                let control = ConstantTraceControl::new(Some((at, error)));
-                assert_eq!(call(&control), Err(FunctionBindingError::Control(error)));
+                let control = ConstantTraceControl::new(Some((at, error.clone())));
+                assert_eq!(
+                    call(&control),
+                    Err(FunctionBindingError::Control(error.clone()))
+                );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
                 assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
             }
+            let control = ConstantTraceControl::new(Some((trace.len() + 1, error)));
+            assert!(matches!(
+                call(&control),
+                Err(FunctionBindingError::InvalidBinding(_))
+            ));
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+            assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
         }
     }
 }

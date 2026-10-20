@@ -174,12 +174,7 @@ impl ConversionRecipe {
                 .ok_or(KernelFailure::ResourceExhausted)?;
             Ok(recipe)
         })();
-        // All callback paths use this work latch or the original typed mapping.
-        if primary(&outcome) {
-            return outcome;
-        }
-        work.finish().map_err(compile_failure)?;
-        outcome
+        work.finish_result(outcome, compile_failure)
     }
     pub(super) fn retained_bytes(&self) -> usize {
         self.retained
@@ -472,12 +467,7 @@ impl ConversionRecipe {
     }
 }
 fn primary<T>(result: &Result<T, KernelFailure>) -> bool {
-    matches!(
-        result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    )
+    result.as_ref().is_err_and(KernelFailure::is_interruption)
 }
 fn finish_evaluation<'a>(
     result: Result<SelectedValues<'a>, KernelFailure>,
@@ -551,13 +541,7 @@ fn compact(
     selected_copy::preflight_take(argument.array().as_ref(), &indices, |boundary| {
         if boundary { work.flush() } else { work.step() }
     })
-    .map_err(|error| match error {
-        CopyError::Control(cause) => cause,
-        CopyError::Extent => KernelFailure::ResourceExhausted,
-        CopyError::Invalid(_) | CopyError::Unsupported(_) => {
-            invalid("conversion selected copy violates its carrier protocol")
-        }
-    })?;
+    .map_err(CopyError::into_kernel)?;
     work.flush()?;
     let indices = UInt64Array::from_iter(indices);
     work.flush()?;
@@ -741,8 +725,8 @@ fn largeint_text(
             output.append_null();
         } else {
             work.flush()?;
-            let text =
-                crate::largeint_text::value_text(source, row).map_err(|error| internal(&error))?;
+            let text = crate::largeint_text::value_text(source, row)
+                .map_err(KernelFailure::from_domain)?;
             work.flush()?;
             bytes = bytes
                 .checked_add(text.len())

@@ -250,7 +250,24 @@ fn constructor_and_all_turns_fit_original_scratch_without_extra_allocation() {
     let refusal = ChunkSlotSchema::try_new_with_field(SlotId::new(7), oversized, None, None)
         .err()
         .expect("execution timezone keeps its original type bound");
-    assert!(refusal.contains("timezone exceeds the byte limit"));
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+    let expected = novarocks_type_contract::ExecutionValueTypeError::Invalid(
+        "value layout timezone exceeds the byte limit",
+    );
+    assert_eq!(refusal.failure_fact(), expected.failure_fact());
+    assert_eq!(refusal.failure_fact().class(), FailureClass::Invariant);
+    let mut source = std::error::Error::source(&refusal);
+    let mut original = None;
+    while let Some(cause) = source {
+        if let Some(cause) =
+            cause.downcast_ref::<novarocks_type_contract::ExecutionValueTypeError>()
+        {
+            original = Some(cause);
+            break;
+        }
+        source = cause.source();
+    }
+    assert_eq!(original, Some(&expected));
     let (input, schema) = fixture(false);
     let (budget, credit) = budget_and_credit();
     let mut owned = begin(&input, schema, credit);

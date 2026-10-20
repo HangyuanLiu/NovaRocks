@@ -41,8 +41,12 @@ impl AggregateFunction for AnyValueAgg {
         _func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let data_type = input_type.ok_or_else(|| "any_value input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let data_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "any_value input type missing",
+            )
+        })?;
         Ok(AggSpec {
             kind: AggKind::AnyValue,
             output_type: data_type.clone(),
@@ -66,10 +70,10 @@ impl AggregateFunction for AnyValueAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "any_value input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("any_value input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -77,10 +81,10 @@ impl AggregateFunction for AnyValueAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "any_value merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("any_value merge input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -98,9 +102,12 @@ impl AggregateFunction for AnyValueAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
-        let tracker = tracker
-            .ok_or_else(|| "allocation-tracked any_value requires a memory tracker".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        let tracker = tracker.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked any_value requires a memory tracker",
+            )
+        })?;
         unsafe {
             ptr.cast::<AnyValueState>()
                 .write(AnyValueState::new(AggregateAllocator::new(tracker)))
@@ -128,19 +135,19 @@ impl AggregateFunction for AnyValueAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("any_value batch input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "any_value batch input type mismatch",
+            ));
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut AnyValueState) };
-            state
-                .update_from_array(
-                    array,
-                    row,
-                    &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
-                )
-                .map_err(|error| error.to_string())?;
+            state.update_from_array(
+                array,
+                row,
+                &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+            )?;
         }
         Ok(())
     }
@@ -151,7 +158,7 @@ impl AggregateFunction for AnyValueAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         // any_value merge is identical to update
         self.update_batch(spec, offset, state_ptrs, input)
     }
@@ -162,17 +169,13 @@ impl AggregateFunction for AnyValueAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let mut values = Vec::with_capacity(group_states.len());
         for &base in group_states {
             let state = unsafe { &*((base as *mut u8).add(offset) as *const AnyValueState) };
-            values.push(
-                state
-                    .output(&mut novarocks_functions::aggregate_scalar::ScalarWork::new(
-                        None,
-                    ))
-                    .map_err(|error| error.to_string())?,
-            );
+            values.push(state.output(
+                &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+            )?);
         }
         build_scalar_array(&spec.output_type, values)
     }

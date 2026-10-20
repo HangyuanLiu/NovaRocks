@@ -529,9 +529,18 @@ fn by_recursive_decode_actual_refusal_restores_each_original_cause_and_partial_g
         let host = Arc::new(Host::default());
         let mut state = new_state(&kernel, host.clone());
         let initial = host.ledger.lock().unwrap().attempts;
-        assert!(
-            matches!(merge(&kernel,&mut state,&malformed,&Control::default()),Err(KernelFailure::Operational(error)) if error.message()=="max_by/min_by merge input has trailing bytes")
+        let failure = merge(&kernel, &mut state, &malformed, &Control::default()).unwrap_err();
+        assert_eq!(
+            failure.to_string(),
+            "max_by/min_by merge input has trailing bytes"
         );
+        {
+            use novarocks_failure_contract::FailureProjection;
+            assert_eq!(
+                failure.failure_fact(),
+                crate::DataFailureReason::InvalidEncoding.failure_fact()
+            );
+        }
         assert_eq!(host.ledger.lock().unwrap().attempts, initial + 4);
         assert_failed(&kernel, &state);
         assert_metadata_only(&host);
@@ -689,3 +698,111 @@ fn by_actual_metadata_constructor_refusal_is_typed_and_never_published() {
 
 #[path = "aggregate_by_window_tests.rs"]
 mod window_tests;
+
+#[test]
+fn by_real_codec_sources_outlive_input_and_release_host_without_retaining_a_state_owner() {
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    fn has_source<E: Error + 'static>(cause: &dyn Error, _: &E) -> bool {
+        let mut source = cause.source();
+        while let Some(actual) = source {
+            if actual.is::<E>() {
+                return true;
+            }
+            source = actual.source();
+        }
+        false
+    }
+    for (tag, bytes) in [(4u8, vec![0xff]), (11u8, b"?".to_vec())] {
+        let host = Arc::new(Host::default());
+        let weak_host = Arc::downgrade(&host);
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let mut state = ByState::new(allocator);
+        let mut payload = vec![1, tag];
+        payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&bytes);
+        payload.push(0);
+        let error = state
+            .merge_bytes(ByDirection::Maximum, &payload, &mut ScalarWork::new(None))
+            .unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            crate::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        if tag == 4 {
+            assert!(has_source(
+                &error,
+                &std::str::from_utf8(&bytes).unwrap_err()
+            ));
+        } else {
+            assert!(has_source(
+                &error,
+                &"?".parse::<arrow_buffer::i256>().unwrap_err()
+            ));
+        }
+        let clone = error.clone();
+        drop(error);
+        drop(payload);
+        drop(bytes);
+        drop(state);
+        assert_released(&host);
+        drop(host);
+        assert!(weak_host.upgrade().is_none());
+        assert_eq!(
+            clone.failure_fact(),
+            crate::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+    }
+}
+
+#[test]
+fn by_codec_respects_frozen_nesting_and_rejects_impossible_child_counts_before_allocation() {
+    use novarocks_failure_contract::FailureProjection;
+    for depth in [
+        novarocks_type_contract::MAX_VALUE_TYPE_DEPTH,
+        novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1,
+    ] {
+        let host = Arc::new(Host::default());
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let mut state = ByState::new(allocator);
+        let mut payload = Vec::new();
+        for _ in 0..depth {
+            payload.extend_from_slice(&[1, 10, 1, 0, 0, 0]);
+        }
+        payload.extend_from_slice(&[1, 1, 1, 0]);
+        let result = state.merge_bytes(ByDirection::Maximum, &payload, &mut ScalarWork::new(None));
+        if depth == novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().failure_fact(),
+                crate::DataFailureReason::InvalidEncoding.failure_fact()
+            );
+        }
+        drop(state);
+        assert_released(&host);
+    }
+    for tag in [8, 9, 10] {
+        let host = Arc::new(Host::default());
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let mut state = ByState::new(allocator);
+        let before = host.ledger.lock().unwrap().attempts;
+        let mut payload = vec![1, tag];
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        payload.push(0);
+        let failure = state
+            .merge_bytes(ByDirection::Maximum, &payload, &mut ScalarWork::new(None))
+            .unwrap_err();
+        assert_eq!(
+            failure.failure_fact(),
+            crate::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        assert_eq!(
+            host.ledger.lock().unwrap().attempts,
+            before,
+            "invalid byte count must precede a speculative vector allocation"
+        );
+        drop(state);
+        assert_released(&host);
+    }
+}

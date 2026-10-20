@@ -27,6 +27,29 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionFailure;
+#[derive(Debug)]
+struct JoinArtifactContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinArtifactContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinArtifactContract {}
+impl novarocks_failure_contract::FailureProjection for JoinArtifactContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinArtifactContract.reason(),
+        )
+    }
+}
+fn contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinArtifactContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+
 use std::sync::Arc;
 
 use super::build_requirements::{
@@ -75,39 +98,39 @@ impl JoinBuildArtifact {
     pub(crate) fn validate_components(
         &self,
         required: BuildComponentRequirements,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if self.provided != required {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "hash join build artifact invalid: component contract mismatch; required={required:?} provided={:?}",
                 self.provided
-            ));
+            )));
         }
         if required.row_payload == RowPayloadRequirement::Required
             && self.build_row_count > 0
             && self.build_store.is_none()
         {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "hash join build artifact invalid: row payload required but missing; required={required:?} provided={:?}",
                 self.provided
-            ));
+            )));
         }
         if required.requires_lookup_table()
             && self.build_table.is_none()
             && self.build_row_count > 0
         {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "hash join build artifact invalid: lookup table required but missing; required={required:?} provided={:?}",
                 self.provided
-            ));
+            )));
         }
         if required.null_keys == NullKeyRequirement::NullKeyRows
             && self.build_row_count > 0
             && self.build_null_key_rows.is_none()
         {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "hash join build artifact invalid: null-key rows required but missing; required={required:?} provided={:?}",
                 self.provided
-            ));
+            )));
         }
         Ok(())
     }
@@ -127,7 +150,7 @@ impl BuildView {
     pub(crate) fn new(
         artifact: Arc<JoinBuildArtifact>,
         required: BuildComponentRequirements,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         artifact.validate_components(required)?;
         Ok(Self { artifact, required })
     }
@@ -139,12 +162,12 @@ impl BuildView {
     pub(crate) fn build_chunk(
         &self,
         context: &'static str,
-    ) -> Result<BuildStoreChunkProjection, String> {
+    ) -> Result<BuildStoreChunkProjection, ExecutionFailure> {
         let store = self.artifact.build_store.as_ref().ok_or_else(|| {
-            format!(
+            contract(format_args!(
                 "hash join row payload required for {context} but missing; required={:?} provided={:?}",
                 self.required, self.artifact.provided
-            )
+            ))
         })?;
         Ok(store.chunk())
     }
@@ -177,6 +200,7 @@ impl BuildView {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
+    use novarocks_failure_contract::FailureProjection;
 
     use crate::exec::operators::hashjoin::build_requirements::{
         BuildComponentRequirements, LookupRequirement, MatchFlagRequirement, NullKeyRequirement,
@@ -253,7 +277,7 @@ mod tests {
         let err = artifact
             .validate_components(membership_only_requirements())
             .expect_err("nonempty membership lookup requires table");
-        assert!(err.contains("lookup table required"));
+        assert!(err.detail().contains("lookup table required"));
     }
 
     #[test]
@@ -263,7 +287,7 @@ mod tests {
         let err = artifact
             .validate_components(row_payload_requirements())
             .expect_err("missing row payload must fail");
-        assert!(err.contains("row payload required"));
+        assert!(err.detail().contains("row payload required"));
     }
 
     #[test]
@@ -301,7 +325,7 @@ mod tests {
         let err = artifact
             .validate_components(row_payload_requirements())
             .expect_err("mismatched provided contract must fail");
-        assert!(err.contains("component contract mismatch"));
+        assert!(err.detail().contains("component contract mismatch"));
     }
 
     #[test]
@@ -311,7 +335,7 @@ mod tests {
         let err = artifact
             .validate_components(null_key_rows_requirements())
             .expect_err("nonempty build must carry required null-key rows");
-        assert!(err.contains("null-key rows required"));
+        assert!(err.detail().contains("null-key rows required"));
     }
 
     #[test]
@@ -330,10 +354,11 @@ mod tests {
             .build_chunk("test context")
             .expect_err("missing payload should report context");
         assert!(
-            err.contains("hash join row payload required for test context but missing"),
+            err.detail()
+                .contains("hash join row payload required for test context but missing"),
             "err={err}"
         );
-        assert!(err.contains("required="), "err={err}");
-        assert!(err.contains("provided="), "err={err}");
+        assert!(err.detail().contains("required="), "err={err}");
+        assert!(err.detail().contains("provided="), "err={err}");
     }
 }

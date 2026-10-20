@@ -40,10 +40,18 @@ fn setup(columns: &[ArrayRef]) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
-fn call(name: &str, arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> Result<ArrayRef, String> {
+fn call(
+    name: &str,
+    arena: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     super::function::string::eval_string_function(name, arena, ExprId(usize::MAX), args, chunk)
 }
-fn raw(name: &str, columns: &[ArrayRef]) -> Result<ArrayRef, String> {
+fn raw(
+    name: &str,
+    columns: &[ArrayRef],
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, chunk) = setup(columns);
     call(name, &arena, &args, &chunk)
 }
@@ -179,15 +187,15 @@ fn original_split_part_original_carrier_errors_before_empty_or_null() {
         let s = text(vec![None; rows]);
         let n = ints(vec![None; rows]);
         assert_eq!(
-            raw("split_part", &[wrong.clone(), s.clone(), n.clone()]).unwrap_err(),
+            (raw("split_part", &[wrong.clone(), s.clone(), n.clone()]).unwrap_err()).to_string(),
             "split_part expects string"
         );
         assert_eq!(
-            raw("split_part", &[s.clone(), wrong.clone(), n]).unwrap_err(),
+            (raw("split_part", &[s.clone(), wrong.clone(), n]).unwrap_err()).to_string(),
             "split_part expects string"
         );
         assert_eq!(
-            raw("split_part", &[s.clone(), s, wrong]).unwrap_err(),
+            (raw("split_part", &[s.clone(), s, wrong]).unwrap_err()).to_string(),
             "split_part expects int"
         );
     }
@@ -207,7 +215,7 @@ fn original_split_part_children_before_carriers_extra_ignored_missing_arity_pani
         let mut bad = args.clone();
         bad[position] = missing;
         assert_eq!(
-            call("split_part", &arena, &bad, &chunk).unwrap_err(),
+            (call("split_part", &arena, &bad, &chunk).unwrap_err()).to_string(),
             "invalid ExprId"
         );
     }
@@ -226,7 +234,7 @@ fn original_split_part_children_before_carriers_extra_ignored_missing_arity_pani
         ints(vec![Some(1)]),
     ]);
     assert_eq!(
-        call("split_part", &arena, &[args[0], args[1], missing], &chunk).unwrap_err(),
+        (call("split_part", &arena, &[args[0], args[1], missing], &chunk).unwrap_err()).to_string(),
         "invalid ExprId"
     );
 }

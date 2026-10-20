@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::ArrayRef;
 
 pub fn eval_group_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,6 +24,6 @@ pub fn eval_group_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Err(("group_concat is an aggregate function".to_string()).into())
+) -> ExecutionResult<ArrayRef> {
+    Err(expression_contract("group_concat is an aggregate function"))
 }

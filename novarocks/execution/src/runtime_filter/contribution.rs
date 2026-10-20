@@ -50,6 +50,7 @@ pub enum ContributionCodecError {
     KindMismatch,
     SchemaMismatch,
     LengthOverflow,
+    ArithmeticOverflow,
     TrailingBytes,
     NonCanonicalPayload,
     EncodedSizeExceeded,
@@ -73,8 +74,11 @@ impl fmt::Display for ContributionSizeError {
 }
 impl Error for ContributionSizeError {}
 impl From<ContributionSizeError> for ContributionCodecError {
-    fn from(_: ContributionSizeError) -> Self {
-        Self::LengthOverflow
+    fn from(source: ContributionSizeError) -> Self {
+        match source {
+            ContributionSizeError::LengthExceedsCanonicalRange => Self::LengthOverflow,
+            ContributionSizeError::SizeOverflow => Self::ArithmeticOverflow,
+        }
     }
 }
 
@@ -710,6 +714,20 @@ impl fmt::Display for OrderedTupleError {
     }
 }
 impl Error for OrderedTupleError {}
+impl novarocks_failure_contract::FailureProjection for OrderedTupleError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        let reason = match self {
+            Self::ArityMismatch => ExecutionReason::FilterOrderedTupleArity,
+            Self::TypeMismatch => ExecutionReason::FilterOrderedTupleType,
+        };
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            reason.reason(),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopKSummaryError {
     TooManyCandidates,
@@ -803,13 +821,14 @@ pub struct RuntimeOrderContract {
 #[derive(Debug)]
 pub enum RuntimeOrderContractValidationFailure<H> {
     Contract(RuntimeFilterContractViolation),
+    Schema(novarocks_local_program::FilterMembershipSchemaError),
     Work(H),
 }
 impl<H> From<novarocks_local_program::FilterMembershipSchemaError>
     for RuntimeOrderContractValidationFailure<H>
 {
     fn from(cause: novarocks_local_program::FilterMembershipSchemaError) -> Self {
-        Self::Contract(super::membership_schema_error(cause))
+        Self::Schema(cause)
     }
 }
 impl RuntimeOrderContract {
@@ -863,7 +882,7 @@ impl RuntimeOrderContract {
         keys: impl IntoIterator<Item = RuntimeOrderKey>,
         comparator_digest: [u8; 32],
         order_contract_digest: [u8; 32],
-    ) -> Result<Self, RuntimeFilterContractViolation> {
+    ) -> Result<Self, super::RuntimeFilterFailure> {
         let keys: Vec<_> = keys.into_iter().collect();
         Self::validate_fragment_keys_observed(
             &keys,
@@ -871,9 +890,12 @@ impl RuntimeOrderContract {
             order_contract_digest,
             |_| Ok::<_, std::convert::Infallible>(()),
         )
-        .map_err(|failure| match failure {
-            RuntimeOrderContractValidationFailure::Contract(cause) => cause,
-            RuntimeOrderContractValidationFailure::Work(never) => match never {},
+        .map_err(|failure| -> super::RuntimeFilterFailure {
+            match failure {
+                RuntimeOrderContractValidationFailure::Contract(cause) => cause.into(),
+                RuntimeOrderContractValidationFailure::Schema(cause) => cause.into(),
+                RuntimeOrderContractValidationFailure::Work(never) => match never {},
+            }
         })?;
         Ok(Self::from_frozen_keys(
             keys,
@@ -1171,7 +1193,7 @@ pub fn encode_contribution(
     let body_len = u64::try_from(body.len()).map_err(|_| ContributionCodecError::LengthOverflow)?;
     let total = HEADER_LEN
         .checked_add(body.len())
-        .ok_or(ContributionCodecError::LengthOverflow)?;
+        .ok_or(ContributionCodecError::ArithmeticOverflow)?;
     if total > max_encoded_bytes {
         return Err(ContributionCodecError::EncodedSizeExceeded);
     }
@@ -1246,7 +1268,7 @@ pub fn max_encoded_len_for_contribution_budget(
 ) -> Result<usize, ContributionCodecError> {
     HEADER_LEN
         .checked_add(max_contribution_bytes)
-        .ok_or(ContributionCodecError::LengthOverflow)
+        .ok_or(ContributionCodecError::ArithmeticOverflow)
 }
 
 pub fn semantic_contribution_bytes(
@@ -1587,21 +1609,21 @@ pub enum MembershipContributionEncodingOutcome {
 pub enum MembershipContributionEncodingError {
     ContractViolation {
         kind: RuntimeFilterContractViolationKind,
-        detail: String,
+        detail: novarocks_failure_contract::BoundedDetail,
     },
     TypeMismatch {
-        expected: DataType,
-        actual: DataType,
+        expected: novarocks_failure_contract::BoundedDetail,
+        actual: novarocks_failure_contract::BoundedDetail,
     },
-    UnsupportedType(DataType),
+    UnsupportedType(novarocks_failure_contract::BoundedDetail),
     InvalidArray {
-        data_type: DataType,
-        detail: String,
+        data_type: novarocks_failure_contract::BoundedDetail,
+        detail: novarocks_failure_contract::BoundedDetail,
     },
     InvalidDecimal {
         precision: u8,
         scale: i8,
-        detail: String,
+        source: ContributionCodecError,
     },
 }
 
@@ -1614,28 +1636,49 @@ impl fmt::Display for MembershipContributionEncodingError {
             ),
             Self::TypeMismatch { expected, actual } => write!(
                 formatter,
-                "runtime-filter membership type mismatch: expected {expected:?}, got {actual:?}"
+                "runtime-filter membership type mismatch: expected {expected}, got {actual}"
             ),
             Self::UnsupportedType(data_type) => write!(
                 formatter,
-                "unsupported runtime-filter membership type: {data_type:?}"
+                "unsupported runtime-filter membership type: {data_type}"
             ),
             Self::InvalidArray { data_type, detail } => write!(
                 formatter,
-                "invalid runtime-filter membership array for {data_type:?}: {detail}"
+                "invalid runtime-filter membership array for {data_type}: {detail}"
             ),
             Self::InvalidDecimal {
                 precision,
                 scale,
-                detail,
+                source,
             } => write!(
                 formatter,
-                "invalid runtime-filter Decimal128({precision}, {scale}) membership value: {detail}"
+                "invalid runtime-filter Decimal128({precision}, {scale}) membership value: {source}"
             ),
         }
     }
 }
-impl Error for MembershipContributionEncodingError {}
+impl Error for MembershipContributionEncodingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidDecimal { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MembershipContributionEncodingError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::ContractViolation { kind, .. } => return kind.failure_fact(),
+            Self::InvalidDecimal { source, .. } => return source.failure_fact(),
+            Self::TypeMismatch { .. } => ExecutionReason::FilterMembershipType,
+            Self::UnsupportedType(_) => ExecutionReason::FilterMembershipUnsupported,
+            Self::InvalidArray { .. } => ExecutionReason::FilterMembershipArray,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
 
 /// The result of deriving a canonical final-domain payload from a finalized
 /// aggregate key column. The budget applies to exactly the canonical domain
@@ -1663,8 +1706,8 @@ pub fn derive_value_domain_from_array(
 ) -> Result<ValueDomainArrayEncodingOutcome, MembershipContributionEncodingError> {
     if array.data_type() != data_type {
         return Err(MembershipContributionEncodingError::TypeMismatch {
-            expected: data_type.clone(),
-            actual: array.data_type().clone(),
+            expected: type_description(data_type),
+            actual: type_description(array.data_type()),
         });
     }
     let domain = value_domain_from_array(array.as_ref(), data_type)?;
@@ -1673,7 +1716,8 @@ pub fn derive_value_domain_from_array(
         Err(
             ContributionCodecError::EncodedSizeExceeded
             | ContributionCodecError::ResourceLimit
-            | ContributionCodecError::LengthOverflow,
+            | ContributionCodecError::LengthOverflow
+            | ContributionCodecError::ArithmeticOverflow,
         ) => Ok(ValueDomainArrayEncodingOutcome::Unavailable(
             MembershipContributionEncodingUnavailable::ResourceOrSize,
         )),
@@ -1739,8 +1783,8 @@ pub fn encode_membership_contributions(
     let expected = schema.data_type().clone();
     if array.data_type() != &expected {
         return Err(MembershipContributionEncodingError::TypeMismatch {
-            expected,
-            actual: array.data_type().clone(),
+            expected: type_description(&expected),
+            actual: type_description(array.data_type()),
         });
     }
     let domain = value_domain_from_array(array.as_ref(), &expected)?;
@@ -1759,7 +1803,8 @@ pub fn encode_membership_contributions(
         Err(
             ContributionCodecError::EncodedSizeExceeded
             | ContributionCodecError::ResourceLimit
-            | ContributionCodecError::LengthOverflow,
+            | ContributionCodecError::LengthOverflow
+            | ContributionCodecError::ArithmeticOverflow,
         ) => {
             return Ok(MembershipContributionEncodingOutcome::Unavailable(
                 MembershipContributionEncodingUnavailable::ResourceOrSize,
@@ -1788,7 +1833,7 @@ fn contract_error(
 ) -> MembershipContributionEncodingError {
     MembershipContributionEncodingError::ContractViolation {
         kind,
-        detail: detail.into(),
+        detail: novarocks_failure_contract::BoundedDetail::truncating(&detail.into()),
     }
 }
 
@@ -1900,14 +1945,14 @@ fn value_domain_from_array(
                     MembershipContributionEncodingError::InvalidDecimal {
                         precision: *precision,
                         scale: *scale,
-                        detail: error.to_string(),
+                        source: error,
                     }
                 })?;
             ValueDomainDelta::new(membership, contains_null)
         }
         other => {
             return Err(MembershipContributionEncodingError::UnsupportedType(
-                other.clone(),
+                type_description(other),
             ));
         }
     })
@@ -1918,8 +1963,8 @@ fn invalid_array(
     detail: impl Into<String>,
 ) -> MembershipContributionEncodingError {
     MembershipContributionEncodingError::InvalidArray {
-        data_type: data_type.clone(),
-        detail: detail.into(),
+        data_type: type_description(data_type),
+        detail: novarocks_failure_contract::BoundedDetail::truncating(&detail.into()),
     }
 }
 
@@ -2085,7 +2130,7 @@ fn validate_decimal(
     }
     let bound = 10_i128
         .checked_pow(precision.into())
-        .ok_or(ContributionCodecError::LengthOverflow)?;
+        .ok_or(ContributionCodecError::ArithmeticOverflow)?;
     if values
         .iter()
         .any(|value| *value <= -bound || *value >= bound)
@@ -3143,5 +3188,72 @@ mod tests {
             Err(RuntimeOrderContractValidationFailure::Work(Original))
         ));
         assert_eq!(prefix, successful[..=boundary]);
+    }
+}
+
+fn type_description(value: &DataType) -> novarocks_failure_contract::BoundedDetail {
+    novarocks_failure_contract::BoundedDetail::truncating_display(format_args!("{value:?}"))
+}
+impl novarocks_failure_contract::FailureProjection for ContributionCodecError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, reason) = match self {
+            Self::LengthOverflow => {
+                return FailureFact::new(
+                    FailureClass::Representation,
+                    ExecutionReason::FilterContributionLength.reason(),
+                )
+                .with_representation(RepresentationFacts {
+                    boundary: RepresentationBoundary::SingleOutput,
+                    layout: RepresentationLayout {
+                        domain: domain::EXECUTION,
+                        code: std::num::NonZeroU16::new(14).unwrap(),
+                    },
+                    required: None,
+                    extent_limit: None,
+                    representable_prefix: None,
+                });
+            }
+            Self::EncodedSizeExceeded | Self::ResourceLimit | Self::ArithmeticOverflow => (
+                FailureClass::Resource,
+                ExecutionReason::FilterContributionResource,
+            ),
+            _ => (
+                FailureClass::Invariant,
+                ExecutionReason::FilterContributionCodec,
+            ),
+        };
+        FailureFact::new(class, reason.reason())
+    }
+}
+
+#[cfg(test)]
+mod failure_source_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::sync::Arc;
+    #[test]
+    fn actual_membership_type_refusal_does_not_pin_original_arrow_fields() {
+        let field = Arc::new(arrow::datatypes::Field::new("value", DataType::Utf8, true));
+        let weak = Arc::downgrade(&field);
+        let expected = DataType::Struct(vec![field.clone()].into());
+        let actual = Arc::new(arrow::array::Int32Array::from(vec![7])) as ArrayRef;
+        let error = derive_value_domain_from_array(&expected, &actual, 4096).unwrap_err();
+        drop(expected);
+        drop(field);
+        assert!(
+            weak.upgrade().is_none(),
+            "the failure keeps diagnostics, not unaccompanied metadata backing"
+        );
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.failure_fact().reason(),
+            crate::runtime::fragment::ExecutionReason::FilterMembershipType.reason()
+        );
+        assert!(error.to_string().contains("expected Struct"));
     }
 }

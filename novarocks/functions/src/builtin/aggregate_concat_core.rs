@@ -17,16 +17,17 @@
 //! One original GROUP_CONCAT state, ordering, DISTINCT and Arrow state codec.
 use crate::aggregate_format::scalar_to_string;
 use crate::aggregate_scalar::{
-    AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork, TrackedAggScalarValue,
+    AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
     aggregate_vec_with_capacity, build_scalar_array, compare_tracked_scalar_values,
     tracked_scalar_from_array, tracked_scalar_heap_capacity, tracked_scalar_to_output,
 };
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::{Array, ArrayRef, ListArray, StructArray, builder::StringBuilder};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
-use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Fields};
 use std::{cmp::Ordering, sync::Arc};
+#[path = "aggregate_concat_source_failure.rs"]
+mod source_failure;
 const DEFAULT_SEPARATOR: &str = ",";
 #[derive(Debug)]
 pub struct GroupConcatState<A: ScalarStateAllocator> {
@@ -57,11 +58,11 @@ impl<A: ScalarStateAllocator> GroupConcatState<A> {
         &mut self,
         row: ScalarVec<Option<TrackedAggScalarValue<A>>, A>,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         work.flush()?;
-        self.rows.try_reserve(1).map_err(|_| {
+        self.rows.try_reserve(1).map_err(|source| {
             self.allocator
-                .scalar_allocation_error("reserve group_concat row")
+                .scalar_allocation_error("reserve group_concat row", source)
         })?;
         work.flush()?;
         let mut retained = row.capacity() * std::mem::size_of::<Option<TrackedAggScalarValue<A>>>();
@@ -83,7 +84,7 @@ impl<A: ScalarStateAllocator> GroupConcatState<A> {
         columns: &[(&ArrayRef, usize)],
         layout: GroupConcatLayout,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         let mut values = aggregate_vec_with_capacity(
             &self.allocator,
             columns.len(),
@@ -109,31 +110,91 @@ pub struct GroupConcatLayout {
     pub order_by_num: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupConcatShapeError {
+    NoArguments,
+    Carrier(novarocks_failure_contract::BoundedDetail),
+    OrderColumns { arguments: usize, ordering: usize },
+    NoOutputColumns,
+    ArgumentLayout,
+    IntermediateType(novarocks_failure_contract::BoundedDetail),
+    NoIntermediateFields,
+    IntermediateField { index: usize },
+}
+impl std::fmt::Display for GroupConcatShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Carrier(detail) => detail.fmt(f),
+            Self::NoArguments => f.write_str("group_concat argument count must be positive"),
+            Self::OrderColumns {
+                arguments,
+                ordering,
+            } => write!(
+                f,
+                "group_concat argument count {arguments} is less than order-by columns {ordering}"
+            ),
+            Self::NoOutputColumns => f.write_str("group_concat output column should not be empty"),
+            Self::ArgumentLayout => f.write_str("group_concat argument layout is invalid"),
+            Self::IntermediateType(actual) => write!(
+                f,
+                "group_concat intermediate type must be STRUCT, got {actual}"
+            ),
+            Self::NoIntermediateFields => {
+                f.write_str("group_concat intermediate type must contain at least one field")
+            }
+            Self::IntermediateField { index } => write!(
+                f,
+                "group_concat intermediate field {index} must be ARRAY type"
+            ),
+        }
+    }
+}
+impl std::error::Error for GroupConcatShapeError {}
+impl novarocks_failure_contract::FailureProjection for GroupConcatShapeError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(155).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for GroupConcatShapeError {}
+impl From<GroupConcatShapeError> for crate::KernelFailure {
+    fn from(source: GroupConcatShapeError) -> Self {
+        Self::from_domain(source)
+    }
+}
+impl GroupConcatShapeError {
+    fn carrier(detail: impl std::fmt::Display) -> Self {
+        Self::Carrier(novarocks_failure_contract::BoundedDetail::truncating_display(detail))
+    }
+}
 impl GroupConcatLayout {
-    pub fn infer(arg_count: usize, order_by_num: usize) -> Result<Self, String> {
+    pub fn infer(arg_count: usize, order_by_num: usize) -> Result<Self, GroupConcatShapeError> {
         if arg_count == 0 {
-            return Err("group_concat argument count must be positive".to_string());
+            return Err(GroupConcatShapeError::NoArguments);
         }
-        if arg_count < order_by_num + 1 {
-            return Err(format!(
-                "group_concat argument count {} is less than order-by columns {}",
-                arg_count, order_by_num
-            ));
+        // Subtraction follows the shape check, so even a maximum ordering
+        // count is rejected without overflowing before validation.
+        if arg_count <= order_by_num {
+            return Err(GroupConcatShapeError::OrderColumns {
+                arguments: arg_count,
+                ordering: order_by_num,
+            });
         }
-
-        // FE usually rewrites group_concat to include separator as one argument.
-        // Preserve the original raw one-argument projection.
-        let (output_col_num, separator_idx, order_by_start) = if arg_count == order_by_num + 1 {
-            (arg_count - order_by_num, None, arg_count - order_by_num)
+        let value_and_separator = arg_count - order_by_num;
+        let (output_col_num, separator_idx, order_by_start) = if value_and_separator == 1 {
+            (value_and_separator, None, value_and_separator)
         } else {
-            let output_col_num = arg_count - order_by_num - 1;
+            let output_col_num = value_and_separator - 1;
             (output_col_num, Some(output_col_num), output_col_num + 1)
         };
         if output_col_num == 0 {
-            return Err("group_concat output column should not be empty".to_string());
+            return Err(GroupConcatShapeError::NoOutputColumns);
         }
-        if order_by_start + order_by_num != arg_count {
-            return Err("group_concat argument layout is invalid".to_string());
+        if order_by_start.checked_add(order_by_num) != Some(arg_count) {
+            return Err(GroupConcatShapeError::ArgumentLayout);
         }
         Ok(Self {
             output_col_num,
@@ -190,22 +251,18 @@ pub fn build_default_intermediate_type(arg_types: &[DataType]) -> DataType {
     DataType::Struct(Fields::from(fields))
 }
 
-pub fn validate_intermediate_type(ty: &DataType) -> Result<&Fields, String> {
+pub fn validate_intermediate_type(ty: &DataType) -> Result<&Fields, GroupConcatShapeError> {
     let DataType::Struct(fields) = ty else {
-        return Err(format!(
-            "group_concat intermediate type must be STRUCT, got {:?}",
-            ty
+        return Err(GroupConcatShapeError::IntermediateType(
+            novarocks_failure_contract::BoundedDetail::truncating_display(format_args!("{ty:?}")),
         ));
     };
     if fields.is_empty() {
-        return Err("group_concat intermediate type must contain at least one field".to_string());
+        return Err(GroupConcatShapeError::NoIntermediateFields);
     }
-    for (idx, field) in fields.iter().enumerate() {
+    for (index, field) in fields.iter().enumerate() {
         if !matches!(field.data_type(), DataType::List(_)) {
-            return Err(format!(
-                "group_concat intermediate field {} must be ARRAY type",
-                idx
-            ));
+            return Err(GroupConcatShapeError::IntermediateField { index });
         }
     }
     Ok(fields)
@@ -216,7 +273,7 @@ pub fn validate_intermediate_type(ty: &DataType) -> Result<&Fields, String> {
 #[derive(Clone, Copy)]
 struct IntermediateArgTypes<'a>(&'a Fields);
 impl<'a> IntermediateArgTypes<'a> {
-    fn try_new(ty: &'a DataType) -> Result<Self, String> {
+    fn try_new(ty: &'a DataType) -> Result<Self, GroupConcatShapeError> {
         validate_intermediate_type(ty).map(Self)
     }
     fn len(self) -> usize {
@@ -260,17 +317,19 @@ impl std::fmt::Debug for MergeArgTypes<'_, '_> {
 }
 pub fn intermediate_arg_types_borrowed(
     intermediate_type: &DataType,
-) -> Result<impl ExactSizeIterator<Item = &DataType>, String> {
+) -> Result<impl ExactSizeIterator<Item = &DataType>, GroupConcatShapeError> {
     Ok(IntermediateArgTypes::try_new(intermediate_type)?.iter())
 }
 
-pub fn extract_input_columns(array: &ArrayRef) -> Result<Vec<ArrayRef>, String> {
+pub fn extract_input_columns(array: &ArrayRef) -> Result<Vec<ArrayRef>, GroupConcatShapeError> {
     match array.data_type() {
         DataType::Struct(_) => {
             let struct_arr = array
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| "group_concat input must be StructArray".to_string())?;
+                .ok_or_else(|| {
+                    GroupConcatShapeError::carrier("group_concat input must be StructArray")
+                })?;
             Ok(struct_arr.columns().to_vec())
         }
         _ => Ok(vec![array.clone()]),
@@ -283,7 +342,7 @@ fn compare_optional_scalar<A: ScalarStateAllocator>(
     asc: bool,
     nulls_first: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Ordering, ScalarStateError> {
+) -> Result<Ordering, crate::KernelFailure> {
     let ord = match (left, right) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => {
@@ -314,7 +373,7 @@ fn sort_indices<A: ScalarStateAllocator>(
     is_asc_order: &[bool],
     nulls_first: &[bool],
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<usize>, ScalarStateError> {
+) -> Result<Vec<usize>, crate::KernelFailure> {
     for _ in rows {
         work.step()?;
     }
@@ -326,7 +385,7 @@ fn sort_indices<A: ScalarStateAllocator>(
     }
 
     work.flush()?;
-    let mut error: Option<ScalarStateError> = None;
+    let mut error: Option<crate::KernelFailure> = None;
     indices.sort_by(|l, r| {
         if error.is_some() {
             return Ordering::Equal;
@@ -362,7 +421,7 @@ fn rows_equal_on_output<A: ScalarStateAllocator>(
     right: &[Option<TrackedAggScalarValue<A>>],
     layout: GroupConcatLayout,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<bool, ScalarStateError> {
+) -> Result<bool, crate::KernelFailure> {
     for col in 0..layout.output_col_num {
         work.step()?;
         match (&left[col], &right[col]) {
@@ -384,7 +443,7 @@ fn mark_duplicated_rows<A: ScalarStateAllocator>(
     layout: GroupConcatLayout,
     is_distinct: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<bool>, ScalarStateError> {
+) -> Result<Vec<bool>, crate::KernelFailure> {
     work.flush()?;
     let mut duplicated = vec![false; rows.len()];
     work.flush()?;
@@ -409,11 +468,15 @@ fn separator_for_row<A: ScalarStateAllocator>(
     arg_types: IntermediateArgTypes<'_>,
     layout: GroupConcatLayout,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<String, ScalarStateError> {
+) -> Result<String, crate::KernelFailure> {
     if let Some(sep_idx) = layout.separator_idx {
         if let Some(separator) = row
             .get(sep_idx)
-            .ok_or_else(|| "group_concat separator index out of bounds".to_string())?
+            .ok_or_else(|| {
+                crate::KernelFailure::from(GroupConcatShapeError::carrier(
+                    "group_concat separator index out of bounds",
+                ))
+            })?
             .as_ref()
         {
             scalar_to_string(
@@ -441,12 +504,14 @@ impl<'a> GroupConcatMerge<'a> {
         array: &'a ArrayRef,
         order_by_num: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, crate::KernelFailure> {
         work.flush()?;
         let struct_arr = array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "group_concat merge input must be StructArray".to_string())?;
+            .ok_or_else(|| {
+                GroupConcatShapeError::carrier("group_concat merge input must be StructArray")
+            })?;
         let field_num = struct_arr.num_columns();
         let layout = GroupConcatLayout::infer(field_num, order_by_num)?;
         let mut list_columns = Vec::with_capacity(field_num);
@@ -454,12 +519,18 @@ impl<'a> GroupConcatMerge<'a> {
         let mut offsets = Vec::with_capacity(field_num);
         for (idx, col) in struct_arr.columns().iter().enumerate() {
             work.step()?;
-            let list_col = col
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| format!("group_concat merge field {} must be ListArray", idx))?;
+            let list_col = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                GroupConcatShapeError::carrier(format_args!(
+                    "group_concat merge field {} must be ListArray",
+                    idx
+                ))
+            })?;
             let DataType::List(_) = list_col.data_type() else {
-                return Err(format!("group_concat merge field {} must be ARRAY type", idx).into());
+                return Err(GroupConcatShapeError::carrier(format_args!(
+                    "group_concat merge field {} must be ARRAY type",
+                    idx
+                ))
+                .into());
             };
             value_columns.push(list_col.values().clone());
             offsets.push(list_col.value_offsets().to_vec());
@@ -484,7 +555,7 @@ impl<'a> GroupConcatMerge<'a> {
         row: usize,
         intermediate_type: &DataType,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         let field_num = self.list_columns.len();
         work.step()?;
         if self.array.is_null(row) {
@@ -498,19 +569,18 @@ impl<'a> GroupConcatMerge<'a> {
                 work.step()?;
                 if !novarocks_type_contract::arrow_data_types_equal_borrowed_observed::<
                     crate::KernelFailure,
-                >(actual, expected, || {
-                    work.step().map_err(ScalarStateError::into_kernel_failure)
-                })? {
+                >(actual, expected, || work.step())?
+                {
                     matches = false;
                     break;
                 }
             }
         }
         if !matches {
-            return Err(format!(
+            return Err(GroupConcatShapeError::carrier(format_args!(
                 "group_concat merge argument types mismatch: expected {expected_types:?}, got {:?}",
                 actual_types
-            )
+            ))
             .into());
         }
 
@@ -535,21 +605,21 @@ impl<'a> GroupConcatMerge<'a> {
         for col_idx in 0..field_num {
             work.step()?;
             if self.list_columns[col_idx].is_null(row) {
-                return Err(format!(
+                return Err(GroupConcatShapeError::carrier(format_args!(
                     "group_concat merge field {} is null while struct row is non-null",
                     col_idx
-                )
+                ))
                 .into());
             }
             let start = self.offsets[col_idx][row] as usize;
             let end = self.offsets[col_idx][row + 1] as usize;
             if end.saturating_sub(start) != row_count {
-                return Err(format!(
+                return Err(GroupConcatShapeError::carrier(format_args!(
                     "group_concat merge field {} length mismatch: expected {}, got {}",
                     col_idx,
                     row_count,
                     end.saturating_sub(start)
-                )
+                ))
                 .into());
             }
         }
@@ -594,13 +664,13 @@ pub fn build_intermediate_array<
     intermediate_type: &DataType,
     group_states: I,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, ScalarStateError> {
+) -> Result<ArrayRef, crate::KernelFailure> {
     let fields = validate_intermediate_type(intermediate_type)?.clone();
     let field_num = fields.len();
 
     let mut offsets = Vec::with_capacity(group_states.len() + 1);
     offsets.push(0_i32);
-    let mut current_len: i64 = 0;
+    let mut current_len: i32 = 0;
     let mut struct_null_builder = NullBufferBuilder::new(group_states.len());
     let mut list_null_builder = NullBufferBuilder::new(group_states.len());
     let mut flat_values: Vec<Vec<Option<AggScalarValue>>> =
@@ -609,16 +679,21 @@ pub fn build_intermediate_array<
     for state in group_states {
         work.step()?;
         if state.rows.is_empty() {
-            offsets.push(current_len as i32);
+            offsets.push(current_len);
             struct_null_builder.append_null();
             list_null_builder.append_null();
             continue;
         }
 
+        let next_offset =
+            crate::aggregate_scalar::checked_list_output_offset(current_len, state.rows.len())?;
         for row in &state.rows {
             work.step()?;
             if row.len() != field_num {
-                return Err("group_concat state row width mismatch".to_string().into());
+                return Err(GroupConcatShapeError::carrier(
+                    "group_concat state row width mismatch",
+                )
+                .into());
             }
             for idx in 0..field_num {
                 work.step()?;
@@ -630,14 +705,8 @@ pub fn build_intermediate_array<
                 );
             }
         }
-        current_len += i64::try_from(state.rows.len())
-            .map_err(|_| "group_concat intermediate row count overflow".to_string())?;
-        if current_len > i32::MAX as i64 {
-            return Err("group_concat intermediate offset overflow"
-                .to_string()
-                .into());
-        }
-        offsets.push(current_len as i32);
+        current_len = next_offset;
+        offsets.push(current_len);
         struct_null_builder.append_non_null();
         list_null_builder.append_non_null();
     }
@@ -647,32 +716,27 @@ pub fn build_intermediate_array<
     for (idx, field) in fields.iter().enumerate() {
         work.step()?;
         let DataType::List(item_field) = field.data_type() else {
-            return Err(
-                format!("group_concat intermediate field {} must be ARRAY type", idx).into(),
-            );
+            return Err(GroupConcatShapeError::IntermediateField { index: idx }.into());
         };
-        let mut values =
-            build_scalar_array(item_field.data_type(), flat_values[idx].clone(), work)?;
+        let values = build_scalar_array(item_field.data_type(), flat_values[idx].clone(), work)?;
         if values.data_type() != item_field.data_type() {
-            work.flush()?;
-            values = cast(&values, item_field.data_type()).map_err(|e| {
-                format!(
-                    "group_concat failed to cast intermediate field {} values: {}",
-                    idx, e
-                )
-            })?;
-            work.flush()?;
+            return Err(GroupConcatShapeError::carrier(
+                "group_concat scalar builder changed the frozen intermediate value type",
+            )
+            .into());
         }
-        let list = ListArray::new(
+        let list = ListArray::try_new(
             item_field.clone(),
             OffsetBuffer::new(offsets.clone().into()),
             values,
             list_nulls.clone(),
-        );
+        )
+        .map_err(source_failure::constructor)?;
         columns.push(Arc::new(list) as ArrayRef);
     }
 
-    let out = StructArray::new(fields, columns, struct_null_builder.finish());
+    let out = StructArray::try_new(fields, columns, struct_null_builder.finish())
+        .map_err(source_failure::constructor)?;
     work.flush()?;
     Ok(Arc::new(out))
 }
@@ -689,7 +753,7 @@ pub fn build_final_array<
     nulls_first: &[bool],
     max_len: i64,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, ScalarStateError> {
+) -> Result<ArrayRef, crate::KernelFailure> {
     let mut builder = StringBuilder::new();
     for state in group_states {
         work.step()?;
@@ -729,7 +793,9 @@ pub fn build_final_array<
             for col in 0..layout.output_col_num {
                 work.step()?;
                 let value = row[col].as_ref().ok_or_else(|| {
-                    "group_concat output column should not contain null".to_string()
+                    crate::KernelFailure::from(GroupConcatShapeError::carrier(
+                        "group_concat output column should not contain null",
+                    ))
                 })?;
                 if append_with_limit(
                     &mut out,
@@ -760,4 +826,74 @@ pub fn build_final_array<
         builder.append_value(out);
     }
     Ok(Arc::new(builder.finish()))
+}
+
+#[cfg(test)]
+mod shape_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn maximum_ordering_count_is_a_shape_refusal_without_arithmetic_panic() {
+        let source = GroupConcatLayout::infer(1, usize::MAX).unwrap_err();
+        assert_eq!(
+            source,
+            GroupConcatShapeError::OrderColumns {
+                arguments: 1,
+                ordering: usize::MAX
+            }
+        );
+        assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+        let fact = source.failure_fact();
+        assert_eq!(crate::KernelFailure::from(source).failure_fact(), fact);
+        let legal = GroupConcatLayout::infer(usize::MAX, usize::MAX - 1).unwrap();
+        assert_eq!(legal.output_col_num, 1);
+        assert_eq!(legal.separator_idx, None);
+    }
+    #[test]
+    fn invalid_nested_schema_is_not_retained_by_the_shape_cause() {
+        let field = Arc::new(Field::new(
+            "numeric overflow ResourceExhausted",
+            DataType::Int32,
+            false,
+        ));
+        let weak = Arc::downgrade(&field);
+        let ty = DataType::List(field.clone());
+        let source = validate_intermediate_type(&ty).unwrap_err();
+        drop(ty);
+        drop(field);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+        assert!(source.to_string().contains("numeric overflow"));
+    }
+    #[test]
+    fn aggregate_concat_merge_contract_keeps_its_source_and_releases_actual_input() {
+        let field = Arc::new(Field::new("field".repeat(512), DataType::Int64, true));
+        let array: ArrayRef = Arc::new(StructArray::new(
+            vec![field.clone()].into(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![Some(7)]))],
+            None,
+        ));
+        let weak_array = Arc::downgrade(&array);
+        let weak_field = Arc::downgrade(&field);
+        let error = match GroupConcatMerge::new(&array, 0, &mut ScalarWork::new(None)) {
+            Err(error) => error,
+            Ok(_) => panic!("scalar column cannot decode as an intermediate List state"),
+        };
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Invariant);
+        assert_eq!(fact.reason().code(), 155);
+        let mut source = std::error::Error::source(&error);
+        let mut nominal = false;
+        while let Some(cause) = source {
+            nominal |= cause.is::<GroupConcatShapeError>();
+            source = cause.source();
+        }
+        assert!(nominal);
+        assert!(error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+        drop(array);
+        drop(field);
+        assert!(weak_array.upgrade().is_none());
+        assert!(weak_field.upgrade().is_none());
+        assert_eq!(error.failure_fact(), fact);
+    }
 }

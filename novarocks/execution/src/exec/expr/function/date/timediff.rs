@@ -16,7 +16,7 @@
 // under the License.
 use super::common::{extract_datetime_array, parse_time, seconds_to_time, to_timestamp_value};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use chrono::NaiveDate;
@@ -27,10 +27,36 @@ pub fn eval_timediff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timediff requires two arguments",
+            )
+            .into(),
+        );
+    }
+    let output_type = super::common::frozen_type(arena.arena(), expr)?.clone();
+    if output_type != DataType::Utf8
+        && output_type != DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+    {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timediff has an unsupported frozen result carrier",
+            )
+            .into(),
+        );
+    }
     let dt1 = extract_datetime_array(&arena.eval(args[0], chunk)?)?;
     let dt2 = extract_datetime_array(&arena.eval(args[1], chunk)?)?;
-    let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Utf8);
+    if dt1.len() != dt2.len() {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timediff argument lengths differ",
+            )
+            .into(),
+        );
+    }
     let mut out = Vec::with_capacity(dt1.len());
     for i in 0..dt1.len() {
         let v = match (dt1[i], dt2[i]) {
@@ -50,7 +76,8 @@ pub fn eval_timediff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let base = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         for v in out {
             let dt = v.and_then(|s| parse_time(&s).map(|t| base.and_time(t)));
-            let ts = dt.and_then(|d| to_timestamp_value(d, &output_type).ok());
+            let ts = dt
+                .and_then(|d| to_timestamp_value(d, arrow::datatypes::TimeUnit::Microsecond).ok());
             ts_out.push(ts);
         }
         Ok(Arc::new(TimestampMicrosecondArray::from(ts_out)) as ArrayRef)

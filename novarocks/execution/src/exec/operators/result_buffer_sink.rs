@@ -15,59 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime::fragment::ExecutionResult;
-
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
-
-use arrow::datatypes::DataType;
-
 use crate::exec::chunk::Chunk;
-use crate::exec::operators::compiled_expression::RuntimeKernelControl;
-use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::pipeline::{
+    input::{AcceptedInput, InputPreparationFailure, RawInput},
+    operator::{ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator},
+    operator_factory::OperatorFactory,
+    shape::{
+        HydrateInput, InputPreparation, PreparationStep, ReceiverPreparation, ReceiverSlot,
+        StepOperator,
+    },
+    step::{AdmissionNext, InputResult, NextStep, StepResult, WaitFact, WaitReason},
+    step_context::StepContext,
 };
-use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::fragment::io::{
-    FragmentResultSession, ResultWriteAdmission, ResultWriteCredit, ResultWriteFailure,
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::{
+    fragment::io::{
+        FragmentResultSession, ResultInputMetadata, ResultWriteAdmission, ResultWriteCredit,
+        ResultWriteFailure,
+    },
+    mem_tracker::MemTracker,
+    observable::Observable,
 };
-use crate::runtime::observable::Observable;
-use crate::runtime::runtime_state::RuntimeState;
+use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Debug)]
 struct ResultBufferSinkShared {
     remaining_drivers: AtomicI32,
 }
-
 impl ResultBufferSinkShared {
     fn new() -> Self {
         Self {
             remaining_drivers: AtomicI32::new(-1),
         }
     }
-
-    fn init_driver_count(&self, dop: i32) {
-        let dop = dop.max(1);
-        let _ =
-            self.remaining_drivers
-                .compare_exchange(-1, dop, Ordering::AcqRel, Ordering::Acquire);
+    fn init_driver_count(&self, dop: i32) -> bool {
+        if dop <= 0 {
+            return false;
+        }
+        match self
+            .remaining_drivers
+            .compare_exchange(-1, dop, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(actual) => actual == dop,
+        }
     }
 }
 
-/// Factory for result sinks that stream encoded batches directly into the fetch result buffer.
 pub struct ResultBufferSinkFactory {
     name: String,
     session: Arc<dyn FragmentResultSession>,
     shared: Arc<ResultBufferSinkShared>,
 }
-
 impl ResultBufferSinkFactory {
     pub fn new(session: Arc<dyn FragmentResultSession>, plan_node_id: Option<i32>) -> Self {
-        let plan_node_id = match plan_node_id {
-            Some(id) if id >= 0 => id,
-            _ => -1,
-        };
+        let plan_node_id = plan_node_id.filter(|id| *id >= 0).unwrap_or(-1);
         Self {
             name: format!("RESULT_BUFFER_SINK (plan_node_id={plan_node_id})"),
             session,
@@ -75,287 +81,424 @@ impl ResultBufferSinkFactory {
         }
     }
 }
-
 impl OperatorFactory for ResultBufferSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn create(&self, dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        self.shared.init_driver_count(dop);
+    fn create(&self, dop: i32, _: i32) -> Box<dyn Operator> {
         Box::new(ResultBufferSinkOperator {
             name: self.name.clone(),
-            session: Arc::clone(&self.session),
-            shared: Arc::clone(&self.shared),
-            credit: Mutex::new(ResultSinkCreditState::Ready),
-            finished: false,
+            session: self.session.clone(),
+            shared: self.shared.clone(),
+            receiver: ReceiverSlot::new(ResultPreparation::default()),
+            next: NextStep::NeedInput,
+            finishing: false,
+            contributed: false,
             construction_factory: None,
             prepared: false,
+            valid_dop: self.shared.init_driver_count(dop),
+            failure: None,
         })
     }
-
     fn is_sink(&self) -> bool {
         true
     }
 }
 
+struct ResultEncoding;
+impl InputEncodingPolicy for ResultEncoding {
+    fn retains_encoded_column(&self, _: SlotId, data_type: &DataType) -> bool {
+        matches!(data_type, DataType::Dictionary(key, value)
+            if key.as_ref() == &DataType::Int32 && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8))
+    }
+}
+#[derive(Default)]
+struct ResultPreparation {
+    reserved: Option<ResultWriteCredit>,
+    blocked: Option<(usize, WaitFact)>,
+    hydrate: HydrateInput,
+}
+impl InputPreparation<ResultEncoding> for ResultPreparation {
+    fn admission(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: &RawInput,
+        _: &ResultEncoding,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        HydrateInput::validate_uncovered(input)?;
+        Ok(None)
+    }
+    fn accept(&mut self, input: RawInput) -> AcceptedInput {
+        self.hydrate.accept_raw(input)
+    }
+    fn prepare(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: AcceptedInput,
+        encoding: &ResultEncoding,
+    ) -> Result<PreparationStep, InputPreparationFailure> {
+        self.hydrate.prepare_accepted(input, encoding)
+    }
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.hydrate.install_tracker(tracker);
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.hydrate.install_factory(factory);
+    }
+}
+impl ResultPreparation {
+    fn reserve(
+        &mut self,
+        input: ResultInputMetadata,
+        session: &dyn FragmentResultSession,
+    ) -> ExecutionResult<Option<WaitFact>> {
+        if input.rows() == 0 {
+            return Ok(None);
+        }
+        let bytes = session.reservation_bytes(input)?;
+        if let Some((previous, wait)) = &self.blocked {
+            let current = session
+                .writable_observable()
+                .ok_or_else(|| fault(ResultReceiverFailure::NoReadiness))?;
+            if !Arc::ptr_eq(&current, &wait.observable) {
+                return Err(fault(ResultReceiverFailure::ChangedReadiness));
+            }
+            if *previous == bytes && !wait.is_ready() {
+                return Ok(Some(wait.clone()));
+            }
+        }
+        let observable = session.writable_observable();
+        let generation = observable.as_ref().map(|event| event.generation());
+        match session.try_acquire(bytes)? {
+            ResultWriteAdmission::Granted(credit) => {
+                if credit.bytes() != bytes {
+                    return Err(fault(ResultReceiverFailure::WrongCredit {
+                        expected: bytes,
+                        actual: credit.bytes(),
+                    }));
+                }
+                self.blocked = None;
+                self.reserved = Some(credit);
+                Ok(None)
+            }
+            ResultWriteAdmission::Blocked => {
+                let observable =
+                    observable.ok_or_else(|| fault(ResultReceiverFailure::NoReadiness))?;
+                let current = session
+                    .writable_observable()
+                    .ok_or_else(|| fault(ResultReceiverFailure::NoReadiness))?;
+                if !Arc::ptr_eq(&current, &observable) {
+                    return Err(fault(ResultReceiverFailure::ChangedReadiness));
+                }
+                let wait = WaitFact {
+                    reason: WaitReason::Output,
+                    observable,
+                    observed_generation: generation.expect("observed before acquisition"),
+                    deadline: None,
+                };
+                self.blocked = Some((bytes, wait.clone()));
+                Ok(Some(wait))
+            }
+        }
+    }
+}
 struct ResultBufferSinkOperator {
+    // Accepted storage exits before its reserved credit and private bindings.
+    receiver: ReceiverSlot<ResultPreparation>,
     name: String,
     session: Arc<dyn FragmentResultSession>,
     shared: Arc<ResultBufferSinkShared>,
-    credit: Mutex<ResultSinkCreditState>,
-    finished: bool,
     construction_factory: Option<Arc<dyn InputConstructionFactory>>,
+    next: NextStep,
+    failure: Option<ExecutionFailure>,
     prepared: bool,
+    valid_dop: bool,
+    finishing: bool,
+    contributed: bool,
 }
-
+#[derive(Debug)]
+enum ResultReceiverFailure {
+    Closed,
+    MissingCredit,
+    WrongCredit { expected: usize, actual: usize },
+    NoReadiness,
+    ChangedReadiness,
+    DriverUnderflow,
+    InvalidDop,
+}
+impl std::fmt::Display for ResultReceiverFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => f.write_str("result input reached a closed receiver"),
+            Self::MissingCredit => f.write_str("result input has no reserved byte credit"),
+            Self::WrongCredit { expected, actual } => write!(
+                f,
+                "result input requires {expected} bytes but owns {actual} bytes of credit"
+            ),
+            Self::NoReadiness => f.write_str("blocked result credit has no readiness observable"),
+            Self::ChangedReadiness => {
+                f.write_str("result credit changed its installed readiness observable")
+            }
+            Self::DriverUnderflow => f.write_str("result driver finish count underflow"),
+            Self::InvalidDop => f.write_str("result factory and prepared driver DOP disagree"),
+        }
+    }
+}
+impl std::error::Error for ResultReceiverFailure {}
+impl novarocks_failure_contract::FailureProjection for ResultReceiverFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::Closed => 80,
+            Self::MissingCredit => 81,
+            Self::WrongCredit { .. } => 82,
+            Self::NoReadiness => 83,
+            Self::ChangedReadiness => 84,
+            Self::DriverUnderflow => 85,
+            Self::InvalidDop => 86,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+fn fault(reason: ResultReceiverFailure) -> ExecutionFailure {
+    ExecutionFailure::from_domain(reason)
+}
 impl ResultBufferSinkOperator {
-    fn prepared_factory(&self) -> Result<&dyn InputConstructionFactory, ConstructionFailure> {
+    fn prepared_factory(&self) -> ExecutionResult<&dyn InputConstructionFactory> {
         if !self.prepared {
-            return Err(ConstructionFailure::MissingOwner);
+            return Err(ConstructionFailure::MissingOwner.into());
         }
         self.construction_factory
             .as_deref()
-            .ok_or(ConstructionFailure::MissingOwner)
+            .ok_or_else(|| ConstructionFailure::MissingOwner.into())
+    }
+    fn fail(&mut self, ctx: &StepContext<'_>, error: ExecutionFailure) -> ExecutionFailure {
+        ctx.report_failure(error.clone());
+        self.failure.get_or_insert(error).clone()
+    }
+    fn discard(&mut self) {
+        self.receiver.discard();
+        let preparation = self.receiver.preparation_mut();
+        drop(preparation.reserved.take());
+        preparation.blocked = None;
+    }
+    fn advance(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        match self.receiver.prepare(ctx, &ResultEncoding)? {
+            ReceiverPreparation::Pending(next) => return Ok(StepResult::new(None, next, 0)),
+            ReceiverPreparation::Ready(prepared) => {
+                let rows = prepared.chunk().len() as u64;
+                if rows > 0 {
+                    let bytes = self
+                        .session
+                        .reservation_bytes(prepared.chunk().into())
+                        .map_err(|error| {
+                            let failure: ExecutionFailure = error.into();
+                            ctx.report_failure(failure.clone());
+                            failure
+                        })?;
+                    let credit =
+                        self.receiver
+                            .preparation_mut()
+                            .reserved
+                            .take()
+                            .ok_or_else(|| {
+                                let failure = fault(ResultReceiverFailure::MissingCredit);
+                                ctx.report_failure(failure.clone());
+                                failure
+                            })?;
+                    if credit.bytes() != bytes {
+                        let error = fault(ResultReceiverFailure::WrongCredit {
+                            expected: bytes,
+                            actual: credit.bytes(),
+                        });
+                        ctx.report_failure(error.clone());
+                        drop(prepared);
+                        drop(credit);
+                        return Err(error);
+                    }
+                    let control = ctx.kernel_control();
+                    self.session
+                        .write_with_credit(
+                            prepared.into_uncovered_chunk()?,
+                            credit,
+                            self.prepared_factory()?,
+                            &control,
+                        )
+                        .map_err(ResultWriteFailure::into_execution)?;
+                }
+                let next = if self.finishing {
+                    NextStep::Runnable
+                } else {
+                    NextStep::NeedInput
+                };
+                return Ok(StepResult::new(None, next, rows));
+            }
+            ReceiverPreparation::Empty => {}
+        }
+        if self.finishing {
+            if !self.contributed {
+                let previous = self
+                    .shared
+                    .remaining_drivers
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                        previous.checked_sub(1).filter(|next| *next >= 0)
+                    })
+                    .map_err(|_| fault(ResultReceiverFailure::DriverUnderflow))?;
+                self.contributed = true;
+                if previous == 1 {
+                    self.session.finish()?;
+                }
+            }
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
+        }
+        Ok(StepResult::new(None, NextStep::NeedInput, 0))
     }
 }
-
-enum ResultSinkCreditState {
-    Ready,
-    Blocked {
-        bytes: usize,
-        observable: Arc<Observable>,
-        generation: u64,
-    },
-    Reserved(ResultWriteCredit),
-}
-
-impl Operator for ResultBufferSinkOperator {
+impl OperatorLifecycle for ResultBufferSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
     fn creates_typed_storage(&self) -> bool {
         true
     }
-
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.receiver
+            .preparation_mut()
+            .hydrate
+            .install_tracker(tracker);
+    }
     fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.receiver
+            .preparation_mut()
+            .hydrate
+            .install_factory(factory.clone());
         self.construction_factory = Some(factory);
     }
-
     fn prepare(&mut self) -> ExecutionResult<()> {
-        self.construction_factory
-            .as_ref()
-            .ok_or(ConstructionFailure::MissingOwner)?;
-        self.prepared = true;
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
+        }
+        let result = if !self.valid_dop {
+            Err(fault(ResultReceiverFailure::InvalidDop))
+        } else {
+            self.construction_factory
+                .as_ref()
+                .map(|_| ())
+                .ok_or_else(|| ConstructionFailure::MissingOwner.into())
+        };
+        if let Err(failure) = &result {
+            self.failure = Some(failure.clone());
+        } else {
+            self.prepared = true;
+        }
+        result
+    }
+
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.discard();
+        self.next = NextStep::Finished;
         Ok(())
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
     fn cancel(&mut self) {
-        *self.credit.lock().expect("result sink credit lock") = ResultSinkCreditState::Ready;
+        self.discard();
+        self.next = NextStep::Finished;
     }
 }
-
-impl ProcessorOperator for ResultBufferSinkOperator {
-    fn need_input(&self) -> bool {
-        if self.finished {
-            return false;
-        }
-        match &*self.credit.lock().expect("result sink credit lock") {
-            ResultSinkCreditState::Blocked {
-                observable,
-                generation,
-                ..
-            } => self.session.writable_observable().is_none_or(|current| {
-                !Arc::ptr_eq(observable, &current) || current.generation() != *generation
-            }),
-            _ => true,
-        }
+impl StepOperator for ResultBufferSinkOperator {
+    fn initial_step(&self) -> NextStep {
+        self.next.clone()
     }
-
-    fn can_accept_input(&self, chunk: &Chunk) -> ExecutionResult<bool> {
-        self.prepared_factory()?;
-        if self.finished || chunk.is_empty() {
-            return Ok(!self.finished);
+    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+        if let Some(failure) = self.failure.clone().or_else(|| ctx.checkpoint().err()) {
+            return InputResult::Rejected { input, failure };
         }
-        let bytes = self
-            .session
-            .reservation_bytes(chunk)
-            .map_err(|error| error.to_string())?;
-        let mut state = self.credit.lock().expect("result sink credit lock");
-        if let ResultSinkCreditState::Reserved(credit) = &*state {
-            if credit.bytes() != bytes {
-                return Err(format!(
-                    "RESULT_SINK retained credit for {} bytes but next chunk requires {bytes}",
-                    credit.bytes()
-                )
-                .into());
-            }
-            return Ok(true);
+        if let Err(error) = self.prepared_factory() {
+            let failure = self.fail(ctx, error);
+            return InputResult::Rejected { input, failure };
         }
-        // Freeze the event before the budget check. A release can race with a
-        // rejected acquisition and must invalidate that cached rejection even
-        // if the scheduler has not frozen its own wait generation yet.
-        let observable = self.session.writable_observable();
-        if let ResultSinkCreditState::Blocked {
-            bytes: blocked_bytes,
-            observable: blocked,
-            generation,
-        } = &*state
-        {
-            let current = observable.as_ref().ok_or_else(|| {
-                "RESULT_SINK blocked credit lost its readiness observable".to_string()
-            })?;
-            if !Arc::ptr_eq(blocked, current) {
-                return Err(
-                    "RESULT_SINK blocked credit changed its readiness observable"
-                        .to_string()
-                        .into(),
-                );
-            }
-            if bytes == *blocked_bytes && current.generation() == *generation {
-                return Ok(false);
-            }
+        if self.finishing || matches!(self.next, NextStep::Finished) {
+            let failure = self.fail(ctx, fault(ResultReceiverFailure::Closed));
+            return InputResult::Rejected { input, failure };
         }
-        let generation = observable.as_ref().map(|event| event.generation());
+        if self.receiver.is_occupied() {
+            return InputResult::Deferred {
+                input,
+                next: AdmissionNext::ResumeExisting,
+            };
+        }
+        if let Err(error) = HydrateInput::validate_uncovered(&input) {
+            let failure = self.fail(ctx, error);
+            return InputResult::Rejected { input, failure };
+        }
         match self
-            .session
-            .try_acquire(bytes)
-            .map_err(|error| error.to_string())?
+            .receiver
+            .preparation_mut()
+            .reserve(input.result_metadata(), self.session.as_ref())
         {
-            ResultWriteAdmission::Granted(credit) => {
-                if credit.bytes() != bytes {
-                    return Err(format!(
-                        "RESULT_SINK received credit for {} bytes but chunk requires {bytes}",
-                        credit.bytes()
-                    )
-                    .into());
-                }
-                *state = ResultSinkCreditState::Reserved(credit);
-                Ok(true)
+            Err(error) => {
+                let failure = self.fail(ctx, error);
+                InputResult::Rejected { input, failure }
             }
-            ResultWriteAdmission::Blocked => {
-                let observable = observable.ok_or_else(|| {
-                    "RESULT_SINK blocked credit has no readiness observable".to_string()
-                })?;
-                let current = self.session.writable_observable().ok_or_else(|| {
-                    "RESULT_SINK blocked credit lost its readiness observable".to_string()
-                })?;
-                if !Arc::ptr_eq(&observable, &current) {
-                    return Err(
-                        "RESULT_SINK blocked credit changed its readiness observable"
-                            .to_string()
-                            .into(),
-                    );
+            Ok(Some(wait)) => InputResult::Deferred {
+                input,
+                next: AdmissionNext::Wait(wait),
+            },
+            Ok(None) => {
+                let result = self.receiver.try_accept(ctx, input, &ResultEncoding);
+                if matches!(&result, InputResult::Accepted(_)) {
+                    self.next = NextStep::Runnable;
                 }
-                *state = ResultSinkCreditState::Blocked {
-                    bytes,
-                    observable,
-                    generation: generation.expect("blocked credit observable generation"),
-                };
-                Ok(false)
+                result
             }
         }
     }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, runtime: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        let factory = self.prepared_factory()?;
-        if self.finished || chunk.is_empty() {
-            return Ok(());
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
         }
-
-        let bytes = self
-            .session
-            .reservation_bytes(&chunk)
-            .map_err(|error| error.to_string())?;
-        let credit = {
-            let mut state = self.credit.lock().expect("result sink credit lock");
-            match std::mem::replace(&mut *state, ResultSinkCreditState::Ready) {
-                ResultSinkCreditState::Reserved(credit) if credit.bytes() == bytes => credit,
-                ResultSinkCreditState::Reserved(credit) => {
-                    return Err(format!(
-                        "RESULT_SINK retained credit for {} bytes but pushed chunk requires {bytes}",
-                        credit.bytes()
-                    ).into());
-                }
-                ResultSinkCreditState::Ready | ResultSinkCreditState::Blocked { .. } => {
-                    drop(state);
-                    match self
-                        .session
-                        .try_acquire(bytes)
-                        .map_err(|error| error.to_string())?
-                    {
-                        ResultWriteAdmission::Granted(credit) if credit.bytes() == bytes => credit,
-                        ResultWriteAdmission::Granted(credit) => {
-                            return Err(format!(
-                                "RESULT_SINK received credit for {} bytes but chunk requires {bytes}",
-                                credit.bytes()
-                            ).into());
-                        }
-                        ResultWriteAdmission::Blocked => {
-                            return Err(
-                                "RESULT_SINK push reached a result session without reserved byte credit"
-                                    .to_string().into(),
-                            );
-                        }
-                    }
-                }
+        ctx.checkpoint()?;
+        if let Err(error) = self.prepared_factory() {
+            return Err(self.fail(ctx, error));
+        }
+        if matches!(self.next, NextStep::Finished) {
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
+        }
+        let result = self.advance(ctx);
+        match result {
+            Ok(step) => {
+                self.next = step.next.clone();
+                Ok(step)
             }
-        };
-        let control = RuntimeKernelControl::new(runtime.error_state());
-        self.session
-            .write_with_credit(chunk, credit, factory, &control)
-            .map_err(ResultWriteFailure::into_execution)
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
+            Err(error) => Err(self.fail(ctx, error)),
         }
-        *self.credit.lock().expect("result sink credit lock") = ResultSinkCreditState::Ready;
-        self.finished = true;
-
-        let prev = self.shared.remaining_drivers.fetch_sub(1, Ordering::AcqRel);
-        if prev <= 0 {
-            return Err("RESULT_SINK driver count underflow".to_string().into());
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
         }
-        if prev == 1 {
-            self.session.finish().map_err(|error| error.to_string())?;
+        ctx.checkpoint()?;
+        if let Err(error) = self.prepared_factory() {
+            return Err(self.fail(ctx, error));
+        }
+        self.finishing = true;
+        if !matches!(self.next, NextStep::Finished) {
+            self.next = NextStep::Runnable;
         }
         Ok(())
     }
-
-    fn sink_observable(&self) -> Option<Arc<Observable>> {
-        self.session.writable_observable()
-    }
-
-    fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
-        matches!(
-            data_type,
-            DataType::Dictionary(key, value)
-                if key.as_ref() == &DataType::Int32
-                    && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
-        )
+}
+impl Drop for ResultBufferSinkOperator {
+    fn drop(&mut self) {
+        self.discard();
     }
 }
 
@@ -373,10 +516,12 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::exec::pipeline::operator::BlockedReason;
+
     use crate::runtime::fragment::io::{
         FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultAbort,
     };
     use crate::runtime::query_options::QueryOptions;
+    use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
 
     struct CreditSession {
@@ -393,6 +538,8 @@ mod tests {
         retained: usize,
         high_water: usize,
         queue: VecDeque<(Chunk, ResultWriteCredit)>,
+        release_backing: Option<Weak<dyn arrow::array::Array>>,
+        released_live_backing: bool,
     }
 
     impl CreditSession {
@@ -404,6 +551,8 @@ mod tests {
                         retained: 0,
                         high_water: 0,
                         queue: VecDeque::new(),
+                        release_backing: None,
+                        released_live_backing: false,
                     }),
                     writable: Arc::new(Observable::new()),
                 }),
@@ -416,6 +565,13 @@ mod tests {
             };
             {
                 let mut state = owner.state.lock().expect("credit session state lock");
+                if state
+                    .release_backing
+                    .as_ref()
+                    .is_some_and(|backing| backing.upgrade().is_some())
+                {
+                    state.released_live_backing = true;
+                }
                 state.retained = state
                     .retained
                     .checked_sub(bytes)
@@ -453,8 +609,11 @@ mod tests {
     }
 
     impl FragmentResultSession for CreditSession {
-        fn reservation_bytes(&self, chunk: &Chunk) -> Result<usize, FragmentIoError> {
-            Ok(chunk.logical_bytes())
+        fn reservation_bytes(
+            &self,
+            input: crate::runtime::fragment::io::ResultInputMetadata,
+        ) -> Result<usize, FragmentIoError> {
+            Ok(input.retained_bytes())
         }
 
         fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, FragmentIoError> {
@@ -545,7 +704,7 @@ mod tests {
         )
         .unwrap();
         let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
             schema,
             vec![Arc::new(Int32Array::from(values))],
             rows,
@@ -555,7 +714,7 @@ mod tests {
     }
 
     fn runtime_state() -> RuntimeState {
-        RuntimeState::new(
+        RuntimeState::for_local_execution(
             Some(QueryOptions::default()),
             None,
             None,
@@ -576,62 +735,93 @@ mod tests {
         operator.prepare().unwrap();
     }
 
+    fn with_context<T>(action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+        let control = crate::runtime::runtime_state::RuntimeErrorState::default();
+        let mut turn =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut StepContext::new(&control, &mut turn))
+    }
+    fn push(operator: &mut dyn Operator, input: RawInput) -> InputResult {
+        with_context(|ctx| operator.try_push(ctx, input))
+    }
+    fn drive(operator: &mut dyn Operator) -> ExecutionResult<StepResult> {
+        with_context(|ctx| operator.drive(ctx))
+    }
+    fn accepted(result: InputResult) {
+        match result {
+            InputResult::Accepted(result) => {
+                result.unwrap();
+            }
+            InputResult::Rejected { failure, .. } => panic!("input rejected: {failure}"),
+            InputResult::Deferred { .. } => panic!("input was not accepted"),
+        }
+    }
     #[test]
     fn byte_credit_blocks_and_consumer_release_wakes_without_overshoot() {
         let first = one_row_chunk();
         let second = one_row_chunk();
+        let original = second.columns()[0].clone();
         let bytes = first.logical_bytes();
         assert!(bytes > 0);
+        let edge = MemTracker::new_root("result edge");
+        let receiver = MemTracker::new_root("result receiver");
+        let mut second = second;
+        second.transfer_to(&edge);
+        let edge_charge = edge.current();
         let session = CreditSession::new(bytes);
         let factory = ResultBufferSinkFactory::new(session.clone(), None);
         let mut operator = factory.create(1, 0);
         prepare_test_sink(operator.as_mut());
-        let processor = operator.as_processor_mut().expect("result processor");
-        let runtime = runtime_state();
-
-        assert!(processor.can_accept_input(&first).expect("first admission"));
-        processor
-            .push_chunk(&runtime, first)
-            .expect("first result write");
+        operator.set_mem_tracker(receiver.clone());
+        accepted(push(operator.as_mut(), RawInput::for_test(first)));
+        drive(operator.as_mut()).unwrap();
         assert_eq!(session.retained(), bytes);
         assert_eq!(session.high_water(), bytes);
-
-        assert!(
-            !processor
-                .can_accept_input(&second)
-                .expect("blocked admission")
-        );
-        assert!(!processor.need_input());
-        let writable = processor
-            .sink_observable()
-            .expect("blocked credit has a stable observable");
-        let generation = writable.generation();
-
+        let raw = RawInput::for_test(second);
+        let (raw, wait) = match push(operator.as_mut(), raw) {
+            InputResult::Deferred {
+                input,
+                next: AdmissionNext::Wait(wait),
+            } => (input, wait),
+            _ => panic!("full receiver must return the original input with its capacity wait"),
+        };
+        assert!(Arc::ptr_eq(
+            &original,
+            &raw.original_for_test().columns()[0]
+        ));
+        assert_eq!(edge.current(), edge_charge);
+        let raw = match push(operator.as_mut(), raw) {
+            InputResult::Deferred {
+                input,
+                next: AdmissionNext::Wait(same),
+            } => {
+                assert_eq!(same.observed_generation, wait.observed_generation);
+                assert!(Arc::ptr_eq(&same.observable, &wait.observable));
+                input
+            }
+            _ => panic!("unchanged capacity still refuses the same input"),
+        };
         session.consume_one();
         assert_eq!(session.retained(), 0);
-        assert!(writable.generation() > generation);
-        assert!(
-            processor
-                .can_accept_input(&second)
-                .expect("retry admission")
-        );
-        processor
-            .push_chunk(&runtime, second)
-            .expect("second result write");
-        processor
-            .set_finishing(&runtime)
-            .expect("result stream finishes");
-
+        assert!(wait.is_ready());
+        accepted(push(operator.as_mut(), raw));
+        assert_eq!(edge.current(), 0);
+        drive(operator.as_mut()).unwrap();
+        with_context(|ctx| operator.as_mut().finish(ctx)).unwrap();
+        assert!(matches!(
+            drive(operator.as_mut()).unwrap().next,
+            NextStep::Finished
+        ));
         assert_eq!(
             session.retained(),
             bytes,
-            "stream finish must not return bytes still retained for the consumer"
+            "finish cannot return consumer-owned bytes"
         );
         assert_eq!(session.high_water(), bytes);
         session.consume_one();
         assert_eq!(session.retained(), 0);
+        assert_eq!(receiver.current(), 0);
     }
-
     #[test]
     fn credit_rejection_does_not_block_a_smaller_reservation_without_a_release() {
         let first = one_row_chunk();
@@ -643,56 +833,77 @@ mod tests {
         let factory = ResultBufferSinkFactory::new(session.clone(), None);
         let mut operator = factory.create(1, 0);
         prepare_test_sink(operator.as_mut());
-        let processor = operator.as_processor_mut().expect("result processor");
-        assert!(processor.can_accept_input(&first).expect("first admission"));
-        processor
-            .push_chunk(&runtime_state(), first)
-            .expect("write");
+        accepted(push(operator.as_mut(), RawInput::for_test(first)));
+        drive(operator.as_mut()).unwrap();
         let generation = session.inner.writable.generation();
-        assert!(!processor.can_accept_input(&large).expect("large blocked"));
-        assert!(processor.can_accept_input(&small).expect("smaller fits"));
+        let large = match push(operator.as_mut(), RawInput::for_test(large)) {
+            InputResult::Deferred { input, .. } => input,
+            _ => panic!("large reservation should not fit"),
+        };
+        accepted(push(operator.as_mut(), RawInput::for_test(small)));
         assert_eq!(session.inner.writable.generation(), generation);
-        processor
-            .push_chunk(&runtime_state(), small)
-            .expect("small write");
+        drive(operator.as_mut()).unwrap();
         assert_eq!(session.high_water(), 2 * bytes);
         session.consume_one();
         session.consume_one();
         assert_eq!(session.retained(), 0);
+        assert_eq!(large.rows(), 2);
+    }
+
+    #[test]
+    fn accepted_result_input_and_credit_survive_yield_and_eos_until_ordered_cancel() {
+        let chunk = one_row_chunk();
+        let backing = Arc::downgrade(&chunk.columns()[0]);
+        let bytes = chunk.logical_bytes();
+        let session = CreditSession::new(bytes);
+        let factory = ResultBufferSinkFactory::new(session.clone(), None);
+        let mut operator = factory.create(1, 0);
+        prepare_test_sink(operator.as_mut());
+        let tracker = MemTracker::new_root("result pending input");
+        operator.set_mem_tracker(tracker.clone());
+        accepted(push(operator.as_mut(), RawInput::for_test(chunk)));
+        assert_eq!(session.retained(), bytes);
+        assert!(tracker.current() > 0);
+        let allocated = tracker.allocated();
+        let control = crate::runtime::runtime_state::RuntimeErrorState::default();
+        let mut turn =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+        let mut ctx = StepContext::new(&control, &mut turn);
+        let step = operator.as_mut().drive(&mut ctx).unwrap();
+        assert!(matches!(step.next, NextStep::Yield));
+        operator.as_mut().finish(&mut ctx).unwrap();
+        assert!(matches!(
+            operator.as_mut().drive(&mut ctx).unwrap().next,
+            NextStep::Yield
+        ));
+        assert_eq!(tracker.allocated(), allocated);
+        assert_eq!(session.retained(), bytes);
+        assert!(session.inner.state.lock().unwrap().queue.is_empty());
+        session.inner.state.lock().unwrap().release_backing = Some(backing.clone());
+        operator.cancel();
+        assert!(backing.upgrade().is_none());
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(session.retained(), 0);
+        assert!(!session.inner.state.lock().unwrap().released_live_backing);
     }
 
     struct OneChunkSource(Option<Chunk>);
 
-    impl Operator for OneChunkSource {
+    impl OperatorLifecycle for OneChunkSource {
         fn name(&self) -> &str {
             "OneChunkSource"
         }
-        fn is_finished(&self) -> bool {
-            self.0.is_none()
-        }
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
     }
-
-    impl ProcessorOperator for OneChunkSource {
-        fn need_input(&self) -> bool {
-            false
-        }
-        fn has_output(&self) -> bool {
-            self.0.is_some()
-        }
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
-            Err("source cannot accept input".to_string().into())
-        }
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(self.0.take())
-        }
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
+    impl crate::exec::pipeline::shape::SourceKernel for OneChunkSource {
+        fn poll_output(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            Ok(crate::exec::pipeline::step::StepResult::new(
+                self.0.take(),
+                crate::exec::pipeline::step::NextStep::Finished,
+                0,
+            ))
         }
     }
 
@@ -719,8 +930,11 @@ mod tests {
     }
 
     impl FragmentResultSession for RacingCreditSession {
-        fn reservation_bytes(&self, chunk: &Chunk) -> Result<usize, FragmentIoError> {
-            self.inner.reservation_bytes(chunk)
+        fn reservation_bytes(
+            &self,
+            input: crate::runtime::fragment::io::ResultInputMetadata,
+        ) -> Result<usize, FragmentIoError> {
+            self.inner.reservation_bytes(input)
         }
         fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, FragmentIoError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -768,7 +982,12 @@ mod tests {
         prepare_test_sink(sink.as_mut());
         PipelineDriver::new(
             0,
-            vec![Box::new(OneChunkSource(Some(chunk))), sink],
+            vec![
+                Box::new(crate::exec::pipeline::shape::Source::new(OneChunkSource(
+                    Some(chunk),
+                ))),
+                sink,
+            ],
             None,
             Vec::new(),
             Arc::new(runtime_state()),
@@ -828,23 +1047,20 @@ mod tests {
                 ConstructionFailure::MissingOwner
             )
         ));
-        let processor = operator.as_processor_mut().unwrap();
-        let error = processor.can_accept_input(&input).unwrap_err();
-        assert!(matches!(
-            error.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Construction(
-                ConstructionFailure::MissingOwner
-            )
+        let original = input.columns()[0].clone();
+        let raw = match push(operator.as_mut(), RawInput::for_test(input.clone())) {
+            InputResult::Rejected { input, failure } => {
+                assert!(failure.same_occurrence(&error));
+                input
+            }
+            _ => panic!("unprepared receiver cannot accept input"),
+        };
+        assert!(Arc::ptr_eq(
+            &original,
+            &raw.original_for_test().columns()[0]
         ));
-        let error = processor
-            .push_chunk(&runtime_state(), input.clone())
-            .unwrap_err();
-        assert!(matches!(
-            error.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Construction(
-                ConstructionFailure::MissingOwner
-            )
-        ));
+        let repeated = drive(operator.as_mut()).unwrap_err();
+        assert!(repeated.same_occurrence(&error));
         assert_eq!(session.retained(), 0);
         assert_eq!(session.high_water(), 0);
         assert!(session.inner.state.lock().unwrap().queue.is_empty());

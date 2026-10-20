@@ -33,7 +33,7 @@ use crate::{
     ProgramNodeKind, ProgramTypedChannels, StaticLayout,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderLinkError {
     Control(CompileControlError),
     ValueType(ValueTypeError),
@@ -338,7 +338,7 @@ mod tests {
             let mut calls = self.calls.lock().unwrap();
             calls.push((phase, units));
             if self.refuse_at == Some(calls.len()) {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -413,7 +413,7 @@ mod tests {
             // refuses even though the fields would produce an ordinary error.
             let owner = OriginalControl {
                 refuse_at: Some(3),
-                cause,
+                cause: cause.clone(),
                 ..OriginalControl::admitted()
             };
             let mut work = CompileCheckpoints::try_new(&owner, CompilePhase::LowerProgram).unwrap();
@@ -425,7 +425,7 @@ mod tests {
                 &mut work,
             )
             .unwrap_err();
-            assert_eq!(failure, ProviderLinkError::Control(cause));
+            assert_eq!(failure, ProviderLinkError::Control(cause.clone()));
             assert!(std::error::Error::source(&failure).is_some());
             assert_eq!(owner.calls.lock().unwrap().len(), 3);
             assert_eq!(work.flush(), Err(cause));

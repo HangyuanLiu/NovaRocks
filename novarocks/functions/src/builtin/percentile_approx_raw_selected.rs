@@ -51,10 +51,18 @@ struct Sink<'a, 'control> {
     sort: Option<OpaqueReservation>,
 }
 impl Sink<'_, '_> {
-    fn diagnostic(&mut self, value: impl fmt::Display) -> RowFailure {
-        match RowDataError::prepare_host(self.ordinal, self.allocator, &mut self.work, |writer| {
-            write!(writer, "{value}")
-        }) {
+    fn diagnostic(
+        &mut self,
+        value: impl fmt::Display,
+        reason: crate::DataFailureReason,
+    ) -> RowFailure {
+        match RowDataError::prepare_host_with_reason(
+            self.ordinal,
+            reason,
+            self.allocator,
+            &mut self.work,
+            |writer| write!(writer, "{value}"),
+        ) {
             Ok(data) => RowFailure::Data(data),
             Err(cause) => RowFailure::Kernel(cause),
         }
@@ -63,14 +71,28 @@ impl Sink<'_, '_> {
 impl ApproxPercentileFailureSink for Sink<'_, '_> {
     type Error = RowFailure;
     fn data(&mut self, recipe: ApproxPercentileDataRecipe<'_>) -> RowFailure {
-        self.diagnostic(recipe)
+        self.diagnostic(recipe, crate::DataFailureReason::InvalidValue)
     }
-    fn allocation(&mut self, _: ApproxPercentileDataRecipe<'_>) -> RowFailure {
-        RowFailure::Kernel(
-            self.allocator
-                .take_recorded_failure()
-                .unwrap_or(KernelFailure::ResourceExhausted),
-        )
+    fn encoding(&mut self, recipe: ApproxPercentileDataRecipe<'_>) -> RowFailure {
+        self.diagnostic(recipe, crate::DataFailureReason::InvalidEncoding)
+    }
+    fn kernel(&mut self, source: KernelFailure) -> RowFailure {
+        RowFailure::Kernel(source)
+    }
+    fn json(&mut self, source: serde_json::Error) -> RowFailure {
+        self.diagnostic(source, crate::DataFailureReason::InvalidEncoding)
+    }
+    fn allocation<E: crate::allocation_failure::AllocationRefusalSource>(
+        &mut self,
+        recipe: ApproxPercentileDataRecipe<'_>,
+        source: E,
+    ) -> RowFailure {
+        RowFailure::Kernel(self.allocator.take_recorded_failure().unwrap_or_else(|| {
+            KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                &recipe.to_string(),
+                source,
+            ))
+        }))
     }
     fn observe(&mut self, event: ApproxPercentileObservation) -> Result<(), RowFailure> {
         match event {
@@ -146,10 +168,13 @@ impl PercentileDecodeStorage for HostAggregateAllocator {
         sink: &mut S,
     ) -> Result<HostVec<T, Self>, S::Error> {
         let mut out = HostVec::new_in(self.clone());
-        out.try_reserve_exact(values.len()).map_err(|_| {
-            sink.allocation(ApproxPercentileDataRecipe::Static(
-                "ResourceExhausted: reserve original decoded percentile values",
-            ))
+        out.try_reserve_exact(values.len()).map_err(|source| {
+            sink.allocation(
+                ApproxPercentileDataRecipe::Static(
+                    "ResourceExhausted: reserve original decoded percentile values",
+                ),
+                source,
+            )
         })?;
         for value in values {
             sink.observe(ApproxPercentileObservation::Step)?;
@@ -163,20 +188,24 @@ impl crate::percentile_approx_raw_core::QuantileEvaluator for Sink<'_, '_> {
     fn payload_failure(
         &mut self,
         failure: PercentilePayloadFailure<'_>,
-    ) -> Result<String, RowFailure> {
-        Err(self.diagnostic(failure.message(PercentileInputDiagnostic::ApproxRaw)))
+    ) -> Result<KernelFailure, RowFailure> {
+        Err(RowFailure::Kernel(
+            failure.into_failure(PercentileInputDiagnostic::ApproxRaw),
+        ))
     }
     fn numeric_failure(
         &mut self,
         failure: PercentileNumericFailure<'_>,
-    ) -> Result<String, RowFailure> {
-        Err(self.diagnostic(failure.message(PercentileInputDiagnostic::ApproxRaw)))
+    ) -> Result<KernelFailure, RowFailure> {
+        Err(RowFailure::Kernel(
+            failure.into_failure(PercentileInputDiagnostic::ApproxRaw),
+        ))
     }
     fn quantile(
         &mut self,
         payload: &[u8],
         quantile: f64,
-    ) -> Result<Result<Option<f64>, String>, RowFailure> {
+    ) -> Result<Result<Option<f64>, KernelFailure>, RowFailure> {
         let state = core::decode_state_with_sink(payload, self.allocator.clone(), self)?;
         Ok(Ok(core::quantile_from_state_with_sink(
             &state,
@@ -280,11 +309,7 @@ pub(super) fn evaluate<'a>(
                     errors.push(data);
                 }
                 Err(RowFailure::Kernel(cause)) => return Err(cause),
-                Ok(Err(_)) => {
-                    return Err(internal(
-                        "percentile_approx_raw host evaluator returned an unhosted diagnostic",
-                    ));
-                }
+                Ok(Err(cause)) => return Err(cause),
             }
         }
         rows.flush()?;

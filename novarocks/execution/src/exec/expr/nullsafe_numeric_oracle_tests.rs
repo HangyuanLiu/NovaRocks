@@ -50,7 +50,10 @@ impl KernelEvaluationControl for OriginalControl {
         panic!("scalar comparison does not wait")
     }
 }
-fn legacy_result(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
+fn legacy_result(
+    left: &ArrayRef,
+    right: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     // These fixtures explicitly author Physical roots. The old carrier-only
     // arena is a value oracle, not evidence of nominal-domain authority.
     let ty = FunctionValueType::new(left.data_type().clone(), true);
@@ -185,7 +188,7 @@ fn intrinsic_null_success_contract_records_legacy_null_carrier_failure_gap() {
     // Legacy Array::is_null does not expose the Null carrier's intrinsic SQL
     // NULL. It reaches the unsupported non-NULL scalar branch instead.
     assert_eq!(
-        legacy_result(&left, &right).unwrap_err(),
+        (legacy_result(&left, &right).unwrap_err()).to_string(),
         "list scalar compare unsupported type: Null"
     );
     let ty = FunctionValueType::new(DataType::Null, true);

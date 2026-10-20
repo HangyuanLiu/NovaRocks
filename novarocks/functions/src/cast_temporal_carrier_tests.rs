@@ -192,7 +192,7 @@ fn temporal_timestamp_date_negative_fraction_and_full_row_diagnostics() {
     }
 }
 #[test]
-fn temporal_date_carrier_preserves_hidden_null_payload_debug_panic() {
+fn temporal_date_carrier_checks_active_range_and_preserves_hidden_null_payload() {
     let dates: ArrayRef = Arc::new(Date32Array::new(
         vec![i32::MAX, 0].into(),
         Some(arrow_buffer::NullBuffer::from(vec![false, true])),
@@ -205,16 +205,35 @@ fn temporal_date_carrier_preserves_hidden_null_payload_debug_panic() {
             DecimalOverflowPolicy::OutputNull,
             false,
         );
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recipe.evaluate_row(EvaluatedArgument::Column(&dates), 0, 0, &Control::default())
-        }));
-        if cfg!(debug_assertions) {
-            assert!(outcome.is_err());
-        } else {
-            assert_eq!(outcome.unwrap().unwrap(), CastRowResult::Null);
-        }
+        assert_eq!(
+            recipe
+                .evaluate_row(EvaluatedArgument::Column(&dates), 0, 0, &Control::default())
+                .unwrap(),
+            CastRowResult::Null
+        );
+        assert_eq!(
+            recipe
+                .evaluate_row(EvaluatedArgument::Column(&dates), 1, 1, &Control::default())
+                .unwrap(),
+            CastRowResult::Timestamp(0)
+        );
+        let active: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
+        let value = recipe
+            .evaluate_row(
+                EvaluatedArgument::Column(&active),
+                7,
+                0,
+                &Control::default(),
+            )
+            .unwrap();
+        let CastRowResult::RowError(error) = value else {
+            panic!("active overflow must be a numeric data cause");
+        };
+        assert_eq!(error.selected_ordinal(), 7);
+        assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
     }
 }
+
 #[test]
 fn temporal_date_carrier_every_control_refusal_retains_original_typed_cause() {
     let dates: ArrayRef = Arc::new(Date32Array::from(vec![0]));

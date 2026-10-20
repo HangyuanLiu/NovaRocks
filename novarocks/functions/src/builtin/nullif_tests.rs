@@ -27,7 +27,7 @@ fn run(
 ) -> Result<ArrayRef, KernelFailure> {
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
-    let result = evaluate_values(left, right, selection, &mut work, None);
+    let result = evaluate_values(left, right, selection, &mut work);
     work.finish_result(result)
 }
 #[test]
@@ -99,23 +99,33 @@ fn selected_nullif_compact_utf8_and_empty_keep_source_identity() {
     assert_eq!(output.data_type(), &DataType::Utf8);
 }
 #[test]
-fn selected_nullif_legacy_raw_long_error_and_timezone_quirks_remain() {
+fn selected_nullif_bounded_contract_error_and_existing_timezone_values() {
     let ty = DataType::FixedSizeList(
         Arc::new(Field::new("x".repeat(900), DataType::Int32, true)),
         1,
     );
     let input = new_null_array(&ty, 2);
-    let actual = evaluate_legacy(input.clone(), input, Some(&ty)).unwrap_err();
-    assert_eq!(actual, format!("nullif unsupported type: {ty:?}"));
-    assert!(actual.len() > 512);
+    let actual = evaluate_legacy(input.clone(), input, &ty).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(actual.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        actual.to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "nullif unsupported type: {ty:?}"
+        ))
+        .as_str()
+    );
+    assert!(actual.to_string().len() <= 512);
     let left: ArrayRef =
         Arc::new(TimestampSecondArray::from(vec![Some(1), Some(2)]).with_timezone("UTC"));
     let right: ArrayRef =
         Arc::new(TimestampSecondArray::from(vec![Some(1), None]).with_timezone("UTC"));
-    let output = evaluate_legacy(left.clone(), right, Some(left.data_type())).unwrap();
+    let output = evaluate_legacy(left.clone(), right, left.data_type()).unwrap();
     assert_eq!(
         output.to_data(),
-        TimestampSecondArray::from(vec![None, Some(2)]).to_data()
+        TimestampSecondArray::from(vec![None, Some(2)])
+            .with_timezone("UTC")
+            .to_data()
     );
 }
 struct RefusingControl {
@@ -180,4 +190,12 @@ fn selected_nullif_every_checkpoint_refusal_is_primary_and_stops_work() {
         assert_eq!(error, invalid("first nullif control refusal"));
         assert_eq!(control.calls.load(Ordering::Relaxed), refuse);
     }
+}
+
+#[test]
+fn nullif_frozen_null_result_has_no_guessed_physical_carrier() {
+    let nulls: ArrayRef = Arc::new(arrow_array::NullArray::new(3));
+    let result = evaluate_legacy(nulls.clone(), nulls, &DataType::Null).unwrap();
+    assert_eq!(result.data_type(), &DataType::Null);
+    assert_eq!(result.len(), 3);
 }

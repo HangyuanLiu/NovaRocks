@@ -510,7 +510,7 @@ mod tests {
             fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
                 assert_eq!(units, 0);
                 if self.calls.fetch_add(1, Ordering::SeqCst) == self.stop_at {
-                    Err(self.error)
+                    Err(self.error.clone())
                 } else {
                     Ok(())
                 }
@@ -525,7 +525,7 @@ mod tests {
                 let control = Stop {
                     calls: AtomicUsize::new(0),
                     stop_at,
-                    error,
+                    error: error.clone(),
                 };
                 let mut ctx = RewriteContext::for_query_with_settings(
                     Default::default(),
@@ -535,7 +535,7 @@ mod tests {
                 let pipeline = RewritePipeline::from_stages(vec![]);
                 assert_eq!(
                     pipeline.rewrite(empty_values_plan(), &mut ctx).unwrap_err(),
-                    crate::compiler::SqlCompileError::from(error)
+                    crate::compiler::SqlCompileError::from(error.clone())
                 );
                 assert_eq!(control.calls.load(Ordering::SeqCst), stop_at + 1);
                 assert!(ctx.trace().events().is_empty());
@@ -553,7 +553,7 @@ mod tests {
         impl PureCompileControl for Owner {
             fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
                 if self.stopped.load(Ordering::SeqCst) {
-                    Err(self.error)
+                    Err(self.error.clone())
                 } else {
                     Ok(())
                 }
@@ -589,7 +589,7 @@ mod tests {
         ] {
             let owner = Owner {
                 stopped: Default::default(),
-                error,
+                error: error.clone(),
             };
             let mut ctx = RewriteContext::for_query_with_settings(
                 Default::default(),

@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
-use novarocks_functions::builtin::aes_rows::{self, Operation, Row};
+use novarocks_functions::builtin::aes_rows::{self, Operation};
 use novarocks_type_contract::ToBase64ByteSource;
 pub fn eval_aes_encrypt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() != 2 && args.len() != 4 && args.len() != 5 {
-        return Err(("aes_encrypt expects 2, 4, or 5 arguments".to_string()).into());
+        return Err(expression_contract(
+            "aes_encrypt expects 2, 4, or 5 arguments",
+        ));
     }
 
     let src = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "aes_encrypt", 0)?;
@@ -78,19 +81,14 @@ pub fn eval_aes_encrypt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         let rows = [row; 5];
-        match aes_rows::evaluate_row(
+        out.push(aes_rows::evaluate_required_row(
             Operation::Encrypt,
-            &inputs,
+            inputs,
             &rows[..inputs.len()],
             ToBase64ByteSource::Ordinary,
-        ) {
-            Row::Value(value) => out.push(value),
-            Row::Data(_) => {
-                return Err(
-                    ("aes_encrypt: requires GCM mode to use AAD parameter".to_string()).into(),
-                );
-            }
-        }
+            row,
+        )?);
     }
-    Ok((super::common::build_bytes_output_latin1(out, arena.data_type(expr)))?)
+    super::common::build_bytes_output_latin1(out, arena.data_type(expr))
+        .map_err(ExecutionFailure::from)
 }

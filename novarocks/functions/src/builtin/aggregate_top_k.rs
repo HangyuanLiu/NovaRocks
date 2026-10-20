@@ -18,13 +18,13 @@
 //! Selected host consumer of the ONE original ApproxTopK computation.
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
-use crate::approx_top_k_core::{self as core, TopKArgument, TopKFailure};
+use crate::aggregate_scalar::{self as scalar, ScalarWork};
+use crate::approx_top_k_core::{self as core, TopKArgument};
 use crate::array_backing_geometry::{self, BorrowedSourceNode, BorrowedSourceObservation};
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
-use crate::scalar_output_operation::{self, ScalarOutputFailure};
+use crate::scalar_output_operation;
 use crate::scalar_output_resources::ScalarOutputResources;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
@@ -231,7 +231,7 @@ fn state_resources(
     state: &TopKState,
     ty: &DataType,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ScalarOutputResources, ScalarStateError> {
+) -> Result<ScalarOutputResources, KernelFailure> {
     let mut total = ScalarOutputResources::from_tracked::<HostAggregateAllocator>(ty, None, work)?;
     total.slots = 0;
     total.heap_bytes = 0;
@@ -248,22 +248,56 @@ fn state_resources(
     total.rows = 1; // TopK always invokes the original builder, even for empty groups.
     Ok(total)
 }
-fn topk_error(failure: TopKFailure, sink: &mut FailureSink<'_, '_>) -> EvaluationFailure {
-    match failure {
-        TopKFailure::Original(message) => sink.diagnostic(&message),
-        TopKFailure::Scalar(ScalarStateError::Legacy(message)) => sink.diagnostic(&message),
-        TopKFailure::Scalar(ScalarStateError::Kernel(cause)) => cause.into(),
-        TopKFailure::Scalar(ScalarStateError::OutputAllocation(_)) => {
-            KernelFailure::ResourceExhausted.into()
+fn topk_error(origin: KernelFailure, sink: &mut FailureSink<'_, '_>) -> EvaluationFailure {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    if origin.failure_fact().class() != FailureClass::Data {
+        return origin.into();
+    }
+    let phase = match &sink.domain {
+        FailureDomain::Mutation { phase, .. } => *phase,
+        FailureDomain::Emission(context) => context.phase(),
+    };
+    match sink.diagnostic(&origin) {
+        EvaluationFailure::InvocationData(data) => data.with_whole_value_source(origin).into(),
+        EvaluationFailure::Kernel(diagnostic) => {
+            KernelFailure::from_domain(TopKDiagnosticFailure {
+                origin,
+                diagnostic,
+                phase,
+            })
+            .into()
         }
     }
 }
-fn output_error(failure: TopKFailure) -> ScalarStateError {
-    match failure {
-        TopKFailure::Original(message) => ScalarStateError::Legacy(message),
-        TopKFailure::Scalar(error) => error,
+#[derive(Debug)]
+struct TopKDiagnosticFailure {
+    origin: KernelFailure,
+    diagnostic: KernelFailure,
+    phase: AggregateInvocationPhase,
+}
+impl std::fmt::Display for TopKDiagnosticFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::aggregate_format::AggregateFailureStage as Stage;
+        let stage = match self.phase {
+            AggregateInvocationPhase::Update => Stage::Update,
+            AggregateInvocationPhase::Merge => Stage::Merge,
+            AggregateInvocationPhase::Intermediate => Stage::BuildIntermediate,
+            AggregateInvocationPhase::Final => Stage::BuildFinal,
+        };
+        stage.message(&self.origin).fmt(f)
     }
 }
+impl std::error::Error for TopKDiagnosticFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.origin)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for TopKDiagnosticFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.origin)
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for TopKDiagnosticFailure {}
 
 impl TopKKernel {
     fn output_type(&self) -> &DataType {
@@ -314,8 +348,7 @@ impl TopKKernel {
                 ty,
                 None,
                 &mut ScalarWork::new(Some(work)),
-            )
-            .map_err(ScalarStateError::into_kernel_failure)?;
+            )?;
             resources.slots = 0;
             resources.heap_bytes = 0;
             resources.rows = expected.max(1);
@@ -329,8 +362,7 @@ impl TopKKernel {
                     )
                     .into());
                 }
-                let actual = state_resources(state, ty, &mut ScalarWork::new(Some(work)))
-                    .map_err(ScalarStateError::into_kernel_failure)?;
+                let actual = state_resources(state, ty, &mut ScalarWork::new(Some(work)))?;
                 resources.slots = plus(resources.slots, actual.slots)?;
                 resources.heap_bytes = plus(resources.heap_bytes, actual.heap_bytes)?;
                 refs.push(&state.core);
@@ -353,18 +385,16 @@ impl TopKKernel {
                             refs.iter().copied(),
                             scalar_work,
                         )
-                        .map_err(output_error)
                     } else {
-                        let mut builder = BinaryBuilder::new();
+                        let mut builder = scalar::BinaryResultBuilder::new();
                         for state in &refs {
                             scalar_work.step()?;
-                            let encoded = core::serialize_state_observed(state, scalar_work)
-                                .map_err(output_error)?;
+                            let encoded = core::serialize_state_observed(state, scalar_work)?;
                             scalar_work.flush()?;
-                            builder.append_value(&encoded);
+                            builder.append_value(&encoded)?;
                             scalar_work.flush()?;
                         }
-                        let result = Arc::new(builder.finish()) as ArrayRef;
+                        let result = Arc::new(builder.finish()?) as ArrayRef;
                         scalar_work.flush()?;
                         Ok(result)
                     }
@@ -372,21 +402,14 @@ impl TopKKernel {
             );
             match result {
                 Ok(leased) => Ok(leased.values),
-                Err(ScalarOutputFailure::Kernel(cause)) => Err(cause.into()),
-                Err(ScalarOutputFailure::OriginalData {
-                    message,
-                    reservation,
-                }) => {
-                    let result = FailureSink {
+                Err(cause) => Err(topk_error(
+                    cause,
+                    &mut FailureSink {
                         allocator: &allocator,
                         domain: FailureDomain::Emission(context),
                         control,
-                    }
-                    .diagnostic(&message);
-                    drop(message);
-                    drop(reservation);
-                    Err(result)
-                }
+                    },
+                )),
             }
         })
     }
@@ -527,17 +550,19 @@ impl PreparedAggregateKernel for TopKKernel {
                 if let Some(recipe) =
                     core::update_input_failure(input.logical_arguments()[0].array())
                 {
-                    return Err(FailureSink {
-                        allocator: &allocator,
-                        domain: FailureDomain::Mutation {
-                            contract: &self.contract,
-                            phase: AggregateInvocationPhase::Update,
-                            selection: input.selection(),
-                            mapping: &mapping,
+                    return Err(topk_error(
+                        KernelFailure::from_domain(recipe),
+                        &mut FailureSink {
+                            allocator: &allocator,
+                            domain: FailureDomain::Mutation {
+                                contract: &self.contract,
+                                phase: AggregateInvocationPhase::Update,
+                                selection: input.selection(),
+                                mapping: &mapping,
+                            },
+                            control,
                         },
-                        control,
-                    }
-                    .diagnostic(&recipe));
+                    ));
                 }
             }
             Ok(TopKUpdate {

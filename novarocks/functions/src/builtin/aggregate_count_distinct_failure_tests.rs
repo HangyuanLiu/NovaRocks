@@ -589,12 +589,19 @@ fn count_actual_malformed_decoder_drops_earlier_state_and_never_replays_a_valid_
     malformed.extend_from_slice(&6_u32.to_le_bytes());
     malformed.extend_from_slice(b"prefix");
     let input = Arc::new(BinaryArray::from(vec![malformed.as_slice()])) as ArrayRef;
-    assert_eq!(
-        merge(&kernel, &mut state, &input, &Control::default()),
-        Err(KernelFailure::Operational(KernelDiagnostic::new(
-            "invalid distinct set encoding"
-        )))
-    );
+    let weak_input = Arc::downgrade(&input);
+    let failure = merge(&kernel, &mut state, &input, &Control::default()).unwrap_err();
+    assert_eq!(failure.to_string(), "invalid distinct set encoding");
+    {
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(
+            failure.failure_fact(),
+            crate::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+    }
+    drop(input);
+    drop(malformed);
+    assert!(weak_input.upgrade().is_none());
     failed(&kernel, &state, &host, &initial);
     let attempts = host.snapshot().attempts;
     assert_eq!(

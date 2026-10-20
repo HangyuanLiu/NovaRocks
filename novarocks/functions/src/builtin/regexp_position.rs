@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! The original regexp_position row calculation, shared by v1 and selected calls.
-use super::string_extended::{LegacyStringControl, StringCoreInput};
+use super::string_extended::{DirectStringControl, StringCoreInput};
 use crate::{
     EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError,
     ScalarCallContract, ScalarCallInput, SelectedValues, Selection,
@@ -29,7 +29,7 @@ use novarocks_type_contract::ValueLogicalType;
 use regex::Regex;
 use std::{alloc::Layout, sync::Arc};
 
-fn strings(array: &ArrayRef) -> Result<Option<&StringArray>, String> {
+fn strings(array: &ArrayRef) -> Result<Option<&StringArray>, KernelFailure> {
     if array.data_type() == &DataType::Null {
         return Ok(None);
     }
@@ -37,7 +37,7 @@ fn strings(array: &ArrayRef) -> Result<Option<&StringArray>, String> {
         .as_any()
         .downcast_ref::<StringArray>()
         .map(Some)
-        .ok_or_else(|| "regexp_position expects string".to_string())
+        .ok_or_else(|| internal("regexp_position expects string"))
 }
 enum Positions<'a> {
     Int32(&'a Int32Array),
@@ -45,7 +45,7 @@ enum Positions<'a> {
     Null,
 }
 impl<'a> Positions<'a> {
-    fn from_array(array: &'a ArrayRef) -> Result<Self, String> {
+    fn from_array(array: &'a ArrayRef) -> Result<Self, KernelFailure> {
         if array.data_type() == &DataType::Null {
             return Ok(Self::Null);
         }
@@ -55,7 +55,7 @@ impl<'a> Positions<'a> {
         if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
             return Ok(Self::Int64(a));
         }
-        Err("regexp_position expects int".to_string())
+        Err(internal("regexp_position expects int"))
     }
     fn value(&self, row: usize) -> Option<i64> {
         match self {
@@ -78,13 +78,16 @@ impl<'a> Positions<'a> {
     }
 }
 /// The v1 shell checks these two arguments before evaluating optional children.
-pub fn validate_legacy_strings(source: &ArrayRef, pattern: &ArrayRef) -> Result<(), String> {
+pub fn validate_argument_strings(
+    source: &ArrayRef,
+    pattern: &ArrayRef,
+) -> Result<(), KernelFailure> {
     strings(source)?;
     strings(pattern)?;
     Ok(())
 }
 /// Original optional raw Int32/Int64/Null admission, before the next child.
-pub fn validate_legacy_position(array: &ArrayRef) -> Result<(), String> {
+pub fn validate_position_argument(array: &ArrayRef) -> Result<(), KernelFailure> {
     Positions::from_array(array).map(|_| ())
 }
 pub(super) fn validate_profile(
@@ -164,9 +167,9 @@ fn eval_row<'a>(
     pattern: &'a str,
     start_pos: i64,
     occurrence: i64,
-    patterns: &mut PatternMemo<'a, Regex, regex::Error>,
+    patterns: &mut PatternMemo<'a, Regex, Arc<regex::Error>>,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Result<i64, String>, KernelFailure> {
+) -> Result<Result<i64, super::string_failure::RegexSyntax>, KernelFailure> {
     if start_pos <= 0 || occurrence <= 0 {
         return Ok(Ok(-1));
     }
@@ -189,15 +192,16 @@ fn eval_row<'a>(
         work.step()?;
     }
     work.flush()?;
-    let compiled = patterns.get_or_compile(pattern, Regex::new);
+    let compiled =
+        patterns.get_or_compile(pattern, |pattern| Regex::new(pattern).map_err(Arc::new));
     work.flush()?;
     let re = match compiled {
         Ok(re) => re,
-        Err(e) => {
+        Err(error) => {
             work.flush()?;
-            let message = format!("Invalid regex expression: {pattern}. Detail message: {e}");
+            let syntax = super::string_failure::regex_syntax(error)?;
             work.flush()?;
-            return Ok(Err(message));
+            return Ok(Err(syntax));
         }
     };
     let suffix = &input[start_byte..];
@@ -271,20 +275,18 @@ fn evaluate_selected<'a>(
                 "regexp_position requires two, three or four evaluated arguments",
             ));
         }
-        let source = strings(input.arguments[0].array()).map_err(|message| internal(&message))?;
-        let pattern = strings(input.arguments[1].array()).map_err(|message| internal(&message))?;
+        let source = strings(input.arguments[0].array())?;
+        let pattern = strings(input.arguments[1].array())?;
         let start = input
             .arguments
             .get(2)
             .map(|a| Positions::from_array(a.array()))
-            .transpose()
-            .map_err(|message| internal(&message))?;
+            .transpose()?;
         let occurrence = input
             .arguments
             .get(3)
             .map(|a| Positions::from_array(a.array()))
-            .transpose()
-            .map_err(|message| internal(&message))?;
+            .transpose()?;
         let selection = input.selection;
         let mut patterns = PatternMemo::new();
         let mut out = reserve::<Option<i32>>(selection.len(), legacy, &mut work)?;
@@ -325,13 +327,18 @@ fn evaluate_selected<'a>(
                 &mut work,
             )? {
                 Ok(value) => out.push(Some(value as i32)),
-                Err(message) => {
+                Err(source) => {
+                    let cause = super::string_failure::StringDataError::RegexLiteral {
+                        pattern: p.value(rows[1]),
+                        source: &source,
+                    };
+                    let message = cause.to_string();
                     for _ in message.as_bytes() {
                         work.step()?;
                     }
                     if let Some(boundary) = input.error_boundary {
                         work.flush()?;
-                        boundary(&message)?;
+                        boundary(ordinal, cause)?;
                         work.flush()?;
                     }
                     work.flush()?;
@@ -359,15 +366,13 @@ fn evaluate_selected<'a>(
     work.finish_result(result)
 }
 /// The v1 shell has already evaluated and admitted arguments in original order.
-pub fn evaluate_legacy(arrays: &[ArrayRef], rows: usize) -> Result<ArrayRef, String> {
+pub fn evaluate_required(arrays: &[ArrayRef], rows: usize) -> Result<ArrayRef, KernelFailure> {
     let arguments = arrays
         .iter()
         .map(EvaluatedArgument::Column)
         .collect::<Vec<_>>();
-    let raw = std::cell::RefCell::new(None);
-    let boundary = |message: &str| {
-        *raw.borrow_mut() = Some(message.to_string());
-        Err(KernelFailure::InstanceFailed)
+    let boundary = |row: usize, cause: super::string_failure::StringDataError<'_>| {
+        Err(super::string_failure::required_row(row, cause))
     };
     let result = evaluate_selected(
         StringCoreInput {
@@ -376,15 +381,11 @@ pub fn evaluate_legacy(arrays: &[ArrayRef], rows: usize) -> Result<ArrayRef, Str
             error_boundary: Some(&boundary),
         },
         true,
-        &LegacyStringControl,
-    );
-    if let Some(error) = raw.into_inner() {
-        return Err(error);
-    }
-    result
-        .map(|values| values.values().clone())
-        .map_err(|e| e.to_string())
+        &DirectStringControl,
+    )?;
+    Ok(Arc::clone(result.values()))
 }
+
 #[cfg(test)]
 #[path = "regexp_position_tests.rs"]
 mod tests;

@@ -250,6 +250,15 @@ fn by_window_tracked_actual_nan_whole_data_full_text_call_phase_no_footer_and_dr
             data.message(),
             "window function #0: update aggregate state: float comparison is not ordered"
         );
+        {
+            use novarocks_failure_contract::FailureProjection;
+            let source = data.original_source().expect("original typed NaN cause");
+            assert_eq!(
+                source.failure_fact(),
+                crate::DataFailureReason::InvalidValue.failure_fact()
+            );
+            assert_eq!(data.failure_fact(), source.failure_fact());
+        }
         assert_eq!(data.partition_rows(), Some(2));
         assert_eq!(data.frame_ordinal(), Some(1));
         assert_eq!(data.input_row(), Some(1));
@@ -635,9 +644,7 @@ fn by_window_tracked_actual_full_generic_scalar_builder_and_nested_metadata() {
 }
 
 #[test]
-fn by_window_tracked_actual_empty_struct_unwinds_original_builder_and_releases_real_admission() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    const ORIGINAL_PANIC: &str = "called `Result::unwrap()` on an `Err` value: InvalidArgumentError(\"use StructArray::try_new_with_length or StructArray::new_empty_fields to create a struct array with no fields so that the length can be set correctly\")";
+fn by_window_tracked_actual_empty_struct_preserves_actual_rows_nulls_and_releases_real_admission() {
     for name in ["max_by", "min_by"] {
         for null_winner in [false, true] {
             let ty = DataType::Struct(arrow_schema::Fields::empty());
@@ -658,18 +665,23 @@ fn by_window_tracked_actual_empty_struct_unwinds_original_builder_and_releases_r
             let input = input(prepared.contract(), &args, &peers, &frames);
             let host = Arc::new(WindowHost::default());
             let control = Control::default();
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                begin(Arc::clone(&prepared), input, Arc::clone(&host), &control)
-            }));
-            let panic = result
-                .err()
-                .expect("ONE original builder still panics for empty Struct");
-            let text = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .expect("original textual panic");
-            assert_eq!(text, ORIGINAL_PANIC);
+            let mut partition =
+                begin(Arc::clone(&prepared), input, Arc::clone(&host), &control).unwrap();
+            let output = partition
+                .evaluate_evaluated(Selection::all(2), 2, &control)
+                .unwrap();
+            let (_, array, errors) = output.into_parts();
+            assert!(errors.is_empty());
+            assert_eq!(array.len(), 2);
+            let structure = array
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .unwrap();
+            assert!(structure.fields().is_empty());
+            assert_eq!(array.null_count(), if null_winner { 2 } else { 0 });
+            partition.finish_evaluated(&control).unwrap();
+            drop(partition);
+            drop(array);
             host.zero();
         }
     }
@@ -795,6 +807,15 @@ fn by_window_whole_invocation_nan_preserves_actual_partition_frame_and_global_ro
         cause.scope(),
         crate::WindowInvocationScope::CompleteInvocation
     );
+    {
+        use novarocks_failure_contract::FailureProjection;
+        let source = cause.original_source().expect("original typed NaN cause");
+        assert_eq!(
+            source.failure_fact(),
+            crate::DataFailureReason::InvalidValue.failure_fact()
+        );
+        assert_eq!(cause.failure_fact(), source.failure_fact());
+    }
     assert_eq!(cause.invocation_rows(), 4);
     assert_eq!(cause.partition_ordinal(), Some(1));
     assert_eq!(cause.partition_rows(), Some(2));
@@ -990,7 +1011,7 @@ fn by_window_structural_scratch_real_layout_refusals_keep_all_seven_causes_and_d
 }
 
 #[test]
-fn by_window_tracked_actual_original_large_utf8_data_is_lossless() {
+fn by_window_tracked_actual_large_utf8_rejection_preserves_contract() {
     use crate::aggregate_scalar::{self as scalar, ScalarWork};
     let values: ArrayRef = Arc::new(arrow_array::LargeStringArray::from(vec!["a", "b"]));
     let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "z"]));
@@ -1039,19 +1060,15 @@ fn by_window_tracked_actual_original_large_utf8_data_is_lossless() {
             Ok(_) => panic!("the original wide scalar reader must fail"),
             Err(first) => first,
         };
-        let WindowEvaluationFailure::InvocationData(data) = &first else {
-            panic!("original scalar Data must not be Operational or Internal");
+        let WindowEvaluationFailure::Kernel(cause) = &first else {
+            panic!("unsupported frozen scalar carrier must remain outer")
         };
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(cause.failure_fact().reason().code(), 313);
         assert_eq!(
-            data.message(),
-            "window function #0: update aggregate state: unsupported tracked scalar type: LargeUtf8"
-        );
-        assert_eq!(data.phase(), WindowInvocationPhase::FrameUpdate);
-        assert_eq!(data.frame_ordinal(), Some(0));
-        assert_eq!(data.input_row(), Some(0));
-        assert!(
-            host.gate.lock().unwrap().opaque > 0,
-            "actual diagnostic backing retains its original granted reservation"
+            cause.to_string(),
+            "unsupported tracked scalar type: LargeUtf8"
         );
         drop(first);
         host.zero();

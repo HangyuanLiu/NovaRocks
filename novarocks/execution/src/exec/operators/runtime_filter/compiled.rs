@@ -62,16 +62,17 @@ impl CompiledRuntimeFilterConsumers {
         node: ProgramNodeId,
         contracts: Vec<execution::RuntimeFilterConsumerContract>,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let contracts = contracts
             .into_iter()
             .enumerate()
             .map(|(index, contract)| {
-                let ordinal = u32::try_from(index)
-                    .map_err(|_| "compiled runtime-filter binding count exceeds u32")?;
+                let ordinal = u32::try_from(index).map_err(|_| {
+                    super::contract_failure("compiled runtime-filter binding count exceeds u32")
+                })?;
                 Ok((ordinal, contract))
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<ExecutionResult<Vec<_>>>()?;
         Self::try_new_at_ordinals(owner, program, node, contracts, error)
     }
 
@@ -83,7 +84,7 @@ impl CompiledRuntimeFilterConsumers {
         node: ProgramNodeId,
         contracts: Vec<(u32, execution::RuntimeFilterConsumerContract)>,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let sites = contracts
             .iter()
             .map(|(binding, _)| ProgramExpressionRootSite::Node {
@@ -102,19 +103,19 @@ impl CompiledRuntimeFilterConsumers {
                 let site = sites[index];
                 let key = root_value_type(&program, site)?;
                 let RuntimeFilterExecutionContract::Membership(schema) = contract.contract() else {
-                    return Err(format!(
+                    return Err(super::contract_failure(format!(
                         "native {owner} runtime-filter binding_id={} requires a membership SetUnion contract",
                         contract.binding_id().get()
-                    ));
+                    )));
                 };
                 if key.data_type() != schema.data_type() {
-                    return Err(format!(
+                    return Err(super::contract_failure(format!(
                         "compiled {owner} runtime-filter binding_id={} key root at local node {} has type {:?}, not its membership type {:?}",
                         contract.binding_id().get(),
                         node.index(),
                         key.data_type(),
                         schema.data_type()
-                    ));
+                    )));
                 }
                 Ok(())
             },
@@ -187,8 +188,6 @@ impl CompiledRuntimeFilterKeys {
     }
 }
 impl RuntimeFilterKeyProvider for CompiledRuntimeFilterKeys {
-    type Error = ExecutionFailure;
-
     fn apply_snapshot(
         &mut self,
         input: Chunk,
@@ -242,15 +241,16 @@ impl RuntimeFilterKeyProvider for CompiledRuntimeFilterKeys {
             &self.sites,
             &self.control,
         )?;
-        let site = *self
-            .sites
-            .get(binding)
-            .ok_or("compiled runtime-filter binding index drifted")?;
+        let site = *self.sites.get(binding).ok_or_else(|| {
+            super::contract_failure("compiled runtime-filter binding index drifted")
+        })?;
         let instance = self
             .instances
             .as_mut()
             .and_then(|instances| instances.get_mut(binding))
-            .ok_or("compiled runtime-filter key instance is missing")?;
+            .ok_or_else(|| {
+                super::contract_failure("compiled runtime-filter key instance is missing")
+            })?;
         if self.controlled_host.is_some() {
             evaluate_chunk_all(instance, site, input, &self.control)
         } else {

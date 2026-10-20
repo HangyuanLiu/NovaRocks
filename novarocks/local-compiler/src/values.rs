@@ -99,9 +99,63 @@ fn constant<'a>(
         Cell::Dynamic(_) => None,
     })
 }
+#[derive(Clone, Copy, Debug)]
+#[repr(u16)]
+enum ValuesArrayOperation {
+    Take = 30,
+    Interleave = 31,
+    Batch = 32,
+}
+#[derive(Debug)]
+struct ValuesArrayFailure {
+    operation: ValuesArrayOperation,
+    source: arrow_schema::ArrowError,
+}
+impl std::fmt::Display for ValuesArrayFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Values {:?}: {}", self.operation, self.source)
+    }
+}
+impl std::error::Error for ValuesArrayFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ValuesArrayFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let class = match &self.source {
+            arrow_schema::ArrowError::MemoryError(_) => FailureClass::Resource,
+            _ => FailureClass::Unexpected,
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(
+                domain::LOCAL_COMPILER,
+                std::num::NonZeroU16::new(self.operation as u16).unwrap(),
+            ),
+        )
+    }
+}
+fn values_array_error(
+    operation: ValuesArrayOperation,
+    source: arrow_schema::ArrowError,
+) -> FragmentCompileError {
+    FragmentCompileError::Owner {
+        phase: "Values array construction",
+        error: novarocks_failure_contract::SharedFailureCause::new(ValuesArrayFailure {
+            operation,
+            source,
+        }),
+    }
+}
+
 fn copy_error(error: CopyError, node: novarocks_physical_plan::NodeId) -> FragmentCompileError {
     match error {
-        CopyError::Extent | CopyError::Control(KernelFailure::ResourceExhausted) => {
+        CopyError::Control(KernelFailure::CompileControl(cause)) => {
+            FragmentCompileError::Control(cause)
+        }
+        CopyError::Control(KernelFailure::ResourceExhausted) => {
             FragmentCompileError::Control(CompileControlError::ResourceExhausted)
         }
         CopyError::Control(KernelFailure::Cancelled) => {
@@ -116,7 +170,7 @@ fn copy_error(error: CopyError, node: novarocks_physical_plan::NodeId) -> Fragme
         },
         error => FragmentCompileError::Owner {
             phase: "Values copy",
-            error: Box::new(error),
+            error: novarocks_failure_contract::SharedFailureCause::new(error),
         },
     }
 }
@@ -125,11 +179,7 @@ impl KernelEvaluationControl for CompileCopyControl<'_> {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
         self.0
             .checkpoint(CompilePhase::LowerProgram, units)
-            .map_err(|cause| match cause {
-                CompileControlError::Cancelled => KernelFailure::Cancelled,
-                CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
-                CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
-            })
+            .map_err(KernelFailure::CompileControl)
     }
     fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
         Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
@@ -279,18 +329,9 @@ fn lower_core_with_creation<H>(
             |visit| {
                 if let ValueTypeVisit::TypeNode(data_type) = visit {
                     validate_arrow_carrier_parameters_observed::<ConstantError>(data_type, || {
-                    work.step().map_err(Into::into)
-                })
-                .map_err(|error| match error {
-                    ConstantError::Control(cause) => FragmentCompileError::Control(cause),
-                    ConstantError::Limit(_) => {
-                        FragmentCompileError::Control(CompileControlError::ResourceExhausted)
-                    }
-                    _ => FragmentCompileError::Unsupported {
-                        node: Some(node.id),
-                        feature: "Values empty carrier has invalid Arrow constructor parameters",
-                    },
-                })?;
+                        work.step().map_err(Into::into)
+                    })
+                    .map_err(FragmentCompileError::from)?;
                 }
                 let unsupported = matches!(visit, ValueTypeVisit::TypeNode(DataType::Union(fields, _)) if fields.is_empty());
                 work.step()?;
@@ -410,10 +451,8 @@ fn lower_core_with_creation<H>(
                     &indices,
                     Some(TakeOptions { check_bounds: true }),
                 );
-                let copied = copied.map_err(|error| FragmentCompileError::Owner {
-                    phase: "Values take",
-                    error: Box::new(error),
-                })?;
+                let copied = copied
+                    .map_err(|source| values_array_error(ValuesArrayOperation::Take, source))?;
                 work.flush()?;
                 copied
             } else {
@@ -434,9 +473,8 @@ fn lower_core_with_creation<H>(
                 }
                 work.flush()?;
                 let copied = interleave(&borrowed, &choices);
-                let copied = copied.map_err(|error| FragmentCompileError::Owner {
-                    phase: "Values interleave",
-                    error: Box::new(error),
+                let copied = copied.map_err(|source| {
+                    values_array_error(ValuesArrayOperation::Interleave, source)
                 })?;
                 work.flush()?;
                 copied
@@ -470,10 +508,7 @@ fn lower_core_with_creation<H>(
         &RecordBatchOptions::new().with_row_count(Some(rows.len())),
     );
     work.flush()?;
-    let batch = batch.map_err(|error| FragmentCompileError::Owner {
-        phase: "Values batch",
-        error: Box::new(error),
-    })?;
+    let batch = batch.map_err(|source| values_array_error(ValuesArrayOperation::Batch, source))?;
     let values = StaticValues::try_new_with_creator(
         batch,
         layout.clone(),
@@ -524,4 +559,51 @@ pub(crate) fn lower_values(
     crate::creation::pure(|creation| {
         lower_values_with_creation(package, node, expressions, slots, control, creation)
     })
+}
+
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    #[test]
+    fn values_array_operations_preserve_sdk_source_without_text_classification() {
+        for operation in [
+            ValuesArrayOperation::Take,
+            ValuesArrayOperation::Interleave,
+            ValuesArrayOperation::Batch,
+        ] {
+            let memory = values_array_error(
+                operation,
+                arrow_schema::ArrowError::MemoryError("actual Values memory refusal".into()),
+            );
+            assert_eq!(memory.failure_fact().class(), FailureClass::Resource);
+            assert_eq!(memory.failure_fact().resource(), None);
+            assert_eq!(memory.failure_fact().reason().code(), operation as u16);
+            assert!(
+                memory
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .is::<arrow_schema::ArrowError>()
+            );
+            let sdk = values_array_error(
+                operation,
+                arrow_schema::ArrowError::ComputeError("resource exhausted 403 overflow".into()),
+            );
+            assert_eq!(sdk.failure_fact().class(), FailureClass::Unexpected);
+            assert!(
+                sdk.source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .is::<arrow_schema::ArrowError>()
+            );
+        }
+    }
 }

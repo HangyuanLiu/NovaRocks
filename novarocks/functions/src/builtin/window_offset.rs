@@ -82,16 +82,7 @@ fn copy_plan(
         if opaque { work.flush() } else { work.step() }
     }) {
         Ok(()) => work.flush(),
-        Err(crate::selected_copy::CopyError::Control(cause)) => Err(cause),
-        Err(crate::selected_copy::CopyError::Extent) => Err(KernelFailure::ResourceExhausted),
-        Err(crate::selected_copy::CopyError::Invalid(message)) => {
-            work.flush()?;
-            Err(invalid(message))
-        }
-        Err(crate::selected_copy::CopyError::Unsupported(_)) => {
-            work.flush()?;
-            Err(invalid("window offset take carrier is unsupported"))
-        }
+        Err(source) => Err(source.into_kernel()),
     }
 }
 
@@ -246,12 +237,7 @@ impl PreparedWindowKernel for PreparedOffset {
             work.flush()?;
             Ok(partition)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish()?;
@@ -339,16 +325,7 @@ impl WindowKernelPartition for OffsetPartition<'_> {
                         },
                     ) {
                         Ok(()) => {}
-                        Err(crate::selected_copy::CopyError::Control(cause)) => return Err(cause),
-                        Err(crate::selected_copy::CopyError::Extent) => {
-                            return Err(KernelFailure::ResourceExhausted);
-                        }
-                        Err(_) => {
-                            work.flush()?;
-                            return Err(invalid(
-                                "window offset default zip profile is unsupported",
-                            ));
-                        }
+                        Err(source) => return Err(source.into_kernel()),
                     }
                     work.flush()?;
                     let zipped = arrow_select::zip::zip(
@@ -369,12 +346,7 @@ impl WindowKernelPartition for OffsetPartition<'_> {
                     || work.step(),
                 )
             })();
-            if matches!(
-                &result,
-                Err(KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted)
-            ) {
+            if result.as_ref().is_err_and(KernelFailure::is_interruption) {
                 return result;
             }
             work.finish()?;

@@ -63,7 +63,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -390,7 +390,7 @@ fn prefixes(
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control),Err(PhysicalWindowOccurrenceError::Control(actual)) if actual==cause),
@@ -409,7 +409,7 @@ fn request_prefixes(source: &ExprNode, fragment: &Fragment, pools: &ConstantPool
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(request(source,fragment,pools,&control),Err(PhysicalWindowRequestError::Control(actual)) if actual==cause)

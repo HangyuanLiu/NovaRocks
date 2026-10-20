@@ -17,6 +17,7 @@
 use super::common::{NumericArrayView, cast_output};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{ArrayRef, Int64Array};
 use novarocks_functions::builtin::numeric_mod_core::{NumericModOp, evaluate_mod_rows};
 use std::sync::Arc;
@@ -27,7 +28,7 @@ fn eval_mod_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     positive: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_view = NumericArrayView::new(&left)?;
@@ -64,9 +65,9 @@ fn eval_mod_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         },
         || Ok(()),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(ExecutionFailure::from)?;
     let out = Arc::new(Int64Array::from(values)) as ArrayRef;
-    Ok((cast_output(out, arena.data_type(expr)))?)
+    cast_output(out, arena.data_type(expr))
 }
 
 pub fn eval_mod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -74,8 +75,8 @@ pub fn eval_mod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_mod_impl(arena, expr, args, chunk, false))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_mod_impl(arena, expr, args, chunk, false)
 }
 
 pub fn eval_pmod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -83,8 +84,8 @@ pub fn eval_pmod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_mod_impl(arena, expr, args, chunk, true))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_mod_impl(arena, expr, args, chunk, true)
 }
 
 #[cfg(test)]

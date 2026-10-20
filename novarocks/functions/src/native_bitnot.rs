@@ -234,7 +234,7 @@ impl PreparedNativeBitNotRecipe {
                 // row; this does not assert or grant allocator capacity.
                 observer(BitArrayObservation::OpaqueBoundary)?;
                 let source = bit_array::to_i128_values(&operand, 0)
-                    .map_err(|e| invalid(&e.legacy_message("bitnot")))?;
+                    .map_err(crate::bit_array::BitArrayError::into_kernel)?;
                 observer(BitArrayObservation::OpaqueBoundary)?;
                 let values = bit_array::map_values_observed(
                     crate::Selection::all(1),
@@ -250,7 +250,7 @@ impl PreparedNativeBitNotRecipe {
             } else {
                 observer(BitArrayObservation::OpaqueBoundary)?;
                 let source = bit_array::to_i64_array(&operand, 0)
-                    .map_err(|e| invalid(&e.legacy_message("bitnot")))?;
+                    .map_err(crate::bit_array::BitArrayError::into_kernel)?;
                 observer(BitArrayObservation::OpaqueBoundary)?;
                 let values = bit_array::map_values_observed(
                     crate::Selection::all(1),
@@ -267,7 +267,7 @@ impl PreparedNativeBitNotRecipe {
             // Valid admitted concrete signed/LARGEINT rows and matching output
             // metadata cannot hit original conversion/output data guards. A
             // forged ABI is never reinterpreted as a successful strict NULL.
-            answer.map_err(|e| invalid(&e.legacy_message("bitnot")))
+            answer.map_err(crate::bit_array::BitArrayError::into_kernel)
         })();
         work.finish_result(outcome)
     }

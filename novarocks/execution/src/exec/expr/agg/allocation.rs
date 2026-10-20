@@ -35,61 +35,165 @@ use crate::runtime::mem_tracker::MemTracker;
 #[derive(Clone, Debug)]
 pub(crate) struct AggregateAllocator {
     tracker: Arc<MemTracker>,
-    admission: AggregateAllocationAdmission,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum AggregateAllocationAdmission {
-    Legacy,
-    Nominal,
 }
 
 impl novarocks_functions::aggregate_scalar::ScalarStateAllocator for AggregateAllocator {
-    fn scalar_allocation_error(
+    fn scalar_allocation_error<
+        E: novarocks_functions::allocation_failure::AllocationRefusalSource,
+    >(
         &self,
-        operation: &str,
-    ) -> novarocks_functions::aggregate_scalar::ScalarStateError {
-        novarocks_functions::aggregate_scalar::ScalarStateError::Legacy(
-            self.allocation_error(operation),
-        )
+        _operation: &str,
+        source: E,
+    ) -> novarocks_functions::KernelFailure {
+        self.allocation_error(_operation, source)
     }
 }
-
 impl novarocks_functions::exact_percentile_core::ExactPercentileAllocator for AggregateAllocator {
     type ParserReservation = AggregateTransientReservation;
     fn reserve_percentile_transient(
         &self,
         bytes: usize,
         operation: &str,
-    ) -> Result<Self::ParserReservation, String> {
+    ) -> Result<Self::ParserReservation, novarocks_functions::KernelFailure> {
         self.reserve_transient(bytes, operation)
     }
-    fn percentile_allocation_error(&self, operation: &str) -> String {
-        self.allocation_error(operation)
+}
+#[derive(Clone, Copy, Debug)]
+struct AggregateRequestExtent {
+    bytes: usize,
+}
+impl std::fmt::Display for AggregateRequestExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "aggregate byte request {} exceeds the signed tracker request extent",
+            self.bytes
+        )
     }
 }
+impl std::error::Error for AggregateRequestExtent {}
+impl novarocks_failure_contract::FailureProjection for AggregateRequestExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts,
+        };
+        FailureFact::new(
+            FailureClass::Resource,
+            crate::runtime::fragment::ExecutionReason::AggregateRequestExtent.reason(),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: None,
+            constraint_scope: None,
+            dimension: ResourceDimension::Bytes,
+            requested: u64::try_from(self.bytes).ok(),
+            required_growth: None,
+            limit: Some(i64::MAX as u64),
+            live: None,
+            committed: None,
+        })
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for AggregateRequestExtent {}
+
+#[derive(Debug)]
+struct AggregateBlockLayoutRefusal {
+    bytes: usize,
+    align: usize,
+    source: std::alloc::LayoutError,
+}
+impl std::fmt::Display for AggregateBlockLayoutRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "aggregate block layout rejected: bytes={} align={}: {}",
+            self.bytes, self.align, self.source
+        )
+    }
+}
+impl std::error::Error for AggregateBlockLayoutRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for AggregateBlockLayoutRefusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts,
+        };
+        if !self.align.is_power_of_two() {
+            FailureFact::new(
+                FailureClass::Invariant,
+                ExecutionReason::AggregateBlockAlignment.reason(),
+            )
+        } else {
+            FailureFact::new(
+                FailureClass::Resource,
+                ExecutionReason::AggregateBlockLayout.reason(),
+            )
+            .with_resource(ResourceFacts {
+                request_scope: None,
+                constraint_scope: None,
+                dimension: ResourceDimension::Bytes,
+                requested: u64::try_from(self.bytes).ok(),
+                required_growth: None,
+                limit: None,
+                live: None,
+                committed: None,
+            })
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for AggregateBlockLayoutRefusal {}
 
 impl AggregateAllocator {
+    pub(crate) fn block_layout(
+        bytes: usize,
+        align: usize,
+    ) -> Result<Layout, novarocks_functions::KernelFailure> {
+        Layout::from_size_align(bytes, align).map_err(|source| {
+            novarocks_functions::KernelFailure::from_domain(AggregateBlockLayoutRefusal {
+                bytes,
+                align,
+                source,
+            })
+        })
+    }
+    pub(crate) fn allocate_zeroed_block(
+        &self,
+        bytes: usize,
+        align: usize,
+    ) -> Result<(NonNull<[u8]>, Layout), novarocks_functions::KernelFailure> {
+        let layout = Self::block_layout(bytes, align)?;
+        let pointer = self.allocate_zeroed(layout).map_err(|source| {
+            self.allocation_error(
+                "allocate aggregate-owned block",
+                novarocks_functions::allocation_failure::AllocatorRequestRefusal::new(
+                    layout, source,
+                ),
+            )
+        })?;
+        Ok((pointer, layout))
+    }
     pub(crate) fn new(tracker: Arc<MemTracker>) -> Self {
-        Self {
-            tracker,
-            admission: AggregateAllocationAdmission::Legacy,
-        }
+        Self { tracker }
     }
 
     /// Use the original tracker author without allocating a refusal message.
     /// Containers still pay their actual Layout, including old + new growth.
     pub(crate) fn new_nominal(tracker: Arc<MemTracker>) -> Self {
-        Self {
-            tracker,
-            admission: AggregateAllocationAdmission::Nominal,
-        }
+        Self { tracker }
     }
 
-    pub(crate) fn allocation_error(&self, operation: &str) -> String {
-        format!(
-            "ResourceExhausted: {operation}: aggregate allocation was rejected by memory tracker {} or the system allocator",
-            self.tracker.label()
+    pub(crate) fn allocation_error<
+        E: novarocks_functions::allocation_failure::AllocationRefusalSource,
+    >(
+        &self,
+        operation: &str,
+        source: E,
+    ) -> novarocks_functions::KernelFailure {
+        novarocks_functions::KernelFailure::from_domain(
+            novarocks_functions::allocation_failure::AllocationRefusal::new(operation, source),
         )
     }
 
@@ -100,10 +204,23 @@ impl AggregateAllocator {
     pub(crate) fn reserve_transient(
         &self,
         bytes: usize,
-        operation: &str,
-    ) -> Result<AggregateTransientReservation, String> {
-        self.try_charge(bytes)
-            .map_err(|_| self.allocation_error(operation))?;
+        _operation: &str,
+    ) -> Result<AggregateTransientReservation, novarocks_functions::KernelFailure> {
+        let signed = i64::try_from(bytes).map_err(|_| {
+            novarocks_functions::KernelFailure::from_domain(AggregateRequestExtent { bytes })
+        })?;
+        if let Err(source) = self.tracker.consume_and_check_limit_nominal(signed) {
+            self.tracker.release(signed);
+            use novarocks_failure_contract::FailureProjection;
+            return Err(novarocks_functions::KernelFailure::Capacity(
+                novarocks_functions::KernelCapacityRefusal::new(
+                    source.failure_fact().reason(),
+                    source.requested,
+                    source.limit,
+                    source.committed,
+                ),
+            ));
+        }
         Ok(AggregateTransientReservation {
             allocator: self.clone(),
             bytes,
@@ -117,15 +234,7 @@ impl AggregateAllocator {
         let Ok(bytes) = i64::try_from(bytes) else {
             return Err(AllocError);
         };
-        let result = match self.admission {
-            AggregateAllocationAdmission::Legacy => {
-                self.tracker.consume_and_check_limit(bytes).map_err(|_| ())
-            }
-            AggregateAllocationAdmission::Nominal => {
-                self.tracker.consume_and_check_limit_nominal(bytes)
-            }
-        };
-        match result {
+        match self.tracker.consume_and_check_limit_nominal(bytes) {
             Ok(()) => Ok(()),
             Err(_) => {
                 self.tracker.release(bytes);
@@ -171,7 +280,7 @@ impl AggregateRetainedCharge {
         &self,
         additional_headroom_bytes: usize,
         operation: &str,
-    ) -> Result<AggregateTransientReservation, String> {
+    ) -> Result<AggregateTransientReservation, novarocks_functions::KernelFailure> {
         self.allocator
             .reserve_transient(additional_headroom_bytes, operation)
     }
@@ -182,16 +291,14 @@ impl AggregateRetainedCharge {
         &mut self,
         new_bytes: usize,
         reservation: &mut AggregateTransientReservation,
-    ) -> Result<(), String> {
+    ) -> Result<(), novarocks_functions::KernelFailure> {
         novarocks_functions::opaque_memory::reconcile_opaque_retained(
             &mut self.bytes,
             &mut reservation.bytes,
             new_bytes,
             |bytes| self.allocator.release_charge(bytes),
-        ).map_err(|error| format!(
-            "aggregate allocation preflight underestimated retained growth: reserved={} growth={}",
-            error.reserved, error.growth,
-        ))
+        )
+        .map_err(novarocks_functions::KernelFailure::from_domain)
     }
 
     #[cfg(test)]
@@ -228,11 +335,11 @@ pub(crate) fn aggregate_hash_map<K, V>(allocator: AggregateAllocator) -> Aggrega
 pub(crate) fn aggregate_bytes(
     allocator: AggregateAllocator,
     bytes: &[u8],
-) -> Result<AggregateVec<u8>, String> {
+) -> Result<AggregateVec<u8>, novarocks_functions::KernelFailure> {
     let mut value = AggregateVec::new_in(allocator.clone());
     value
         .try_reserve_exact(bytes.len())
-        .map_err(|_| allocator.allocation_error("reserve aggregate byte value"))?;
+        .map_err(|source| allocator.allocation_error("reserve aggregate byte value", source))?;
     value.extend_from_slice(bytes);
     Ok(value)
 }
@@ -359,6 +466,41 @@ mod tests {
     }
 
     #[test]
+    fn transient_refusal_keeps_original_limit_facts_and_no_tracker_owner() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        let tracker = MemTracker::new_root("native transient refusal");
+        tracker.install_limit_once(8).unwrap();
+        let weak = Arc::downgrade(&tracker);
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let error = match allocator.reserve_transient(16, "numeric overflow authentication failure")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("request exceeds the original tracker limit"),
+        };
+        assert_eq!(
+            tracker.current(),
+            0,
+            "failed prospective charge rolls back before publication"
+        );
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().domain(), domain::MEMORY.get());
+        assert_eq!(fact.reason().code(), 8);
+        let resource = fact.resource().unwrap();
+        assert_eq!(
+            (resource.requested, resource.limit, resource.committed),
+            (Some(16), Some(8), Some(16))
+        );
+        drop(allocator);
+        drop(tracker);
+        assert!(
+            weak.upgrade().is_none(),
+            "error facts do not extend the tracker lifetime"
+        );
+        assert_eq!(error.failure_fact(), fact);
+    }
+
+    #[test]
     fn rejects_growth_before_allocation_and_releases_exact_layouts() {
         let tracker = MemTracker::new_root("aggregate-test");
         tracker.install_limit_once(8).unwrap();
@@ -370,14 +512,19 @@ mod tests {
         assert_eq!(tracker.current(), 8);
 
         let capacity = values.capacity();
-        assert!(values.try_reserve_exact(1).is_err());
+        let source = values.try_reserve_exact(1).unwrap_err();
         assert_eq!(values.capacity(), capacity);
         assert_eq!(tracker.current(), 8);
-        assert!(
-            allocator
-                .allocation_error("grow aggregate vector")
-                .contains("ResourceExhausted")
+        use novarocks_failure_contract::FailureProjection;
+        let error = allocator.allocation_error("grow aggregate vector", source);
+        let fact = error.failure_fact();
+        assert_eq!(
+            fact.class(),
+            novarocks_failure_contract::FailureClass::Resource
         );
+        assert_eq!(fact.resource().unwrap().requested, Some(16));
+        assert_eq!(fact.resource().unwrap().limit, None);
+        assert_eq!(fact.resource().unwrap().committed, None);
 
         drop(values);
         assert_eq!(tracker.current(), 0);
@@ -427,5 +574,51 @@ mod tests {
             assert_eq!(tracker.current(), 16);
         }
         assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[cfg(test)]
+mod block_geometry_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn actual_block_layout_sources_separate_invalid_alignment_and_large_legal_request() {
+        for (bytes, align, class, reason) in [
+            (
+                16,
+                3,
+                FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::AggregateBlockAlignment,
+            ),
+            (
+                usize::MAX,
+                8,
+                FailureClass::Resource,
+                crate::runtime::fragment::ExecutionReason::AggregateBlockLayout,
+            ),
+        ] {
+            let error = AggregateAllocator::block_layout(bytes, align).unwrap_err();
+            let fact = error.failure_fact();
+            assert_eq!(fact.class(), class);
+            assert_eq!(fact.reason(), reason.reason());
+            let novarocks_functions::KernelFailure::Source(source) = &error else {
+                panic!("original layout cause lost")
+            };
+            let cause = std::error::Error::source(source)
+                .unwrap()
+                .downcast_ref::<AggregateBlockLayoutRefusal>()
+                .unwrap();
+            assert_eq!((cause.bytes, cause.align), (bytes, align));
+            if class == FailureClass::Resource {
+                assert_eq!(
+                    fact.resource().unwrap().requested,
+                    u64::try_from(bytes).ok()
+                );
+            }
+        }
+        assert_eq!(
+            AggregateAllocator::block_layout(16, 8).unwrap(),
+            Layout::from_size_align(16, 8).unwrap()
+        );
     }
 }

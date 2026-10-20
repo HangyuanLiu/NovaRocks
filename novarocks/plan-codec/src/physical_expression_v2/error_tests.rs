@@ -38,13 +38,13 @@ fn receiving_dependency_refusals_never_reobserve_an_originating_cause() {
         CompileControlError::ResourceExhausted,
     ] {
         for lifted in [
-            ExpressionCodecError::from(ValueCodecError::Control(cause)),
+            ExpressionCodecError::from(ValueCodecError::Control(cause.clone())),
             ExpressionCodecError::from(
-                novarocks_physical_plan::ExprArenaConstructionError::Control(cause),
+                novarocks_physical_plan::ExprArenaConstructionError::Control(cause.clone()),
             ),
-            ExpressionCodecError::from(ConstantReferenceError::Control(cause)),
+            ExpressionCodecError::from(ConstantReferenceError::Control(cause.clone())),
             ExpressionCodecError::from(ConstantReferenceError::Constant(ConstantError::Control(
-                cause,
+                cause.clone(),
             ))),
         ] {
             let control = Control(Mutex::new(Vec::new()));

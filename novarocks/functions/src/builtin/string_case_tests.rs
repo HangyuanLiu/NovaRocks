@@ -84,7 +84,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -354,18 +354,30 @@ fn string_case_empty_selection_bypasses_body_and_selected_shape_errors_poison_on
 #[test]
 fn string_case_output_and_unicode_temporary_layouts_refuse_before_requests() {
     assert_eq!(
-        output_capacity(usize::MAX, 0),
+        output_layout(usize::MAX, 0),
         Err(KernelFailure::ResourceExhausted)
     );
-    assert_eq!(
-        output_capacity(1, i32::MAX as usize + 1),
-        Err(KernelFailure::ResourceExhausted)
-    );
+    // A column-wide layout is not a single-value UTF-8 extent proof.
+    assert!(output_layout(1, i32::MAX as usize + 1).is_ok());
+    assert_eq!(value_extent(i32::MAX as u128).unwrap(), i32::MAX as usize);
+    for required in [i32::MAX as u128 + 1, u128::MAX] {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+        let failure = value_extent(required).unwrap_err();
+        let fact = failure.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(fact.reason().code(), 358);
+        assert!(fact.resource().is_none());
+        let representation = fact.representation().unwrap();
+        assert_eq!(representation.boundary, RepresentationBoundary::MinimumUnit);
+        assert_eq!(representation.required, u64::try_from(required).ok());
+        assert_eq!(representation.extent_limit, Some(i32::MAX as u64));
+        assert_eq!(representation.representable_prefix, None);
+    }
     assert_eq!(
         temporary_layout(1, usize::MAX),
         Err(KernelFailure::ResourceExhausted)
     );
-    assert!(output_capacity(0, 0).is_ok());
+    assert!(output_layout(0, 0).is_ok());
     assert!(temporary_layout(0, 0).is_ok());
     assert!(temporary_layout(2, 3).is_ok());
 }
@@ -566,10 +578,11 @@ fn string_case_compile_success_and_ordinary_tail_preserve_all_callback_causes() 
                 CompileControlError::Cancelled,
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
+                CompileControlError::from_domain(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "lower",
@@ -594,6 +607,65 @@ fn string_case_compile_success_and_ordinary_tail_preserve_all_callback_causes() 
                 assert_eq!(actual, Some(cause));
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             }
+        }
+    }
+}
+
+#[test]
+fn direct_case_carrier_failure_is_nominal_and_does_not_retain_the_input() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    for op in [StringCaseOp::Lower, StringCaseOp::Upper] {
+        let input: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7]));
+        let weak = Arc::downgrade(&input);
+        let failure = evaluate_required_case(op, &input).unwrap_err();
+        drop(input);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 359);
+        assert!(
+            failure
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<CaseFailure>()
+        );
+    }
+}
+
+#[test]
+fn case_measured_expansion_and_whole_context_use_the_same_output_geometry() {
+    let expanded = "ΐ".repeat(1025);
+    let sigma = "Ο".to_owned() + &"A".repeat(1025) + "Σ";
+    let input: ArrayRef = Arc::new(StringArray::from(vec![
+        Some(expanded.as_str()),
+        None,
+        Some(sigma.as_str()),
+        Some(""),
+    ]));
+    for op in [StringCaseOp::Lower, StringCaseOp::Upper] {
+        let control = Control::default();
+        let mut work = EvaluationCheckpoints::new(&control);
+        let output = evaluate_required_case(op, &input).unwrap();
+        let values = output.as_any().downcast_ref::<StringArray>().unwrap();
+        for (row, source) in [expanded.as_str(), "", sigma.as_str(), ""]
+            .iter()
+            .enumerate()
+        {
+            if row == 1 {
+                assert!(values.is_null(row));
+                continue;
+            }
+            let expected = match op {
+                StringCaseOp::Lower => source.to_lowercase(),
+                StringCaseOp::Upper => source.to_uppercase(),
+            };
+            assert_eq!(
+                mapped_length(op, source, &mut work).unwrap(),
+                expected.len() as u128
+            );
+            assert_eq!(values.value(row), expected);
         }
     }
 }

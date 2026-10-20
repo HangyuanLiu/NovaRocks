@@ -48,7 +48,7 @@ impl PureCompileControl for CompileControl {
         assert!(work <= 256);
         self.work.lock().unwrap().push(work);
         if !self.positive_only || work > 0 {
-            self.failure.map_or(Ok(()), Err)
+            self.failure.clone().map_or(Ok(()), Err)
         } else {
             Ok(())
         }
@@ -645,6 +645,8 @@ fn equal_foreign_body_arc_cannot_bind_and_post_callback_contract_drift_is_checke
     assert_eq!(evaluator.calls, 0);
     for failure in [
         None,
+        Some(operational()),
+        Some(actual_lifecycle_source()),
         Some(KernelFailure::Cancelled),
         Some(KernelFailure::DeadlineExceeded),
         Some(KernelFailure::ResourceExhausted),
@@ -923,7 +925,7 @@ fn body_context_capture_domain_and_compile_observation_are_exact() {
     ] {
         for positive_only in [false, true] {
             let control = CompileControl {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive_only,
                 work: Mutex::default(),
             };
@@ -935,7 +937,7 @@ fn body_context_capture_domain_and_compile_observation_are_exact() {
                 &control,
             )
             .unwrap_err();
-            assert_eq!(error, compile_failure(failure));
+            assert_eq!(error, compile_failure(failure.clone()));
             let work = control.work.lock().unwrap();
             if positive_only {
                 assert!(work.contains(&256));
@@ -962,7 +964,7 @@ fn higher_order_entry_control_precedes_wrong_kind_or_non_higher_order_rejection(
         CompileControlError::ResourceExhausted,
     ] {
         let control = CompileControl {
-            failure: Some(failure),
+            failure: Some(failure.clone()),
             ..Default::default()
         };
         assert_eq!(
@@ -1006,7 +1008,7 @@ fn higher_order_entry_control_precedes_wrong_kind_or_non_higher_order_rejection(
     assert_eq!(
         HigherOrderCallContract::from_refined(input, &receipt, owner.selected.clone(), &cancelled)
             .unwrap_err(),
-        KernelFailure::Cancelled
+        KernelFailure::CompileControl(CompileControlError::Cancelled)
     );
     assert!(matches!(
         HigherOrderCallContract::from_refined(
@@ -1258,4 +1260,21 @@ fn required_error_reborrow_observes_complete_independent_sparse_outer_rows() {
     ));
     // A mismatch in the suffix cannot avoid observation of its earlier rows.
     assert!(control.work.lock().unwrap().contains(&256));
+}
+
+fn actual_lifecycle_source() -> KernelFailure {
+    let source = crate::aggregate_scalar::build_scalar_array(
+        &DataType::Boolean,
+        vec![Some(crate::aggregate_scalar::AggScalarValue::Int64(1))],
+        &mut crate::aggregate_scalar::ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&source);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 315);
+    assert!(matches!(&source, KernelFailure::Source(_)));
+    source
 }

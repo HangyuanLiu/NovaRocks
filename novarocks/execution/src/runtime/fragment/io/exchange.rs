@@ -139,7 +139,10 @@ impl TestExchangeReceiverPort {
 
 #[cfg(test)]
 impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
-    fn register(&self, registration: super::ExchangeReceiverRegistration) -> Result<(), String> {
+    fn register(
+        &self,
+        registration: super::ExchangeReceiverRegistration,
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
         self.registry
             .try_register_expected_chunk_schema_with_binding(
                 Self::key(registration.key),
@@ -154,7 +157,7 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         &self,
         key: super::ExchangeReceiverKey,
         frame: super::ExchangeReceiverFrame,
-    ) -> Result<(), crate::runtime::exchange::ExchangeReceiveFailure> {
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
         let key = Self::key(key);
         let sender = crate::runtime::exchange::ExchangeSenderIdentity::native(
             frame.source_fragment_instance_id,
@@ -181,7 +184,10 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         &self,
         key: super::ExchangeReceiverKey,
         expected_senders: usize,
-    ) -> Result<crate::runtime::exchange::ExchangeReceiverHandle, String> {
+    ) -> Result<
+        crate::runtime::exchange::ExchangeReceiverHandle,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
         self.registry
             .get_receiver_handle(Self::key(key), expected_senders)
     }
@@ -189,7 +195,10 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         &self,
         key: super::ExchangeReceiverKey,
         root: &std::sync::Arc<crate::runtime::mem_tracker::MemTracker>,
-    ) -> Result<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>, String> {
+    ) -> Result<
+        std::sync::Arc<crate::runtime::mem_tracker::MemTracker>,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
         self.registry
             .ensure_receiver_mem_tracker(Self::key(key), root)
     }

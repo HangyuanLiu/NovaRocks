@@ -17,6 +17,7 @@
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{ArrayRef, Float64Array};
 use novarocks_functions::builtin::dround_core::{DroundComputation, evaluate_legacy_dround};
 use std::sync::Arc;
@@ -26,7 +27,7 @@ fn evaluate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     unary: DroundComputation,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let left = arena.eval(args[0], chunk)?;
     let (op, right) = if args.len() == 1 {
         (unary, None)
@@ -36,30 +37,30 @@ fn evaluate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             Some(arena.eval(args[1], chunk)?),
         )
     };
-    Ok((evaluate_legacy_dround(
+    evaluate_legacy_dround(
         op,
         &left,
         right.as_ref(),
         chunk.len(),
         arena.data_type(expr),
     )
-    .map_err(|error| error.to_string()))?)
+    .map_err(ExecutionFailure::from)
 }
 pub fn eval_truncate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((evaluate(arena, expr, args, chunk, DroundComputation::Truncate))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    evaluate(arena, expr, args, chunk, DroundComputation::Truncate)
 }
 pub fn eval_dround<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((evaluate(arena, expr, args, chunk, DroundComputation::Round))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    evaluate(arena, expr, args, chunk, DroundComputation::Round)
 }
 
 #[cfg(test)]
@@ -269,7 +270,7 @@ mod legacy_rounding_contract_tests {
         value: ArrayRef,
         digits: Option<Digits>,
         output_type: DataType,
-    ) -> Result<ArrayRef, String> {
+    ) -> Result<ArrayRef, ExecutionFailure> {
         let mut inputs = vec![value];
         let literal = match digits {
             Some(Digits::Column(array)) => {
@@ -489,7 +490,10 @@ mod legacy_rounding_contract_tests {
                     DataType::Int64
                 };
                 let error = evaluate(input.clone(), digits, output_type).unwrap_err();
-                assert!(error.contains("unsupported numeric type"), "{error}");
+                assert!(
+                    error.detail().contains("unsupported numeric type"),
+                    "{error}"
+                );
             }
         }
     }

@@ -57,7 +57,10 @@ fn fixture(inputs: Vec<ArrayRef>, rows: usize) -> (ExprArena, Vec<ExprId>, Chunk
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
 
-fn raw_round(inputs: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw_round(
+    inputs: Vec<ArrayRef>,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = inputs[0].len();
     let (mut arena, args, chunk) = fixture(inputs, rows);
     let expr = output.map_or(ExprId(usize::MAX), |ty| {
@@ -71,7 +74,9 @@ fn raw_round(inputs: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef
     });
     eval_round(&arena, expr, args[0], args.get(1).copied(), &chunk)
 }
-fn raw_dround(inputs: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn raw_dround(
+    inputs: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = inputs[0].len();
     let (arena, args, chunk) = fixture(inputs, rows);
     eval_math_function("dround", &arena, ExprId(usize::MAX), &args, &chunk)
@@ -180,48 +185,58 @@ fn legacy_round_raw_decimal_keeps_out_of_precision_raw_without_validation() {
     assert_eq!(result.data_type(), &DataType::Decimal128(38, 0));
 }
 #[test]
-fn legacy_round_raw_decimal_full_errors_preserve_factor_primary_and_adjust_stages() {
+fn round_decimal_primary_factor_and_adjust_keep_their_original_numeric_causes() {
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_functions::legacy_decimal::DecimalMathFailure;
     let bound = 10_i128.pow(38) - 1;
-    assert_eq!(
-        raw_round(
+    for (input, output, expected) in [
+        (
             vec![decimal(vec![Some(bound)], 0)],
-            Some(DataType::Decimal128(38, 1))
-        )
-        .unwrap_err(),
-        "decimal overflow in round"
-    );
-    assert_eq!(
-        raw_round(
+            DataType::Decimal128(38, 1),
+            DecimalMathFailure::Overflow,
+        ),
+        (
             vec![decimal(vec![Some(1)], 38), digits(vec![Some(-38)])],
-            Some(DataType::Decimal128(38, 38))
-        )
-        .unwrap_err(),
-        "decimal overflow"
-    );
-    assert_eq!(
-        raw_round(
+            DataType::Decimal128(38, 38),
+            DecimalMathFailure::Power {
+                exponent: 76,
+                bits: 128,
+            },
+        ),
+        (
             vec![decimal(vec![Some(bound)], 0), digits(vec![Some(-1)])],
-            Some(DataType::Decimal128(38, 2))
-        )
-        .unwrap_err(),
-        "decimal overflow in round adjust"
-    );
+            DataType::Decimal128(38, 2),
+            DecimalMathFailure::Overflow,
+        ),
+    ] {
+        let failure = raw_round(input, Some(output)).unwrap_err();
+        assert_eq!(
+            failure.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+        assert_eq!(*original_source::<DecimalMathFailure>(&failure), expected);
+    }
     // Empty and SQL NULL rows do not request a dynamic rounding factor.
-    let result = raw_round(
+    let output = raw_round(
         vec![decimal(vec![None], 38), digits(vec![Some(-38)])],
         Some(DataType::Decimal128(38, 38)),
     )
     .unwrap();
-    assert_eq!(raws(&result), vec![None]);
+    assert_eq!(raws(&output), vec![None]);
 }
+
 #[test]
 fn legacy_round_raw_full_output_errors_and_unary_scale_projection_are_unchanged() {
     assert_eq!(
-        raw_round(vec![float(vec![Some(1.0)])], None).unwrap_err(),
+        raw_round(vec![float(vec![Some(1.0)])], None)
+            .unwrap_err()
+            .to_string(),
         "round: missing output type"
     );
     assert_eq!(
-        raw_round(vec![decimal(vec![Some(1)], 0)], Some(DataType::Float64)).unwrap_err(),
+        raw_round(vec![decimal(vec![Some(1)], 0)], Some(DataType::Float64))
+            .unwrap_err()
+            .to_string(),
         "round: expected Decimal128 output type, got Float64"
     );
     let result = raw_round(
@@ -233,10 +248,24 @@ fn legacy_round_raw_full_output_errors_and_unary_scale_projection_are_unchanged(
     // An all-NULL native digits carrier still runs Arrow's static cast preparation.
     let value: ArrayRef = Arc::new(NullArray::new(1));
     let input = decimal(vec![None], -39);
-    let expected = arrow::compute::cast(&input, &DataType::Int64).unwrap_err();
+    let expected = arrow::compute::cast(&input, &DataType::Int64)
+        .unwrap_err()
+        .to_string();
+    let failure = raw_round(vec![value, input], Some(DataType::Float64)).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(failure.failure_fact().class(), FailureClass::Data);
     assert_eq!(
-        raw_round(vec![value, input], Some(DataType::Float64)).unwrap_err(),
-        format!("round: failed to cast decimals to Int64: {expected}")
+        failure.failure_fact().reason(),
+        crate::runtime::fragment::ExecutionReason::ArrayCastData.reason()
+    );
+    assert!(
+        failure
+            .detail()
+            .starts_with("round: failed to cast decimals to Int64:")
+    );
+    assert_eq!(
+        original_source::<arrow::error::ArrowError>(&failure).to_string(),
+        expected
     );
 }
 #[test]
@@ -270,5 +299,19 @@ fn legacy_dround_raw_original_numeric_digits_projection_and_extreme_negation_are
                 .value(0),
             1.0
         );
+    }
+}
+
+fn original_source<'a, T: std::error::Error + 'static>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> &'a T {
+    let mut source = error;
+    loop {
+        if let Some(original) = source.downcast_ref::<T>() {
+            return original;
+        }
+        source = source
+            .source()
+            .expect("original domain source must survive propagation");
     }
 }

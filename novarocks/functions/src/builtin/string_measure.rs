@@ -33,31 +33,63 @@ pub(super) enum StringMeasureOp {
 }
 #[derive(Debug)]
 enum MeasureFailure {
-    Kernel(KernelFailure),
-    Legacy(String),
+    Carrier(StringMeasureOp),
+    Int32 {
+        value: i64,
+        source: std::num::TryFromIntError,
+    },
+    MissingReturnType,
+    ReturnType(novarocks_failure_contract::BoundedDetail),
 }
-impl From<KernelFailure> for MeasureFailure {
-    fn from(error: KernelFailure) -> Self {
-        Self::Kernel(error)
+impl std::fmt::Display for MeasureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Carrier(StringMeasureOp::Ascii) => f.write_str("ascii expects string"),
+            Self::Carrier(_) => f.write_str("length expects string"),
+            Self::Int32 { value, .. } => write!(f, "length result out of INT range: {value}"),
+            Self::MissingReturnType => f.write_str("length return type is missing"),
+            Self::ReturnType(value) => write!(
+                f,
+                "length return type must be INT/BIGINT, got {}",
+                value.as_str()
+            ),
+        }
     }
 }
-fn string_reader(array: &ArrayRef, op: StringMeasureOp) -> Result<&StringArray, MeasureFailure> {
-    array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        MeasureFailure::Legacy(
-            if op == StringMeasureOp::Ascii {
-                "ascii expects string"
-            } else {
-                "length expects string"
-            }
-            .to_string(),
-        )
-    })
+impl std::error::Error for MeasureFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Int32 { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MeasureFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+        };
+        match self {
+            Self::Int32 { .. } => crate::DataFailureReason::NumericOutOfRange.failure_fact(),
+            _ => FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(357).unwrap()),
+            ),
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for MeasureFailure {}
+fn string_reader(array: &ArrayRef, op: StringMeasureOp) -> Result<&StringArray, KernelFailure> {
+    array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| KernelFailure::from_domain(MeasureFailure::Carrier(op)))
 }
 fn original_value(
     op: StringMeasureOp,
     text: &str,
     work: &mut Option<EvaluationCheckpoints<'_>>,
-) -> Result<i64, MeasureFailure> {
+) -> Result<i64, KernelFailure> {
     Ok(match op {
         StringMeasureOp::Ascii => i64::from(text.as_bytes().first().copied().unwrap_or(0) as i32),
         StringMeasureOp::Bytes => text.len() as i64,
@@ -81,8 +113,8 @@ fn compute_rows(
     selection: Selection<'_>,
     nullable: Option<bool>,
     work: &mut Option<EvaluationCheckpoints<'_>>,
-    mut output: impl FnMut(Option<i64>) -> Result<(), MeasureFailure>,
-) -> Result<(), MeasureFailure> {
+    mut output: impl FnMut(Option<i64>) -> Result<(), KernelFailure>,
+) -> Result<(), KernelFailure> {
     for (ordinal, batch) in selection.iter().enumerate() {
         if let Some(work) = work {
             work.step()?;
@@ -107,11 +139,11 @@ fn compute_rows(
     }
     Ok(())
 }
-fn int32_value(value: i64) -> Result<i32, MeasureFailure> {
+fn int32_value(value: i64) -> Result<i32, KernelFailure> {
     i32::try_from(value)
-        .map_err(|_| MeasureFailure::Legacy(format!("length result out of INT range: {value}")))
+        .map_err(|source| KernelFailure::from_domain(MeasureFailure::Int32 { value, source }))
 }
-fn length_int32(values: Vec<Option<i64>>) -> Result<ArrayRef, MeasureFailure> {
+fn length_int32(values: Vec<Option<i64>>) -> Result<ArrayRef, KernelFailure> {
     let mut out = Vec::with_capacity(values.len());
     for value in values {
         out.push(value.map(int32_value).transpose()?);
@@ -204,30 +236,15 @@ pub(super) fn evaluate_string_measure<'a>(
             };
             Ok(())
         },
-    )
-    .map_err(|error| match error {
-        MeasureFailure::Kernel(cause) => cause,
-        MeasureFailure::Legacy(message)
-            if message == "ascii expects string" || message == "length expects string" =>
-        {
-            internal("string measurement selected Utf8 carrier cannot be downcast")
-        }
-        MeasureFailure::Legacy(message) => internal(&message),
-    })?;
+    )?;
     let output = Arc::new(builder.finish()) as ArrayRef;
     work.take().unwrap().finish()?;
     SelectedValues::try_new(selection, target.data_type(), output, Box::default())
         .map_err(|_| internal("string measurement compact output violates its selected contract"))
 }
-fn legacy_failure(error: MeasureFailure) -> String {
-    match error {
-        MeasureFailure::Kernel(cause) => cause.to_string(),
-        MeasureFailure::Legacy(message) => message,
-    }
-}
 /// V1 retains its original source length and ignores the result type.
-pub fn evaluate_legacy_ascii(array: &ArrayRef) -> Result<ArrayRef, String> {
-    let values = string_reader(array, StringMeasureOp::Ascii).map_err(legacy_failure)?;
+pub fn evaluate_required_ascii(array: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
+    let values = string_reader(array, StringMeasureOp::Ascii)?;
     let mut rows = Vec::with_capacity(array.len());
     compute_rows(
         StringMeasureOp::Ascii,
@@ -240,22 +257,21 @@ pub fn evaluate_legacy_ascii(array: &ArrayRef) -> Result<ArrayRef, String> {
             rows.push(value.map(int32_value).transpose()?);
             Ok(())
         },
-    )
-    .map_err(legacy_failure)?;
+    )?;
     Ok(Arc::new(Int32Array::from(rows)))
 }
 /// V1 computes all input rows before checking its original requested carrier.
-pub fn evaluate_legacy_length(
+pub fn evaluate_required_length(
     array: &ArrayRef,
     characters: bool,
     target: Option<&DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, KernelFailure> {
     let op = if characters {
         StringMeasureOp::Characters
     } else {
         StringMeasureOp::Bytes
     };
-    let values = string_reader(array, op).map_err(legacy_failure)?;
+    let values = string_reader(array, op)?;
     let mut rows = Vec::with_capacity(array.len());
     compute_rows(
         op,
@@ -268,15 +284,15 @@ pub fn evaluate_legacy_length(
             rows.push(value);
             Ok(())
         },
-    )
-    .map_err(legacy_failure)?;
-    match target.ok_or_else(|| "length return type is missing".to_string())? {
-        DataType::Int32 => length_int32(rows).map_err(legacy_failure),
+    )?;
+    match target.ok_or_else(|| KernelFailure::from_domain(MeasureFailure::MissingReturnType))? {
+        DataType::Int32 => length_int32(rows),
         DataType::Int64 => Ok(Arc::new(arrow_array::Int64Array::from(rows))),
-        other => Err(format!(
-            "length return type must be INT/BIGINT, got {:?}",
-            other
-        )),
+        other => Err(KernelFailure::from_domain(MeasureFailure::ReturnType(
+            novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                "{other:?}"
+            )),
+        ))),
     }
 }
 /// Allocation representability only; the host owns formal memory admission.
@@ -522,7 +538,7 @@ mod tests {
             let mut nonnull = instance(name, false);
             assert!(matches!(
                 nonnull.evaluate(Selection::all(3), &args, &Control::default()),
-                Err(KernelFailure::InvalidProgram(_))
+                Err(ref cause) if crate::kernel_control::test_contract::input(cause)
             ));
             let after = Control::default();
             assert_eq!(
@@ -558,13 +574,13 @@ mod tests {
                 let args = [EvaluatedArgument::Column(array)];
                 assert!(matches!(
                     kernel.evaluate(Selection::all(2), &args, &Control::default()),
-                    Err(KernelFailure::InvalidProgram(_))
+                    Err(ref cause) if crate::kernel_control::test_contract::input(cause)
                 ));
             }
             let mut kernel = instance(name, false);
             assert!(matches!(
                 kernel.evaluate(Selection::all(1), &[], &Control::default()),
-                Err(KernelFailure::InvalidProgram(_))
+                Err(ref cause) if crate::kernel_control::test_contract::input(cause)
             ));
         }
     }
@@ -595,7 +611,7 @@ mod tests {
                 let args = [EvaluatedArgument::SelectedColumn(compact)];
                 assert!(matches!(
                     kernel.evaluate(selection, &args, &Control::default()),
-                    Err(KernelFailure::InvalidProgram(_))
+                    Err(ref cause) if crate::kernel_control::test_contract::input(cause)
                 ));
             }
         }
@@ -790,3 +806,37 @@ mod tests {
 #[cfg(test)]
 #[path = "string_measure_shared_control_tests.rs"]
 mod shared_control_tests;
+
+#[cfg(test)]
+mod source_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn direct_carrier_and_frozen_return_guards_do_not_retain_arrays_or_field_metadata() {
+        let source: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+        let weak = Arc::downgrade(&source);
+        let failure = evaluate_required_ascii(&source).unwrap_err();
+        drop(source);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 357);
+        assert_eq!(failure.to_string(), "ascii expects string");
+        let field = Arc::new(arrow_schema::Field::new(
+            "ResourceExhausted",
+            DataType::Int32,
+            true,
+        ));
+        let weak_field = Arc::downgrade(&field);
+        let target = DataType::Struct(arrow_schema::Fields::from(vec![field]));
+        let source: ArrayRef = Arc::new(StringArray::from(vec!["🦀"]));
+        let weak = Arc::downgrade(&source);
+        let failure = evaluate_required_length(&source, true, Some(&target)).unwrap_err();
+        drop(source);
+        drop(target);
+        assert!(weak.upgrade().is_none());
+        assert!(weak_field.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 357);
+        assert!(failure.failure_fact().resource().is_none());
+    }
+}

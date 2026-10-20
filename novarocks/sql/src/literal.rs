@@ -32,25 +32,30 @@ use crate::semantic::Literal;
 use novarocks_parser::{ast, printer};
 use novarocks_types::schema::{ColumnDefault, SqlType, validate_column_default};
 
-fn native_literal_to_literal(literal: &ast::Literal) -> Result<Literal, String> {
+#[path = "literal_failure.rs"]
+mod failure;
+pub use failure::LiteralFailure;
+
+fn native_literal_to_literal(literal: &ast::Literal) -> Result<Literal, LiteralFailure> {
     match &literal.kind {
         ast::LiteralKind::Null => Ok(Literal::Null),
         ast::LiteralKind::Boolean(value) => Ok(Literal::Bool(*value)),
         ast::LiteralKind::Number(value) => Ok(sql_number_literal(value)),
         ast::LiteralKind::String(value) => Ok(Literal::String(value.clone())),
         ast::LiteralKind::HexString(value) => {
-            let bytes = hex::decode(value)
-                .map_err(|error| format!("invalid hex literal X'{value}': {error}"))?;
+            let bytes = hex::decode(value).map_err(|source| {
+                LiteralFailure::hex(format_args!("invalid hex literal X'{value}'"), source)
+            })?;
             Ok(Literal::String(bytes_to_latin1_string(&bytes)))
         }
     }
 }
 
-fn object_name_lower(name: &ast::ObjectName) -> Result<String, String> {
+fn object_name_lower(name: &ast::ObjectName) -> Result<String, LiteralFailure> {
     name.parts
         .last()
         .map(|part| part.value.to_ascii_lowercase())
-        .ok_or_else(|| "function name cannot be empty".to_string())
+        .ok_or_else(|| LiteralFailure::rejected("function name cannot be empty"))
 }
 
 pub fn bytes_to_latin1_string(bytes: &[u8]) -> String {
@@ -125,7 +130,7 @@ pub(crate) fn parse_datetime_string_to_nanos(s: &str) -> Result<i64, String> {
 }
 
 /// Convert a native expression to a Literal for INSERT VALUES.
-pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, String> {
+pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
     match expr {
         ast::Expr::Literal(literal) => native_literal_to_literal(literal),
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
@@ -143,10 +148,10 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, String> {
         // DECIMAL(p,s) is handled at write time (with rounding).
         ast::Expr::Cast(cast) => {
             if cast_type_is_decimal(&cast.data_type) {
-                Err(format!(
+                Err(LiteralFailure::rejected(format_args!(
                     "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {}",
                     printer::print_expr(expr)
-                ))
+                )))
             } else {
                 expr_to_literal(&cast.expr)
             }
@@ -160,25 +165,28 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, String> {
             let l = expr_to_literal(&binary.left)?;
             let r = expr_to_literal(&binary.right)?;
             match (l, binary.operator, r) {
-                (Literal::Int(a), ast::BinaryOperator::Add, Literal::Int(b)) => {
-                    Ok(Literal::Int(a + b))
-                }
-                (Literal::Int(a), ast::BinaryOperator::Subtract, Literal::Int(b)) => {
-                    Ok(Literal::Int(a - b))
-                }
-                (Literal::Int(a), ast::BinaryOperator::Multiply, Literal::Int(b)) => {
-                    Ok(Literal::Int(a * b))
-                }
+                (Literal::Int(a), ast::BinaryOperator::Add, Literal::Int(b)) => a
+                    .checked_add(b)
+                    .map(Literal::Int)
+                    .ok_or_else(|| LiteralFailure::numeric("integer literal arithmetic overflow")),
+                (Literal::Int(a), ast::BinaryOperator::Subtract, Literal::Int(b)) => a
+                    .checked_sub(b)
+                    .map(Literal::Int)
+                    .ok_or_else(|| LiteralFailure::numeric("integer literal arithmetic overflow")),
+                (Literal::Int(a), ast::BinaryOperator::Multiply, Literal::Int(b)) => a
+                    .checked_mul(b)
+                    .map(Literal::Int)
+                    .ok_or_else(|| LiteralFailure::numeric("integer literal arithmetic overflow")),
                 (Literal::Float(a), ast::BinaryOperator::Add, Literal::Float(b)) => {
                     Ok(Literal::Float(a + b))
                 }
                 (Literal::Float(a), ast::BinaryOperator::Subtract, Literal::Float(b)) => {
                     Ok(Literal::Float(a - b))
                 }
-                _ => Err(format!(
+                _ => Err(LiteralFailure::rejected(format_args!(
                     "unsupported expression in INSERT VALUES: {}",
                     printer::print_expr(expr)
-                )),
+                ))),
             }
         }
         // Handle array literal [1, 2, 3]
@@ -208,12 +216,12 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, String> {
             map.entries
                 .iter()
                 .map(|entry| Ok((expr_to_literal(&entry.key)?, expr_to_literal(&entry.value)?)))
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, LiteralFailure>>()?,
         )),
-        _ => Err(format!(
+        _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported expression in INSERT VALUES: {}",
             printer::print_expr(expr)
-        )),
+        ))),
     }
 }
 
@@ -230,13 +238,13 @@ fn cast_type_is_decimal(data_type: &ast::TypeName) -> bool {
     })
 }
 
-fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, String> {
+fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, LiteralFailure> {
     let name = data_type
         .name
         .parts
         .last()
         .map(|part| part.value.to_ascii_lowercase())
-        .ok_or_else(|| "CAST target type has no name".to_string())?;
+        .ok_or_else(|| LiteralFailure::rejected("CAST target type has no name"))?;
     match name.as_str() {
         "tinyint" => Ok(SqlType::TinyInt),
         "smallint" => Ok(SqlType::SmallInt),
@@ -257,8 +265,22 @@ fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, String> {
         "time" => Ok(SqlType::Time),
         "variant" => Ok(SqlType::Variant),
         "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let precision = type_numeric_argument(&data_type.arguments, 0)?.unwrap_or(38) as u8;
-            let scale = type_numeric_argument(&data_type.arguments, 1)?.unwrap_or(0) as i8;
+            let precision = type_numeric_argument(&data_type.arguments, 0)?.unwrap_or(38);
+            let scale = type_numeric_argument(&data_type.arguments, 1)?.unwrap_or(0);
+            let precision = u8::try_from(precision).map_err(|_| {
+                LiteralFailure::rejected(
+                    "literal DECIMAL precision exceeds its supported parameter domain",
+                )
+            })?;
+            let scale = i8::try_from(scale).map_err(|_| {
+                LiteralFailure::rejected(
+                    "literal DECIMAL scale exceeds its supported parameter domain",
+                )
+            })?;
+            arrow::array::types::validate_decimal_precision_and_scale::<
+                arrow::array::types::Decimal128Type,
+            >(precision, scale)
+            .map_err(LiteralFailure::decimal_parameters)?;
             Ok(SqlType::Decimal { precision, scale })
         }
         "array" => Ok(SqlType::Array(Box::new(type_type_argument(
@@ -282,39 +304,47 @@ fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, String> {
                 ast::TypeNameArgument::Type(data_type) => {
                     Ok((format!("f{}", index + 1), type_name_to_sql_type(data_type)?))
                 }
-                ast::TypeNameArgument::Literal(_) => {
-                    Err("STRUCT type field must include a type name".to_string())
-                }
+                ast::TypeNameArgument::Literal(_) => Err(LiteralFailure::rejected(
+                    "STRUCT type field must include a type name",
+                )),
             })
             .collect::<Result<Vec<_>, _>>()
             .map(SqlType::Struct),
-        _ => Err(format!("unsupported SQL type: {name}")),
+        _ => Err(LiteralFailure::rejected(format_args!(
+            "unsupported SQL type: {name}"
+        ))),
     }
 }
 
 fn type_numeric_argument(
     arguments: &[ast::TypeNameArgument],
     index: usize,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<u64>, LiteralFailure> {
     let Some(ast::TypeNameArgument::Literal(literal)) = arguments.get(index) else {
         return Ok(None);
     };
     let ast::LiteralKind::Number(value) = &literal.kind else {
-        return Err("numeric type parameter must be an integer literal".to_string());
+        return Err(LiteralFailure::rejected(
+            "numeric type parameter must be an integer literal",
+        ));
     };
-    value
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|error| format!("invalid numeric type parameter `{value}`: {error}"))
+    value.parse::<u64>().map(Some).map_err(|source| {
+        LiteralFailure::parameter(
+            format_args!("invalid numeric type parameter `{value}`"),
+            source,
+        )
+    })
 }
 
 fn type_type_argument(
     arguments: &[ast::TypeNameArgument],
     index: usize,
     kind: &str,
-) -> Result<SqlType, String> {
+) -> Result<SqlType, LiteralFailure> {
     let Some(ast::TypeNameArgument::Type(data_type)) = arguments.get(index) else {
-        return Err(format!("{kind} type requires a type parameter"));
+        return Err(LiteralFailure::rejected(format_args!(
+            "{kind} type requires a type parameter"
+        )));
     };
     type_name_to_sql_type(data_type)
 }
@@ -337,18 +367,23 @@ pub(crate) fn is_integral_sql_number(input: &str) -> bool {
     !input.contains(['.', 'e', 'E'])
 }
 
-pub(crate) fn negate_literal(literal: Literal) -> Result<Literal, String> {
+pub(crate) fn negate_literal(literal: Literal) -> Result<Literal, LiteralFailure> {
     match literal {
-        Literal::Int(i) => Ok(Literal::Int(-i)),
+        Literal::Int(i) => i
+            .checked_neg()
+            .map(Literal::Int)
+            .ok_or_else(|| LiteralFailure::numeric("integer literal negation overflow")),
         Literal::Float(f) => Ok(Literal::Float(-f)),
         Literal::String(s) if is_integral_sql_number(s.trim()) => {
             Ok(Literal::String(format!("-{}", s.trim())))
         }
-        other => Err(format!("cannot negate {other:?}")),
+        other => Err(LiteralFailure::rejected(format_args!(
+            "cannot negate {other:?}"
+        ))),
     }
 }
 
-fn literal_to_json_key(literal: Literal) -> Result<Option<String>, String> {
+fn literal_to_json_key(literal: Literal) -> Result<Option<String>, LiteralFailure> {
     Ok(match literal {
         Literal::Null => None,
         Literal::Bool(v) => Some(if v { "true" } else { "false" }.to_string()),
@@ -356,12 +391,14 @@ fn literal_to_json_key(literal: Literal) -> Result<Option<String>, String> {
         Literal::Float(v) => Some(v.to_string()),
         Literal::String(v) | Literal::Date(v) => Some(v),
         Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
-            return Err("json_object key does not support complex type".to_string());
+            return Err(LiteralFailure::rejected(
+                "json_object key does not support complex type",
+            ));
         }
     })
 }
 
-fn literal_to_json_value(literal: Literal) -> Result<JsonValue, String> {
+fn literal_to_json_value(literal: Literal) -> Result<JsonValue, LiteralFailure> {
     Ok(match literal {
         Literal::Null => JsonValue::Null,
         Literal::Bool(v) => JsonValue::Bool(v),
@@ -398,7 +435,7 @@ fn literal_to_json_value(literal: Literal) -> Result<JsonValue, String> {
     })
 }
 
-fn json_object_literal(args: &[&ast::Expr]) -> Result<Literal, String> {
+fn json_object_literal(args: &[&ast::Expr]) -> Result<Literal, LiteralFailure> {
     let mut object = JsonMap::new();
     let mut idx = 0usize;
     while idx < args.len() {
@@ -414,15 +451,15 @@ fn json_object_literal(args: &[&ast::Expr]) -> Result<Literal, String> {
         object.insert(key, value);
         idx += 2;
     }
-    let json_text = serde_json::to_string(&JsonValue::Object(object))
-        .map_err(|e| format!("json_object stringify failed: {e}"))?;
+    let json_text =
+        serde_json::to_string(&JsonValue::Object(object)).map_err(LiteralFailure::json)?;
     let bytes =
         novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(&json_text)
-            .map_err(|e| format!("json_object failed: {e}"))?;
+            .map_err(|source| LiteralFailure::variant("json_object failed", source))?;
     Ok(Literal::String(bytes_to_latin1_string(&bytes)))
 }
 
-pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, String> {
+pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, LiteralFailure> {
     let args = function_expr_args(&func.arguments)?;
     let name = object_name_lower(&func.name)?;
     if let Some(value) = try_array_map_cast_string_literal(&name, &args)? {
@@ -438,24 +475,36 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
         }
         "array_repeat" => {
             if args.len() != 2 {
-                return Err("array_repeat expects 2 arguments".to_string());
+                return Err(LiteralFailure::rejected("array_repeat expects 2 arguments"));
             }
             let value = expr_to_literal(args[0])?;
             let repeat = match expr_to_literal(args[1])? {
                 Literal::Int(v) => v,
-                other => return Err(format!("array_repeat expects integer count, got {other:?}")),
+                other => {
+                    return Err(LiteralFailure::rejected(format_args!(
+                        "array_repeat expects integer count, got {other:?}"
+                    )));
+                }
             };
             if repeat <= 0 {
                 return Ok(Literal::Array(Vec::new()));
             }
+            let required = repeat as u128 * std::mem::size_of::<Literal>() as u128;
             let repeat = usize::try_from(repeat)
-                .map_err(|_| "array_repeat count is too large".to_string())?;
-            Ok(Literal::Array(vec![value; repeat]))
+                .map_err(|source| LiteralFailure::address(required, source))?;
+            std::alloc::Layout::array::<Literal>(repeat)
+                .map_err(|source| LiteralFailure::layout(required, source))?;
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(repeat)
+                .map_err(|source| LiteralFailure::allocation(required, source))?;
+            values.resize(repeat, value);
+            Ok(Literal::Array(values))
         }
         "json_object" => json_object_literal(&args),
         "array_append" => {
             if args.len() != 2 {
-                return Err("array_append expects 2 arguments".to_string());
+                return Err(LiteralFailure::rejected("array_append expects 2 arguments"));
             }
             let array = expr_to_literal(args[0])?;
             let value = expr_to_literal(args[1])?;
@@ -465,14 +514,14 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
                     values.push(value);
                     Ok(Literal::Array(values))
                 }
-                other => Err(format!(
+                other => Err(LiteralFailure::rejected(format_args!(
                     "array_append expects ARRAY argument, got {other:?}"
-                )),
+                ))),
             }
         }
         "bitmap_empty" => {
             if !args.is_empty() {
-                return Err("bitmap_empty expects 0 arguments".to_string());
+                return Err(LiteralFailure::rejected("bitmap_empty expects 0 arguments"));
             }
             // SeriV2 empty bitmap encoding: a single BITMAP_TYPE_EMPTY (=0) byte,
             // matching `eval_bitmap_empty` runtime output.
@@ -482,7 +531,7 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
         }
         "hll_hash" => {
             if args.len() != 1 {
-                return Err("hll_hash expects 1 argument".to_string());
+                return Err(LiteralFailure::rejected("hll_hash expects 1 argument"));
             }
             // Reject explicit narrowing CAST since this const-fold path always
             // hashes Int64 little-endian bytes, while the runtime path hashes
@@ -503,11 +552,10 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
                     )
                 });
                 if narrowing {
-                    return Err(
+                    return Err(LiteralFailure::rejected(
                         "hll_hash with narrowing CAST argument is not supported in INSERT VALUES; \
-                         wrap the value directly without CAST"
-                            .to_string(),
-                    );
+                         wrap the value directly without CAST",
+                    ));
                 }
             }
             use novarocks_functions::hll_hash_core::encode_scalar_bytes;
@@ -520,22 +568,32 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
                 Literal::Float(v) => encode_scalar_bytes(Some(&v.to_le_bytes())),
                 Literal::String(s) => encode_scalar_bytes(Some(s.as_bytes())),
                 Literal::Bool(b) => encode_scalar_bytes(Some(&[if b { 1u8 } else { 0u8 }])),
-                other => return Err(format!("hll_hash unsupported literal: {other:?}")),
+                other => {
+                    return Err(LiteralFailure::rejected(format_args!(
+                        "hll_hash unsupported literal: {other:?}"
+                    )));
+                }
             };
             Ok(Literal::String(bytes_to_latin1_string(&bytes)))
         }
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
-                return Err("to_binary expects 1 or 2 arguments".to_string());
+                return Err(LiteralFailure::rejected(
+                    "to_binary expects 1 or 2 arguments",
+                ));
             }
 
             let Literal::String(input) = expr_to_literal(args[0])? else {
-                return Err("to_binary expects VARCHAR as first argument".to_string());
+                return Err(LiteralFailure::rejected(
+                    "to_binary expects VARCHAR as first argument",
+                ));
             };
 
             let format = if args.len() == 2 {
                 let Literal::String(format) = expr_to_literal(args[1])? else {
-                    return Err("to_binary expects VARCHAR format argument".to_string());
+                    return Err(LiteralFailure::rejected(
+                        "to_binary expects VARCHAR format argument",
+                    ));
                 };
                 format
             } else {
@@ -550,10 +608,11 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
                     use base64::Engine;
                     base64::engine::general_purpose::STANDARD
                         .decode(input.as_bytes())
-                        .map_err(|e| format!("to_binary encode64 decode failed: {e}"))?
+                        .map_err(LiteralFailure::base64)?
                 }
                 "utf8" => input.into_bytes(),
-                _ => hex::decode(input).map_err(|e| format!("to_binary hex decode failed: {e}"))?,
+                _ => hex::decode(input)
+                    .map_err(|source| LiteralFailure::hex("to_binary hex decode failed", source))?,
             };
 
             Ok(Literal::String(
@@ -562,22 +621,25 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
         }
         "bitmap_from_string" => {
             if args.len() != 1 {
-                return Err("bitmap_from_string expects 1 argument".to_string());
+                return Err(LiteralFailure::rejected(
+                    "bitmap_from_string expects 1 argument",
+                ));
             }
             let arg = expr_to_literal(args[0])?;
             let text = match arg {
                 Literal::Null => return Ok(Literal::Null),
                 Literal::String(s) => s,
                 other => {
-                    return Err(format!(
+                    return Err(LiteralFailure::rejected(format_args!(
                         "bitmap_from_string expects VARCHAR argument, got {other:?}"
-                    ));
+                    )));
                 }
             };
             // Mirror runtime semantics: malformed string -> NULL (not error).
             let values = match novarocks_types::value::bitmap::parse_bitmap_string(&text) {
                 Ok(v) => v,
-                Err(_) => return Ok(Literal::Null),
+                Err(source) if source.is_data() => return Ok(Literal::Null),
+                Err(source) => return Err(source.into()),
             };
             // Use the EXTERNAL (storage / SeriV1-style) encoding here —
             // that's the format the StarRocks table bitmap column
@@ -589,7 +651,7 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
         }
         "to_bitmap" => {
             if args.len() != 1 {
-                return Err("to_bitmap expects 1 argument".to_string());
+                return Err(LiteralFailure::rejected("to_bitmap expects 1 argument"));
             }
             use novarocks_types::value::bitmap::encode_bitmap_single;
             let arg = expr_to_literal(args[0])?;
@@ -613,7 +675,11 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
                     Ok(v) => v,
                     Err(_) => return Ok(Literal::Null),
                 },
-                other => return Err(format!("to_bitmap unsupported literal: {other:?}")),
+                other => {
+                    return Err(LiteralFailure::rejected(format_args!(
+                        "to_bitmap unsupported literal: {other:?}"
+                    )));
+                }
             };
             let bytes = encode_bitmap_single(value);
             Ok(Literal::String(bytes_to_latin1_string(&bytes)))
@@ -632,15 +698,17 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
         }
         "parse_json" => {
             if args.len() != 1 {
-                return Err("parse_json expects 1 argument".to_string());
+                return Err(LiteralFailure::rejected("parse_json expects 1 argument"));
             }
             let Literal::String(json_text) = expr_to_literal(args[0])? else {
-                return Err("parse_json expects VARCHAR argument".to_string());
+                return Err(LiteralFailure::rejected(
+                    "parse_json expects VARCHAR argument",
+                ));
             };
             let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(
                 &json_text,
             )
-            .map_err(|e| format!("parse_json failed: {e}"))?;
+            .map_err(|source| LiteralFailure::variant("parse_json failed", source))?;
             // Pack raw variant bytes into Literal::String via Latin-1 (matches
             // `to_binary` convention; INSERT VALUES decodes via
             // `latin1_string_to_bytes`).
@@ -653,10 +721,10 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
         )),
         "named_struct" => {
             if args.len() % 2 != 0 {
-                return Err(format!(
+                return Err(LiteralFailure::rejected(format_args!(
                     "named_struct literal requires an even number of arguments, got {}",
                     args.len()
-                ));
+                )));
             }
             Ok(Literal::Struct(
                 args.into_iter()
@@ -668,10 +736,10 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
         }
         "map" => {
             if args.len() % 2 != 0 {
-                return Err(format!(
+                return Err(LiteralFailure::rejected(format_args!(
                     "MAP literal requires an even number of arguments, got {}",
                     args.len()
-                ));
+                )));
             }
             let mut entries = Vec::with_capacity(args.len() / 2);
             for pair in args.chunks_exact(2) {
@@ -679,30 +747,30 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
             }
             Ok(Literal::Map(entries))
         }
-        _ => Err(format!(
+        _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported expression in INSERT VALUES: {}",
             printer::print_expr(&ast::Expr::FunctionCall(func.clone()))
-        )),
+        ))),
     }
 }
 
-fn literal_to_varchar_bytes(value: &Literal) -> Result<Option<Vec<u8>>, String> {
+fn literal_to_varchar_bytes(value: &Literal) -> Result<Option<Vec<u8>>, LiteralFailure> {
     match value {
         Literal::Null => Ok(None),
         Literal::Bool(v) => Ok(Some(if *v { b"1".to_vec() } else { b"0".to_vec() })),
         Literal::Int(v) => Ok(Some(v.to_string().into_bytes())),
         Literal::Float(v) => Ok(Some(v.to_string().into_bytes())),
         Literal::String(v) | Literal::Date(v) => Ok(Some(v.as_bytes().to_vec())),
-        Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
-            Err("md5sum literal folding does not support complex arguments".to_string())
-        }
+        Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => Err(LiteralFailure::rejected(
+            "md5sum literal folding does not support complex arguments",
+        )),
     }
 }
 
 fn try_array_map_cast_string_literal(
     name: &str,
     args: &[&ast::Expr],
-) -> Result<Option<Literal>, String> {
+) -> Result<Option<Literal>, LiteralFailure> {
     if name != "array_map" && name != "transform" {
         return Ok(None);
     }
@@ -718,11 +786,13 @@ fn try_array_map_cast_string_literal(
             .collect::<Result<Vec<_>, _>>()
             .map(Literal::Array)
             .map(Some),
-        other => Err(format!("array_map expects ARRAY input, got {other:?}")),
+        other => Err(LiteralFailure::rejected(format_args!(
+            "array_map expects ARRAY input, got {other:?}"
+        ))),
     }
 }
 
-fn array_map_cast_string_lambda_matches(args: &[&ast::Expr]) -> Result<bool, String> {
+fn array_map_cast_string_lambda_matches(args: &[&ast::Expr]) -> Result<bool, LiteralFailure> {
     if args.len() != 2 {
         return Ok(false);
     }
@@ -743,7 +813,10 @@ fn parse_single_arrow_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
     }
 }
 
-fn lambda_body_casts_param_to_string(expr: &ast::Expr, param_name: &str) -> Result<bool, String> {
+fn lambda_body_casts_param_to_string(
+    expr: &ast::Expr,
+    param_name: &str,
+) -> Result<bool, LiteralFailure> {
     match expr {
         ast::Expr::Nested(nested) => {
             lambda_body_casts_param_to_string(&nested.expression, param_name)
@@ -764,7 +837,7 @@ fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
     }
 }
 
-pub(crate) fn function_expr_args(args: &[ast::Expr]) -> Result<Vec<&ast::Expr>, String> {
+pub(crate) fn function_expr_args(args: &[ast::Expr]) -> Result<Vec<&ast::Expr>, LiteralFailure> {
     Ok(args.iter().collect())
 }
 
@@ -772,7 +845,7 @@ pub(crate) fn function_expr_args(args: &[ast::Expr]) -> Result<Vec<&ast::Expr>, 
 pub(crate) fn cast_literal(
     value: Literal,
     data_type: &novarocks_types::schema::SqlType,
-) -> Result<Literal, String> {
+) -> Result<Literal, LiteralFailure> {
     use novarocks_types::schema::SqlType;
     match data_type {
         SqlType::String | SqlType::Json => match &value {
@@ -785,9 +858,9 @@ pub(crate) fn cast_literal(
             Literal::Int(v) => Ok(Literal::String(v.to_string())),
             Literal::Float(v) => Ok(Literal::String(v.to_string())),
             Literal::String(_) | Literal::Date(_) => Ok(value),
-            Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
-                Err("cannot cast complex literal to string".to_string())
-            }
+            Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => Err(
+                LiteralFailure::rejected("cannot cast complex literal to string"),
+            ),
         },
         SqlType::Binary | SqlType::Bitmap | SqlType::Hll => match &value {
             Literal::Null => Ok(Literal::Null),
@@ -799,21 +872,27 @@ pub(crate) fn cast_literal(
             Literal::Int(v) => Ok(Literal::String(v.to_string())),
             Literal::Float(v) => Ok(Literal::String(v.to_string())),
             Literal::String(_) | Literal::Date(_) => Ok(value),
-            Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
-                Err("cannot cast complex literal to binary".to_string())
-            }
+            Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => Err(
+                LiteralFailure::rejected("cannot cast complex literal to binary"),
+            ),
         },
         SqlType::Int | SqlType::BigInt | SqlType::TinyInt | SqlType::SmallInt => match &value {
             Literal::Null => Ok(Literal::Null),
             Literal::Int(_) => Ok(value),
             Literal::Float(v) => Ok(Literal::Int(*v as i64)),
-            other => Err(format!("cannot cast {:?} to integer", other)),
+            other => Err(LiteralFailure::rejected(format_args!(
+                "cannot cast {:?} to integer",
+                other
+            ))),
         },
         SqlType::Float | SqlType::Double => match &value {
             Literal::Null => Ok(Literal::Null),
             Literal::Int(v) => Ok(Literal::Float(*v as f64)),
             Literal::Float(_) => Ok(value),
-            other => Err(format!("cannot cast {:?} to floating point", other)),
+            other => Err(LiteralFailure::rejected(format_args!(
+                "cannot cast {:?} to floating point",
+                other
+            ))),
         },
         SqlType::Array(inner) => match value {
             Literal::Null => Ok(Literal::Null),
@@ -822,18 +901,23 @@ pub(crate) fn cast_literal(
                 .map(|item| cast_literal(item, inner))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Literal::Array),
-            other => Err(format!("cannot cast {:?} to array", other)),
+            other => Err(LiteralFailure::rejected(format_args!(
+                "cannot cast {:?} to array",
+                other
+            ))),
         },
-        other => Err(format!(
+        other => Err(LiteralFailure::rejected(format_args!(
             "standalone generate_series does not support CAST to {:?}",
             other
-        )),
+        ))),
     }
 }
 
-pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, String> {
+pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, LiteralFailure> {
     if args.is_empty() || args.len() > 3 {
-        return Err("array_generate expects 1 to 3 numeric arguments".to_string());
+        return Err(LiteralFailure::rejected(
+            "array_generate expects 1 to 3 numeric arguments",
+        ));
     }
     // SQL NULL propagation: if any argument is NULL, the whole call is NULL.
     if args.iter().any(|a| matches!(a, Literal::Null)) {
@@ -841,9 +925,9 @@ pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, S
     }
     let literal_to_i64 = |value: &Literal| match value {
         Literal::Int(v) => Ok(*v),
-        other => Err(format!(
+        other => Err(LiteralFailure::rejected(format_args!(
             "array_generate expects integer arguments, got {other:?}"
-        )),
+        ))),
     };
     let (start, stop, step) = match args.len() {
         1 => (1, literal_to_i64(&args[0])?, 1),
@@ -856,24 +940,32 @@ pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, S
         _ => unreachable!(),
     };
     if step == 0 {
-        return Err("array_generate step must not be zero".to_string());
+        return Err(LiteralFailure::rejected(
+            "array_generate step must not be zero",
+        ));
     }
 
-    let mut values = Vec::new();
-    let mut current = start;
-    if step > 0 {
-        while current <= stop {
-            values.push(Literal::Int(current));
-            current = current
-                .checked_add(step)
-                .ok_or_else(|| "array_generate value overflow".to_string())?;
-        }
+    let count = if (step > 0 && start > stop) || (step < 0 && start < stop) {
+        0u128
     } else {
-        while current >= stop {
-            values.push(Literal::Int(current));
+        i128::from(start).abs_diff(i128::from(stop)) / i128::from(step).unsigned_abs() + 1
+    };
+    let required = count * std::mem::size_of::<Literal>() as u128;
+    let count =
+        usize::try_from(count).map_err(|source| LiteralFailure::address(required, source))?;
+    std::alloc::Layout::array::<Literal>(count)
+        .map_err(|source| LiteralFailure::layout(required, source))?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|source| LiteralFailure::allocation(required, source))?;
+    let mut current = start;
+    for ordinal in 0..count {
+        values.push(Literal::Int(current));
+        if ordinal + 1 < count {
             current = current
                 .checked_add(step)
-                .ok_or_else(|| "array_generate value overflow".to_string())?;
+                .ok_or_else(|| LiteralFailure::numeric("array_generate value overflow"))?;
         }
     }
     Ok(Literal::Array(values))
@@ -1486,7 +1578,9 @@ mod tests {
     #[test]
     fn parse_datetime_string_to_nanos_rejects_out_of_range() {
         assert_eq!(
-            parse_datetime_string_to_nanos("2262-04-12 00:00:00").unwrap_err(),
+            parse_datetime_string_to_nanos("2262-04-12 00:00:00")
+                .unwrap_err()
+                .to_string(),
             "DATETIME literal '2262-04-12 00:00:00' out of nanosecond representable range"
         );
     }
@@ -1544,7 +1638,8 @@ mod tests {
                 &ColumnDefault::Array(vec![ColumnDefault::Int32(1)]),
                 &SqlType::Array(Box::new(SqlType::Int)),
             )
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
             "non-empty ARRAY write-default is not yet supported (1 elements)"
         );
         assert_eq!(
@@ -1563,7 +1658,8 @@ mod tests {
                 )]),
                 &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
             )
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
             "non-empty MAP write-default is not yet supported (1 entries)"
         );
         assert_eq!(
@@ -1578,7 +1674,8 @@ mod tests {
                     scale: 0,
                 },
             )
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
             "negative DECIMAL scale -1 is not supported"
         );
     }
@@ -1658,8 +1755,9 @@ mod tests {
 
     #[test]
     fn column_default_to_ast_literal_rejects_neutral_type_mismatch() {
-        let error =
-            column_default_to_ast_literal(&ColumnDefault::Int32(1), &SqlType::String).unwrap_err();
+        let error = column_default_to_ast_literal(&ColumnDefault::Int32(1), &SqlType::String)
+            .unwrap_err()
+            .to_string();
         assert!(error.starts_with("write-default literal type does not match column type:"));
         assert!(error.contains("Int32(1)"));
         assert!(error.contains("column=String"));
@@ -1667,14 +1765,20 @@ mod tests {
 
     #[test]
     fn temporal_literal_parsers_preserve_invalid_error_text() {
-        let date_error = parse_date_string_to_days("not-a-date").unwrap_err();
+        let date_error = parse_date_string_to_days("not-a-date")
+            .unwrap_err()
+            .to_string();
         assert!(date_error.starts_with("invalid date literal `not-a-date`:"));
         assert_eq!(
-            parse_datetime_string_to_micros("not-a-datetime").unwrap_err(),
+            parse_datetime_string_to_micros("not-a-datetime")
+                .unwrap_err()
+                .to_string(),
             "invalid datetime literal `not-a-datetime`"
         );
         assert_eq!(
-            parse_datetime_string_to_nanos("not-a-datetime").unwrap_err(),
+            parse_datetime_string_to_nanos("not-a-datetime")
+                .unwrap_err()
+                .to_string(),
             "invalid datetime literal `not-a-datetime`"
         );
     }
@@ -1708,7 +1812,7 @@ mod tests {
         };
         let err = function_to_literal(func).expect_err("must fail");
         assert!(
-            err.contains("parse_json expects 1 argument"),
+            err.to_string().contains("parse_json expects 1 argument"),
             "unexpected error: {err}"
         );
     }
@@ -1755,7 +1859,7 @@ mod tests {
             };
             let err = function_to_literal(func).expect_err(&format!("must reject `{sql}`"));
             assert!(
-                err.contains("hll_hash with narrowing CAST"),
+                err.to_string().contains("hll_hash with narrowing CAST"),
                 "unexpected error for `{sql}`: {err}"
             );
         }
@@ -1905,5 +2009,122 @@ mod tests {
         let literal = literal_from_batch(&array, 0).expect("large binary literal");
 
         assert_eq!(literal, Literal::String(bytes_to_latin1_string(raw)));
+    }
+}
+
+#[cfg(test)]
+mod source_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    fn fold(source: &str) -> Result<Literal, LiteralFailure> {
+        let tokens = novarocks_parser::lex(source).unwrap();
+        let expr = novarocks_parser::parser::parse_expression(source, &tokens).unwrap();
+        expr_to_literal(&expr)
+    }
+    #[test]
+    fn literal_source_keeps_original_bitmap_and_variant_facts_without_text_classification() {
+        if let Some(entries) = (u32::MAX as usize).checked_add(1) {
+            let bitmap = novarocks_types::value::bitmap::BitmapValueFailure::EntryCount { entries };
+            let expected = bitmap.failure_fact();
+            let error = LiteralFailure::from(bitmap);
+            assert_eq!(error.failure_fact(), expected);
+            assert!(
+                error
+                    .source()
+                    .unwrap()
+                    .is::<novarocks_types::value::bitmap::BitmapValueFailure>()
+            );
+        }
+        assert_eq!(fold("bitmap_from_string('bad')").unwrap(), Literal::Null);
+        let error = fold("parse_json('not-json')").unwrap_err();
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .is::<novarocks_types::value::variant_encode::VariantEncodeFailure>()
+        );
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        let error = LiteralFailure::rejected("cancelled resource exhausted numeric overflow");
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_ne!(
+            error.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+    }
+    #[test]
+    fn literal_source_integer_overflow_and_wide_repeat_are_explicit_causes() {
+        for sql in [
+            "9223372036854775807 + 1",
+            "(-9223372036854775807 - 1) - 1",
+            "9223372036854775807 * 2",
+        ] {
+            let error = fold(sql).unwrap_err();
+            assert_eq!(
+                error.failure_fact(),
+                novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+            );
+        }
+        let error = negate_literal(Literal::Int(i64::MIN)).unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+        let error = fold("array_repeat(1, 9223372036854775807)").unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert!(error.source().unwrap().is::<std::alloc::LayoutError>());
+        assert_eq!(
+            error.failure_fact().resource().unwrap().limit,
+            Some(isize::MAX as u64)
+        );
+    }
+    #[test]
+    fn literal_source_inclusive_series_never_advances_past_its_last_value() {
+        assert_eq!(
+            eval_array_generate_literal(&[
+                Literal::Int(i64::MAX),
+                Literal::Int(i64::MAX),
+                Literal::Int(1)
+            ])
+            .unwrap(),
+            Literal::Array(vec![Literal::Int(i64::MAX)])
+        );
+        assert_eq!(
+            eval_array_generate_literal(&[
+                Literal::Int(i64::MIN),
+                Literal::Int(i64::MIN),
+                Literal::Int(-1)
+            ])
+            .unwrap(),
+            Literal::Array(vec![Literal::Int(i64::MIN)])
+        );
+        let error = eval_array_generate_literal(&[
+            Literal::Int(i64::MIN),
+            Literal::Int(i64::MAX),
+            Literal::Int(1),
+        ])
+        .unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(error.failure_fact().resource().unwrap().requested, None);
+        assert_eq!(
+            error.failure_fact().resource().unwrap().limit,
+            Some(isize::MAX as u64)
+        );
+    }
+    #[test]
+    fn literal_source_decimal_parameters_never_narrow_modulo_the_carrier() {
+        for sql in [
+            "CAST(1 AS DECIMAL(294,0))",
+            "CAST(1 AS DECIMAL(38,256))",
+            "CAST(1 AS DECIMAL(39,0))",
+        ] {
+            let tokens = novarocks_parser::lex(sql).unwrap();
+            let ast::Expr::Cast(expr) =
+                novarocks_parser::parser::parse_expression(sql, &tokens).unwrap()
+            else {
+                panic!("actual CAST source");
+            };
+            assert!(type_name_to_sql_type(&expr.data_type).is_err());
+        }
     }
 }

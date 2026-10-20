@@ -611,7 +611,7 @@ pub struct ExprArena {
 }
 
 /// Failures of sparse definition ownership, before fragment semantics are checked.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExprArenaConstructionError {
     Control(CompileControlError),
     TooManyDefinitions,

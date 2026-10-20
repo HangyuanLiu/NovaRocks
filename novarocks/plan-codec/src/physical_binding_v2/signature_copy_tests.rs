@@ -61,7 +61,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         state.trace.push(units);
-        match state.stop {
+        match state.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -130,7 +130,7 @@ fn prefixes(source: &BoundFunction, expected_success: bool) {
     assert!(!trace.is_empty());
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::rejecting(at, cause);
+            let control = Control::rejecting(at, cause.clone());
             assert!(
                 matches!(run(source, &control), Err(BindingCodecError::Control(actual)) if actual == cause)
             );
@@ -318,7 +318,7 @@ fn signature_copy_actual_callbacks_preserve_success_ordinary_and_all_control_pre
     assert_eq!(control.trace(), [0, 1]);
     for at in 0..2 {
         for cause in CAUSES {
-            let control = Control::rejecting(at, cause);
+            let control = Control::rejecting(at, cause.clone());
             let result = (|| {
                 let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode)?;
                 let result = copy_scalar_signature_observed(&legacy, &mut work);
@@ -512,7 +512,7 @@ fn table_signature_copy_empty_roots_and_all_actual_refusal_prefixes() {
         let trace = control.trace();
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let control = Control::rejecting(at, cause);
+                let control = Control::rejecting(at, cause.clone());
                 assert!(
                     matches!(run_table(source, &control), Err(BindingCodecError::Control(actual)) if actual == cause)
                 );
@@ -536,7 +536,7 @@ fn table_signature_copy_empty_roots_and_all_actual_refusal_prefixes() {
     let trace = control.trace();
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::rejecting(at, cause);
+            let control = Control::rejecting(at, cause.clone());
             assert!(
                 matches!(run_table(&legacy, &control), Err(BindingCodecError::Control(actual)) if actual == cause)
             );

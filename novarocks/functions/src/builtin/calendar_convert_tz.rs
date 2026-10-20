@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 //! The original conversion between explicit offset/named timezone arguments.
-use super::{
-    calendar_extended::{DateInput, timestamp_value_for_type},
-    calendar_extended_shared::CalendarInput,
-};
+use super::calendar_timestamp::timestamp_value;
+use super::{calendar_extended::DateInput, calendar_extended_shared::CalendarInput};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, SelectedValues,
     kernel_control::{internal, invalid},
@@ -75,8 +73,8 @@ fn convert_tz_with_zone(
     Some(out)
 }
 
-pub(super) fn evaluate_convert_tz<'a>(
-    input: CalendarInput<'_, 'a>,
+pub(super) fn evaluate_convert_tz<'a, E>(
+    input: CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
@@ -178,9 +176,7 @@ pub(super) fn evaluate_convert_tz<'a>(
                 work.flush()?;
                 let result = match (date, from, to) {
                     (Some(date), Some(from), Some(to)) => convert_tz_with_zone(date, from, to)
-                        .and_then(|date| {
-                            timestamp_value_for_type(date, input.target.data_type()).ok()
-                        }),
+                        .and_then(|date| timestamp_value(date, TimeUnit::Microsecond).ok()),
                     _ => None,
                 };
                 work.flush()?;

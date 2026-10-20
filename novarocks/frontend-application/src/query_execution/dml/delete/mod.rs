@@ -114,7 +114,10 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
     /// terms.
     fn run(
         &self,
-    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, DmlExecutionError>;
+    ) -> Result<
+        crate::query_execution::outcome::QueryExecutionResult,
+        crate::dml::error::DmlExecutionError,
+    >;
     /// The admitted request context this statement commits and reconciles
     /// under. It is the statement's own context, never a fresh one: a commit
     /// issued under different credentials is a different request.
@@ -130,7 +133,7 @@ pub trait DeleteEngine: Send + Sync {
     fn run_delete(
         &self,
         prepared: &dyn DeletePrepared,
-    ) -> Result<DeleteWriteReport, DmlExecutionError>;
+    ) -> Result<DeleteWriteReport, crate::dml::error::DmlExecutionError>;
     fn commit_delete_terminal(
         &self,
         _prepared: &dyn DeletePrepared,
@@ -193,7 +196,7 @@ impl DeleteEngine for DmlExecutionKernel {
     fn run_delete(
         &self,
         prepared: &dyn DeletePrepared,
-    ) -> Result<DeleteWriteReport, DmlExecutionError> {
+    ) -> Result<DeleteWriteReport, crate::dml::error::DmlExecutionError> {
         let prepared = downcast_prepared(prepared)?;
         let result = prepared.execution.run()?;
         Ok(delete_write_report_from_result(
@@ -250,7 +253,7 @@ impl DeleteEngine for DmlExecutionKernel {
 fn delete_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
     context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<DeleteWriteReport, String> {
+) -> Result<DeleteWriteReport, crate::dml::error::DmlExecutionError> {
     let Some(completion) = result.write_session else {
         return Ok(DeleteWriteReport::NoOp);
     };

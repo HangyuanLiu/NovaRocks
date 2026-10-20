@@ -641,7 +641,7 @@ mod pure_schema_tests {
             assert!(units <= 256);
             let mut calls = self.trace.lock().unwrap();
             calls.push(units);
-            if let Some((at, error)) = self.refusal {
+            if let Some((at, error)) = self.refusal.clone() {
                 if calls.len() == at {
                     return Err(error);
                 }
@@ -878,7 +878,7 @@ mod pure_schema_tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((at, error)),
+                    refusal: Some((at, error.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -898,7 +898,7 @@ mod pure_schema_tests {
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                refusal: Some((final_call, error)),
+                refusal: Some((final_call, error.clone())),
                 ..Control::default()
             };
             assert!(

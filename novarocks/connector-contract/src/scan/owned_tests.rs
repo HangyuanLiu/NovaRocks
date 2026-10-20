@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal")
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -384,7 +384,7 @@ fn scan_every_actual_small_success_and_ordinary_tail_preserves_three_control_cau
             for cause in CAUSES {
                 let c = Control {
                     trace: Mutex::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(observed(make(),&c),Err(PureProviderCompileError::Control(e)) if e==cause)
@@ -512,7 +512,7 @@ fn scan_wide_actual_expression_loops_have_real_quantum_and_ordered_copy() {
         for cause in CAUSES {
             let c = Control {
                 trace: Mutex::default(),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(observed(make(),&c),Err(PureProviderCompileError::Control(e)) if e==cause)

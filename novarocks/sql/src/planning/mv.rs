@@ -1093,7 +1093,7 @@ mod refresh_property_facade_tests {
             let mut trace = self.trace.lock().unwrap();
             trace.push((phase, units));
             if self.refuse == Some(trace.len() - 1) {
-                return Err(self.cause);
+                return Err(self.cause.clone());
             }
             Ok(())
         }
@@ -1121,7 +1121,7 @@ mod refresh_property_facade_tests {
                     CompileControlError::DeadlineExceeded,
                     CompileControlError::ResourceExhausted,
                 ] {
-                    let refusing = IdentityControl::new(Some(index), cause);
+                    let refusing = IdentityControl::new(Some(index), cause.clone());
                     let error = run(&refusing).unwrap_err();
                     assert!(matches!(
                         (cause, error),
@@ -1154,7 +1154,7 @@ mod refresh_property_facade_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusing = IdentityControl::new(Some(trace.len() - 1), cause);
+            let refusing = IdentityControl::new(Some(trace.len() - 1), cause.clone());
             let error = invalid.refresh_property(&refusing).unwrap_err();
             assert!(matches!(
                 (cause, error),

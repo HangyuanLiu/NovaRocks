@@ -45,6 +45,19 @@ fn functions() -> PureEngineFunctionCatalog {
     builder.seal_pure(installed).unwrap()
 }
 pub(super) fn program() -> Arc<LocalProgram> {
+    program_with_target(FunctionValueType::new(
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))),
+        true,
+    ))
+}
+pub(super) fn row_data_program() -> Arc<LocalProgram> {
+    program_with_target(FunctionValueType::new(DataType::Utf8, true))
+}
+fn program_with_target(target: FunctionValueType) -> Arc<LocalProgram> {
     let functions = functions();
     let fragment_id = FragmentId::new(198);
     let source = NodeId::new(0);
@@ -60,14 +73,7 @@ pub(super) fn program() -> Arc<LocalProgram> {
     for i in 0..4 {
         let ty = match i {
             0 | 1 => FunctionValueType::new(DataType::Int64, true),
-            2 => FunctionValueType::new(
-                DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Utf8,
-                    true,
-                ))),
-                true,
-            ),
+            2 => target.clone(),
             _ => FunctionValueType::new(DataType::Boolean, true),
         };
         let expr = b
@@ -100,17 +106,7 @@ pub(super) fn program() -> Arc<LocalProgram> {
         vec![
             argument(ty.clone(), None),
             argument(ty.clone(), None),
-            argument(
-                FunctionValueType::new(
-                    DataType::List(Arc::new(arrow::datatypes::Field::new(
-                        "item",
-                        DataType::Utf8,
-                        true,
-                    ))),
-                    true,
-                ),
-                None,
-            ),
+            argument(target.clone(), None),
         ],
         ControlShape::Eager,
     );
@@ -215,6 +211,20 @@ pub(super) fn source_batch(p: &LocalProgram) -> RecordBatch {
             Arc::new(Int64Array::from(vec![1, 2, 3])),
             Arc::new(Int64Array::from(vec![17, 17, 17])),
             Arc::new(b.finish()),
+            Arc::new(BooleanArray::from(vec![false, true, false])),
+        ],
+    )
+    .unwrap()
+}
+
+pub(super) fn row_data_batch(p: &LocalProgram) -> RecordBatch {
+    use arrow::array::{BooleanArray, Int64Array};
+    RecordBatch::try_new(
+        p.graph().nodes()[1].output_layout().schema().clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![17, 999, 17])),
+            Arc::new(StringArray::from(vec!["HLL_6", "HLL_6", "HLL_6"])),
             Arc::new(BooleanArray::from(vec![false, true, false])),
         ],
     )

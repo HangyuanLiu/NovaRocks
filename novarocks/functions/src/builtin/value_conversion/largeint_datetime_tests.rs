@@ -182,14 +182,18 @@ fn largeint_datetime_intermediate_every_actual_constructor_refusal_is_preserved_
                 let mut observer = |_| {
                     let ordinal = calls;
                     calls += 1;
-                    if ordinal == at { Err(cause) } else { Ok(()) }
+                    if ordinal == at {
+                        Err(cause.clone())
+                    } else {
+                        Ok(())
+                    }
                 };
                 let mut creation =
                     ScalarConstruction::new(ValueTypeStorageLifetime::pure(), Some(&mut observer));
                 conversion_intermediate_type_with_construction(&source, &target, &mut creation)
             };
             assert!(
-                matches!(result,Err(OwnerFailure::Construction(ValueConstructionFailure::Observer(actual))) if actual==cause),
+                matches!(&result,Err(OwnerFailure::Construction(ValueConstructionFailure::Observer(actual))) if actual==&cause),
                 "{result:?}"
             );
             assert_eq!(calls, at + 1);

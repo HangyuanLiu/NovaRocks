@@ -414,12 +414,9 @@ fn unknown_failure(
 }
 
 fn ctas_failure(source_text: &str, failure: CtasFailure) -> DmlError {
-    if let Some(reason) = failure.compiled_shape_refusal() {
-        let error =
-            novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
-                reason,
-            );
-        return DmlError::executor(error.to_user_message()).with_engine_error_code(error.code());
+    if let Some(input) = failure.execution_failure() {
+        return DmlError::from_execution(input)
+            .with_compile_control(failure.compile_control_error());
     }
     if let Some(error) = failure.compile_control_error() {
         return DmlError::compile_control(error);
@@ -531,21 +528,23 @@ mod tests {
     #[test]
     fn compiled_ctas_refusal_preserves_capability_identity_before_publication_wrapping() {
         use crate::query_execution::dml::ctas::CtasUserError;
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        let original = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+            "change-stream router".into(),
+        );
+        let expected = original.failure_fact();
+        let source = SharedFailureCause::new(original);
         let failure = CtasFailure {
-            kind: CtasFailureKind::Unsupported,
-            message: "[UnsupportedCompiledShape] change-stream router".into(),
-            user_error: Some(CtasUserError::UnsupportedCompiledShape(
-                "change-stream router".into(),
-            )),
+            kind: CtasFailureKind::Internal,
+            message: source.detail().to_owned(),
+            user_error: Some(CtasUserError::Compilation(source.clone())),
         };
         let error = ctas_failure("CREATE TABLE AS SELECT ...", failure);
+        assert_eq!(error.execution_failure().unwrap().fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Unsupported);
         assert_eq!(
-            error.engine_error_code(),
-            Some(EngineErrorCode::UnsupportedCompiledShape)
-        );
-        assert_eq!(
-            format!("[{}] {error}", error.engine_error_code().unwrap().as_str()),
-            "[UnsupportedCompiledShape] Executor: change-stream router"
+            error.compile_control_error(),
+            Some(novarocks_type_contract::CompileControlError::Source(source))
         );
         let failure = internal_failure("unsupported text does not imply capability");
         assert_eq!(
@@ -951,6 +950,60 @@ mod tests {
                 .expect("terminal")
                 .disposition(),
             LakePublicationDisposition::KnownCommitted
+        );
+    }
+
+    #[test]
+    fn an_execution_failure_retains_its_input_and_prepublication_terminal() {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
+        };
+        let input = ExecutionFailureInput::new(
+            novarocks_functions::KernelFailure::ResourceExhausted.failure_fact(),
+            SafeDetail::truncating("the original CTAS runtime exhausted its resources"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let mut attempt = attempt();
+        let failure = pre_dispatch_failure(
+            &mut attempt,
+            "CREATE TABLE dst AS SELECT 1",
+            CtasFailure::from_execution(input.clone()),
+        );
+        assert_eq!(failure.execution_failure(), Some(&input));
+        assert_eq!(
+            failure.publication_terminal().unwrap().disposition(),
+            LakePublicationDisposition::KnownUncommitted
+        );
+        let sql = input.descriptor();
+        assert_eq!((sql.errno, sql.sqlstate), (1041, "HY000"));
+    }
+
+    #[test]
+    fn a_compilation_source_preserves_its_fact_at_the_ctas_statement_boundary() {
+        use novarocks_execution_contract::failure::{FailureProjection, SharedFailureCause};
+        let source = SharedFailureCause::new(novarocks_functions::ConstantError::Limit(
+            "finite constant policy",
+        ));
+        let cause = CtasFailure {
+            kind: CtasFailureKind::Internal,
+            message: "local compilation diagnostics".to_owned(),
+            user_error: Some(
+                crate::query_execution::dml::ctas::CtasUserError::Compilation(source.clone()),
+            ),
+        };
+        let failure = ctas_failure("CREATE TABLE dst AS SELECT 1", cause);
+        let input = failure
+            .execution_failure()
+            .expect("the CTAS boundary must retain the domain fact");
+        assert_eq!(input.fact(), source.failure_fact());
+        assert_eq!(
+            input.detail().as_str(),
+            "pure SQL compilation failed in its source domain"
+        );
+        assert_eq!(
+            (input.descriptor().errno, input.descriptor().sqlstate),
+            (1041, "HY000")
         );
     }
 }

@@ -47,7 +47,7 @@ pub(super) fn actual(
     array: &ArrayRef,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ty = FunctionValueType::new(array.data_type().clone(), true);
     let schema = Arc::new(Schema::new(vec![
         ty.try_to_field("original-float").unwrap(),
@@ -171,7 +171,10 @@ fn legacy_float_date_original_all_invalid_nonfinite_extremes_keep_full_string_un
                 DecimalOverflowPolicy::ReportError,
             ] {
                 for allow in [false, true] {
-                    assert_eq!(actual(&array, policy, allow).unwrap_err(), message);
+                    assert_eq!(
+                        (actual(&array, policy, allow).unwrap_err()).to_string(),
+                        message
+                    );
                 }
             }
         }

@@ -31,7 +31,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         self.observations.lock().unwrap().push((phase, units));
         if units > 0
-            && let Some(failure) = self.fail
+            && let Some(failure) = self.fail.clone()
         {
             return Err(failure);
         }
@@ -374,7 +374,7 @@ fn empty_fields_observe_typed_control_failure_before_unbounded_traversal() {
         });
         let owner = Control {
             observations: Mutex::default(),
-            fail: Some(failure),
+            fail: Some(failure.clone()),
         };
         assert_eq!(
             PhysicalExpressionRoots::try_new(&fragment, &owner).unwrap_err(),
@@ -1045,7 +1045,7 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
     ] {
         let owner = Control {
             observations: Mutex::default(),
-            fail: Some(failure),
+            fail: Some(failure.clone()),
         };
         assert_eq!(
             PredicateConjunctSource::try_new(&fragment, &roots, site, vec![0; depth - 1], &owner)

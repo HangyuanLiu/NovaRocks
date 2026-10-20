@@ -519,7 +519,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
 }
 
 fn runtime_state() -> Arc<RuntimeState> {
-    Arc::new(RuntimeState::new(
+    Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,

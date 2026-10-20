@@ -892,7 +892,7 @@ impl FragmentEventSink for RecordingEvents {
 
 fn state(session: Arc<LoopbackSession>) -> Arc<RuntimeState> {
     Arc::new(
-        RuntimeState::new(
+        RuntimeState::for_local_execution(
             Some(QueryOptions {
                 runtime_filter_wait_timeout_ms: Some(60_000),
                 ..Default::default()

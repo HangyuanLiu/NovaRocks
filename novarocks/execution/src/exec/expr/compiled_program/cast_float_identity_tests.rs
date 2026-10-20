@@ -442,7 +442,7 @@ fn float_identity_original_compile_and_runtime_refusals_keep_exact_prefix_and_fa
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusal = CompileCallbacks::new(cause, stop_at);
+            let refusal = CompileCallbacks::new(cause.clone(), stop_at);
             assert!(
                 matches!(compile(&functions, package.clone(), &refusal), Err(FragmentCompileError::Control(actual)) if actual == cause)
             );

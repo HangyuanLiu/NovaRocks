@@ -35,7 +35,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at + 1
         {
             Err(cause)
@@ -317,6 +317,7 @@ fn every_decimal_overflow_policy_is_independent_and_allow_adds_only_multiplicati
                         panic!("numeric overflow disappeared")
                     };
                     assert_eq!(error.selected_ordinal(), 9);
+                    assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
                     let name = match op {
                         Add => "add",
                         Subtract => "sub",
@@ -608,7 +609,7 @@ fn original_prepare_and_row_controls_keep_all_primary_prefixes_including_ordinar
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = CompileControl {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..CompileControl::default()
                 };
                 assert_eq!(

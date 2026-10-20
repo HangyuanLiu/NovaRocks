@@ -419,10 +419,20 @@ pub mod test_support {
                 if handle == &catalog_handle {
                     Ok(execution.clone())
                 } else {
-                    Err("no query-leased test catalog runtime".to_owned())
+                    Err(
+                        novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
+                            catalog: handle.clone(),
+                        },
+                    )
                 }
             }),
-            std::sync::Arc::new(|_| Err("no query-leased test writer runtime".to_owned())),
+            std::sync::Arc::new(|handle| {
+                Err(
+                    novarocks_worker::CatalogExecutionAccessError::WriteUnavailable {
+                        catalog: handle.clone(),
+                    },
+                )
+            }),
             queues,
             session,
             std::sync::Arc::new(|| Ok(None)),
@@ -481,6 +491,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
+    use tokio_stream::Stream;
 
     use novarocks_execution::connector::TaskAttemptSplitQueues;
     use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanOp, ScanSource};
@@ -613,12 +624,14 @@ mod tests {
             Box::pin(ScriptedPageStream {
                 pages: pages.into(),
                 closes: Arc::clone(&self.closes),
+                close_error: None,
             })
         }
     }
 
     struct ProbePreparationControl {
         retained: AtomicUsize,
+        changed: tokio::sync::Notify,
     }
 
     impl ConnectorPreparationControl for ProbePreparationControl {
@@ -626,18 +639,38 @@ mod tests {
         fn request_resume(&self) {}
         fn request_reclaim(&self) {
             self.retained.store(0, Ordering::Release);
+            self.changed.notify_waiters();
         }
         fn request_stop(&self) {
             self.retained.store(0, Ordering::Release);
+            self.changed.notify_waiters();
         }
         fn retained_input_bytes(&self) -> u64 {
             self.retained.load(Ordering::Acquire) as u64
         }
         fn is_drained(&self) -> bool {
-            true
+            self.retained.load(Ordering::Acquire) == 0
         }
-        fn wait_drained(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            Box::pin(async {})
+        fn wait_drained(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = novarocks_spi::connector::read_stack::ConnectorPreparationExit>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                loop {
+                    let changed = self.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if self.is_drained() {
+                        return novarocks_spi::connector::read_stack::ConnectorPreparationExit::Exited;
+                    }
+                    changed.await;
+                }
+            })
         }
     }
 
@@ -682,6 +715,7 @@ mod tests {
             self.provider
                 .record(format!("promote:{}", self.sequence_id));
             self.control.retained.store(0, Ordering::Release);
+            self.control.changed.notify_waiters();
             Ok(self.page_stream())
         }
     }
@@ -729,6 +763,7 @@ mod tests {
                         sequence_id: scheduled_split_sequence_id,
                         control: Arc::new(ProbePreparationControl {
                             retained: AtomicUsize::new(1),
+                            changed: tokio::sync::Notify::new(),
                         }),
                     })),
                 ),
@@ -786,6 +821,13 @@ mod tests {
     }
 
     fn request(cancellation: ConnectorStopView) -> ConnectorRequestContext {
+        execution_request(cancellation, ConnectorSourceOperations::new())
+    }
+
+    fn execution_request(
+        cancellation: ConnectorStopView,
+        operations: ConnectorSourceOperations,
+    ) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
             cancellation,
@@ -793,6 +835,13 @@ mod tests {
             1 << 22,
         )
         .expect("request context")
+        // This is an execution fixture, with its exact NODE and real Task
+        // operation ledger. Production never supplies a default source.
+        .with_execution_source(
+            novarocks_spi::connector::ConnectorRangeScope::try_new(1, 2, 1, 3, 4, NODE)
+                .expect("fixture execution scope"),
+            operations,
+        )
     }
 
     fn session() -> ConnectorSession {
@@ -857,6 +906,7 @@ mod tests {
     struct ScriptedPageStream {
         pages: std::collections::VecDeque<Option<SourcePage>>,
         closes: Arc<AtomicUsize>,
+        close_error: Option<ConnectorError>,
     }
 
     impl tokio_stream::Stream for ScriptedPageStream {
@@ -889,7 +939,8 @@ mod tests {
 
         fn close(self: Pin<Box<Self>>) -> CloseFuture {
             self.closes.fetch_add(1, Ordering::AcqRel);
-            Box::pin(async { Ok(()) })
+            let result = self.close_error.clone().map_or(Ok(()), Err);
+            Box::pin(async move { result })
         }
     }
 
@@ -901,6 +952,7 @@ mod tests {
         closes: Arc<AtomicUsize>,
         budgets: Mutex<Vec<ConnectorPollBudget>>,
         filter_columns: Mutex<Option<usize>>,
+        close_error: Mutex<Option<ConnectorError>>,
     }
 
     impl ScriptedStreamProvider {
@@ -911,6 +963,7 @@ mod tests {
                 closes: Arc::new(AtomicUsize::new(0)),
                 budgets: Mutex::new(Vec::new()),
                 filter_columns: Mutex::new(None),
+                close_error: Mutex::new(None),
             })
         }
     }
@@ -941,6 +994,7 @@ mod tests {
             Ok(Box::pin(ScriptedPageStream {
                 pages: pages.into(),
                 closes: Arc::clone(&self.closes),
+                close_error: self.close_error.lock().unwrap().take(),
             }))
         }
     }
@@ -960,19 +1014,101 @@ mod tests {
     {
         novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),novarocks_execution::runtime::mem_tracker::MemTracker::new_root("typed provider stream fixture creator"),std::sync::Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default())).unwrap()
     }
-    fn claim(
-        op: &Arc<dyn ScanOp>,
-        budget: &ConnectorPollBudget,
-    ) -> novarocks_execution::exec::node::scan::ScanOutputStream {
-        op.stream_source()
+    // The test driver retains the same independent observation as production.
+    // The wrapper owns no second source receiver or artificial stop signal.
+    #[derive(Default)]
+    struct TestSourceReports {
+        runtime: novarocks_execution::runtime::runtime_state::RuntimeErrorState,
+        cleanup: Mutex<Vec<novarocks_execution::runtime::fragment::ExecutionFailure>>,
+    }
+    impl novarocks_execution::runtime::fragment::ExecutionFailureReporter for TestSourceReports {
+        fn report_failure(&self, cause: novarocks_execution::runtime::fragment::ExecutionFailure) {
+            self.runtime.set_error(cause);
+        }
+        fn report_cleanup(&self, cause: &novarocks_execution::runtime::fragment::ExecutionFailure) {
+            self.cleanup.lock().unwrap().push(cause.clone());
+            self.runtime.report_cleanup(cause);
+        }
+        fn report_unresolved_exit(
+            &self,
+            cause: &novarocks_execution::runtime::fragment::ExecutionFailure,
+        ) {
+            self.runtime.report_unresolved_exit(cause);
+        }
+    }
+    type ObservedTestFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+    struct ObservedTestStream {
+        stream: novarocks_execution::exec::node::scan::ScanOutputStream,
+        exit: Option<ObservedTestFuture<novarocks_execution::exec::node::scan::ScanExitProof>>,
+        proof: Option<novarocks_execution::exec::node::scan::ScanExitProof>,
+        failures: Arc<TestSourceReports>,
+    }
+    type ObservedTestOutput = std::pin::Pin<Box<ObservedTestStream>>;
+    impl tokio_stream::Stream for ObservedTestStream {
+        type Item = novarocks_execution::runtime::fragment::ExecutionResult<
+            novarocks_execution::exec::chunk::Chunk,
+        >;
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if let Some(exit) = &mut this.exit {
+                if let std::task::Poll::Ready(proof) = exit.as_mut().poll(cx) {
+                    this.proof = Some(proof);
+                    this.exit = None;
+                }
+            }
+            this.stream.as_mut().poll_next(cx)
+        }
+    }
+    fn claim(op: &Arc<dyn ScanOp>, budget: &ConnectorPollBudget) -> ObservedTestOutput {
+        let mut stream = op
+            .stream_source()
             .claim(budget.clone(), None, actual_stream_test_factory())
-            .expect("claim the scan's stream")
+            .expect("claim the scan's stream");
+        let failures = Arc::new(TestSourceReports::default());
+        let observation = stream
+            .as_mut()
+            .take_exit_observation(failures.clone())
+            .expect("claim the original source observer before reading");
+        Box::pin(ObservedTestStream {
+            stream,
+            exit: Some(observation.actual_exit),
+            proof: None,
+            failures,
+        })
+    }
+    fn close_observed(
+        stream: ObservedTestOutput,
+    ) -> ObservedTestFuture<novarocks_execution::runtime::fragment::ExecutionResult<()>> {
+        let this = *std::pin::Pin::into_inner(stream);
+        let close = novarocks_execution::exec::node::scan::ScanChunkStream::close(
+            this.stream,
+            this.failures,
+        );
+        Box::pin(async move {
+            let exit = async move {
+                match (this.proof, this.exit) {
+                    (Some(proof), _) => proof,
+                    (None, Some(exit)) => exit.await,
+                    (None, None) => panic!("the original test observer remains owned until proof"),
+                }
+            };
+            let (result, proof) = tokio::join!(close, exit);
+            assert_eq!(
+                proof,
+                novarocks_execution::exec::node::scan::ScanExitProof::Exited,
+                "a clean fixture close requires actual source proof"
+            );
+            result
+        })
     }
 
     /// Polls as a driver does, one refilled turn per poll, until the stream
     /// yields an item or ends.
     fn next_item(
-        stream: &mut novarocks_execution::exec::node::scan::ScanOutputStream,
+        stream: &mut ObservedTestOutput,
         budget: &ConnectorPollBudget,
     ) -> Option<
         novarocks_execution::runtime::fragment::ExecutionResult<
@@ -989,10 +1125,7 @@ mod tests {
         panic!("the stream made no progress on ready input");
     }
 
-    fn drain_values(
-        stream: &mut novarocks_execution::exec::node::scan::ScanOutputStream,
-        budget: &ConnectorPollBudget,
-    ) -> Vec<i64> {
+    fn drain_values(stream: &mut ObservedTestOutput, budget: &ConnectorPollBudget) -> Vec<i64> {
         let mut values = Vec::new();
         while let Some(chunk) = next_item(stream, budget) {
             values.extend(chunk_values(&chunk.expect("chunk")));
@@ -1049,17 +1182,13 @@ mod tests {
 
     /// A request carrying the Task source its operations are admitted to.
     fn request_with_source(operations: &ConnectorSourceOperations) -> ConnectorRequestContext {
-        request(ConnectorStopOwner::new().view()).with_execution_source(
-            novarocks_spi::connector::ConnectorRangeScope::try_new(1, 2, 1, 3, 4, NODE)
-                .expect("range scope"),
-            operations.clone(),
-        )
+        execution_request(ConnectorStopOwner::new().view(), operations.clone())
     }
 
-    fn close_now(stream: novarocks_execution::exec::node::scan::ScanOutputStream) {
+    fn close_now(stream: ObservedTestOutput) {
         crate::backend_test_support::test_scan_stream_runtime()
-            .block_on(novarocks_execution::exec::node::scan::ScanChunkStream::close(stream))
-            .expect("close the scan's stream");
+            .block_on(close_observed(stream))
+            .expect("close the scan's stream and its actual source");
     }
 
     #[test]
@@ -1330,7 +1459,7 @@ mod tests {
         let running = operations.admit(Arc::new(|| {})).expect("admitted");
 
         let runtime = crate::backend_test_support::test_scan_stream_runtime();
-        let mut closed = novarocks_execution::exec::node::scan::ScanChunkStream::close(stream);
+        let mut closed = close_observed(stream);
         assert!(operations.is_sealed());
         assert!(queues.queue(NODE).is_closed());
         assert!(
@@ -1341,7 +1470,7 @@ mod tests {
                 .is_err(),
             "the close waits for the running operation"
         );
-        running.end(Ok(()));
+        running.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
         runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(5), closed).await })
             .expect("the close resolves once the operation exited")
@@ -1421,6 +1550,64 @@ mod tests {
     }
 
     #[test]
+    fn normal_split_cleanup_does_not_replace_required_work_or_end_later_split_data() {
+        use novarocks_execution::runtime::fragment::{
+            ExecutionFailureCause, connector_failure::ConnectorOperation,
+        };
+        let queues = attempt_queues();
+        let provider = ScriptedStreamProvider::new(vec![
+            vec![Some(int_page(vec![1]))],
+            vec![Some(int_page(vec![2]))],
+        ]);
+        let cleanup = ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            "the actual first reader close failed",
+        );
+        *provider.close_error.lock().unwrap() = Some(cleanup.clone());
+        let source = stream_source_with(
+            provider.clone(),
+            queues.clone(),
+            request(ConnectorStopOwner::new().view()),
+        );
+        let op = bind(&source);
+        queues
+            .queue(NODE)
+            .offer_splits(NODE, vec![scheduled_split(1), scheduled_split(2)], true)
+            .unwrap();
+        let budget = ConnectorPollBudget::new();
+        let mut stream = claim(&op, &budget);
+        let reports = stream.failures.clone();
+        assert_eq!(
+            drain_values(&mut stream, &budget),
+            vec![1, 2],
+            "cleanup does not cancel required sibling reads"
+        );
+        assert_eq!(provider.closes.load(Ordering::Acquire), 2);
+        assert!(
+            reports.runtime.error().is_none(),
+            "cleanup cannot accept an originating Task failure"
+        );
+        assert!(
+            reports.runtime.local_exit_fault().is_none(),
+            "an ordinary close error is not missing exit proof"
+        );
+        let recorded = reports.cleanup.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        let ExecutionFailureCause::Connector(actual) = recorded[0].cause() else {
+            panic!("the original close author remains typed");
+        };
+        assert_eq!(actual.operation(), ConnectorOperation::CloseReader);
+        assert_eq!(actual.cause(), &cleanup);
+        close_now(stream);
+        assert_eq!(
+            reports.cleanup.lock().unwrap().len(),
+            1,
+            "terminal cleanup does not repeat the consumed split close"
+        );
+        assert!(reports.runtime.error().is_none());
+    }
+
+    #[test]
     fn a_scan_hands_out_its_stream_once() {
         let source = stream_source_with(
             ScriptedStreamProvider::new(Vec::new()) as Arc<dyn ConnectorReadPageSourceProvider>,
@@ -1443,6 +1630,7 @@ mod tests {
     struct ScriptedSystemStreams {
         pages: Mutex<Vec<Option<SourcePage>>>,
         closes: Arc<AtomicUsize>,
+        close_error: Option<ConnectorError>,
     }
 
     impl ConnectorReadSystemTableProvider for ScriptedSystemStreams {
@@ -1459,6 +1647,7 @@ mod tests {
             Ok(Box::pin(ScriptedPageStream {
                 pages: pages.into(),
                 closes: Arc::clone(&self.closes),
+                close_error: self.close_error.clone(),
             }))
         }
     }
@@ -1472,6 +1661,7 @@ mod tests {
             Arc::new(ScriptedSystemStreams {
                 pages: Mutex::new(vec![Some(int_page(vec![7])), None, Some(int_page(vec![8]))]),
                 closes: Arc::clone(&closes),
+                close_error: None,
             }),
             session(),
             request_with_source(&operations),
@@ -1513,5 +1703,78 @@ mod tests {
         assert_eq!(closes.load(Ordering::Acquire), 1);
         close_now(stream);
         assert!(operations.is_sealed());
+    }
+
+    #[test]
+    fn a_system_relation_close_error_is_cleanup_after_real_data_eos() {
+        use novarocks_execution::runtime::fragment::{
+            ExecutionFailureCause, connector_failure::ConnectorOperation,
+        };
+        let cleanup = ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "the actual system reader cleanup failed",
+        );
+        let closes = Arc::new(AtomicUsize::new(0));
+        let operations = ConnectorSourceOperations::new();
+        let source = TypedConnectorSystemTableScanSource::new(
+            descriptor(),
+            Arc::new(ScriptedSystemStreams {
+                pages: Mutex::new(vec![Some(int_page(vec![7])), None, Some(int_page(vec![8]))]),
+                closes: Arc::clone(&closes),
+                close_error: Some(cleanup.clone()),
+            }),
+            session(),
+            request_with_source(&operations),
+            NODE,
+            vec![SlotId::new(1)],
+            Arc::new({
+                // This source is explicitly Plain INT64; its Arrow field is
+                // presentation only and cannot author its value domain.
+                let value = novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                );
+                let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+                let slot = novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_typed(
+                    SlotId::new(1),
+                    Arc::new(arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )),
+                    value.typed_binding().clone(),
+                    None,
+                    storage.clone(),
+                )
+                .expect("complete test output slot");
+                novarocks_execution::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage)
+                    .expect("complete test output schema")
+            }),
+            #[cfg(novarocks_dev_controls)]
+            None,
+            crate::backend_test_support::test_scan_stream_runtime(),
+        );
+        let op = source
+            .bind(BoundScanRanges::None)
+            .expect("a system relation binds with no range");
+        let budget = ConnectorPollBudget::new();
+        let mut stream = claim(&op, &budget);
+        let reports = stream.failures.clone();
+        assert_eq!(drain_values(&mut stream, &budget), vec![7, 8]);
+        assert!(reports.runtime.error().is_none());
+        assert!(reports.runtime.local_exit_fault().is_none());
+        let recorded = reports.cleanup.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        let ExecutionFailureCause::Connector(actual) = recorded[0].cause() else {
+            panic!("the original system close author remains typed");
+        };
+        assert_eq!(actual.operation(), ConnectorOperation::CloseReader);
+        assert_eq!(actual.cause(), &cleanup);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        close_now(stream);
+        assert!(operations.is_sealed());
+        assert!(operations.is_exited());
+        assert_eq!(reports.cleanup.lock().unwrap().len(), 1);
+        assert!(reports.runtime.error().is_none());
     }
 }

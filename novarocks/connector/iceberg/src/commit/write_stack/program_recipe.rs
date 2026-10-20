@@ -54,11 +54,7 @@ impl ConnectorWriteRecipeCompiler for IcebergWriteRecipeCompiler {
     ) -> Result<ConnectorWriteRecipeDraft, Failure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
         let result = compile(draft, control, &mut work);
-        if matches!(&result, Err(Failure::Control(_))) {
-            return result;
-        }
-        work.finish()?;
-        result
+        work.finish_result(result, Failure::Control)
     }
 }
 
@@ -314,7 +310,7 @@ fn copy_text(value: &str, work: &mut CompileCheckpoints<'_>) -> Result<String, F
 
 fn lift(error: ConnectorCodecError) -> Failure {
     match error.compile_control_error() {
-        Some(cause) => Failure::Control(cause),
+        Some(cause) => Failure::Control(cause.clone()),
         None => Failure::Provider(error),
     }
 }

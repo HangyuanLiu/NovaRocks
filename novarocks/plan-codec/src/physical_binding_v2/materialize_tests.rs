@@ -66,7 +66,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         s.trace.push(units);
-        match s.stop {
+        match s.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -198,7 +198,7 @@ fn prefix(
         for cause in CAUSES {
             let c = Control::default();
             assert!(
-                matches!(call(&c,Some((at,cause))),Err(Error::Control(actual))if actual==cause)
+                matches!(call(&c,Some((at,cause.clone()))),Err(Error::Control(actual))if actual==cause)
             );
             assert_eq!(c.trace(), trace[..=at]);
         }
@@ -472,7 +472,7 @@ fn materialization_wide_actual_argument_loop_has_256_unit_sample() {
         for cause in CAUSES {
             let c = Control::default();
             with_headers(&c, &raw, |h| {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(prepare_function_bindings_materialization(h,SOURCE,limits()),Err(Error::Control(actual))if actual==cause)
                 );
@@ -505,7 +505,7 @@ fn materialization_wide_actual_argument_loop_has_256_unit_sample() {
             with_headers(&c, &raw, |h| {
                 let prepared =
                     prepare_function_bindings_materialization(h, SOURCE, limits()).unwrap();
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(materialize_function_bindings(prepared),Err(Error::Control(actual)) if actual==cause)
                 );
@@ -931,7 +931,7 @@ fn admitted_clone_uses_original_requests_and_callbacks_without_double_charge() {
     assert_eq!(control.trace(), trace);
     for at in 0..trace.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(matches!(run(true, &control), Err(Error::Control(actual)) if actual == cause));
             assert_eq!(control.trace(), trace[..=at]);
         }

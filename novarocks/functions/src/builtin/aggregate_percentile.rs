@@ -18,7 +18,7 @@
 //! Selected host consumer of the one original exact-percentile computation.
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::{self as scalar, ScalarStateAllocator, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, ScalarStateAllocator, ScalarWork};
 use crate::exact_percentile_core::{self as core, ExactPercentileAllocator};
 use crate::exact_percentile_failure::{PercentileDataRecipe, PercentileFailureSink};
 use crate::kernel_control::{internal, invalid};
@@ -56,12 +56,22 @@ unsafe impl Allocator for PercentileAllocator {
     }
 }
 impl ScalarStateAllocator for PercentileAllocator {
-    fn scalar_allocation_error(&self, _operation: &str) -> ScalarStateError {
-        ScalarStateError::Kernel(
-            self.0
-                .recorded_failure()
-                .unwrap_or(KernelFailure::ResourceExhausted),
-        )
+    fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+        &self,
+        _operation: &str,
+        source: E,
+    ) -> crate::KernelFailure {
+        if source.allocator_refusal() == Some(true) {
+            self.0.recorded_failure().unwrap_or_else(|| {
+                KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                    _operation, source,
+                ))
+            })
+        } else {
+            KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                _operation, source,
+            ))
+        }
     }
 }
 impl ExactPercentileAllocator for PercentileAllocator {
@@ -69,29 +79,13 @@ impl ExactPercentileAllocator for PercentileAllocator {
     fn reserve_percentile_transient(
         &self,
         bytes: usize,
-        operation: &str,
-    ) -> Result<Self::ParserReservation, String> {
-        self.reserve_percentile_transient_lossless(bytes, operation)
-            .map_err(|error| error.to_string())
-    }
-    fn reserve_percentile_transient_lossless(
-        &self,
-        bytes: usize,
         _operation: &str,
-    ) -> Result<Self::ParserReservation, ScalarStateError> {
+    ) -> Result<Self::ParserReservation, KernelFailure> {
         let mut reservation = HostVec::new_in(self.clone());
         reservation
             .try_reserve_exact(bytes)
-            .map_err(|_| self.scalar_allocation_error("reserve percentile scratch"))?;
+            .map_err(|source| self.scalar_allocation_error("reserve percentile scratch", source))?;
         Ok(reservation)
-    }
-    fn percentile_allocation_failure(&self, operation: &str) -> ScalarStateError {
-        self.scalar_allocation_error(operation)
-    }
-    fn percentile_allocation_error(&self, _operation: &str) -> String {
-        // serde needs its error carrier, while the real typed refusal stays in
-        // the same host journal until the synchronous JSON failure continuation.
-        "exact percentile host allocation refused".to_string()
     }
 }
 pub(super) struct PercentileState {
@@ -114,10 +108,7 @@ impl PercentileState {
         for value in &self.core.values[from..] {
             self.heap_bytes = self
                 .heap_bytes
-                .checked_add(
-                    scalar::tracked_scalar_heap_capacity(value, work)
-                        .map_err(ScalarStateError::into_kernel_failure)?,
-                )
+                .checked_add(scalar::tracked_scalar_heap_capacity(value, work)?)
                 .ok_or(KernelFailure::ResourceExhausted)?;
         }
         Ok(())
@@ -148,7 +139,11 @@ struct FailureSink<'a, 'host> {
     control: &'a dyn KernelEvaluationControl,
 }
 impl FailureSink<'_, '_> {
-    fn diagnostic<T: std::fmt::Display + ?Sized>(&mut self, original: &T) -> EvaluationFailure {
+    fn diagnostic<T: std::fmt::Display + ?Sized>(
+        &mut self,
+        original: &T,
+        reason: crate::DataFailureReason,
+    ) -> EvaluationFailure {
         use crate::aggregate_format::AggregateFailureStage;
         let stage = match &self.domain {
             FailureDomain::Mutation {
@@ -179,18 +174,23 @@ impl FailureSink<'_, '_> {
                     phase,
                     selection,
                     mapping,
-                } => InvocationData::prepare_aggregate(
+                } => InvocationData::prepare_aggregate_with_reason(
                     self.allocator,
                     Arc::clone(contract),
                     *phase,
                     *selection,
                     mapping,
                     text,
+                    reason,
                     &mut work,
                 ),
-                FailureDomain::Emission(context) => {
-                    InvocationData::prepare_emission(self.allocator, context, text, &mut work)
-                }
+                FailureDomain::Emission(context) => InvocationData::prepare_emission_with_reason(
+                    self.allocator,
+                    context,
+                    text,
+                    reason,
+                    &mut work,
+                ),
             }
         })();
         match result {
@@ -202,22 +202,28 @@ impl FailureSink<'_, '_> {
 impl PercentileFailureSink<PercentileAllocator> for FailureSink<'_, '_> {
     type Error = EvaluationFailure;
     fn data(&mut self, recipe: PercentileDataRecipe<'_, PercentileAllocator>) -> Self::Error {
-        self.diagnostic(&recipe)
-    }
-    fn scalar(&mut self, error: ScalarStateError) -> Self::Error {
-        match error {
-            ScalarStateError::Kernel(cause) => cause.into(),
-            ScalarStateError::OutputAllocation(_) => KernelFailure::ResourceExhausted.into(),
-            ScalarStateError::Legacy(message) => self.reader(message),
+        match recipe.value_reason() {
+            Some(reason) => self.diagnostic(&recipe, reason),
+            None => recipe.into_failure().into(),
         }
     }
-    fn reader(&mut self, error: String) -> Self::Error {
-        self.diagnostic(&error)
+    fn scalar(&mut self, error: KernelFailure) -> Self::Error {
+        error.into()
     }
-    fn json(&mut self, error: &serde_json::Error, allocator: &PercentileAllocator) -> Self::Error {
-        match allocator.0.take_recorded_failure() {
-            Some(cause) => cause.into(),
-            None => self.data(PercentileDataRecipe::Json(error)),
+    fn reader(&mut self, error: KernelFailure) -> Self::Error {
+        error.into()
+    }
+    fn json(&mut self, error: serde_json::Error, allocator: &PercentileAllocator) -> Self::Error {
+        if let Some(cause) = allocator.0.take_recorded_failure() {
+            return cause.into();
+        }
+        // The full host diagnostic and the original SDK cause have distinct
+        // lifetimes. A failed diagnostic admission keeps its own refusal.
+        match self.diagnostic(&error, crate::DataFailureReason::InvalidEncoding) {
+            EvaluationFailure::InvocationData(data) => EvaluationFailure::InvocationData(
+                data.with_whole_value_source(crate::exact_percentile_failure::json_failure(error)),
+            ),
+            failure => failure,
         }
     }
 }
@@ -584,7 +590,7 @@ impl PreparedAggregateKernel for PercentileKernel {
         observed(control, |work| {
             let expected = states.len();
             self.check_emit(context, expected)?;
-            let mut builder = BinaryBuilder::new();
+            let mut builder = scalar::BinaryResultBuilder::new();
             let mut count = 0;
             for state in states {
                 if state.failed {
@@ -598,9 +604,9 @@ impl PreparedAggregateKernel for PercentileKernel {
                 work.step()?;
                 // The original serde encoder and builder are opaque operations.
                 work.flush()?;
-                let encoded = core::encode_state(&state.core);
+                let encoded = core::encode_state(&state.core)?;
                 work.flush()?;
-                builder.append_value(encoded);
+                builder.append_value(encoded)?;
                 work.flush()?;
                 count += 1;
             }
@@ -609,7 +615,7 @@ impl PreparedAggregateKernel for PercentileKernel {
                     internal("percentile state iterator shortened its actual extent").into(),
                 );
             }
-            let array = Arc::new(builder.finish()) as ArrayRef;
+            let array = Arc::new(builder.finish()?) as ArrayRef;
             work.flush()?;
             Ok(array)
         })
@@ -650,7 +656,9 @@ impl PreparedAggregateKernel for PercentileKernel {
                         internal("percentile final iterator exceeded its actual extent").into(),
                     );
                 }
-                scalar_work.step().map_err(|error| sink.scalar(error))?;
+                scalar_work
+                    .step()
+                    .map_err(|error| sink.scalar(error.into()))?;
                 output.push(match self.operation {
                     PercentileOperation::Continuous => core::finalize_cont_with_sink(
                         &state.core,
@@ -669,7 +677,7 @@ impl PreparedAggregateKernel for PercentileKernel {
                 );
             }
             scalar::build_scalar_array(self.output_type(), output, &mut scalar_work)
-                .map_err(|error| sink.scalar(error))
+                .map_err(|error| sink.scalar(error.into()))
         })
     }
 }

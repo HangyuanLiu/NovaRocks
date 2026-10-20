@@ -27,21 +27,112 @@ use crate::aggregate_scalar_debug::{ScalarDebugFailure, ScalarDebugObserver, Sca
 use crate::decimal256_digits::fixed_digits;
 use crate::parse_json_core::{JsonRenderMessages, ParseJsonFailure, ParseJsonObserver};
 use arrow_array::{ArrayRef, builder::StringBuilder};
-use chrono::NaiveDate;
 use std::{convert::Infallible, sync::Arc};
 
-const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
 const MESSAGES: JsonRenderMessages = JsonRenderMessages {
     stringify: "json_object stringify failed: ",
     stringify_key: "json_object stringify key failed: ",
     missing_key: "json_object missing object key",
 };
 
+#[derive(Debug)]
 pub enum JsonObjectFailure<E> {
-    OriginalData(String),
+    OriginalData(JsonObjectValueFailure),
+    Outer(crate::KernelFailure),
     Control(E),
 }
-use JsonObjectFailure::{Control, OriginalData};
+use JsonObjectFailure::{Control, OriginalData, Outer};
+#[derive(Debug)]
+pub enum JsonObjectValueFailure {
+    Date32 { days: i32 },
+    ComplexKey,
+}
+impl JsonObjectValueFailure {
+    pub const fn reason(&self) -> crate::DataFailureReason {
+        match self {
+            Self::Date32 { .. } => crate::DataFailureReason::NumericOutOfRange,
+            Self::ComplexKey => crate::DataFailureReason::InvalidValue,
+        }
+    }
+}
+impl std::fmt::Display for JsonObjectValueFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Date32 { days } => write!(f, "json_object invalid date32 day value: {days}"),
+            Self::ComplexKey => f.write_str("json_object key does not support complex type"),
+        }
+    }
+}
+impl std::error::Error for JsonObjectValueFailure {}
+impl novarocks_failure_contract::FailureProjection for JsonObjectValueFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.reason())
+    }
+}
+#[derive(Debug)]
+enum JsonObjectContractFailure {
+    Arity,
+    Quote(serde_json::Error),
+}
+impl std::fmt::Display for JsonObjectContractFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Arity => f.write_str("json_object expects at least 1 argument"),
+            Self::Quote(source) => write!(f, "json_object string serialization failed: {source}"),
+        }
+    }
+}
+impl std::error::Error for JsonObjectContractFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Quote(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for JsonObjectContractFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::Arity => 302,
+            Self::Quote(_) => 304,
+        };
+        // The destination is a String and the serialized input is an &str.
+        // Its serializer cannot report a user-value or external IO failure.
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for JsonObjectContractFailure {}
+impl<E: std::fmt::Display> std::fmt::Display for JsonObjectFailure<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OriginalData(source) => source.fmt(f),
+            Self::Outer(source) => source.fmt(f),
+            Self::Control(source) => source.fmt(f),
+        }
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for JsonObjectFailure<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OriginalData(source) => Some(source),
+            Self::Outer(source) => Some(source),
+            Self::Control(source) => Some(source),
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for JsonObjectFailure<Infallible> {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::OriginalData(source) => source.failure_fact(),
+            Self::Outer(source) => source.failure_fact(),
+            Self::Control(never) => match *never {},
+        }
+    }
+}
 
 pub trait JsonObjectArguments {
     fn len(&self) -> usize;
@@ -95,9 +186,8 @@ impl<P: JsonObjectPort> ScalarDebugObserver for Observer<'_, P> {
 }
 
 fn format_date32<E>(days: i32) -> Result<String, JsonObjectFailure<E>> {
-    // Preserve the original arithmetic overflow/panic frontier.
-    let naive = NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
-        .ok_or_else(|| OriginalData(format!("json_object invalid date32 day value: {}", days)))?;
+    let naive = crate::datetime_value::date32_to_naive(days)
+        .ok_or(OriginalData(JsonObjectValueFailure::Date32 { days }))?;
     Ok(naive.format("%Y-%m-%d").to_string())
 }
 fn decimal256<P: JsonObjectPort>(
@@ -132,9 +222,9 @@ fn key_from_scalar<P: JsonObjectPort>(
         Decimal256(v) => decimal256(v, port)?,
         Binary(v) => hex::encode(v),
         Struct(_) | Map(_) | List(_) => {
-            return Err(OriginalData(
-                "json_object key does not support complex type".to_string(),
-            ));
+            // The generic invocation admits these scalar values. This owner
+            // rejects them as JSON object keys, independently of Arrow shape.
+            return Err(OriginalData(JsonObjectValueFailure::ComplexKey));
         }
     };
     port.boundary().map_err(Control)?;
@@ -145,7 +235,11 @@ fn quote<P: JsonObjectPort>(
     port: &mut P,
 ) -> Result<String, JsonObjectFailure<P::Control>> {
     port.boundary().map_err(Control)?;
-    let out = serde_json::to_string(text).map_err(|e| OriginalData(e.to_string()))?;
+    let out = serde_json::to_string(text).map_err(|source| {
+        Outer(crate::KernelFailure::from_domain(
+            JsonObjectContractFailure::Quote(source),
+        ))
+    })?;
     port.boundary().map_err(Control)?;
     Ok(out)
 }
@@ -236,9 +330,9 @@ pub fn evaluate_selected<A: JsonObjectArguments + ?Sized, P: JsonObjectPort>(
     port: &mut P,
 ) -> Result<ArrayRef, JsonObjectFailure<P::Control>> {
     if arguments.is_empty() {
-        return Err(OriginalData(
-            "json_object expects at least 1 argument".to_string(),
-        ));
+        return Err(Outer(crate::KernelFailure::from_domain(
+            JsonObjectContractFailure::Arity,
+        )));
     }
     port.boundary().map_err(Control)?;
     let mut builder = StringBuilder::new();
@@ -303,8 +397,8 @@ pub fn evaluate_selected<A: JsonObjectArguments + ?Sized, P: JsonObjectPort>(
 struct OriginalPort;
 impl ScalarReadFailureSink for OriginalPort {
     type Error = JsonObjectFailure<Infallible>;
-    fn read_data(&mut self, failure: ScalarReadFailure<'_>) -> Self::Error {
-        OriginalData(failure.to_string())
+    fn read_contract(&mut self, failure: ScalarReadFailure<'_>) -> Self::Error {
+        Outer(failure.into_kernel())
     }
     fn observe(&mut self, _: ScalarReadObservation) -> Result<(), Self::Error> {
         Ok(())
@@ -336,12 +430,8 @@ impl JsonObjectPort for OriginalPort {
 pub fn evaluate_original(
     arguments: &[ArrayRef],
     selection: Selection<'_>,
-) -> Result<ArrayRef, String> {
-    match evaluate_selected(arguments, selection, &mut OriginalPort) {
-        Ok(out) => Ok(out),
-        Err(OriginalData(message)) => Err(message),
-        Err(Control(cause)) => match cause {},
-    }
+) -> Result<ArrayRef, JsonObjectFailure<Infallible>> {
+    evaluate_selected(arguments, selection, &mut OriginalPort)
 }
 
 #[cfg(test)]

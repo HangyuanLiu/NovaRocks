@@ -286,11 +286,7 @@ impl NdvOwner {
             })?;
             Ok(self.call_effects(input.proof_scope))
         })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        work.finish_result(result, FunctionEffectOwnerError::Control)
     }
     fn prepare_core(
         &self,
@@ -361,15 +357,10 @@ impl NdvOwner {
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        work.finish_result(result, compile_failure)
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_hll_owner_compile_tests.rs"]
+mod compile_first_cause_tests;

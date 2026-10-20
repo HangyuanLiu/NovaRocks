@@ -18,9 +18,14 @@
 //! Context root request/reply projection. Body allocations are byte carriers;
 //! Native transport must preflight envelope and hold physical leases separately.
 use crate::identity::{decode_task_identity, encode_task_identity};
+use crate::status::{
+    decode_failure_fact, decode_resource_facts, decode_safe_detail, encode_failure_fact,
+    encode_resource_facts,
+};
 use crate::{invalid, missing};
 use novarocks_execution_contract::root_result::{
-    RootReadOutcome, RootResultData, RootResultEnd, RootResultRead, RootResultReply,
+    RootReadDeferral, RootReadDeferred, RootReadOutcome, RootReadRefusal, RootReadResponse,
+    RootResultData, RootResultEnd, RootResultRead, RootResultReply,
 };
 use novarocks_proto_codec::root_result::{decode_kind, decode_profile, encode_kind};
 use novarocks_proto_codec::{FieldPath, ProtocolError};
@@ -102,7 +107,7 @@ pub fn encode_reply(
     value
         .validate()
         .map_err(|error| invalid(FieldPath::root("root_reply"), error.to_string()))?;
-    use wire::fetch_root_result_response::Outcome;
+    use wire::root_read_receipt::Outcome;
     let outcome = match &value.outcome {
         RootReadOutcome::AckOnly => Outcome::AckOnly(true),
         RootReadOutcome::NotReady => Outcome::NotReady(true),
@@ -119,17 +124,21 @@ pub fn encode_reply(
         root_task: Some(encode_task_identity(value.root_task)),
         profile_id: value.profile.get(),
         output_kind: Some(encode_kind(value.kind)),
-        accepted_consumed_sequence: value.accepted_consumed,
-        outcome: Some(outcome),
+        result: Some(wire::fetch_root_result_response::Result::Reply(
+            wire::RootReadReceipt {
+                accepted_consumed_sequence: value.accepted_consumed,
+                outcome: Some(outcome),
+            },
+        )),
     })
 }
-pub fn decode_reply(
+pub fn decode_response(
     value: wire::FetchRootResultResponse,
     expected: &RootResultRead,
     maximum_delivered_consumed: u64,
     path: FieldPath,
-) -> Result<RootResultReply, ProtocolError> {
-    use wire::fetch_root_result_response::Outcome;
+) -> Result<RootReadResponse, ProtocolError> {
+    use wire::root_read_receipt::Outcome;
     let task = decode_task_identity(
         value.root_task.as_ref().ok_or_else(|| {
             missing(
@@ -155,6 +164,47 @@ pub fn decode_reply(
             "root reply does not match its frozen request identity/profile/purpose",
         ));
     }
+    use wire::fetch_root_result_response::Result as WireResult;
+    let value = match value.result {
+        Some(WireResult::Reply(receipt)) => receipt,
+        Some(WireResult::Deferred(deferred)) => {
+            use wire::root_read_deferred::Reason;
+            let p = path.field("deferred");
+            let reason = match deferred.reason {
+                Some(Reason::Preparing(true)) => RootReadDeferral::Preparing,
+                Some(Reason::ReadHoldersBusy(r)) => RootReadDeferral::ReadHoldersBusy(
+                    decode_resource_facts(&r, p.field("read_holders_busy"))?,
+                ),
+                Some(Reason::SendMetadataBusy(r)) => RootReadDeferral::SendMetadataBusy(
+                    decode_resource_facts(&r, p.field("send_metadata_busy"))?,
+                ),
+                Some(Reason::SendBackingBusy(r)) => RootReadDeferral::SendBackingBusy(
+                    decode_resource_facts(&r, p.field("send_backing_busy"))?,
+                ),
+                _ => return Err(invalid(p, "deferred root read requires a closed reason")),
+            };
+            return Ok(RootReadResponse::Deferred(RootReadDeferred::for_request(
+                expected, reason,
+            )));
+        }
+        Some(WireResult::Refused(refused)) => {
+            let p = path.field("refused");
+            let fact = decode_failure_fact(
+                refused.fact.as_ref().ok_or_else(|| {
+                    missing(
+                        p.clone().field("fact"),
+                        "root refusal requires producer facts",
+                    )
+                })?,
+                p.clone().field("fact"),
+            )?;
+            let detail = decode_safe_detail(&refused.safe_detail, p.field("safe_detail"))?;
+            return Ok(RootReadResponse::Refused(RootReadRefusal::for_request(
+                expected, fact, detail,
+            )));
+        }
+        None => return Err(missing(path, "root read requires one response result")),
+    };
     // One read/ACK RPC is in flight. Older legal cumulative requests may
     // return a newer applied watermark, bounded by the caller's actual socket
     // delivery proofs rather than by prefetch or validation.
@@ -229,12 +279,68 @@ pub fn decode_reply(
     reply
         .validate()
         .map_err(|error| invalid(path, error.to_string()))?;
-    Ok(reply)
+    Ok(RootReadResponse::Reply(reply))
+}
+
+/// Non-receipt results carry exact binding and producer facts, never an ACK.
+pub fn encode_response(
+    value: &RootReadResponse,
+) -> Result<wire::FetchRootResultResponse, ProtocolError> {
+    use wire::fetch_root_result_response::Result as WireResult;
+    let result = match value {
+        RootReadResponse::Reply(reply) => return encode_reply(reply),
+        RootReadResponse::Deferred(deferred) => {
+            use wire::root_read_deferred::Reason;
+            let reason = match deferred.reason() {
+                RootReadDeferral::Preparing => Reason::Preparing(true),
+                RootReadDeferral::ReadHoldersBusy(r) => {
+                    Reason::ReadHoldersBusy(encode_resource_facts(r))
+                }
+                RootReadDeferral::SendMetadataBusy(r) => {
+                    Reason::SendMetadataBusy(encode_resource_facts(r))
+                }
+                RootReadDeferral::SendBackingBusy(r) => {
+                    Reason::SendBackingBusy(encode_resource_facts(r))
+                }
+            };
+            WireResult::Deferred(wire::RootReadDeferred {
+                reason: Some(reason),
+            })
+        }
+        RootReadResponse::Refused(refused) => WireResult::Refused(wire::RootReadRefusal {
+            fact: Some(encode_failure_fact(refused.fact())),
+            safe_detail: refused.detail().as_str().to_owned(),
+        }),
+    };
+    Ok(wire::FetchRootResultResponse {
+        root_task: Some(encode_task_identity(value.root_task())),
+        profile_id: value.profile().get(),
+        output_kind: Some(encode_kind(value.kind())),
+        result: Some(result),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These existing receipt tests intentionally reject non-receipt branches.
+    fn decode_reply(
+        value: wire::FetchRootResultResponse,
+        expected: &RootResultRead,
+        maximum: u64,
+        path: FieldPath,
+    ) -> Result<RootResultReply, ProtocolError> {
+        match decode_response(value, expected, maximum, path.clone())? {
+            RootReadResponse::Reply(reply) => Ok(reply),
+            _ => Err(invalid(path, "test expected an actual receipt")),
+        }
+    }
+    fn receipt(value: &mut wire::FetchRootResultResponse) -> &mut wire::RootReadReceipt {
+        match value.result.as_mut().expect("encoded result") {
+            wire::fetch_root_result_response::Result::Reply(reply) => reply,
+            _ => panic!("test expected an actual receipt"),
+        }
+    }
     use bytes::Bytes;
     use novarocks_execution_contract::identity::TaskIdentity;
     use novarocks_result_contract::{RootOutputKind, RootProfileId};
@@ -448,14 +554,101 @@ mod tests {
                 "closed replies cannot exceed actual socket delivery proofs",
             );
             let mut wire = encode_reply(&reply).unwrap();
-            wire.outcome = Some(wire::fetch_root_result_response::Outcome::AckOnly(true));
+            receipt(&mut wire).outcome = Some(wire::root_read_receipt::Outcome::AckOnly(true));
             assert!(decode_reply(wire, &request, 2, FieldPath::root("reply")).is_err());
             let mut wire = encode_reply(&reply).unwrap();
-            wire.outcome = Some(wire::fetch_root_result_response::Outcome::NotReady(true));
+            receipt(&mut wire).outcome = Some(wire::root_read_receipt::Outcome::NotReady(true));
             assert!(decode_reply(wire, &request, 2, FieldPath::root("reply")).is_err());
             let mut wire = encode_reply(&reply).unwrap();
-            wire.outcome = Some(wire::fetch_root_result_response::Outcome::Retired(true));
+            receipt(&mut wire).outcome = Some(wire::root_read_receipt::Outcome::Retired(true));
             assert!(decode_reply(wire, &request, 2, FieldPath::root("reply")).is_err());
+        }
+    }
+    #[test]
+    fn non_receipt_root_results_preserve_request_and_producer_facts_without_ack() {
+        use novarocks_execution_contract::{SafeDetail, failure::*};
+        use prost::Message;
+        use std::num::NonZeroU16;
+        let request = read(Some(3), 2);
+        let facts = ResourceFacts {
+            dimension: ResourceDimension::Bytes,
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: None,
+            requested: Some(u64::MAX),
+            required_growth: Some(0),
+            limit: None,
+            live: Some(0),
+            committed: Some(u64::MAX),
+        };
+        let reason = FailureReason::new(
+            NonZeroU16::new(65535).unwrap(),
+            NonZeroU16::new(65534).unwrap(),
+        );
+        let failure = FailureFact::new(FailureClass::Resource, reason).with_resource(facts);
+        let mut results = vec![RootReadResponse::Refused(RootReadRefusal::for_request(
+            &request,
+            failure,
+            SafeDetail::new("x".repeat(512)).unwrap(),
+        ))];
+        for reason in [
+            RootReadDeferral::Preparing,
+            RootReadDeferral::ReadHoldersBusy(facts),
+            RootReadDeferral::SendMetadataBusy(facts),
+            RootReadDeferral::SendBackingBusy(facts),
+        ] {
+            results.push(RootReadResponse::Deferred(RootReadDeferred::for_request(
+                &request, reason,
+            )));
+        }
+        for result in results {
+            let wire = encode_response(&result).unwrap();
+            assert!(!matches!(
+                wire.result,
+                Some(wire::fetch_root_result_response::Result::Reply(_))
+            ));
+            let bytes = wire.encode_to_vec();
+            crate::resource_preflight::check_root_result_reply(&bytes).unwrap();
+            assert!(bytes.len() <= novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES);
+            let decoded = decode_response(
+                wire::FetchRootResultResponse::decode(bytes.as_slice()).unwrap(),
+                &request,
+                2,
+                FieldPath::root("reply"),
+            )
+            .unwrap();
+            assert_eq!(decoded, result);
+        }
+    }
+    #[test]
+    fn non_receipt_root_results_require_actual_facts_and_closed_deferral() {
+        let request = read(Some(1), 0);
+        let binding = || wire::FetchRootResultResponse {
+            root_task: Some(encode_task_identity(request.root_task())),
+            profile_id: request.profile().get(),
+            output_kind: Some(encode_kind(request.kind())),
+            result: None,
+        };
+        let mut values = vec![binding()];
+        let mut value = binding();
+        value.result = Some(wire::fetch_root_result_response::Result::Refused(
+            wire::RootReadRefusal {
+                fact: None,
+                safe_detail: "original domain refusal".into(),
+            },
+        ));
+        values.push(value);
+        for reason in [
+            None,
+            Some(wire::root_read_deferred::Reason::Preparing(false)),
+        ] {
+            let mut value = binding();
+            value.result = Some(wire::fetch_root_result_response::Result::Deferred(
+                wire::RootReadDeferred { reason },
+            ));
+            values.push(value);
+        }
+        for value in values {
+            assert!(decode_response(value, &request, 0, FieldPath::root("reply")).is_err());
         }
     }
 }

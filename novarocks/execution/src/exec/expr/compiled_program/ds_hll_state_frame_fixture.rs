@@ -65,6 +65,11 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
     let mut output_values = vec![];
     let mut children = vec![];
     for i in 0..count {
+        let ty = if i == 2 {
+            FunctionValueType::new(DataType::Utf8, true)
+        } else {
+            ty.clone()
+        };
         let expr = b
             .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
             .unwrap();
@@ -92,7 +97,18 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
     let owner = author(
         &functions,
         "ds_hll_count_distinct_state",
-        (0..count).map(|_| argument(ty.clone(), None)).collect(),
+        (0..count)
+            .map(|i| {
+                argument(
+                    if i == 2 {
+                        FunctionValueType::new(DataType::Utf8, true)
+                    } else {
+                        ty.clone()
+                    },
+                    None,
+                )
+            })
+            .collect(),
         ControlShape::Eager,
     );
     let result_ty = owner.result();
@@ -164,10 +180,10 @@ pub(super) fn source_batch(program: &LocalProgram, count: usize) -> RecordBatch 
         ])));
     }
     if count >= 3 {
-        arrays.push(Arc::new(arrow::array::Int64Array::from(vec![
-            Some(88),
+        arrays.push(Arc::new(StringArray::from(vec![
+            Some("HLL_6"),
             None,
-            Some(44),
+            Some("HLL_6"),
         ])));
     }
     RecordBatch::try_new(

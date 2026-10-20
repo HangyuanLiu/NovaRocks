@@ -30,7 +30,11 @@
 //! row exactly when the build is empty. Output batches are the node's frozen
 //! canonical layout.
 
-use std::collections::VecDeque;
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
@@ -52,15 +56,17 @@ use crate::exec::operators::hashjoin::{
 };
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    shape::{Transform, TransformKernel},
+    step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
-
-fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
-    ExecutionFailure::from(format!("{context}: {error}"))
-}
 
 /// The frozen facts of one compiled NestedLoopJoin node.
 pub(crate) struct CompiledNlJoinPlan {
@@ -73,11 +79,13 @@ pub(crate) struct CompiledNlJoinPlan {
 }
 
 impl CompiledNlJoinPlan {
-    pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> Result<Self, String> {
-        let graph_node =
-            program.graph().nodes().get(node.index()).ok_or_else(|| {
-                format!("compiled nested-loop join node {} is absent", node.index())
-            })?;
+    pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> ExecutionResult<Self> {
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled nested-loop join node {} is absent", node.index()),
+            )
+        })?;
         let ProgramNodeKind::NestedLoopJoin {
             join_type,
             join_conjunct,
@@ -87,9 +95,9 @@ impl CompiledNlJoinPlan {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!(
-                "compiled node {} is not a nested-loop join",
-                node.index()
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled node {} is not a nested-loop join", node.index()),
             ));
         };
         validate_join_scope(node, left_layout, right_layout, join_scope_layout)?;
@@ -101,9 +109,12 @@ impl CompiledNlJoinPlan {
             | NestedLoopJoinType::LeftAnti => {}
             NestedLoopJoinType::NullAwareLeftAnti if join_conjunct.is_none() => {}
             other => {
-                return Err(format!(
-                    "compiled {other:?} nested-loop join at local node {} is not executable yet",
-                    node.index()
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled {other:?} nested-loop join at local node {} is not executable yet",
+                        node.index()
+                    ),
                 ));
             }
         }
@@ -159,7 +170,7 @@ impl OperatorFactory for CompiledNlJoinProbeProcessorFactory {
         &self.name
     }
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledNlJoinProbe {
+        Box::new(Transform::hydrating(CompiledNlJoinProbe {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             plan: Arc::clone(&self.plan),
@@ -172,10 +183,8 @@ impl OperatorFactory for CompiledNlJoinProbeProcessorFactory {
             instance: None,
             build: None,
             cursor: None,
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
-        })
+            batch_size: None,
+        }))
     }
 }
 
@@ -201,12 +210,10 @@ struct CompiledNlJoinProbe {
     instance: Option<Vec<CompiledExpressionInstance>>,
     build: Option<Arc<Vec<Chunk>>>,
     cursor: Option<ProbeCursor>,
-    pending: VecDeque<Chunk>,
-    finishing: bool,
-    finished: bool,
+    batch_size: Option<NonZeroUsize>,
 }
 
-impl Operator for CompiledNlJoinProbe {
+impl OperatorLifecycle for CompiledNlJoinProbe {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -242,8 +249,6 @@ impl Operator for CompiledNlJoinProbe {
                 // Only complete schema preparation is published. Earlier
                 // temporary schemas have already dropped on this refusal.
                 self.prepare_failure = Some(first.clone());
-                self.finishing = true;
-                self.finished = true;
                 Err(first)
             }
         }
@@ -251,6 +256,13 @@ impl Operator for CompiledNlJoinProbe {
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
+        self.batch_size = Some(NonZeroUsize::new(state.chunk_size()).ok_or_else(|| {
+            novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "compiled nested-loop join requires a positive output batch size",
+                ),
+            )
+        })?);
         Ok(())
     }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
@@ -259,104 +271,134 @@ impl Operator for CompiledNlJoinProbe {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.release_owned();
+        Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.release_owned();
+    }
+    fn on_driver_failure(&mut self) {
+        self.release_owned();
     }
 }
 
-impl ProcessorOperator for CompiledNlJoinProbe {
-    fn need_input(&self) -> bool {
-        self.prepare_failure.is_none()
-            && self.schemas.is_some()
-            && !self.finishing
-            && !self.finished
-            && self.cursor.is_none()
-            && self.pending.is_empty()
-            && (self.build.is_some() || self.state.has_build())
-    }
-    fn has_output(&self) -> bool {
-        self.prepare_failure.is_none() && (!self.pending.is_empty() || self.cursor.is_some())
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        self.prepared_schemas()?;
-        if self.finishing || self.finished {
-            return Err("compiled nested-loop join probe received input after finishing".into());
-        }
-        if self.cursor.is_some() || !self.pending.is_empty() {
-            return Err(
-                "compiled nested-loop join probe received input while output is pending".into(),
-            );
-        }
-        self.load_build()?;
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        if let Some(site) = self.plan.predicate {
-            instances(
-                &mut self.instance,
-                &self.program,
-                std::slice::from_ref(&site),
-                &self.control,
-            )?;
-        }
-        self.cursor = Some(ProbeCursor {
-            matched: vec![false; chunk.len()],
-            chunk,
-            batch: 0,
-            probe_row: 0,
-            build_row: 0,
-        });
-        Ok(())
-    }
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        self.prepared_schemas()?;
-        while self.pending.is_empty() && self.cursor.is_some() {
-            if let Some(batch) = self.advance(state.chunk_size().max(1))?
-                && batch.num_rows() > 0
-            {
-                let owner = self
-                    .control
-                    .construction_owner(&self.prepared_schemas()?.output)?;
-                self.pending.push_back(
-                    batch
-                        .into_chunk(owner.as_ref())
-                        .map_err(JoinGatherError::into_execution)?,
-                );
-            }
-        }
-        let output = self.pending.pop_front();
-        if self.finishing && self.cursor.is_none() && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.prepared_schemas()?;
-        self.finishing = true;
-        if self.cursor.is_none() && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(())
-    }
-    fn precondition_dependency(&self) -> Option<DependencyHandle> {
-        if self.prepare_failure.is_some() {
-            return None;
-        }
+impl InputEncodingPolicy for CompiledNlJoinProbe {}
+impl TransformKernel for CompiledNlJoinProbe {
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let observable = self.dep.observable();
+        let observed_generation = observable.generation();
         if self.build.is_some() || self.state.has_build() {
-            None
-        } else {
-            Some(self.dep.clone())
+            return Ok(None);
         }
+        Ok(Some(AdmissionNext::Wait(WaitFact {
+            reason: WaitReason::Dependency,
+            observable,
+            observed_generation,
+            deadline: None,
+        })))
+    }
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let result = (|| {
+            self.prepared_schemas()?;
+            self.load_build()?;
+            if chunk.is_empty() {
+                return Ok(StepResult::new(None, NextStep::NeedInput, rows));
+            }
+            if let Some(site) = self.plan.predicate {
+                instances(
+                    &mut self.instance,
+                    &self.program,
+                    std::slice::from_ref(&site),
+                    &self.control,
+                )?;
+            }
+            self.cursor = Some(ProbeCursor {
+                matched: vec![false; chunk.len()],
+                chunk,
+                batch: 0,
+                probe_row: 0,
+                build_row: 0,
+            });
+            Ok(StepResult::new(None, NextStep::Runnable, rows))
+        })();
+        self.complete_step(ctx, result)
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.cursor.is_none() {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
+        }
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        let result = (|| {
+            let block = self
+                .batch_size
+                .ok_or(ConstructionFailure::MissingOwner)?
+                .get();
+            let output = match self.advance(block)? {
+                Some(batch) if batch.num_rows() > 0 => {
+                    let owner = self
+                        .control
+                        .construction_owner(&self.prepared_schemas()?.output)?;
+                    Some(
+                        batch
+                            .into_chunk(owner.as_ref())
+                            .map_err(JoinGatherError::into_execution)?,
+                    )
+                }
+                _ => None,
+            };
+            let next = if self.cursor.is_some() {
+                NextStep::Runnable
+            } else {
+                NextStep::NeedInput
+            };
+            Ok(StepResult::new(output, next, 0))
+        })();
+        self.complete_step(ctx, result)
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        let result = self
+            .prepared_schemas()
+            .map(|_| StepResult::new(None, NextStep::Finished, 0));
+        let step = self.complete_step(ctx, result)?;
+        self.release_owned();
+        Ok(step)
     }
 }
 
 impl CompiledNlJoinProbe {
+    fn release_owned(&mut self) {
+        self.cursor = None;
+        self.build = None;
+        self.instance = None;
+    }
+    fn complete_step(
+        &mut self,
+        ctx: &StepContext<'_>,
+        result: ExecutionResult<StepResult>,
+    ) -> ExecutionResult<StepResult> {
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+            self.release_owned();
+        }
+        result
+    }
+
     fn prepared_schemas(&self) -> ExecutionResult<&PreparedJoinSchemas> {
         if let Some(first) = &self.prepare_failure {
             return Err(first.clone());
@@ -371,7 +413,7 @@ impl CompiledNlJoinProbe {
             let artifact = self
                 .state
                 .get_build()
-                .ok_or("compiled nested-loop join build is not ready")?;
+                .ok_or(NestedLoopFailure::BuildNotReady)?;
             self.build = Some(Arc::clone(&artifact.build_batches));
         }
         Ok(())
@@ -383,7 +425,7 @@ impl CompiledNlJoinProbe {
         let build = Arc::clone(
             self.build
                 .as_ref()
-                .ok_or("compiled nested-loop join build is not loaded")?,
+                .ok_or(NestedLoopFailure::BuildNotLoaded)?,
         );
         let plan = Arc::clone(&self.plan);
         let scope = Arc::clone(&self.prepared_schemas()?.scope);
@@ -391,7 +433,7 @@ impl CompiledNlJoinProbe {
         let cursor = self
             .cursor
             .as_mut()
-            .ok_or("compiled nested-loop join has no probe chunk")?;
+            .ok_or(NestedLoopFailure::MissingProbe)?;
         // Without a predicate a semi or anti decision only needs whether
         // the build has a row.
         if plan.predicate.is_none() && !plan.emits_pairs() {
@@ -412,12 +454,8 @@ impl CompiledNlJoinProbe {
         let mut build_indices = Vec::with_capacity(block);
         while probe_indices.len() < block && cursor.probe_row < probe_rows {
             while probe_indices.len() < block && cursor.build_row < right.len() {
-                probe_indices.push(
-                    u32::try_from(cursor.probe_row).map_err(|_| "join probe row id overflow")?,
-                );
-                build_indices.push(
-                    u32::try_from(cursor.build_row).map_err(|_| "join build row id overflow")?,
-                );
+                probe_indices.push(input_row_id(cursor.probe_row, JoinInputSide::Probe)?);
+                build_indices.push(input_row_id(cursor.build_row, JoinInputSide::Build)?);
                 cursor.build_row += 1;
             }
             if cursor.build_row >= right.len() {
@@ -452,7 +490,7 @@ impl CompiledNlJoinProbe {
                     .instance
                     .as_mut()
                     .and_then(|roots| roots.first_mut())
-                    .ok_or("compiled nested-loop join predicate instance is missing")?;
+                    .ok_or(NestedLoopFailure::MissingPredicate)?;
                 let mask = true_mask(&evaluate_all(
                     instance,
                     site,
@@ -494,7 +532,7 @@ impl CompiledNlJoinProbe {
                     .iter()
                     .enumerate()
                     .filter(|(_, matched)| !**matched)
-                    .map(|(row, _)| u32::try_from(row).map_err(|_| "join probe row id overflow"))
+                    .map(|(row, _)| input_row_id(row, JoinInputSide::Probe))
                     .collect::<Result<Vec<_>, _>>()?;
                 let schemas = self.prepared_schemas()?;
                 let owner = self.control.construction_owner(&schemas.output)?;
@@ -515,10 +553,7 @@ impl CompiledNlJoinProbe {
                 cursor.matched.into_iter().map(|matched| !matched).collect()
             }
             other => {
-                return Err(failure(
-                    "compiled nested-loop join",
-                    format!("{other:?} is not executable yet"),
-                ));
+                return Err(NestedLoopFailure::UnsupportedJoin(other).into());
             }
         };
         if !keep.iter().any(|keep| *keep) {
@@ -534,5 +569,105 @@ impl CompiledNlJoinProbe {
         )
         .map(Some)
         .map_err(JoinGatherError::into_execution)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinInputSide {
+    Probe,
+    Build,
+}
+#[derive(Debug)]
+enum NestedLoopFailure {
+    BuildNotReady,
+    BuildNotLoaded,
+    MissingProbe,
+    MissingPredicate,
+    UnsupportedJoin(NestedLoopJoinType),
+    RowIdExtent { side: JoinInputSide, row: usize },
+}
+fn input_row_id(row: usize, side: JoinInputSide) -> Result<u32, NestedLoopFailure> {
+    u32::try_from(row).map_err(|_| NestedLoopFailure::RowIdExtent { side, row })
+}
+impl std::fmt::Display for NestedLoopFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BuildNotReady => f.write_str("compiled nested-loop join build is not ready"),
+            Self::BuildNotLoaded => f.write_str("compiled nested-loop join build is not loaded"),
+            Self::MissingProbe => f.write_str("compiled nested-loop join has no probe chunk"),
+            Self::MissingPredicate => {
+                f.write_str("compiled nested-loop join predicate instance is missing")
+            }
+            Self::UnsupportedJoin(kind) => write!(
+                f,
+                "compiled nested-loop join {kind:?} is not executable yet"
+            ),
+            Self::RowIdExtent { side, row } => write!(
+                f,
+                "join {side:?} row {row} exceeds its UInt32 row-id representation"
+            ),
+        }
+    }
+}
+impl std::error::Error for NestedLoopFailure {}
+impl novarocks_failure_contract::FailureProjection for NestedLoopFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let reason = match self {
+            Self::BuildNotReady => ExecutionReason::NestedLoopBuildNotReady,
+            Self::BuildNotLoaded => ExecutionReason::NestedLoopBuildNotLoaded,
+            Self::MissingProbe => ExecutionReason::NestedLoopMissingProbe,
+            Self::MissingPredicate => ExecutionReason::NestedLoopMissingPredicate,
+            Self::UnsupportedJoin(_) => ExecutionReason::NestedLoopUnsupportedJoin,
+            Self::RowIdExtent { row, .. } => {
+                return FailureFact::new(
+                    FailureClass::Representation,
+                    ExecutionReason::NestedLoopRowIdExtent.reason(),
+                )
+                .with_representation(RepresentationFacts {
+                    boundary: RepresentationBoundary::MinimumUnit,
+                    // Execution layout 2: a source row ordinal in a UInt32 join selection.
+                    layout: RepresentationLayout {
+                        domain: domain::EXECUTION,
+                        code: std::num::NonZeroU16::new(2).unwrap(),
+                    },
+                    required: u64::try_from(*row).ok(),
+                    extent_limit: None,
+                    representable_prefix: None,
+                });
+            }
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<NestedLoopFailure> for ExecutionFailure {
+    fn from(cause: NestedLoopFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+#[cfg(test)]
+mod row_id_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    #[test]
+    fn row_id_boundary_refuses_one_unaddressable_pair_without_numeric_data_overflow() {
+        let maximum = u32::MAX as usize;
+        for side in [JoinInputSide::Probe, JoinInputSide::Build] {
+            assert_eq!(input_row_id(maximum, side).unwrap(), u32::MAX);
+            if let Some(unrepresentable) = maximum.checked_add(1) {
+                let failure: ExecutionFailure =
+                    input_row_id(unrepresentable, side).unwrap_err().into();
+                let fact = failure.failure_fact();
+                assert_eq!(fact.class(), FailureClass::Representation);
+                let representation = fact.representation().unwrap();
+                assert_eq!(representation.boundary, RepresentationBoundary::MinimumUnit);
+                assert_eq!(representation.required, u64::try_from(unrepresentable).ok());
+                assert_eq!(representation.extent_limit, None);
+            }
+        }
     }
 }

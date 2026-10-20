@@ -77,16 +77,7 @@ fn copy_plan(
         if opaque { work.flush() } else { work.step() }
     }) {
         Ok(()) => work.flush(),
-        Err(crate::selected_copy::CopyError::Control(cause)) => Err(cause),
-        Err(crate::selected_copy::CopyError::Extent) => Err(KernelFailure::ResourceExhausted),
-        Err(crate::selected_copy::CopyError::Invalid(message)) => {
-            work.flush()?;
-            Err(invalid(message))
-        }
-        Err(crate::selected_copy::CopyError::Unsupported(_)) => {
-            work.flush()?;
-            Err(invalid("window value take carrier is unsupported"))
-        }
+        Err(source) => Err(source.into_kernel()),
     }
 }
 
@@ -209,12 +200,7 @@ impl PreparedWindowKernel for PreparedValue {
             work.flush()?;
             Ok(partition)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish()?;
@@ -266,12 +252,7 @@ impl WindowKernelPartition for ValuePartition<'_> {
                     || work.step(),
                 )
             })();
-            if matches!(
-                &result,
-                Err(KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted)
-            ) {
+            if result.as_ref().is_err_and(KernelFailure::is_interruption) {
                 return result;
             }
             work.finish()?;

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     start_expr: ExprId,
     length_expr: Option<ExprId>,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let str_array = arena.eval(str_expr, chunk)?;
     let start_array = arena.eval(start_expr, chunk)?;
 
@@ -50,7 +51,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let str_arr = str_array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "substring: first argument must be a string array".to_string())?;
+        .ok_or_else(|| expression_contract("substring: first argument must be a string array"))?;
 
     // Extract start values (convert to i64)
     let start_values: Vec<Option<i64>> = match start_array.data_type() {
@@ -58,7 +59,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = start_array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast start to Int64Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast start to Int64Array"))?;
             (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -73,7 +74,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = start_array
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "failed to downcast start to Int32Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast start to Int32Array"))?;
             (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -88,7 +89,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = start_array
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast start to Float64Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast start to Float64Array"))?;
             (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -99,7 +100,11 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 })
                 .collect()
         }
-        _ => return Err(("substring: second argument must be a numeric array".to_string()).into()),
+        _ => {
+            return Err(expression_contract(
+                "substring: second argument must be a numeric array",
+            ));
+        }
     };
 
     // Extract length values (convert to i64)
@@ -108,7 +113,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = length_array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast length to Int64Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast length to Int64Array"))?;
             (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -123,7 +128,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = length_array
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "failed to downcast length to Int32Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast length to Int32Array"))?;
             (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -138,7 +143,7 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = length_array
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast length to Float64Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast length to Float64Array"))?;
             (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -149,7 +154,11 @@ pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 })
                 .collect()
         }
-        _ => return Err(("substring: third argument must be a numeric array".to_string()).into()),
+        _ => {
+            return Err(expression_contract(
+                "substring: third argument must be a numeric array",
+            ));
+        }
     };
 
     // StarRocks SUBSTR narrows BIGINT pos/length to INT (i32); column values

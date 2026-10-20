@@ -2230,7 +2230,14 @@ impl fmt::Display for SqlCompileProgressError {
     }
 }
 
-impl std::error::Error for SqlCompileProgressError {}
+impl std::error::Error for SqlCompileProgressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Compile(source) => Some(source),
+            Self::Protocol(source) => Some(source),
+        }
+    }
+}
 
 impl From<SqlCompileError> for SqlCompileProgressError {
     fn from(error: SqlCompileError) -> Self {

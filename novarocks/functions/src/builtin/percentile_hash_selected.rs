@@ -168,32 +168,26 @@ pub(super) fn evaluate<'a>(
                     return Err(cause);
                 }
             };
-            // Original unsupported type/downcast messages remain raw full Strings.
-            // They cannot arise from the original resolver's checked numeric profile
-            // and canonical carrier. This is not a RowData/wholeData conversion for a
-            // valid profile, nor an admission change for raw legacy callers.
-            let payload = payload.map_err(|_| {
-                internal(
-                    "percentile_hash checked numeric carrier violated its original reader contract",
-                )
-            })?;
-            let extent = bytes
-                .len()
-                .checked_add(payload.len())
-                .ok_or(KernelFailure::ResourceExhausted)?;
-            i32::try_from(extent).map_err(|_| KernelFailure::ResourceExhausted)?;
-            Layout::array::<u8>(extent).map_err(|_| KernelFailure::ResourceExhausted)?;
+            // A reader contract failure keeps its original domain fact and source.
+            let payload = payload?;
+            let extent = crate::aggregate_scalar::checked_binary_output_offset(
+                *offsets.last().expect("initial offset is installed"),
+                payload.len(),
+            )?;
             observed(bytes_work.flush())?;
-            bytes
-                .try_reserve_exact(payload.len())
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            bytes.try_reserve_exact(payload.len()).map_err(|source| {
+                KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                    "reserve percentile hash output",
+                    source,
+                ))
+            })?;
             observed(control.checkpoint(0))?;
             for byte in payload {
                 bytes.push(byte);
                 observed(bytes_work.step())?;
             }
             drop(encoder);
-            offsets.push(extent as i32);
+            offsets.push(extent);
             observed(rows.step())?;
         }
         observed(bytes_work.flush())?;
@@ -213,12 +207,7 @@ pub(super) fn evaluate<'a>(
     })();
     if observer_refused
         || encoder_refused
-        || matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        )
+        || result.as_ref().is_err_and(KernelFailure::is_interruption)
     {
         return result;
     }
@@ -237,19 +226,13 @@ impl crate::percentile_hash_core::ValueEncoder for Encoder<'_> {
     fn single(&mut self, value: f64) -> Result<Vec<u8>, KernelFailure> {
         let state =
             crate::approx_percentile_core::single_value_state_in(value, self.allocator.clone())
-                .map_err(|_| {
-                    self.allocator.take_recorded_failure().unwrap_or_else(|| {
-                        internal(
-                            "original percentile singleton violated its bounded state invariant",
-                        )
-                    })
-                })?;
+                .map_err(|source| self.allocator.take_recorded_failure().unwrap_or(source))?;
         let extent =
             crate::approx_percentile_core::scalar_hash_codec_extent(&state).ok_or_else(|| {
                 internal("original percentile singleton differs from its codec reservation recipe")
             })?;
         self.reservation = Some(self.charge.reserve_operation(extent)?);
-        Ok(crate::approx_percentile_core::encode_state(&state))
+        crate::approx_percentile_core::encode_state(&state)
     }
     fn empty(&mut self) -> Result<Vec<u8>, KernelFailure> {
         let state = crate::approx_percentile_core::PercentileState::new_in(
@@ -261,6 +244,6 @@ impl crate::percentile_hash_core::ValueEncoder for Encoder<'_> {
                 internal("original empty percentile differs from its codec reservation recipe")
             })?;
         self.reservation = Some(self.charge.reserve_operation(extent)?);
-        Ok(crate::approx_percentile_core::encode_state(&state))
+        crate::approx_percentile_core::encode_state(&state)
     }
 }

@@ -143,7 +143,7 @@ fn null_or_empty_selected_compact_scalar_and_column_origins_keep_null_true() {
 fn null_or_empty_shared_raw_preserves_unsupported_all_null_empty_and_long_type_errors() {
     let input = Arc::new(Int64Array::from(vec![None; 3])) as ArrayRef;
     assert_eq!(
-        evaluate_legacy(&input)
+        evaluate_required(&input)
             .unwrap()
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -151,13 +151,14 @@ fn null_or_empty_shared_raw_preserves_unsupported_all_null_empty_and_long_type_e
         &BooleanArray::from(vec![Some(true); 3])
     );
     let empty = input.slice(0, 0);
-    assert_eq!(evaluate_legacy(&empty).unwrap().len(), 0);
+    assert_eq!(evaluate_required(&empty).unwrap().len(), 0);
     let input = Arc::new(Int64Array::from(vec![None, Some(1)])) as ArrayRef;
     assert_eq!(
-        evaluate_legacy(&input).unwrap_err(),
+        evaluate_required(&input).unwrap_err().to_string(),
         "null_or_empty expects string or array, got Int64"
     );
     let field = Arc::new(Field::new("x".repeat(900), DataType::Int64, true));
+    let weak_field = Arc::downgrade(&field);
     let input = Arc::new(StructArray::new(
         vec![field].into(),
         vec![Arc::new(Int64Array::from(vec![Some(1)]))],
@@ -168,5 +169,25 @@ fn null_or_empty_shared_raw_preserves_unsupported_all_null_empty_and_long_type_e
         input.data_type()
     );
     assert!(expected.len() > 512);
-    assert_eq!(evaluate_legacy(&input).unwrap_err(), expected);
+    let weak_array = Arc::downgrade(&input);
+    let failure = evaluate_required(&input).unwrap_err();
+    drop(input);
+    assert!(weak_array.upgrade().is_none());
+    assert!(weak_field.upgrade().is_none());
+    use std::error::Error;
+    assert!(
+        failure
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .is::<NullOrEmptyFailure>()
+    );
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(
+        failure.to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(&expected).to_string()
+    );
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 361);
 }

@@ -24,7 +24,10 @@ use arrow_array::{Array, ArrayRef, LargeStringArray, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{ValueKind, ValueTypeRef};
 
-use super::{ArrayNormalizationStep, ArrayPathStep};
+use super::{
+    ArrayNormalizationStep, ArrayPathStep, ArrayProjectionFailure, ArrayProjectionOperation,
+    ArrayProjectionViolation,
+};
 
 pub fn normalize_inactive_nulls<E, F>(
     root: &ValueTypeRef,
@@ -34,7 +37,7 @@ pub fn normalize_inactive_nulls<E, F>(
     observe: &mut F,
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     if decoded.null_count() == 0 {
@@ -48,16 +51,18 @@ where
                 .get(*index)
                 .map(|field| field.value_type())
                 .ok_or_else(|| {
-                    E::from("typed hydration Struct occurrence is missing".to_owned())
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::StructOccurrence,
+                    ))
                 })?,
             (ArrayPathStep::ListItem, ValueKind::List(item))
             | (ArrayPathStep::ListItem, ValueKind::FixedSizeList { item, .. }) => item,
             (ArrayPathStep::MapKey, ValueKind::Map { key, .. }) => key,
             (ArrayPathStep::MapValue, ValueKind::Map { value, .. }) => value,
             _ => {
-                return Err(E::from(
-                    "typed hydration path disagrees with its complete binding".to_owned(),
-                ));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::HydrationPath,
+                )));
             }
         };
     }
@@ -65,19 +70,21 @@ where
         return Ok(decoded);
     }
     let DataType::Dictionary(key, source_values) = source.data_type() else {
-        return Err(E::from(
-            "required decoded leaf lacks its original Dictionary carrier".to_owned(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::MissingDictionaryCarrier,
+        )));
     };
     if key.as_ref() != &DataType::Int32 || source_values.as_ref() != decoded.data_type() {
-        return Err(E::from(
-            "required decoded leaf has an unsupported encoding transition".to_owned(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::UnsupportedEncodingTransition,
+        )));
     }
     macro_rules! normalize {
         ($array:ty) => {{
             let array = decoded.as_any().downcast_ref::<$array>().ok_or_else(|| {
-                E::from("required decoded String leaf has a different physical wrapper".to_owned())
+                E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::PhysicalWrapper,
+                ))
             })?;
             // The locked Int32 String dictionary cast uses take_bytes, which
             // gives every decoded NULL an empty offset range. Verify that
@@ -90,9 +97,9 @@ where
                     if array.is_null(row)
                         && array.value_offsets()[row] != array.value_offsets()[row + 1]
                     {
-                        return Err(E::from(
-                            "required decoded String NULL has a nonempty offset range".to_owned(),
-                        ));
+                        return Err(E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::NonemptyNullString,
+                        )));
                     }
                 }
             }
@@ -105,7 +112,12 @@ where
             // caller's observed locked-operation work bound.
             let normalized =
                 <$array>::try_new(array.offsets().clone(), array.values().clone(), None).map_err(
-                    |error| E::from(format!("normalize inactive required String NULL: {error}")),
+                    |error| {
+                        E::from(ArrayProjectionFailure::Arrow {
+                            operation: ArrayProjectionOperation::NormalizeRequiredString,
+                            source: error,
+                        })
+                    },
                 )?;
             observe(ArrayNormalizationStep::OpaqueOperationFinished)?;
             Ok(Arc::new(normalized) as ArrayRef)
@@ -114,8 +126,8 @@ where
     match decoded.data_type() {
         DataType::Utf8 => normalize!(StringArray),
         DataType::LargeUtf8 => normalize!(LargeStringArray),
-        _ => Err(E::from(
-            "required decoded NULL normalization supports only Int32 UTF-8 dictionaries".to_owned(),
-        )),
+        _ => Err(E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::UnsupportedNullNormalization,
+        ))),
     }
 }

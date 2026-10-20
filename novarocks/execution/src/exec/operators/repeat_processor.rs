@@ -27,14 +27,22 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
+#[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::array::{Int64Array, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -46,7 +54,7 @@ pub(crate) fn repeat_output_chunk_schema(
     input: &ChunkSchemaRef,
     null_slot_ids: &[Vec<SlotId>],
     grouping_slot_ids: &[SlotId],
-) -> Result<ChunkSchemaRef, String> {
+) -> ExecutionResult<ChunkSchemaRef> {
     let nullable_slot_ids: HashSet<SlotId> = null_slot_ids
         .iter()
         .flat_map(|slots| slots.iter().copied())
@@ -68,6 +76,71 @@ pub(crate) fn repeat_output_chunk_schema(
     Ok(Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?))
 }
 
+#[derive(Debug)]
+enum RepeatSchemaViolation {
+    Configuration(novarocks_failure_contract::BoundedDetail),
+    MissingSlot { slot: SlotId },
+    MissingGrouping { index: usize, repetition: usize },
+    OutputNotPrepared,
+    Channels { fields: usize, slots: usize },
+    MissingBinding { ordinal: usize },
+    NullDeclaration { ordinal: usize },
+}
+impl std::fmt::Display for RepeatSchemaViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(detail) => detail.fmt(f),
+            Self::MissingSlot { slot } => {
+                write!(f, "repeat null slot id {slot} not found in input chunk")
+            }
+            Self::MissingGrouping { index, repetition } => write!(
+                f,
+                "repeat grouping_list[{index}] missing value at repeat_idx={repetition}"
+            ),
+            Self::OutputNotPrepared => {
+                f.write_str("repeat output schema was not prepared before computation")
+            }
+            Self::Channels { fields, slots } => write!(
+                f,
+                "Repeat source requires exact declared channels (fields={fields}, slots={slots})"
+            ),
+            Self::MissingBinding { ordinal } => write!(
+                f,
+                "Repeat source requires complete value binding at {ordinal}"
+            ),
+            Self::NullDeclaration { ordinal } => write!(
+                f,
+                "Repeat source NULL declaration differs from its binding at {ordinal}"
+            ),
+        }
+    }
+}
+impl std::error::Error for RepeatSchemaViolation {}
+impl novarocks_failure_contract::FailureProjection for RepeatSchemaViolation {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        let reason = match self {
+            Self::Configuration(_) => ExecutionReason::RepeatConfiguration,
+            Self::MissingSlot { .. } => ExecutionReason::RepeatMissingSlot,
+            Self::MissingGrouping { .. } => ExecutionReason::RepeatMissingGrouping,
+            Self::OutputNotPrepared => ExecutionReason::RepeatOutputNotPrepared,
+            Self::Channels { .. } => ExecutionReason::RepeatSchemaChannels,
+            Self::MissingBinding { .. } => ExecutionReason::RepeatSchemaMissingBinding,
+            Self::NullDeclaration { .. } => ExecutionReason::RepeatSchemaNullDeclaration,
+        };
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            reason.reason(),
+        )
+    }
+}
+
+fn repeat_configuration(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(RepeatSchemaViolation::Configuration(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+
 /// Author only Repeat's original root-NULL widening and fixed GROUPING fields.
 /// The caller owns two actual ports: the null-membership table is temporary;
 /// fields, immutable types and the returned schema retain their creating scope.
@@ -84,7 +157,8 @@ pub(crate) fn repeat_output_chunk_schema_observed<'a, E>(
     mut work: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<ChunkSchemaRef, E>
 where
-    E: From<String> + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    E: From<crate::exec::chunk::ChunkConstructionFailure>
+        + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
 {
     use novarocks_type_contract::{
         TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef,
@@ -97,7 +171,10 @@ where
     work(0)?;
     if input_schema.fields().len() != input_slots.len() {
         return Err(E::from(
-            "Repeat source requires exact declared channels".to_string(),
+            crate::exec::chunk::ChunkConstructionFailure::source(RepeatSchemaViolation::Channels {
+                fields: input_schema.fields().len(),
+                slots: input_slots.len(),
+            }),
         ));
     }
     let mut occurrences = 0usize;
@@ -109,11 +186,8 @@ where
     }
     // std HashSet delegates to hashbrown HashMap<T, ()>. The explicit one-shot
     // reserve uses the sole locked RawTable author, not a private layout mirror.
-    let table =
-        hashmap::fresh_table_layout::<SlotId, ()>(occurrences).map_err(|cause| match cause {
-            hashmap::HashMapResourceError::Arithmetic(_) => LayoutResourceError::Arithmetic,
-            hashmap::HashMapResourceError::SourceModel(_) => LayoutResourceError::SourceModel,
-        })?;
+    let table = hashmap::fresh_table_layout::<SlotId, ()>(occurrences)
+        .map_err(|source| E::from(crate::exec::chunk::ChunkConstructionFailure::from(source)))?;
     if let Some(layout) = table.layout {
         temporary(layout)?;
     }
@@ -134,12 +208,17 @@ where
     let mut slots = Vec::with_capacity(count);
     for (ordinal, slot_id) in input_slots.iter().enumerate() {
         work(1)?;
-        let (original, unique_id) = binding_at(ordinal)
-            .ok_or_else(|| E::from("Repeat source requires complete value bindings".to_string()))?;
+        let (original, unique_id) = binding_at(ordinal).ok_or_else(|| {
+            E::from(crate::exec::chunk::ChunkConstructionFailure::source(
+                RepeatSchemaViolation::MissingBinding { ordinal },
+            ))
+        })?;
         let field = &input_schema.fields()[ordinal];
         if field.is_nullable() != original.nullable() {
             return Err(E::from(
-                "Repeat source NULL declaration differs from its binding".to_string(),
+                crate::exec::chunk::ChunkConstructionFailure::source(
+                    RepeatSchemaViolation::NullDeclaration { ordinal },
+                ),
             ));
         }
         let nullable = original.nullable() || nullable_slots.contains(slot_id);
@@ -178,13 +257,15 @@ where
         work(0)?;
         let value =
             ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int64), true, storage.clone())
-                .map_err(|cause| E::from(cause.to_string()))?;
+                .map_err(|cause| {
+                    E::from(crate::exec::chunk::ChunkConstructionFailure::from(cause))
+                })?;
         request(ValueLayout::storage_allocation_layout()?)?;
         work(0)?;
         let layout = ValueLayout::try_new(&DataType::Int64, storage.clone())
-            .map_err(|cause| E::from(cause.to_string()))?;
+            .map_err(|cause| E::from(crate::exec::chunk::ChunkConstructionFailure::from(cause)))?;
         let binding = TypedValueBinding::try_new(value, layout)
-            .map_err(|cause| E::from(cause.to_string()))?;
+            .map_err(|cause| E::from(crate::exec::chunk::ChunkConstructionFailure::from(cause)))?;
         let digits = if index == 0 {
             1
         } else {
@@ -275,9 +356,11 @@ impl RepeatFixtureFactory {
         repeat_times: usize,
         input: novarocks_local_program::StaticLayout,
         output: novarocks_local_program::StaticLayout,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if !input.is_typed() || !output.is_typed() {
-            return Err("Repeat requires complete input and output declarations".into());
+            return Err(repeat_configuration(
+                "Repeat requires complete input and output declarations",
+            ));
         }
         let mut factory = Self::new(
             node_id,
@@ -298,9 +381,11 @@ impl RepeatFixtureFactory {
         grouping_list: Vec<Vec<i64>>,
         repeat_times: usize,
         input: ChunkSchemaRef,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if !input.is_typed() {
-            return Err("Repeat construction requires a complete input declaration".into());
+            return Err(repeat_configuration(
+                "Repeat construction requires a complete input declaration",
+            ));
         }
         let mut factory = Self::new(
             node_id,
@@ -321,7 +406,7 @@ impl OperatorFactory for RepeatFixtureFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(RepeatFixtureOperator {
+        Box::new(Transform::hydrating(RepeatFixtureKernel {
             name: self.name.clone(),
             null_slot_ids: self.null_slot_ids.clone(),
             grouping_slot_ids: self.grouping_slot_ids.clone(),
@@ -330,8 +415,6 @@ impl OperatorFactory for RepeatFixtureFactory {
 
             input: None,
             repeat_idx: 0,
-            finishing: false,
-            finished: false,
             emit_empty_once: false,
             output_schema: None,
             output_chunk_schema: None,
@@ -339,12 +422,12 @@ impl OperatorFactory for RepeatFixtureFactory {
             output_layout: self.output_layout.clone(),
             declared_input: self.declared_input.clone(),
             construction: None,
-        })
+        }))
     }
 }
 
 #[cfg(test)]
-struct RepeatFixtureOperator {
+struct RepeatFixtureKernel {
     name: String,
     null_slot_ids: Vec<Vec<SlotId>>,
     grouping_slot_ids: Vec<SlotId>,
@@ -353,8 +436,6 @@ struct RepeatFixtureOperator {
 
     input: Option<Chunk>,
     repeat_idx: usize,
-    finishing: bool,
-    finished: bool,
     emit_empty_once: bool,
     output_schema: Option<Arc<Schema>>,
     output_chunk_schema: Option<ChunkSchemaRef>,
@@ -365,7 +446,7 @@ struct RepeatFixtureOperator {
 }
 
 #[cfg(test)]
-impl Operator for RepeatFixtureOperator {
+impl OperatorLifecycle for RepeatFixtureKernel {
     fn creates_typed_storage(&self) -> bool {
         self.input_layout.is_some() || self.declared_input.is_some()
     }
@@ -441,41 +522,32 @@ impl Operator for RepeatFixtureOperator {
         &self.name
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.input = None;
+        self.emit_empty_once = false;
+        Ok(())
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.input = None;
+        self.emit_empty_once = false;
+        Ok(())
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.input = None;
+        self.emit_empty_once = false;
     }
 }
-
 #[cfg(test)]
-impl ProcessorOperator for RepeatFixtureOperator {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.input.is_none()
-    }
-
-    fn has_output(&self) -> bool {
-        if self.finished {
-            return false;
-        }
-        if self.emit_empty_once {
-            return true;
-        }
-        self.input.is_some() && self.repeat_idx < self.repeat_times
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if !self.need_input() {
-            return Err("repeat push_chunk called when operator does not need input"
-                .to_string()
-                .into());
-        }
+impl InputEncodingPolicy for RepeatFixtureKernel {}
+#[cfg(test)]
+impl TransformKernel for RepeatFixtureKernel {
+    fn apply(
+        &mut self,
+        _ctx: &mut StepContext<'_>,
+        chunk: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = chunk.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         self.validate_config()?;
         if self.input_layout.is_some() || self.declared_input.is_some() {
             use crate::exec::pipeline::operator::ConstructionFailure;
@@ -508,7 +580,7 @@ impl ProcessorOperator for RepeatFixtureOperator {
             self.emit_empty_once = chunk.is_empty();
             self.input = Some(chunk);
             self.repeat_idx = 0;
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::Runnable, rows));
         }
         if chunk.chunk_schema().is_typed() {
             return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
@@ -520,7 +592,7 @@ impl ProcessorOperator for RepeatFixtureOperator {
             self.emit_empty_once = true;
             self.output_schema = None;
             self.output_chunk_schema = None;
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::Runnable, rows));
         }
 
         let output = repeat_output_chunk_schema(
@@ -534,12 +606,12 @@ impl ProcessorOperator for RepeatFixtureOperator {
         self.input = Some(chunk);
         self.repeat_idx = 0;
         self.emit_empty_once = false;
-        Ok(())
+        Ok(StepResult::new(None, NextStep::Runnable, rows))
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if !self.has_output() {
-            return Ok(None);
+    fn drive(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.input.is_none() {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
         if self.input_layout.is_some() || self.declared_input.is_some() {
             let source = self.input.as_ref().ok_or_else(|| {
@@ -556,22 +628,23 @@ impl ProcessorOperator for RepeatFixtureOperator {
                 .as_ref()
                 .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
             let set = self.repeat_idx;
-            let nulls =
-                self.null_slot_ids[set].iter().map(|slot| {
-                    source.slot_id_to_index().get(slot).copied().ok_or_else(|| {
-                        format!("repeat null slot id {} not found in input chunk", slot)
+            let nulls = self.null_slot_ids[set].iter().map(|slot| {
+                source.slot_id_to_index().get(slot).copied().ok_or_else(|| {
+                    ExecutionFailure::from_domain(RepeatSchemaViolation::MissingSlot {
+                        slot: *slot,
                     })
-                });
+                })
+            });
             let groups = self
                 .grouping_list
                 .iter()
                 .enumerate()
                 .map(|(index, values)| {
                     values.get(set).copied().ok_or_else(|| {
-                        format!(
-                            "repeat grouping_list[{}] missing value at repeat_idx={}",
-                            index, set
-                        )
+                        ExecutionFailure::from_domain(RepeatSchemaViolation::MissingGrouping {
+                            index,
+                            repetition: set,
+                        })
                     })
                 });
             let produced = repeat_output_columns_owned(
@@ -587,39 +660,25 @@ impl ProcessorOperator for RepeatFixtureOperator {
                     )))
                 },
             )?;
-            self.repeat_idx += 1;
-            if self.emit_empty_once || self.repeat_idx >= self.repeat_times {
-                self.emit_empty_once = false;
-                self.input = None;
-                if self.finishing {
-                    self.finished = true;
-                }
-            }
-            return Ok(Some(produced));
+            return Ok(self.advance_output(produced));
         }
         if self.emit_empty_once {
-            self.emit_empty_once = false;
-            self.input = None;
-            if self.finishing {
-                self.finished = true;
-            }
-            return Ok(Some(Chunk::default()));
+            return Ok(self.advance_output(Chunk::default()));
         }
 
         self.validate_config()?;
         let Some(chunk) = self.input.as_ref() else {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         };
         if self.repeat_idx >= self.repeat_times {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
 
-        let _schema = self
-            .output_schema
-            .as_ref()
-            .ok_or_else(|| "repeat missing output schema; push_chunk was not called".to_string())?;
+        let _schema = self.output_schema.as_ref().ok_or_else(|| {
+            ExecutionFailure::from_domain(RepeatSchemaViolation::OutputNotPrepared)
+        })?;
         let output_chunk_schema = self.output_chunk_schema.as_ref().ok_or_else(|| {
-            "repeat missing output chunk schema; push_chunk was not called".to_string()
+            ExecutionFailure::from_domain(RepeatSchemaViolation::OutputNotPrepared)
         })?;
         let num_rows = chunk.len();
         let mut columns = chunk.record_batch().columns().to_vec();
@@ -630,7 +689,9 @@ impl ProcessorOperator for RepeatFixtureOperator {
                 .get(slot_id)
                 .copied()
                 .ok_or_else(|| {
-                    format!("repeat null slot id {} not found in input chunk", slot_id)
+                    ExecutionFailure::from_domain(RepeatSchemaViolation::MissingSlot {
+                        slot: *slot_id,
+                    })
                 })?;
             let dt = columns[col_idx].data_type().clone();
             columns[col_idx] = new_null_array(&dt, num_rows);
@@ -638,65 +699,62 @@ impl ProcessorOperator for RepeatFixtureOperator {
 
         for (gidx, values) in self.grouping_list.iter().enumerate() {
             let v = values.get(self.repeat_idx).copied().ok_or_else(|| {
-                format!(
-                    "repeat grouping_list[{}] missing value at repeat_idx={}",
-                    gidx, self.repeat_idx
-                )
+                ExecutionFailure::from_domain(RepeatSchemaViolation::MissingGrouping {
+                    index: gidx,
+                    repetition: self.repeat_idx,
+                })
             })?;
             let arr = Int64Array::from_iter(std::iter::repeat_n(Some(v), num_rows));
             columns.push(Arc::new(arr) as _);
         }
 
-        self.repeat_idx += 1;
-        if self.repeat_idx >= self.repeat_times {
-            self.input = None;
-            if self.finishing {
-                self.finished = true;
-            }
-        }
-        Ok(Some(
-            Chunk::try_new_with_columns(Arc::clone(output_chunk_schema), columns)
-                .map_err(|e| format!("repeat build batch failed: {e}"))?,
-        ))
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        if self.input.is_none() && !self.emit_empty_once {
-            self.finished = true;
-        }
-        Ok(())
+        let output = Chunk::try_new_with_columns(Arc::clone(output_chunk_schema), columns)
+            .map_err(ExecutionFailure::from)?;
+        Ok(self.advance_output(output))
     }
 }
 
 #[cfg(test)]
-impl RepeatFixtureOperator {
-    fn validate_config(&self) -> Result<(), String> {
+impl RepeatFixtureKernel {
+    fn advance_output(&mut self, output: Chunk) -> StepResult {
+        self.repeat_idx += 1;
+        let next = if self.emit_empty_once || self.repeat_idx >= self.repeat_times {
+            self.emit_empty_once = false;
+            self.input = None;
+            NextStep::NeedInput
+        } else {
+            NextStep::Runnable
+        };
+        StepResult::new(Some(output), next, 0)
+    }
+    fn validate_config(&self) -> ExecutionResult<()> {
         if self.repeat_times == 0 {
-            return Err("repeat operator requires repeat_times > 0".to_string());
+            return Err(repeat_configuration(
+                "repeat operator requires repeat_times > 0",
+            ));
         }
         if self.null_slot_ids.len() != self.repeat_times {
-            return Err(format!(
+            return Err(repeat_configuration(format_args!(
                 "repeat null_slot_ids size mismatch: expected={} actual={}",
                 self.repeat_times,
                 self.null_slot_ids.len()
-            ));
+            )));
         }
         if self.grouping_slot_ids.len() != self.grouping_list.len() {
-            return Err(format!(
+            return Err(repeat_configuration(format_args!(
                 "repeat grouping slot ids mismatch: slot_ids={} grouping_list={}",
                 self.grouping_slot_ids.len(),
                 self.grouping_list.len()
-            ));
+            )));
         }
         for (idx, row) in self.grouping_list.iter().enumerate() {
             if row.len() != self.repeat_times {
-                return Err(format!(
+                return Err(repeat_configuration(format_args!(
                     "repeat grouping_list[{}] size mismatch: expected={} actual={}",
                     idx,
                     self.repeat_times,
                     row.len()
-                ));
+                )));
             }
         }
         Ok(())
@@ -706,6 +764,7 @@ impl RepeatFixtureOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
     use crate::runtime::runtime_state::RuntimeState;
 
     use arrow::array::Array;
@@ -738,7 +797,7 @@ mod tests {
             Chunk::new_with_chunk_schema(batch, chunk_schema)
         };
 
-        let mut op = RepeatFixtureOperator {
+        let mut op = Transform::hydrating(RepeatFixtureKernel {
             name: "Repeat".to_string(),
             null_slot_ids: vec![vec![SlotId::new(2)], vec![SlotId::new(1)]],
             grouping_slot_ids: vec![SlotId::new(10)],
@@ -747,8 +806,6 @@ mod tests {
 
             input: None,
             repeat_idx: 0,
-            finishing: false,
-            finished: false,
             emit_empty_once: false,
             output_schema: None,
             output_chunk_schema: None,
@@ -756,14 +813,25 @@ mod tests {
             output_layout: None,
             declared_input: None,
             construction: None,
-        };
+        });
 
         let state = RuntimeState::default();
-        op.push_chunk(&state, chunk).expect("push_chunk");
-
-        let out1 = op.pull_chunk(&state).expect("pull1").expect("chunk1");
-        let out2 = op.pull_chunk(&state).expect("pull2").expect("chunk2");
-        assert!(op.pull_chunk(&state).expect("pull3").is_none());
+        let mut calls = TestDriver::new(&mut op, &state);
+        calls.accept_without_output(chunk).unwrap();
+        let out1 = calls
+            .advance_to_boundary()
+            .expect("step1")
+            .output
+            .expect("chunk1");
+        let out2 = calls
+            .advance_to_boundary()
+            .expect("step2")
+            .output
+            .expect("chunk2");
+        assert!(matches!(calls.next(), NextStep::NeedInput));
+        let idle = calls.drive().unwrap();
+        assert!(idle.output.is_none());
+        assert!(matches!(idle.next, NextStep::NeedInput));
 
         assert_eq!(out1.len(), 2);
         assert_eq!(out2.len(), 2);
@@ -922,29 +990,11 @@ mod typed_owner_tests {
         op.set_construction_factory(factory.clone());
         op.prepare().unwrap();
         let state = RuntimeState::default();
-        op.as_processor_mut()
-            .unwrap()
-            .push_chunk(&state, source(json))
-            .unwrap();
-        let nulled = op
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
-            .unwrap();
-        let kept = op
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
-            .unwrap();
-        assert!(
-            op.as_processor_mut()
-                .unwrap()
-                .pull_chunk(&state)
-                .unwrap()
-                .is_none()
-        );
+        let mut calls = crate::exec::pipeline::test_driver::TestDriver::new(op.as_mut(), &state);
+        calls.accept_without_output(source(json)).unwrap();
+        let nulled = calls.advance_to_boundary().unwrap().output.unwrap();
+        let kept = calls.advance_to_boundary().unwrap().output.unwrap();
+        assert!(calls.advance_to_boundary().unwrap().output.is_none());
         assert_eq!((nulled.len(), kept.len()), (2, 2));
         assert_eq!(
             nulled
@@ -1005,16 +1055,9 @@ mod typed_owner_tests {
             .unwrap();
         drop(owner);
         drop(empty_source);
-        op.as_processor_mut()
-            .unwrap()
-            .push_chunk(&state, empty)
-            .unwrap();
-        let empty = op
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
-            .unwrap();
+        let mut calls = crate::exec::pipeline::test_driver::TestDriver::new(op.as_mut(), &state);
+        calls.accept_without_output(empty).unwrap();
+        let empty = calls.advance_to_boundary().unwrap().output.unwrap();
         assert_eq!(empty.len(), 0);
         assert_eq!(empty.columns().len(), 2);
         assert_eq!(
@@ -1023,18 +1066,13 @@ mod typed_owner_tests {
         );
         assert_eq!(empty.record_batch().schema(), kept.record_batch().schema());
         assert!(empty.chunk_schema().is_typed());
-        assert!(
-            op.as_processor_mut()
-                .unwrap()
-                .pull_chunk(&state)
-                .unwrap()
-                .is_none()
-        );
+        assert!(calls.advance_to_boundary().unwrap().output.is_none());
         drop(empty);
         let late_batch = kept.batch_projection();
         let late_slot = kept.chunk_schema().slots()[0].clone();
         drop(kept);
         drop(nulled);
+        drop(calls);
         drop(op);
         drop(factory);
         drop(errors);
@@ -1132,7 +1170,9 @@ mod typed_owner_tests {
             prior,
             "rejected request adds no fee or tail allocation"
         );
-        let caller = ExecutionFailure::from("repeat original caller");
+        let caller = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(&("repeat original caller")),
+        ));
         errors.set_error(caller.clone());
         temporary_requests = 0;
         retained_requests = 0;
@@ -1201,11 +1241,12 @@ mod typed_owner_tests {
         let mut op = operator(input.clone(), output);
         op.set_construction_factory(factory.clone());
         op.prepare().unwrap();
-        let error = op
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&RuntimeState::default(), source(ValueKind::String))
-            .unwrap_err();
+        let error = crate::exec::pipeline::test_driver::TestDriver::new(
+            op.as_mut(),
+            &RuntimeState::default(),
+        )
+        .input_and_collect(source(ValueKind::String))
+        .unwrap_err();
         assert!(matches!(error.cause(), ExecutionFailureCause::Construction(
             ConstructionFailure::InvalidSource(detail)) if detail.contains("complete declared type")));
         drop(op);
@@ -1378,8 +1419,8 @@ pub(crate) fn validate_repeat_input<'a>(
 pub(crate) fn repeat_output_columns_owned(
     source: &Chunk,
     output: &ChunkSchemaRef,
-    null_ordinals: impl IntoIterator<Item = Result<usize, String>>,
-    grouping_values: impl IntoIterator<Item = Result<i64, String>>,
+    null_ordinals: impl IntoIterator<Item = ExecutionResult<usize>>,
+    grouping_values: impl IntoIterator<Item = ExecutionResult<i64>>,
     factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
     mut grouping_array: impl FnMut(i64, usize) -> arrow::array::ArrayRef,
 ) -> ExecutionResult<Chunk> {
@@ -1393,19 +1434,7 @@ pub(crate) fn repeat_output_columns_owned(
         match cause {
             CopyConstructionError::Creator(cause) => cause.into(),
             CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
-            CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
-            CopyConstructionError::Copy(CopyError::Extent) => {
-                novarocks_functions::KernelFailure::ResourceExhausted.into()
-            }
-            CopyConstructionError::Copy(CopyError::Invalid(message)) => {
-                ConstructionFailure::InvalidSource(message.into()).into()
-            }
-            CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
-                ConstructionFailure::InvalidSource(format!(
-                    "Repeat construction carrier {ty:?} is unsupported"
-                ))
-                .into()
-            }
+            CopyConstructionError::Copy(cause) => cause.into_kernel().into(),
         }
     }
     factory.observe_input_work(0)?;

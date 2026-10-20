@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::expr::expression_contract;
+use crate::exec::expr::function::array::common as array_common;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, ListArray, UInt32Array, make_array,
@@ -33,14 +36,18 @@ fn build_chunk_from_columns(
     fields: &[Field],
     columns: &[ArrayRef],
     slot_ids: &[SlotId],
-) -> Result<Chunk, String> {
+) -> ExecutionResult<Chunk> {
     let schema = Arc::new(Schema::new(fields.to_vec()));
-    let batch =
-        RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|e| e.to_string())?;
-    Chunk::try_new_with_chunk_schema(
+    let batch = RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_sort_lambda Arrow operation",
+            source,
+        )
+    })?;
+    Ok(Chunk::try_new_with_chunk_schema(
         batch,
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)?,
-    )
+    )?)
 }
 
 fn sign_i128(value: i128) -> i8 {
@@ -51,9 +58,11 @@ fn sign_i128(value: i128) -> i8 {
     }
 }
 
-fn sign_f64(value: f64) -> Result<i8, String> {
+fn sign_f64(value: f64) -> ExecutionResult<i8> {
     if !value.is_finite() {
-        return Err("array_sort comparator returned non-finite value".to_string());
+        return Err(array_common::lambda_value_failure(
+            "array_sort comparator returned non-finite value",
+        ));
     }
     Ok(match value.partial_cmp(&0.0).unwrap_or(Ordering::Equal) {
         Ordering::Less => -1,
@@ -62,9 +71,11 @@ fn sign_f64(value: f64) -> Result<i8, String> {
     })
 }
 
-fn comparator_sign(array: &ArrayRef, idx: usize) -> Result<i8, String> {
+fn comparator_sign(array: &ArrayRef, idx: usize) -> ExecutionResult<i8> {
     if array.is_null(idx) {
-        return Err("array_sort comparator returned NULL".to_string());
+        return Err(array_common::lambda_value_failure(
+            "array_sort comparator returned NULL",
+        ));
     }
     match array.data_type() {
         DataType::Int8 => {
@@ -99,17 +110,25 @@ fn comparator_sign(array: &ArrayRef, idx: usize) -> Result<i8, String> {
             let arr = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "array_sort comparator failed to downcast LARGEINT".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("array_sort comparator failed to downcast LARGEINT")
+                })?;
             Ok(sign_i128(novarocks_types::largeint::value_at(arr, idx)?))
         }
-        other => Err(format!(
+        other => Err(expression_contract(format_args!(
             "array_sort comparator must return numeric type, got {:?}",
             other
-        )),
+        ))),
     }
 }
 
-fn validate_comparator(matrix: &[i8], len: usize, nulls: &[bool]) -> Result<(), String> {
+fn validate_comparator(matrix: &[i8], len: usize, nulls: &[bool]) -> ExecutionResult<()> {
+    let pairs = array_common::comparator_pair_count(len)?;
+    if matrix.len() != pairs || nulls.len() != len {
+        return Err(expression_contract(
+            "array_sort comparator matrix shape differs",
+        ));
+    }
     let at = |i: usize, j: usize| matrix[i * len + j];
 
     for (i, is_null) in nulls.iter().enumerate().take(len) {
@@ -118,9 +137,13 @@ fn validate_comparator(matrix: &[i8], len: usize, nulls: &[bool]) -> Result<(), 
                 continue;
             }
             if at(i, i) > 0 {
-                return Err("Comparator violates incomparability transitivity.".to_string());
+                return Err(array_common::lambda_value_failure(
+                    "Comparator violates incomparability transitivity.",
+                ));
             }
-            return Err("Comparator violates irreflexivity.".to_string());
+            return Err(array_common::lambda_value_failure(
+                "Comparator violates irreflexivity.",
+            ));
         }
     }
 
@@ -139,7 +162,9 @@ fn validate_comparator(matrix: &[i8], len: usize, nulls: &[bool]) -> Result<(), 
                 || (ij == 0 && ji != 0)
                 || (ji == 0 && ij != 0)
             {
-                return Err("Comparator violates asymmetry.".to_string());
+                return Err(array_common::lambda_value_failure(
+                    "Comparator violates asymmetry.",
+                ));
             }
         }
     }
@@ -151,10 +176,14 @@ fn validate_comparator(matrix: &[i8], len: usize, nulls: &[bool]) -> Result<(), 
                     continue;
                 }
                 if at(i, j) < 0 && at(j, k) < 0 && at(i, k) >= 0 {
-                    return Err("Comparator violates transitivity.".to_string());
+                    return Err(array_common::lambda_value_failure(
+                        "Comparator violates transitivity.",
+                    ));
                 }
                 if at(i, j) == 0 && at(j, k) == 0 && at(i, k) != 0 {
-                    return Err("Comparator violates incomparability transitivity.".to_string());
+                    return Err(array_common::lambda_value_failure(
+                        "Comparator violates incomparability transitivity.",
+                    ));
                 }
             }
         }
@@ -179,19 +208,19 @@ fn insertion_sort_indices(matrix: &[i8], len: usize, indices: &mut [usize]) {
     }
 }
 
-fn broadcast_array(array: &ArrayRef, len: usize) -> Result<ArrayRef, String> {
+fn broadcast_array(array: &ArrayRef, len: usize) -> ExecutionResult<ArrayRef> {
     if array.len() == len {
         return Ok(array.clone());
     }
     if array.len() != 1 {
-        return Err(format!(
+        return Err(expression_contract(format_args!(
             "array_sort comparator result length mismatch: expected {} or 1, got {}",
             len,
             array.len()
-        ));
+        )));
     }
     let indices = UInt32Array::from(vec![0_u32; len]);
-    take(array.as_ref(), &indices, None).map_err(|e| e.to_string())
+    array_common::take_values(array.as_ref(), &indices, "higher-order take")
 }
 
 fn eval_comparator_matrix<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -202,10 +231,8 @@ fn eval_comparator_matrix<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     values: &ArrayRef,
     start: usize,
     len: usize,
-) -> Result<Vec<i8>, __Eval::Error> {
-    let pair_count = len
-        .checked_mul(len)
-        .ok_or_else(|| "array_sort comparator pair count overflow".to_string())?;
+) -> ExecutionResult<Vec<i8>> {
+    let pair_count = array_common::comparator_pair_count(len)?;
     if pair_count == 0 {
         return Ok(Vec::new());
     }
@@ -213,21 +240,23 @@ fn eval_comparator_matrix<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let mut left_indices = Vec::with_capacity(pair_count);
     let mut right_indices = Vec::with_capacity(pair_count);
     for left in 0..len {
-        let left_idx =
-            u32::try_from(start + left).map_err(|_| "array_sort index overflow".to_string())?;
+        let left_idx = array_common::index_u32(start + left)?;
         for right in 0..len {
             left_indices.push(left_idx);
-            right_indices.push(
-                u32::try_from(start + right)
-                    .map_err(|_| "array_sort index overflow".to_string())?,
-            );
+            right_indices.push(array_common::index_u32(start + right)?);
         }
     }
 
-    let left_values =
-        take(values.as_ref(), &UInt32Array::from(left_indices), None).map_err(|e| e.to_string())?;
-    let right_values = take(values.as_ref(), &UInt32Array::from(right_indices), None)
-        .map_err(|e| e.to_string())?;
+    let left_values = array_common::take_values(
+        values.as_ref(),
+        &UInt32Array::from(left_indices),
+        "higher-order take",
+    )?;
+    let right_values = array_common::take_values(
+        values.as_ref(),
+        &UInt32Array::from(right_indices),
+        "higher-order take",
+    )?;
 
     let mut fields = vec![
         Field::new("left", values.data_type().clone(), true),
@@ -255,14 +284,18 @@ fn eval_comparator_matrix<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let typed = signs
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
-            .ok_or_else(|| "array_sort comparator failed to downcast BooleanArray".to_string())?;
+            .ok_or_else(|| {
+                expression_contract("array_sort comparator failed to downcast BooleanArray")
+            })?;
         let mut matrix = Vec::with_capacity(pair_count);
         for left in 0..len {
             for right in 0..len {
                 let idx = left * len + right;
                 let rev_idx = right * len + left;
                 if typed.is_null(idx) || typed.is_null(rev_idx) {
-                    return Err(("array_sort comparator returned NULL".to_string()).into());
+                    return Err(array_common::lambda_value_failure(
+                        "array_sort comparator returned NULL",
+                    ));
                 }
                 let left_before_right = typed.value(idx);
                 let right_before_left = typed.value(rev_idx);
@@ -291,27 +324,30 @@ pub fn eval_array_sort_lambda<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    if args.len() < 2 {
-        return Err((format!(
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(format_args!(
             "array_sort_lambda expects at least 2 arguments, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
 
     let (array_id, lambda_id) = match arena.node(args[0]) {
         Some(ExprNode::LambdaFunction { .. }) => {
             if args.len() != 2 {
-                return Err(
-                    ("array_sort_lambda expects ARRAY and lambda arguments".to_string()).into(),
-                );
+                return Err(expression_contract(
+                    "array_sort_lambda expects ARRAY and lambda arguments",
+                ));
             }
             (args[1], args[0])
         }
         _ => match args.last().and_then(|id| arena.node(*id)) {
             Some(ExprNode::LambdaFunction { .. }) => (args[0], args[args.len() - 1]),
-            _ => return Err(("array_sort_lambda expects a lambda function".to_string()).into()),
+            _ => {
+                return Err(expression_contract(
+                    "array_sort_lambda expects a lambda function",
+                ));
+            }
         },
     };
 
@@ -323,35 +359,39 @@ pub fn eval_array_sort_lambda<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
             ..
         }) => (*body, arg_slots.clone(), common_sub_exprs.clone()),
         _ => {
-            return Err(
-                ("array_sort_lambda expects lambda function expression".to_string()).into(),
-            );
+            return Err(expression_contract(
+                "array_sort_lambda expects lambda function expression",
+            ));
         }
     };
     if lambda_args.len() != 2 {
-        return Err(
-            ("array_sort_lambda expects comparator with exactly two arguments".to_string()).into(),
-        );
+        return Err(expression_contract(
+            "array_sort_lambda expects comparator with exactly two arguments",
+        ));
     }
 
     let arr = arena.eval(array_id, chunk)?;
     let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-        format!(
+        expression_contract(format_args!(
             "array_sort_lambda expects ListArray, got {:?}",
             arr.data_type()
-        )
+        ))
     })?;
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list.data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_sort_lambda output must be List, got {other:?}"
+            )));
+        }
+        None => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err((format!(
+                return Err(expression_contract(format_args!(
                     "array_sort_lambda output type must be List, got {:?}",
                     other
-                ))
-                .into());
+                )));
             }
         },
     };
@@ -359,22 +399,17 @@ pub fn eval_array_sort_lambda<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
 
     let mut values = list.values().clone();
     if values.data_type() != &target_item_type {
-        values = cast(&values, &target_item_type).map_err(|e| {
-            format!(
-                "array_sort_lambda failed to cast element type {:?} -> {:?}: {}",
-                values.data_type(),
-                target_item_type,
-                e
-            )
-        })?;
+        values = cast(&values, &target_item_type)
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
+    array_common::validate_rows(list.len(), chunk.len(), "array_sort_lambda input")?;
     let values_data = values.to_data();
     let mut mutable = MutableArrayData::new(vec![&values_data], false, 0);
     let offsets = list.value_offsets();
     let mut out_offsets = Vec::with_capacity(chunk.len() + 1);
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
@@ -406,29 +441,36 @@ pub fn eval_array_sort_lambda<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
             insertion_sort_indices(&matrix, len, &mut positions);
             for pos in positions {
                 let idx = start + pos;
+                let next =
+                    novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
                 mutable.extend(0, idx, idx + 1);
-                current += 1;
+                current = next;
             }
         } else {
             for idx in start..end {
+                let next =
+                    novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
                 mutable.extend(0, idx, idx + 1);
-                current += 1;
+                current = next;
             }
         }
 
-        if current > i32::MAX as i64 {
-            return Err(("array_sort_lambda offset overflow".to_string()).into());
-        }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_sort_lambda constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }

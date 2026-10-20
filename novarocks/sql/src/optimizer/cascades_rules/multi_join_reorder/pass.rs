@@ -518,7 +518,7 @@ mod tests {
         ) -> Result<(), novarocks_type_contract::CompileControlError> {
             let mut observations = self.units.lock().unwrap();
             observations.push(units);
-            if let Some((point, error)) = self.stop {
+            if let Some((point, error)) = self.stop.clone() {
                 let stop = match point {
                     StopPoint::Entry => observations.len() == 1,
                     StopPoint::Batch => units == 256,
@@ -570,7 +570,7 @@ mod tests {
             Error::ResourceExhausted,
         ] {
             for point in [StopPoint::Entry, StopPoint::Batch, StopPoint::Finish] {
-                let control = observed_control(Some((point, error)));
+                let control = observed_control(Some((point, error.clone())));
                 let mut memo = wide_leaf_memo();
                 let failure = run_multi_join_reorder(
                     &mut memo,
@@ -579,7 +579,7 @@ mod tests {
                     &control,
                 )
                 .unwrap_err();
-                assert_eq!(failure, SqlCompileError::from(error));
+                assert_eq!(failure, SqlCompileError::from(error.clone()));
                 let units = control.units.lock().unwrap();
                 assert!(units.iter().all(|units| *units <= 256));
                 match point {
@@ -673,7 +673,7 @@ mod tests {
             Error::ResourceExhausted,
         ] {
             let (mut memo, root, candidate) = candidate_comparison_fixture();
-            let control = observed_control(Some((StopPoint::Batch, error)));
+            let control = observed_control(Some((StopPoint::Batch, error.clone())));
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
             let failure = inject_candidate(
                 &mut memo,

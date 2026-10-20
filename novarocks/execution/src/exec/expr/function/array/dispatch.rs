@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::ArrayRef;
 use std::collections::HashMap;
 
@@ -45,7 +46,7 @@ pub fn eval_array_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let canonical = ARRAY_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
@@ -57,9 +58,7 @@ pub fn eval_array_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         "array_append" => Ok((super::array_append::eval_array_append(arena, expr, args, chunk))?),
         "array_avg" => Ok((super::array_avg::eval_array_avg(arena, expr, args, chunk))?),
         "array_concat" => Ok((super::array_concat::eval_array_concat(arena, expr, args, chunk))?),
-        "array_cum_sum" => {
-            Ok((super::array_cum_sum::eval_array_cum_sum(arena, expr, args, chunk))?)
-        }
+        "array_cum_sum" => super::array_cum_sum::eval_array_cum_sum(arena, expr, args, chunk),
         "array_length" => Ok((super::array_length::eval_array_length(arena, expr, args, chunk))?),
         "array_contains" => {
             Ok((super::array_contains::eval_array_contains(arena, expr, args, chunk))?)
@@ -74,14 +73,14 @@ pub fn eval_array_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             Ok((super::array_distinct::eval_array_distinct(arena, expr, args, chunk))?)
         }
         "array_difference" => {
-            Ok((super::array_difference::eval_array_difference(arena, expr, args, chunk))?)
+            super::array_difference::eval_array_difference(arena, expr, args, chunk)
         }
         "__array_element_at" | "element_at" => {
             Ok((super::element_at::eval_element_at(arena, expr, args, chunk))?)
         }
-        "__array_struct_subfield" | "array_struct_subfield" => Ok(
-            (super::array_struct_subfield::eval_array_struct_subfield(arena, expr, args, chunk))?,
-        ),
+        "__array_struct_subfield" | "array_struct_subfield" => {
+            super::array_struct_subfield::eval_array_struct_subfield(arena, expr, args, chunk)
+        }
         "array_filter" => Ok((super::array_filter::eval_array_filter(arena, expr, args, chunk))?),
         "array_flatten" => {
             Ok((super::array_flatten::eval_array_flatten(arena, expr, args, chunk))?)
@@ -105,13 +104,13 @@ pub fn eval_array_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         "array_sort_lambda" => {
             Ok((super::array_sort_lambda::eval_array_sort_lambda(arena, expr, args, chunk))?)
         }
-        "array_sortby" => Ok((super::array_sortby::eval_array_sortby(arena, expr, args, chunk))?),
-        "array_top_n" => Ok((super::array_top_n::eval_array_top_n(arena, expr, args, chunk))?),
-        "array_sum" => Ok((super::array_sum::eval_array_sum(arena, expr, args, chunk))?),
-        "arrays_overlap" => {
-            Ok((super::arrays_overlap::eval_arrays_overlap(arena, expr, args, chunk))?)
-        }
-        other => Err((format!("unsupported array function: {}", other)).into()),
+        "array_sortby" => super::array_sortby::eval_array_sortby(arena, expr, args, chunk),
+        "array_top_n" => super::array_top_n::eval_array_top_n(arena, expr, args, chunk),
+        "array_sum" => super::array_sum::eval_array_sum(arena, expr, args, chunk),
+        "arrays_overlap" => super::arrays_overlap::eval_arrays_overlap(arena, expr, args, chunk),
+        other => Err(expression_contract(format_args!(
+            "unsupported array function: {other}"
+        ))),
     }
 }
 

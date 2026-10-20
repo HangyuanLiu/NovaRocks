@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop);
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -82,31 +82,28 @@ fn borrowed_diagnostics_512_candidates_keep_original_content_and_full_request_in
         append(&mut context, &mut resources, &mut |_| Ok(()), &mut work).unwrap();
     }
     assert_eq!(context.errors, original.errors);
-    assert_eq!(context.errors.len(), 129);
-    assert_eq!(context.errors.capacity(), 256);
+    assert_eq!(context.errors.len(), 128);
+    assert_eq!(context.errors.capacity(), 128);
     let result =
         ValidationErrors::from_collector_in(context, &mut resources, &mut |_| Ok(()), &mut work)
             .unwrap();
     assert_eq!(result, ValidationErrors::from_collector(original));
-    // Independent locked-Vec invoice: full growth requests 4+8+16+32+64+128+256
-    // and the real 129-element final trim, plus every candidate's two byte Boxes.
+    // Independent locked-Vec invoice: growth 4+8+16+32+64+128 and no
+    // final trim at exact capacity, plus every candidate's two byte Boxes.
     let header = Layout::new::<ValidationError>().size();
     assert_eq!(
         resources.facts().allocation_requests_upper_bound,
-        512 * 2 + 2 + 7 + 1
+        512 * 2 + 6
     );
     assert_eq!(
         resources.facts().allocation_request_bytes_upper_bound,
-        512 * 5
-            + "validation".len()
-            + "additional validation errors were truncated".len()
-            + (508 + 129) * header
+        512 * 5 + 252 * header
     );
     work.finish().unwrap();
 }
 
 #[test]
-fn borrowed_diagnostics_130th_candidate_still_copies_without_second_sentinel_or_vec_request() {
+fn borrowed_diagnostics_130th_candidate_still_copies_without_collector_growth() {
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let mut resources = ControlResourceCounter::default();
@@ -126,11 +123,9 @@ fn borrowed_diagnostics_130th_candidate_still_copies_without_second_sentinel_or_
         after.allocation_request_bytes_upper_bound - before.allocation_request_bytes_upper_bound,
         5
     );
-    assert_eq!(context.errors.len(), 129);
+    assert_eq!(context.errors.len(), 128);
     assert_eq!(context.errors.as_ptr(), pointer);
-    context
-        .mark_truncated_in(&mut resources, &mut |_| Ok(()), &mut work)
-        .unwrap();
+    context.mark_truncated();
     assert_eq!(resources.facts(), after);
 }
 
@@ -169,58 +164,21 @@ fn borrowed_diagnostic_both_known_boxes_refuse_before_real_pending_copy_observat
 }
 
 #[test]
-fn borrowed_sentinel_admits_both_spellings_and_actual_collector_growth_before_observation() {
-    for axis in 0..2 {
-        for cause in CAUSES {
-            let mut context = ValidationContext::new();
-            for _ in 0..128 {
-                context.push(ValidationError::resource_limit("p\0", "mλ"));
-            }
-            assert_eq!(context.errors.len(), 128);
-            assert_eq!(context.errors.capacity(), 128);
-            // The incoming context is real, built before this caller scope.
-            // Admit its actual backing and closed byte payloads once.
-            let mut resources = ControlResourceCounter::default();
-            resources
-                .buffer::<ValidationError>(context.errors.capacity(), 1)
-                .unwrap();
-            for error in &context.errors {
-                resources.buffer::<u8>(error.path().len(), 1).unwrap();
-                resources.buffer::<u8>(error.message().len(), 1).unwrap();
-            }
-            let before = resources.facts();
-            let requested_bytes = "validation".len()
-                + "additional validation errors were truncated".len()
-                + Layout::array::<ValidationError>(256).unwrap().size();
-            let control = Control {
-                trace: Mutex::default(),
-                refusal: Some((1, cause)),
-            };
-            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-            let result = context.mark_truncated_in(
-                &mut resources,
-                &mut |facts| {
-                    let over = if axis == 0 {
-                        facts.allocation_requests_upper_bound
-                            > before.allocation_requests_upper_bound + 3 - 1
-                    } else {
-                        facts.allocation_request_bytes_upper_bound
-                            > before.allocation_request_bytes_upper_bound + requested_bytes - 1
-                    };
-                    if over {
-                        Err(CompileControlError::ResourceExhausted)
-                    } else {
-                        Ok(())
-                    }
-                },
-                &mut work,
-            );
-            assert_eq!(result, Err(CompileControlError::ResourceExhausted.into()));
-            assert_eq!(control.trace(), [0]);
-            assert_eq!(context.errors.len(), 128);
-            assert_eq!(context.errors.capacity(), 128);
-        }
+fn truncation_metadata_preserves_bounded_payload_and_cause_categories() {
+    let mut context = ValidationContext::new();
+    for _ in 0..128 {
+        context.push(ValidationError::resource_limit("p", "m"));
     }
+    let pointer = context.errors.as_ptr();
+    context.mark_truncated();
+    assert!(context.truncated);
+    assert_eq!(context.errors.len(), 128);
+    assert_eq!(context.errors.capacity(), 128);
+    assert_eq!(context.errors.as_ptr(), pointer);
+    let errors = ValidationErrors::from_collector(context);
+    assert!(errors.diagnostics_truncated());
+    assert!(errors.has(ValidationErrorCategory::ResourceLimit));
+    assert!(!errors.has(ValidationErrorCategory::StructuralInvariant));
 }
 
 fn small(control: &Control) -> Result<ValidationErrors, ControlResourceError> {
@@ -228,7 +186,7 @@ fn small(control: &Control) -> Result<ValidationErrors, ControlResourceError> {
     let mut resources = ControlResourceCounter::default();
     let mut context = ValidationContext::new();
     append(&mut context, &mut resources, &mut |_| Ok(()), &mut work)?;
-    context.mark_truncated_in(&mut resources, &mut |_| Ok(()), &mut work)?;
+    context.mark_truncated();
     let result =
         ValidationErrors::from_collector_in(context, &mut resources, &mut |_| Ok(()), &mut work)?;
     work.finish()?;
@@ -238,18 +196,18 @@ fn small(control: &Control) -> Result<ValidationErrors, ControlResourceError> {
 fn borrowed_diagnostic_each_actual_small_callback_preserves_three_causes_and_caller_tail() {
     let baseline = Control::default();
     let result = small(&baseline).unwrap();
-    assert_eq!(result.errors().len(), 2);
+    assert_eq!(result.errors().len(), 1);
     assert_eq!(
         result.errors()[0].category(),
         ValidationErrorCategory::ResourceLimit
     );
-    assert_eq!(result.errors()[1].path(), "validation");
+    assert!(result.diagnostics_truncated());
     let trace = baseline.trace();
     for at in 0..trace.len() {
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert_eq!(small(&control), Err(cause.into()));
             assert_eq!(control.trace(), trace[..=at]);
@@ -468,24 +426,21 @@ fn formatted_candidates_keep_original_std_text_after_collector_saturation_and_kn
             .unwrap();
     }
     assert_eq!(context.errors, original.errors);
-    assert_eq!(context.errors.len(), 129);
-    assert_eq!(context.errors.capacity(), 256);
+    assert_eq!(context.errors.len(), 128);
+    assert_eq!(context.errors.capacity(), 128);
     assert_eq!(
         resources.facts().allocation_requests_upper_bound,
-        512 * 3 + 2 + 7
+        512 * 3 + 6
     );
     assert_eq!(
         resources.facts().allocation_request_bytes_upper_bound,
-        512 * (2 * bound + 2)
-            + "validation".len()
-            + "additional validation errors were truncated".len()
-            + 508 * Layout::new::<ValidationError>().size()
+        512 * (2 * bound + 2) + 252 * Layout::new::<ValidationError>().size()
     );
     work.finish().unwrap();
 }
 
 #[test]
-fn formatted_report_combines_candidate_and_sentinel_before_any_format_observer() {
+fn formatted_report_at_capacity_admits_candidate_before_any_format_observer() {
     for cause in CAUSES {
         let mut context = ValidationContext::new();
         for _ in 0..128 {
@@ -511,14 +466,14 @@ fn formatted_report_combines_candidate_and_sentinel_before_any_format_observer()
             "candidate ".len() + 10,
             &mut resources,
             &mut |facts| {
-                // Candidate String+two Boxes, sentinel two Boxes and real growth
-                // are all already known before the first formatting observation.
+                // The candidate String and two Boxes are known before the
+                // first formatting observation. Truncation adds no payload.
                 assert_eq!(
                     facts.allocation_requests_upper_bound,
-                    before.allocation_requests_upper_bound + 6
+                    before.allocation_requests_upper_bound + 3
                 );
                 if facts.allocation_requests_upper_bound
-                    > before.allocation_requests_upper_bound + 5
+                    > before.allocation_requests_upper_bound + 2
                 {
                     Err(CompileControlError::ResourceExhausted)
                 } else {
@@ -572,7 +527,7 @@ fn actual_standard_formatter_preserves_first_control_and_typed_source_bound_fail
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert_eq!(formatted_small(&control, bound), Err(cause.into()));
             assert_eq!(control.trace(), trace[..=at]);

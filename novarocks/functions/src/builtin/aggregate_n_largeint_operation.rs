@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Lossless N operation errors under one actual same-host prefix.
-use super::aggregate_n_largeint_resources::{LEGACY_TEXT_UPPER, operation_prefix_bytes};
+use super::aggregate_n_largeint_resources::operation_prefix_bytes;
 use crate::aggregate_format::AggregateFailureStage;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
@@ -39,36 +39,36 @@ pub(super) enum NDataDomain<'a> {
     Emission(&'a AggregateEmissionContext<'a>),
 }
 impl NDataDomain<'_> {
-    fn stage(&self) -> Result<AggregateFailureStage, KernelFailure> {
+    fn stage(&self) -> Option<AggregateFailureStage> {
         match self {
             Self::Mutation {
                 phase: AggregateInvocationPhase::Update,
                 ..
-            } => Ok(AggregateFailureStage::Update),
+            } => Some(AggregateFailureStage::Update),
             Self::Mutation {
                 phase: AggregateInvocationPhase::Merge,
                 ..
-            } => Ok(AggregateFailureStage::Merge),
+            } => Some(AggregateFailureStage::Merge),
             Self::Emission(context) if context.phase() == AggregateInvocationPhase::Final => {
-                Ok(AggregateFailureStage::BuildFinal)
+                Some(AggregateFailureStage::BuildFinal)
             }
             Self::Emission(context)
                 if context.phase() == AggregateInvocationPhase::Intermediate =>
             {
-                Ok(AggregateFailureStage::BuildIntermediate)
+                Some(AggregateFailureStage::BuildIntermediate)
             }
-            _ => Err(invalid(
-                "min_n/max_n core call has an unsupported invocation domain",
-            )),
+            _ => None,
         }
     }
     fn diagnostic(
         &self,
-        message: &str,
+        message: &(impl std::fmt::Display + ?Sized),
         allocator: &HostAggregateAllocator,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<InvocationData, KernelFailure> {
-        let stage = self.stage()?;
+        let stage = self
+            .stage()
+            .ok_or_else(|| invalid("min_n/max_n core call has an unsupported invocation domain"))?;
         let diagnostic = HostDiagnostic::prepare(allocator, work, |writer| {
             write!(writer, "{}", stage.message(message))
         })?;
@@ -93,33 +93,26 @@ impl NDataDomain<'_> {
         }
     }
 }
-pub(super) fn classify(
-    error: ScalarStateError,
+pub(super) fn project_failure(
+    cause: KernelFailure,
     domain: &NDataDomain<'_>,
     allocator: &HostAggregateAllocator,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> EvaluationFailure {
-    match error {
-        ScalarStateError::Kernel(cause) => cause.into(),
-        ScalarStateError::OutputAllocation(message) => {
-            drop(message);
-            KernelFailure::ResourceExhausted.into()
-        }
-        ScalarStateError::Legacy(message) => {
-            if message.len() > LEGACY_TEXT_UPPER {
-                drop(message);
-                return internal(
-                    "min_n/max_n private producer exceeded its original diagnostic extent",
-                )
-                .into();
-            }
-            let converted = domain.diagnostic(&message, allocator, work);
-            drop(message);
-            match converted {
-                Ok(data) => EvaluationFailure::InvocationData(data),
-                Err(cause) => cause.into(),
-            }
-        }
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    // The producer already decided the kind. This host only attaches the
+    // actual whole-invocation scope, never a maskable row attribution.
+    if cause.failure_fact().class() != FailureClass::Data {
+        return cause.into();
+    }
+    match domain.diagnostic(&cause, allocator, work) {
+        Ok(data) => data.with_whole_value_source(cause).into(),
+        Err(diagnostic) => KernelFailure::from_domain(NDiagnosticFailure {
+            origin: cause,
+            diagnostic,
+            stage: domain.stage(),
+        })
+        .into(),
     }
 }
 /// Successful owned output cannot escape this temporary prefix. Output has its
@@ -129,7 +122,7 @@ pub(super) fn call_unit(
     allocator: &HostAggregateAllocator,
     domain: NDataDomain<'_>,
     control: &dyn KernelEvaluationControl,
-    operation: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<(), ScalarStateError>,
+    operation: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<(), KernelFailure>,
 ) -> Result<(), EvaluationFailure> {
     let prefix = charge.reserve_operation(operation_prefix_bytes()?)?;
     if !prefix.belongs_to_allocator(allocator) {
@@ -146,9 +139,37 @@ pub(super) fn call_unit(
             Ok(())
         }
         Err(error) => {
-            let failure = classify(error, &domain, allocator, &mut checkpoints);
+            let failure = project_failure(error, &domain, allocator, &mut checkpoints);
             drop(checkpoints);
             Err(failure)
         }
     }
 }
+
+/// A failed diagnostic is secondary to the already-known computation origin.
+/// Keep both actual sources locally, without retaining the invocation graph.
+#[derive(Debug)]
+pub(super) struct NDiagnosticFailure {
+    pub(super) origin: KernelFailure,
+    pub(super) diagnostic: KernelFailure,
+    stage: Option<AggregateFailureStage>,
+}
+impl std::fmt::Display for NDiagnosticFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.stage {
+            Some(stage) => stage.message(&self.origin).fmt(f),
+            None => self.origin.fmt(f),
+        }
+    }
+}
+impl std::error::Error for NDiagnosticFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.origin)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for NDiagnosticFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.origin)
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for NDiagnosticFailure {}

@@ -39,7 +39,7 @@ use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
 };
-use novarocks_worker::{PreparationStop, TestPreparationControl};
+use novarocks_worker::{TestPreparationControl, TestPreparationIntent};
 use std::{sync::Arc, time::Duration};
 
 struct Control;
@@ -165,7 +165,10 @@ fn original_large_field_alias_keeps_real_origin_to_cross_thread_last_free() {
             .fields[0]
             .name,
     );
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let mut journal = TypeMaterializationJournal::default();
     let table = materialize_package_types_for_test(
         &source,
@@ -277,7 +280,10 @@ fn original_type_host_keeps_real_capacity_and_stop_refusals_before_body() {
     binding
         .account()
         .install_policy(0, novarocks_memory::LimitDimension::Work);
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let mut journal = TypeMaterializationJournal::default();
     assert!(matches!(
         materialize_package_types_for_test(
@@ -296,24 +302,29 @@ fn original_type_host_keeps_real_capacity_and_stop_refusals_before_body() {
     assert!(journal.body.settlement.is_none());
     assert!(journal.capacity.is_some());
     assert_eq!(binding.account().snapshot().granted_bytes, 0);
-    assert!(owner.stop(PreparationStop::Abort(
+    assert!(owner.stop(TestPreparationIntent::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
+    let loan = owner.loan();
+    let accepted = loan
+        .checkpoint()
+        .expect_err("original Worker accepted abort");
     let mut stopped = TypeMaterializationJournal::default();
-    assert!(matches!(
-        materialize_package_types_for_test(
-            &source,
-            SOURCE_INVOICE,
-            decode_limits().types,
-            &Control,
-            &binding,
-            &owner.loan(),
-            &mut stopped
-        ),
-        Err(ProjectionFailure::Host(
-            TypeMaterializationRefusal::Stopped(PreparationStop::Abort(_))
-        ))
-    ));
+    let error = materialize_package_types_for_test(
+        &source,
+        SOURCE_INVOICE,
+        decode_limits().types,
+        &Control,
+        &binding,
+        &loan,
+        &mut stopped,
+    )
+    .err()
+    .expect("original Worker stop precedes another admission");
+    let ProjectionFailure::Host(TypeMaterializationRefusal::Interrupted(original)) = error else {
+        panic!("expected original Worker interruption: {error:?}");
+    };
+    assert!(std::ptr::eq(original.cause(), accepted.cause()));
     assert!(stopped.body.settlement.is_none());
     assert!(
         stopped.capacity.is_none(),
@@ -347,7 +358,10 @@ fn original_type_host_preserves_a_qualified_shared_shortage_without_running_body
         (PAYLOAD + 8) as u64
     );
     let source = source();
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let mut journal = TypeMaterializationJournal::default();
     let result = materialize_package_types_for_test(
         &source,
@@ -412,4 +426,16 @@ fn original_type_host_preserves_a_qualified_shared_shortage_without_running_body
     assert!(journal.capacity.is_none());
     drop(filler);
     drop(ready);
+}
+
+fn preparation_identity(
+    execution: novarocks_types::identity::QueryExecutionId,
+) -> novarocks_execution_contract::TaskIdentity {
+    use novarocks_types::identity::{BackendProcessId, StageId, TaskId};
+    novarocks_execution_contract::TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    )
 }

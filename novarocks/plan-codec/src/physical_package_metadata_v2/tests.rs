@@ -41,7 +41,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         events.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -399,7 +399,7 @@ fn metadata_all_actual_small_success_and_ordinary_control_prefixes_keep_three_ca
             for cause in CAUSES {
                 let c = Control {
                     events: Mutex::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 let (result, trace) = decode(input, &c, limits());
                 assert!(matches!(result,Err(Error::Control(found)) if found==cause));
@@ -418,7 +418,7 @@ fn metadata_all_actual_small_success_and_ordinary_control_prefixes_keep_three_ca
         for cause in CAUSES {
             let c = Control {
                 events: Mutex::default(),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             let (result, trace) = encode(&source, &c, limits());
             assert!(matches!(result,Err(Error::Control(found)) if found==cause));
@@ -438,7 +438,7 @@ fn metadata_known_text_parent_numeric_refusal_precedes_pending_255_late_control(
         for decode_direction in [false, true] {
             let c = Control {
                 events: Mutex::default(),
-                stop: Some((1, cause)),
+                stop: Some((1, cause.clone())),
             };
             let mut work = CompileCheckpoints::try_new(
                 &c,

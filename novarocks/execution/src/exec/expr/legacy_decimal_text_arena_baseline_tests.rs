@@ -97,29 +97,10 @@ fn original_decimal_text_arena_and_types_keep_scale_min_null_slice_empty() {
             .with_precision_and_scale(38, 2)
             .unwrap(),
     );
-    // Original debug abs panics; an overflow-check-free build wraps the same MIN.
-    for raw_types in [false, true] {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if raw_types {
-                novarocks_types::arrow_cast::cast_scalar_with_special_rules(
-                    &minimum128,
-                    &DataType::Utf8,
-                )
-                .unwrap()
-            } else {
-                arena_text(minimum128.clone())
-            }
-        }));
-        if cfg!(debug_assertions) {
-            assert!(result.is_err());
-        } else {
-            assert_eq!(
-                result.unwrap().to_data(),
-                StringArray::from(vec![Some("--1701411834604692317316873037158841057.28")])
-                    .to_data()
-            );
-        }
-    }
+    assert_both(
+        minimum128,
+        vec![Some("-1701411834604692317316873037158841057.28")],
+    );
     let minimum256 = i256::from_string(
         "-57896044618658097711785492504343953926634992332820282019728792003956564819968",
     )

@@ -126,95 +126,97 @@ mod tests {
     fn comparison_common_type_numeric_and_decimal() {
         // equal -> Ok(None)
         assert_eq!(
-            comparison_common_type(&DataType::Int32, &DataType::Int32),
-            Ok(None)
+            comparison_common_type(&DataType::Int32, &DataType::Int32).unwrap(),
+            None
         );
         // int width mismatch -> both Int64
         assert_eq!(
-            comparison_common_type(&DataType::Int32, &DataType::Int64),
-            Ok(Some(DataType::Int64))
+            comparison_common_type(&DataType::Int32, &DataType::Int64).unwrap(),
+            Some(DataType::Int64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Int16, &DataType::Int8),
-            Ok(Some(DataType::Int64))
+            comparison_common_type(&DataType::Int16, &DataType::Int8).unwrap(),
+            Some(DataType::Int64)
         );
         // int <-> float / float x float -> both Float64
         assert_eq!(
-            comparison_common_type(&DataType::Int32, &DataType::Float64),
-            Ok(Some(DataType::Float64))
+            comparison_common_type(&DataType::Int32, &DataType::Float64).unwrap(),
+            Some(DataType::Float64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Float32, &DataType::Float64),
-            Ok(Some(DataType::Float64))
+            comparison_common_type(&DataType::Float32, &DataType::Float64).unwrap(),
+            Some(DataType::Float64)
         );
         // decimal x decimal <=38 -> common Decimal128
         assert_eq!(
-            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(18, 4)),
-            Ok(Some(DataType::Decimal128(18, 4)))
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(18, 4))
+                .unwrap(),
+            Some(DataType::Decimal128(18, 4))
         );
         assert_eq!(
-            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(10, 2)),
-            Ok(None)
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(10, 2))
+                .unwrap(),
+            None
         );
         // int x decimal: int modeled as zero-scale decimal -> common decimal
         // Int32 -> Decimal128(10,0); scale=2, int_digits=max(10,8)=10, prec=12
         assert_eq!(
-            comparison_common_type(&DataType::Int32, &DataType::Decimal128(10, 2)),
-            Ok(Some(DataType::Decimal128(12, 2)))
+            comparison_common_type(&DataType::Int32, &DataType::Decimal128(10, 2)).unwrap(),
+            Some(DataType::Decimal128(12, 2))
         );
         // string x numeric -> numeric operand's type
         assert_eq!(
-            comparison_common_type(&DataType::Utf8, &DataType::Int32),
-            Ok(Some(DataType::Int32))
+            comparison_common_type(&DataType::Utf8, &DataType::Int32).unwrap(),
+            Some(DataType::Int32)
         );
     }
 
     #[test]
     fn comparison_common_type_new_arms_s3() {
         assert_eq!(
-            comparison_common_type(&DataType::Int64, &DataType::Decimal128(10, 2)),
-            Ok(Some(DataType::Decimal128(21, 2)))
+            comparison_common_type(&DataType::Int64, &DataType::Decimal128(10, 2)).unwrap(),
+            Some(DataType::Decimal128(21, 2))
         );
         assert_eq!(
-            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Int32),
-            Ok(Some(DataType::Decimal128(12, 2)))
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Int32).unwrap(),
+            Some(DataType::Decimal128(12, 2))
         );
         assert_eq!(
-            comparison_common_type(&DataType::Float64, &DataType::Decimal128(10, 2)),
-            Ok(Some(DataType::Float64))
+            comparison_common_type(&DataType::Float64, &DataType::Decimal128(10, 2)).unwrap(),
+            Some(DataType::Float64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Float32),
-            Ok(Some(DataType::Float64))
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Float32).unwrap(),
+            Some(DataType::Float64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Utf8, &DataType::Int32),
-            Ok(Some(DataType::Int32))
+            comparison_common_type(&DataType::Utf8, &DataType::Int32).unwrap(),
+            Some(DataType::Int32)
         );
         assert_eq!(
-            comparison_common_type(&DataType::LargeUtf8, &DataType::Int32),
-            Ok(Some(DataType::Int32))
+            comparison_common_type(&DataType::LargeUtf8, &DataType::Int32).unwrap(),
+            Some(DataType::Int32)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Utf8),
-            Ok(Some(DataType::Decimal128(10, 2)))
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Utf8).unwrap(),
+            Some(DataType::Decimal128(10, 2))
         );
         assert_eq!(
-            comparison_common_type(&DataType::Utf8, &DataType::Float64),
-            Ok(Some(DataType::Float64))
+            comparison_common_type(&DataType::Utf8, &DataType::Float64).unwrap(),
+            Some(DataType::Float64)
         );
         let largeint = DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH);
         assert_eq!(
-            comparison_common_type(&largeint, &DataType::Decimal128(10, 2)),
-            Ok(None)
+            comparison_common_type(&largeint, &DataType::Decimal128(10, 2)).unwrap(),
+            None
         );
         assert_eq!(
-            comparison_common_type(&DataType::Utf8, &DataType::Utf8),
-            Ok(None)
+            comparison_common_type(&DataType::Utf8, &DataType::Utf8).unwrap(),
+            None
         );
         assert_eq!(
-            comparison_common_type(&DataType::Utf8, &DataType::Date32),
-            Ok(None)
+            comparison_common_type(&DataType::Utf8, &DataType::Date32).unwrap(),
+            None
         );
     }
 
@@ -228,12 +230,13 @@ mod tests {
                     DataType::Decimal128(10, 2),
                     true
                 ))),
-            ),
-            Ok(Some(DataType::List(Arc::new(Field::new(
+            )
+            .unwrap(),
+            Some(DataType::List(Arc::new(Field::new(
                 "item",
                 DataType::Decimal128(12, 2),
                 true
-            )))))
+            ))))
         );
 
         assert_eq!(
@@ -244,12 +247,13 @@ mod tests {
                     DataType::Decimal128(10, 2),
                     true
                 ))),
-            ),
-            Ok(Some(DataType::List(Arc::new(Field::new(
+            )
+            .unwrap(),
+            Some(DataType::List(Arc::new(Field::new(
                 "item",
                 DataType::Utf8,
                 true
-            )))))
+            ))))
         );
 
         assert_eq!(
@@ -262,11 +266,12 @@ mod tests {
                     Field::new("c0", DataType::Int32, true),
                     Field::new("c1", DataType::Utf8, true),
                 ])),
-            ),
-            Ok(Some(DataType::Struct(Fields::from(vec![
+            )
+            .unwrap(),
+            Some(DataType::Struct(Fields::from(vec![
                 Field::new("c0", DataType::Decimal128(16, 3), true),
                 Field::new("c1", DataType::Utf8, true),
-            ]))))
+            ])))
         );
 
         let decimal_map = DataType::Map(
@@ -292,8 +297,8 @@ mod tests {
             false,
         );
         assert_eq!(
-            comparison_common_type(&decimal_map, &int_map),
-            Ok(Some(decimal_map))
+            comparison_common_type(&decimal_map, &int_map).unwrap(),
+            Some(decimal_map)
         );
     }
 
@@ -302,36 +307,36 @@ mod tests {
         let largeint = DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH);
 
         assert_eq!(
-            comparison_common_type(&DataType::Boolean, &DataType::Int64),
-            Ok(Some(DataType::Int64))
+            comparison_common_type(&DataType::Boolean, &DataType::Int64).unwrap(),
+            Some(DataType::Int64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Int32, &DataType::Boolean),
-            Ok(Some(DataType::Int64))
+            comparison_common_type(&DataType::Int32, &DataType::Boolean).unwrap(),
+            Some(DataType::Int64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Boolean, &DataType::Float64),
-            Ok(Some(DataType::Float64))
+            comparison_common_type(&DataType::Boolean, &DataType::Float64).unwrap(),
+            Some(DataType::Float64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Boolean, &DataType::Decimal128(10, 2)),
-            Ok(Some(DataType::Decimal128(10, 2)))
+            comparison_common_type(&DataType::Boolean, &DataType::Decimal128(10, 2)).unwrap(),
+            Some(DataType::Decimal128(10, 2))
         );
         assert_eq!(
-            comparison_common_type(&DataType::Int64, &DataType::Null),
-            Ok(Some(DataType::Int64))
+            comparison_common_type(&DataType::Int64, &DataType::Null).unwrap(),
+            Some(DataType::Int64)
         );
         assert_eq!(
-            comparison_common_type(&DataType::Null, &DataType::Boolean),
-            Ok(Some(DataType::Boolean))
+            comparison_common_type(&DataType::Null, &DataType::Boolean).unwrap(),
+            Some(DataType::Boolean)
         );
         assert_eq!(
-            comparison_common_type(&largeint, &DataType::Int64),
-            Ok(Some(largeint.clone()))
+            comparison_common_type(&largeint, &DataType::Int64).unwrap(),
+            Some(largeint.clone())
         );
         assert_eq!(
-            comparison_common_type(&DataType::Int32, &largeint),
-            Ok(Some(largeint))
+            comparison_common_type(&DataType::Int32, &largeint).unwrap(),
+            Some(largeint)
         );
     }
 
@@ -339,13 +344,15 @@ mod tests {
     fn comparison_common_type_decimal_overflow_promotes_to_256() {
         // scale=max(0,10)=10, int_digits=max(30-0,30-10)=30, precision=40 > 38 -> Decimal256
         assert_eq!(
-            comparison_common_type(&DataType::Decimal128(30, 0), &DataType::Decimal128(30, 10)),
-            Ok(Some(DataType::Decimal256(40, 10)))
+            comparison_common_type(&DataType::Decimal128(30, 0), &DataType::Decimal128(30, 10))
+                .unwrap(),
+            Some(DataType::Decimal256(40, 10))
         );
         // either side already Decimal256 -> Decimal256
         assert_eq!(
-            comparison_common_type(&DataType::Decimal256(40, 2), &DataType::Decimal128(10, 2)),
-            Ok(Some(DataType::Decimal256(40, 2)))
+            comparison_common_type(&DataType::Decimal256(40, 2), &DataType::Decimal128(10, 2))
+                .unwrap(),
+            Some(DataType::Decimal256(40, 2))
         );
     }
 
@@ -355,8 +362,14 @@ mod tests {
         let err =
             comparison_common_type(&DataType::Decimal256(76, 0), &DataType::Decimal256(76, 38));
         let err = err.expect_err("expected overflow Err");
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(err.failure_fact().class(), FailureClass::Representation);
+        assert_eq!(
+            err.failure_fact().representation().unwrap().required,
+            Some(114)
+        );
         assert!(
-            err.contains("precision overflow"),
+            err.to_string().contains("precision overflow"),
             "expected precision overflow Err, got {err}"
         );
     }

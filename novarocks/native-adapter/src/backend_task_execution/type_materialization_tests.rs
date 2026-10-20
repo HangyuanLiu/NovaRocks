@@ -37,6 +37,18 @@ use novarocks_types::{
 use novarocks_worker::TestPreparationControl;
 use std::{cell::Cell, sync::Arc, time::Duration};
 
+fn preparation_identity(
+    binding: &QueryMemoryBinding,
+) -> novarocks_execution_contract::TaskIdentity {
+    use novarocks_types::identity::{BackendProcessId, StageId, TaskId};
+    novarocks_execution_contract::TaskIdentity::new(
+        binding.execution(),
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    )
+}
+
 struct Control;
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -227,7 +239,8 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
         }],
         ..Default::default()
     };
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner =
+        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
     let loan = owner.loan();
     let calls = Cell::new(0);
     let mut journal = TypeMaterializationJournal::default();

@@ -28,74 +28,203 @@ use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
 use novarocks_execution_contract::task_execution::identity::QueryContextRef;
 use novarocks_execution_contract::task_execution::operation::{CredentialUpdate, TaskDomainUpdate};
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory,
+    AbortCause, CancelReason, SafeDetail, TaskFailureCategory,
 };
+
+use novarocks_execution_contract::failure::FailureProjection;
 
 use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
 use crate::root_result_channel::RootResultChannel;
 
-/// Borrowed cancellation and bounded wait on the original creation winner.
-/// Pending keeps its synchronous continuation and preparation charges on that
-/// same worker. This capability lends no account, grant, scope or runtime.
-pub struct PreparationControlLoan<'a> {
-    state: &'a crate::task_registry_entry::CreationControlState,
+/// Actual preparation work borrows its accepted owner. Only this work scope
+/// may hand a controller to the installed runtime; immutable metadata receives
+/// the separate weak view and cannot acquire a reporting capability from it.
+#[derive(Clone, Copy)]
+pub struct TaskPreparationContext<'a> {
+    owner: &'a Arc<crate::TaskStatusOwner>,
     cadence: std::time::Duration,
 }
-impl<'a> PreparationControlLoan<'a> {
+impl<'a> TaskPreparationContext<'a> {
     pub(crate) fn new(
-        cell: &'a crate::task_registry_entry::CreationCell,
+        owner: &'a Arc<crate::TaskStatusOwner>,
         cadence: std::time::Duration,
     ) -> Self {
-        Self {
-            state: cell.control_state(),
-            cadence,
-        }
+        Self { owner, cadence }
     }
-    pub(crate) fn from_view(view: &'a crate::TaskPreparationStopView) -> Self {
-        let (state, cadence) = view.control();
-        Self { state, cadence }
+    /// Registers only the original child's exit metadata, before any runtime
+    /// commit. Immutable TaskPreparationView deliberately has no such method.
+    pub fn register_child(
+        &self,
+        child: Arc<dyn crate::TaskPreparationChild>,
+    ) -> Result<(), crate::TaskPreparationChildRegistrationFailure> {
+        self.owner.preparation_scope().register(child)
     }
-    pub fn checkpoint(&self) -> Result<(), crate::PreparationStop> {
-        match self.state.stop() {
-            Some(stop) => Err(stop),
-            None => Ok(()),
-        }
+    pub fn view(&self) -> crate::TaskPreparationView {
+        crate::TaskPreparationView::from_owner(self.owner, self.cadence)
     }
-    /// Return after the explicit worker cadence, a spurious wake, or an original stop.
-    /// The caller requalifies its original request outside the decision lock.
-    pub fn wait(&self) -> Result<(), crate::PreparationStop> {
-        self.state.wait(self.cadence)
+    pub fn runtime_control(
+        &self,
+    ) -> Arc<novarocks_execution::runtime::task_control::TaskExecutionControl> {
+        self.owner
+            .execution_control(novarocks_execution_contract::TaskFailurePhase::Execution)
     }
 }
 
-/// An actual creation cell for direct host contract tests. Production obtains
-/// its loan only from the Worker creation winner, never from this test owner.
+/// One operation's short lease on the exact accepted Task. Immutable metadata
+/// keeps only a weak observer; this loan alone pins the owner while work or a
+/// bounded wait is in progress. It grants no account, capacity or retry right.
+pub struct PreparationControlLoan<'a> {
+    control: Option<novarocks_execution::runtime::task_control::TaskExecutionControl>,
+    cadence: std::time::Duration,
+    _borrow: std::marker::PhantomData<&'a crate::TaskPreparationView>,
+}
+
+#[derive(Debug)]
+struct PreparationOwnerUnavailable;
+impl std::fmt::Display for PreparationOwnerUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("preparation requires a live, unfinished Task owner")
+    }
+}
+impl std::error::Error for PreparationOwnerUnavailable {}
+impl novarocks_execution_contract::failure::FailureProjection for PreparationOwnerUnavailable {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::PreparationOwnerUnavailable.reason(),
+        )
+    }
+}
+impl<'a> PreparationControlLoan<'a> {
+    pub(crate) fn from_view(view: &'a crate::TaskPreparationView) -> Self {
+        let (owner, cadence) = view.control();
+        let control = owner.map(|owner| {
+            novarocks_execution::runtime::task_control::TaskExecutionControl::new(
+                owner.identity(),
+                owner,
+                novarocks_execution_contract::TaskFailurePhase::Preparation,
+            )
+            .expect("preparation borrows its exact Task owner")
+        });
+        Self {
+            control,
+            cadence,
+            _borrow: std::marker::PhantomData,
+        }
+    }
+    pub fn checkpoint(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        let Some(control) = &self.control else {
+            return Err(
+                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                    PreparationOwnerUnavailable,
+                ),
+            );
+        };
+        if control.is_stopped() {
+            // A successful conclusion is not permission to start new work.
+            return Err(control.error().unwrap_or_else(|| {
+                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                    PreparationOwnerUnavailable,
+                )
+            }));
+        }
+        Ok(())
+    }
+    pub fn wait(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.checkpoint()?;
+        let control = self
+            .control
+            .as_ref()
+            .expect("checkpoint qualified the live Task");
+        control.wait_until_stopped(self.cadence);
+        self.checkpoint()
+    }
+}
+
+/// Direct host tests own an actual Task acceptance domain for their declared
+/// identity. The fixture must outlive all operations using its weak views.
 #[cfg(any(test, novarocks_dev_controls))]
 pub struct TestPreparationControl {
-    cell: crate::task_registry_entry::CreationCell,
-    cadence: std::time::Duration,
+    status: Arc<crate::TaskStatusOwner>,
+    view: crate::TaskPreparationView,
 }
 #[cfg(any(test, novarocks_dev_controls))]
 impl TestPreparationControl {
-    pub fn new(cadence: std::time::Duration) -> Self {
+    pub fn new(
+        identity: novarocks_execution_contract::TaskIdentity,
+        cadence: std::time::Duration,
+    ) -> Self {
         assert!(
             !cadence.is_zero(),
             "test preparation cadence must be explicit and nonzero"
         );
+        let status = Arc::new(crate::TaskStatusOwner::new(
+            identity,
+            Arc::new(crate::TaskStatusSource::new()),
+            Arc::new(crate::ManualClock::new()),
+            std::time::Duration::ZERO,
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        ));
+        Self::from_status(status, cadence)
+    }
+    pub fn from_status(status: Arc<crate::TaskStatusOwner>, cadence: std::time::Duration) -> Self {
+        let cell = crate::task_registry_entry::CreationCell::for_accepted_fixture(&status);
+        cell.accept(status.clone());
         Self {
-            cell: crate::task_registry_entry::CreationCell::new(),
-            cadence,
+            status,
+            view: cell.preparation_stop_view(cadence),
         }
     }
+    pub fn status(&self) -> &Arc<crate::TaskStatusOwner> {
+        &self.status
+    }
     pub fn loan(&self) -> PreparationControlLoan<'_> {
-        PreparationControlLoan::new(&self.cell, self.cadence)
+        self.view.borrow_control()
     }
-    pub fn stop_view(&self) -> crate::TaskPreparationStopView {
-        self.cell.preparation_stop_view(self.cadence)
+    pub fn stop_view(&self) -> crate::TaskPreparationView {
+        self.view.clone()
     }
-    pub fn stop(&self, stop: crate::PreparationStop) -> bool {
-        self.cell.request_stop(stop)
+    pub fn scope(&self) -> TaskPreparationContext<'_> {
+        TaskPreparationContext::new(&self.status, self.view.control().1)
+    }
+    /// The direct host call has returned. Drive the original finite rollback
+    /// scope with the actual host cleanup calls, without accepting a new cause.
+    /// The fixture must first publish its real refusal or explicit stop intent.
+    pub fn rollback_host(&self, remove_inbound: impl FnOnce(), remove_receiver: impl FnOnce()) {
+        let scope = self.status.preparation_scope();
+        scope.request_rollback();
+        scope.cleanup(
+            crate::task_preparation::PreparationCleanup::Inbound,
+            remove_inbound,
+        );
+        scope.cleanup(
+            crate::task_preparation::PreparationCleanup::Receiver,
+            remove_receiver,
+        );
+        scope.body_exited();
+    }
+    /// Actual child/holder exit, rather than disappearance of a fixture alias.
+    pub fn rollback_exited(&self) -> bool {
+        self.status.preparation_scope().rollback_exited()
+    }
+    pub fn stop(&self, stop: crate::TestPreparationIntent) -> bool {
+        use novarocks_execution_contract::{
+            TaskConclusion, TaskConclusionPort, TaskConclusionProposal, TerminationDetail,
+        };
+        let (proposal, expected) = match stop {
+            crate::TestPreparationIntent::Cancel(reason) => (
+                TaskConclusionProposal::Canceled(reason),
+                TerminationDetail::Canceled(reason),
+            ),
+            crate::TestPreparationIntent::Abort(cause) => (
+                TaskConclusionProposal::Aborted(cause),
+                TerminationDetail::Aborted(cause),
+            ),
+        };
+        self.status.submit(proposal).accepted.neutral().conclusion()
+            == &TaskConclusion::Terminated(expected)
     }
 }
 
@@ -122,9 +251,8 @@ impl PreparedTaskInstallation {
         if root.is_some()
             && facts.sink_kind() != novarocks_execution_contract::FragmentSinkKind::Result
         {
-            return Err(HostRejection::new(
-                TaskFailureCategory::Protocol,
-                "bounded root channel requires a result sink",
+            return Err(installation_rejection(
+                PreparedInstallationFailure::RootSink,
             ));
         }
         Ok(Self { facts, root })
@@ -133,14 +261,14 @@ impl PreparedTaskInstallation {
         self.facts
     }
     pub fn validate_task(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
-        if self
-            .root
-            .as_ref()
-            .is_some_and(|root| root.spec().task != descriptor.identity())
+        if let Some(root) = self.root.as_ref()
+            && root.spec().task != descriptor.identity()
         {
-            return Err(HostRejection::new(
-                TaskFailureCategory::Protocol,
-                "prepared root channel names a different task",
+            return Err(installation_rejection(
+                PreparedInstallationFailure::RootTask {
+                    expected: descriptor.identity(),
+                    actual: root.spec().task,
+                },
             ));
         }
         Ok(())
@@ -201,62 +329,198 @@ impl<'a> SharedFactsRequest<'a> {
     }
 }
 
-/// A bounded, already-redacted rejection from an execution-side port.
-///
-/// It is a [`TaskFailure`] by construction so that a port rejection reaching a
-/// task's status can never be widened into free-form text or a different
-/// category on the way.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostRejection {
-    failure: TaskFailure,
-    /// This rejection is "the plan node stopped taking input", which a caller
-    /// holding a replay may treat as moot rather than illegal. It is a
-    /// separate flag rather than a category because the category is what
-    /// reaches a task's status, and this distinction must not widen that
-    /// vocabulary.
-    closed_queue: bool,
+#[derive(Debug)]
+enum PreparedInstallationFailure {
+    RootSink,
+    RootTask {
+        expected: novarocks_execution_contract::TaskIdentity,
+        actual: novarocks_execution_contract::TaskIdentity,
+    },
+}
+impl fmt::Display for PreparedInstallationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootSink => f.write_str("bounded root channel requires a result sink"),
+            Self::RootTask { expected, actual } => write!(
+                f,
+                "prepared root channel names a different task: expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+impl std::error::Error for PreparedInstallationFailure {}
+impl novarocks_execution_contract::failure::FailureProjection for PreparedInstallationFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            match self {
+                Self::RootSink => R::PreparedRootSink,
+                Self::RootTask { .. } => R::PreparedRootTask,
+            }
+            .reason(),
+        )
+    }
+}
+fn installation_rejection(source: PreparedInstallationFailure) -> HostRejection {
+    // This local formatter contains only static policy text and exact IDs.
+    let detail = SafeDetail::truncating_display(&source);
+    HostRejection::from_domain_with_detail(TaskFailureCategory::Protocol, source, detail)
 }
 
+#[cfg(novarocks_dev_controls)]
+#[derive(Debug)]
+pub(crate) enum TestUpdateConsumptionFailure {
+    UnsupportedHost,
+    LiveTaskRequired(novarocks_execution_contract::TaskIdentity),
+}
+#[cfg(novarocks_dev_controls)]
+impl fmt::Display for TestUpdateConsumptionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedHost => f.write_str(
+                "this execution host does not support a controlled split-consumption gate",
+            ),
+            Self::LiveTaskRequired(identity) => {
+                write!(f, "replay gate requires actual live Task {identity}")
+            }
+        }
+    }
+}
+#[cfg(novarocks_dev_controls)]
+impl std::error::Error for TestUpdateConsumptionFailure {}
+#[cfg(novarocks_dev_controls)]
+impl novarocks_execution_contract::failure::FailureProjection for TestUpdateConsumptionFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            match self {
+                Self::UnsupportedHost => R::TestUpdateConsumptionUnsupportedHost.reason(),
+                Self::LiveTaskRequired(_) => R::TestUpdateConsumptionLiveTaskRequired.reason(),
+            },
+        )
+    }
+}
+
+/// A port refusal retaining its actual local domain source. The legacy
+/// category/detail are this operation's response projection, never a Task
+/// conclusion and never an authority that can reclassify the domain facts.
+/// Only TaskStatusOwner accepts a Task failure, with explicit scope/phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostRejection {
+    response_category: TaskFailureCategory,
+    detail: SafeDetail,
+    fact: novarocks_execution_contract::failure::FailureFact,
+    source: novarocks_execution::runtime::fragment::ExecutionFailure,
+    closed_queue: bool,
+}
 impl HostRejection {
-    pub fn new(category: TaskFailureCategory, detail: impl AsRef<str>) -> Self {
+    pub fn from_domain<E>(category: TaskFailureCategory, source: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_execution_contract::failure::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::from_failure(
+            category,
+            novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(source),
+        )
+    }
+    pub fn from_failure(
+        category: TaskFailureCategory,
+        source: novarocks_execution::runtime::fragment::ExecutionFailure,
+    ) -> Self {
+        let fact = source.failure_fact();
+        let detail = source.safe_detail_for_fact(fact);
         Self {
-            failure: TaskFailure::new(category, SafeDetail::truncating(detail.as_ref())),
+            response_category: category,
+            detail,
+            fact,
+            source,
             closed_queue: false,
         }
     }
-
-    /// The same rejection, marked as caused by a closed plan-node queue.
-    pub fn from_closed_queue(category: TaskFailureCategory, detail: impl AsRef<str>) -> Self {
+    /// The boundary supplies context made only from known-safe typed facts.
+    /// The source's class/reason and local error chain remain unchanged.
+    pub fn from_domain_with_detail<E>(
+        category: TaskFailureCategory,
+        source: E,
+        detail: SafeDetail,
+    ) -> Self
+    where
+        E: std::error::Error
+            + novarocks_execution_contract::failure::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let source = novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(source);
+        let fact = source.failure_fact();
         Self {
-            closed_queue: true,
-            ..Self::new(category, detail)
+            response_category: category,
+            detail,
+            fact,
+            source,
+            closed_queue: false,
         }
     }
-
+    pub fn from_closed_queue<E>(category: TaskFailureCategory, source: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_execution_contract::failure::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            closed_queue: true,
+            ..Self::from_domain(category, source)
+        }
+    }
     pub const fn is_closed_queue(&self) -> bool {
         self.closed_queue
     }
-
-    pub const fn failure(&self) -> &TaskFailure {
-        &self.failure
-    }
-
     pub const fn category(&self) -> TaskFailureCategory {
-        self.failure.category()
+        self.response_category
     }
-
     pub const fn detail(&self) -> &SafeDetail {
-        self.failure.detail()
+        &self.detail
+    }
+    /// Freeze this port's neutral facts before source transfer or foreign cleanup.
+    pub fn operation_failure(
+        &self,
+    ) -> novarocks_execution_contract::operation::OperationDomainFailure {
+        novarocks_execution_contract::operation::OperationDomainFailure::new(
+            self.fact,
+            self.detail.clone(),
+        )
+    }
+    /// Transfer the original execution carrier without rebuilding it from the
+    /// response projection or retaining it in a neutral tombstone.
+    pub fn into_failure(self) -> novarocks_execution::runtime::fragment::ExecutionFailure {
+        self.source
     }
 }
-
 impl fmt::Display for HostRejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.failure.fmt(formatter)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.response_category, self.detail)
     }
 }
-
-impl std::error::Error for HostRejection {}
+impl std::error::Error for HostRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for HostRejection {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        self.fact
+    }
+}
 
 /// The opaque terminal evidence one query-context release sealed.
 ///
@@ -445,7 +709,7 @@ pub trait TaskExecutionHost: Send + Sync {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
-        preparation_stop: crate::TaskPreparationStopView,
+        preparation: TaskPreparationContext<'_>,
     ) -> Result<PreparedTaskInstallation, HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);
@@ -481,9 +745,9 @@ pub trait TaskExecutionHost: Send + Sync {
         _request: &novarocks_execution_contract::UpdateTask,
         _control: novarocks_failpoint::scope::ControlCancellation,
     ) -> Result<Box<dyn TestTaskUpdateConsumptionReservation>, HostRejection> {
-        Err(HostRejection::new(
+        Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
-            "this execution host does not support a controlled split-consumption gate",
+            TestUpdateConsumptionFailure::UnsupportedHost,
         ))
     }
 
@@ -508,14 +772,46 @@ pub trait TaskExecutionHost: Send + Sync {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct ClosedQueueFixture(String);
+    impl fmt::Display for ClosedQueueFixture {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+    impl std::error::Error for ClosedQueueFixture {}
+    impl novarocks_execution_contract::failure::FailureProjection for ClosedQueueFixture {
+        fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+            use novarocks_execution_contract::failure::*;
+            FailureFact::stop_observation(FailureReason::new(
+                domain::WORKER,
+                std::num::NonZeroU16::new(65000).unwrap(),
+            ))
+        }
+    }
+
     #[test]
     fn a_port_rejection_stays_bounded_and_preserves_the_closed_queue_fact() {
-        let rejection =
-            HostRejection::from_closed_queue(TaskFailureCategory::Protocol, "x".repeat(8 * 1024));
+        let rejection = HostRejection::from_closed_queue(
+            TaskFailureCategory::Protocol,
+            ClosedQueueFixture("x".repeat(8 * 1024)),
+        );
 
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(rejection.is_closed_queue());
         assert!(rejection.detail().as_str().len() < 8 * 1024);
+    }
+
+    fn preparation_identity() -> novarocks_execution_contract::TaskIdentity {
+        use novarocks_types::identity::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        novarocks_execution_contract::TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(812, 1), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        )
     }
 
     #[test]
@@ -523,9 +819,11 @@ mod tests {
         for before in [false, true] {
             for _ in 0..64 {
                 let owner = std::sync::Arc::new(TestPreparationControl::new(
+                    preparation_identity(),
                     std::time::Duration::from_secs(30),
                 ));
-                let stop = crate::PreparationStop::Cancel(CancelReason::UpstreamNoLongerNeeded);
+                let stop =
+                    crate::TestPreparationIntent::Cancel(CancelReason::UpstreamNoLongerNeeded);
                 if before {
                     assert!(owner.stop(stop));
                 }
@@ -537,14 +835,26 @@ mod tests {
                 if !before {
                     assert!(owner.stop(stop));
                 }
-                assert!(matches!(
-                    receive
-                        .recv_timeout(std::time::Duration::from_secs(1))
-                        .unwrap(),
-                    Err(crate::PreparationStop::Cancel(
+                let observed = receive
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap_err();
+                use novarocks_execution_contract::{
+                    TaskConclusion, TaskConclusionPort, TerminationDetail,
+                };
+                assert_eq!(
+                    owner.status().accepted().unwrap().neutral().conclusion(),
+                    &TaskConclusion::Terminated(TerminationDetail::Canceled(
                         CancelReason::UpstreamNoLongerNeeded
                     ))
-                ));
+                );
+                assert_eq!(
+                    novarocks_execution_contract::failure::FailureProjection::failure_fact(
+                        &observed
+                    )
+                    .evidence(),
+                    novarocks_execution_contract::failure::FailureEvidence::StopObservation
+                );
                 worker.join().unwrap();
                 assert!(owner.loan().checkpoint().is_err());
             }
@@ -553,8 +863,219 @@ mod tests {
 
     #[test]
     fn preparation_control_explicit_cadence_returns_retry_without_creating_stop() {
-        let owner = TestPreparationControl::new(std::time::Duration::from_millis(1));
+        let owner = TestPreparationControl::new(
+            preparation_identity(),
+            std::time::Duration::from_millis(1),
+        );
         assert!(owner.loan().wait().is_ok());
         assert!(owner.loan().checkpoint().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod operation_failure_snapshot_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Debug)]
+    struct ActualDomain {
+        fact: FailureFact,
+        drops: Arc<AtomicUsize>,
+    }
+    impl std::fmt::Display for ActualDomain {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("private provider material")
+        }
+    }
+    impl std::error::Error for ActualDomain {}
+    impl FailureProjection for ActualDomain {
+        fn failure_fact(&self) -> FailureFact {
+            self.fact
+        }
+    }
+    impl Drop for ActualDomain {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    #[derive(Debug)]
+    struct CountedProjectionDomain {
+        first: FailureFact,
+        later: FailureFact,
+        projections: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl std::fmt::Display for CountedProjectionDomain {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("private counted provider material")
+        }
+    }
+    impl std::error::Error for CountedProjectionDomain {}
+    impl FailureProjection for CountedProjectionDomain {
+        fn failure_fact(&self) -> FailureFact {
+            if self.projections.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.first
+            } else {
+                // Deliberately reveal a forbidden second call instead of
+                // allowing a stable mock to hide re-projection in replay.
+                self.later
+            }
+        }
+    }
+    impl Drop for CountedProjectionDomain {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    #[test]
+    fn frozen_operation_snapshot_and_cached_replay_never_reproject_the_original_source() {
+        use novarocks_execution::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use novarocks_execution_contract::operation::{DomainFailureOutcome, OperationResult};
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let first = FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(nz(65534), nz(65001)),
+        )
+        .with_row_position(FailureRowPosition {
+            selected_ordinal: 0,
+            batch_row: 19,
+        });
+        let later = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(nz(65534), nz(65002)),
+        );
+        for explicit_detail in [false, true] {
+            let projections = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let cause = CountedProjectionDomain {
+                first,
+                later,
+                projections: Arc::clone(&projections),
+                drops: Arc::clone(&drops),
+            };
+            let rejection = if explicit_detail {
+                HostRejection::from_domain_with_detail(
+                    TaskFailureCategory::Protocol,
+                    cause,
+                    SafeDetail::new("producer checked context").unwrap(),
+                )
+            } else {
+                HostRejection::from_failure(
+                    TaskFailureCategory::Protocol,
+                    ExecutionFailure::from_domain(cause).at_operator(7, PipelineOperation::Push),
+                )
+            };
+            assert_eq!(
+                projections.load(Ordering::Acquire),
+                1,
+                "both actual constructors freeze exactly one fact"
+            );
+            let expected_detail = if explicit_detail {
+                "producer checked context"
+            } else {
+                "Representation failure (reason 65534:65001) at operator 7 during Push at batch row 19 (selected ordinal 0)"
+            };
+            assert_eq!(rejection.detail().as_str(), expected_detail);
+            let original = rejection.source.clone();
+            let alias = rejection.clone();
+            let snapshot = rejection.operation_failure();
+            assert_eq!(snapshot.fact(), first);
+            assert_eq!(snapshot.detail().as_str(), expected_detail);
+            assert_eq!(alias.operation_failure(), snapshot);
+            assert_eq!(rejection.operation_failure(), snapshot);
+            assert_eq!(rejection.failure_fact(), first);
+            let cached = crate::task_registry_entry::CreationFailure::domain(
+                DomainFailureOutcome::InvalidStateOrRequest,
+                snapshot.clone(),
+            );
+            for _ in 0..3 {
+                let receipt: crate::OperationReceipt<()> =
+                    cached.receipt(novarocks_execution_contract::TaskOperationId::new_v7());
+                let OperationResult::DomainFailure { failure, .. } = receipt.result() else {
+                    panic!("the actual cached domain branch must survive replay");
+                };
+                assert_eq!(failure, &snapshot);
+                assert!(receipt.acknowledgement().is_none());
+            }
+            assert_eq!(
+                projections.load(Ordering::Acquire),
+                1,
+                "all snapshots and cached replay use the already frozen fact"
+            );
+            drop(alias);
+            let carried = rejection.into_failure();
+            assert!(std::ptr::eq(carried.cause(), original.cause()));
+            drop(carried);
+            drop(original);
+            assert_eq!(
+                drops.load(Ordering::Acquire),
+                1,
+                "the actual domain source exits once"
+            );
+            assert_eq!(projections.load(Ordering::Acquire), 1);
+            assert_eq!(snapshot.fact(), first);
+        }
+    }
+
+    #[test]
+    fn frozen_port_failure_keeps_original_facts_without_retaining_domain_state() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let fact = FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(nz(65534), nz(65535)),
+        )
+        .with_row_position(FailureRowPosition {
+            selected_ordinal: 0,
+            batch_row: 19,
+        })
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: Some(ResourceScope::Task),
+            dimension: ResourceDimension::Bytes,
+            requested: Some(0),
+            required_growth: None,
+            limit: Some(u64::MAX),
+            live: None,
+            committed: Some(0),
+        })
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: nz(65535),
+                code: nz(1),
+            },
+            required: Some(0),
+            extent_limit: None,
+            representable_prefix: Some(0),
+        });
+        let source =
+            novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(ActualDomain {
+                fact,
+                drops: drops.clone(),
+            });
+        let original = source.clone();
+        let rejection = HostRejection::from_failure(TaskFailureCategory::Protocol, source);
+        let frozen = rejection.operation_failure();
+        assert_eq!(frozen.fact(), fact);
+        assert!(
+            !frozen
+                .detail()
+                .as_str()
+                .contains("private provider material")
+        );
+        let carried = rejection.into_failure();
+        assert!(std::ptr::eq(carried.cause(), original.cause()));
+        drop(carried);
+        drop(original);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            frozen.fact(),
+            fact,
+            "neutral operation failure owns no source or Task control"
+        );
     }
 }

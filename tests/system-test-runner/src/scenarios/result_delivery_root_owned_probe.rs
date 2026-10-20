@@ -151,18 +151,21 @@ pub(crate) fn probe_owned(
     let cleanup = runtime.block_on(settle_original_driver(&mut original_driver));
     let (frame, status) = assemble_probe_outcome(outcome, cleanup, deadline)?;
     ensure!(
-        status != ProbeStatus::UnknownRoot,
-        "independently selected original root returned UnknownRoot"
+        status == ProbeStatus::Success,
+        "original root transport did not succeed"
     );
     let message = single_message(&frame)?;
     let wire =
-        proto::FetchRootResultResponse::decode(message).context("decode root reply protobuf")?;
-    let reply = decode_reply(
+        proto::FetchRootResultResponse::decode(message).context("decode root response protobuf")?;
+    let response = decode_response(
         wire,
         &expected,
         maximum_delivered_consumed,
         FieldPath::root("root_probe_reply"),
     )?;
+    let RootReadResponse::Reply(reply) = response else {
+        anyhow::bail!("independently selected original root supplied no ACK receipt: {response:?}");
+    };
     let (outcome, sequence, body_bytes, body_sha256) = match &reply.outcome {
         RootReadOutcome::Data(data) => (
             "data",

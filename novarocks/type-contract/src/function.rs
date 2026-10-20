@@ -911,12 +911,12 @@ mod tests {
                 let result = value.exactly_equals_observed::<Failure>(&value, || {
                     observed += 1;
                     if observed == stop {
-                        Err(Failure::Control(failure))
+                        Err(Failure::Control(failure.clone()))
                     } else {
                         Ok(())
                     }
                 });
-                assert_eq!(result, Err(Failure::Control(failure)));
+                assert_eq!(result, Err(Failure::Control(failure.clone())));
                 assert_eq!(observed, stop);
             }
         }

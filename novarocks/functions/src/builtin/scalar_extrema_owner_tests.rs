@@ -239,7 +239,8 @@ fn extrema_owner_null_result_refusal_preserves_the_original_full_cast_error() {
                     rows,
                     Some(&DataType::Null)
                 )
-                .unwrap_err(),
+                .unwrap_err()
+                .to_string(),
                 expected
             );
         }

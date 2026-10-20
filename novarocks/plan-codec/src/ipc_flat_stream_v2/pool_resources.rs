@@ -73,7 +73,17 @@ impl fmt::Display for FlatPoolResourceError {
         }
     }
 }
-impl std::error::Error for FlatPoolResourceError {}
+impl std::error::Error for FlatPoolResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Shape(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Control(source) => Some(source),
+            Self::ConstructionResource(source) => Some(source),
+            Self::SourceMetadata(source) => Some(source),
+        }
+    }
+}
 
 impl From<novarocks_type_contract::ValueTypeError> for FlatPoolResourceError {
     fn from(error: novarocks_type_contract::ValueTypeError) -> Self {

@@ -4011,7 +4011,7 @@ crate::constant::test_constant_policy(),
                 units: u32,
             ) -> Result<(), novarocks_type_contract::CompileControlError> {
                 assert_eq!(units, 0);
-                Err(self.0)
+                Err(self.0.clone())
             }
         }
         use novarocks_type_contract::CompileControlError as Error;
@@ -4020,7 +4020,7 @@ crate::constant::test_constant_policy(),
             Error::DeadlineExceeded,
             Error::ResourceExhausted,
         ] {
-            let control = Stop(error);
+            let control = Stop(error.clone());
             let failure = run_imv_rewrite(ImvRewriteInput {
                 plan: empty_values_plan(),
                 snapshot: empty_mv_ctx(),

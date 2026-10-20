@@ -423,7 +423,7 @@ impl PreparedIcebergWrite {
                     .with_attempt_reservation(attempt_reservation),
             )
             .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
-            .map_err(crate::dml::error::DmlExecutionError::from)?;
+            .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
         Ok(outcome.into_execution_result())
     }
 

@@ -256,8 +256,18 @@ fn bigint(array: &ArrayRef) -> Option<i64> {
     (!array.is_null(0)).then(|| array.value(0))
 }
 
-fn is_operational(result: Result<ArrayRef, KernelFailure>) -> bool {
-    matches!(result, Err(KernelFailure::Operational(_)))
+fn is_numeric_data(result: Result<ArrayRef, KernelFailure>) -> bool {
+    use novarocks_failure_contract::FailureProjection;
+    match result {
+        Err(error) => {
+            assert_eq!(
+                error.failure_fact(),
+                DataFailureReason::NumericOutOfRange.failure_fact()
+            );
+            true
+        }
+        Ok(_) => false,
+    }
 }
 
 /// Single-phase SUM of `values`, fed as one batch per `split` boundary.
@@ -449,7 +459,7 @@ fn bigint_sum_is_exact_in_every_order_batch_split_and_phase_split() {
 }
 
 #[test]
-fn bigint_sum_overflow_is_an_operational_error_of_the_final_value_only() {
+fn bigint_sum_overflow_is_numeric_data_of_the_final_value_only() {
     let fixture = Fixture::new(
         FunctionValueType::new(DataType::Int64, true),
         DecimalOverflowPolicy::ReportError,
@@ -463,8 +473,8 @@ fn bigint_sum_overflow_is_an_operational_error_of_the_final_value_only() {
         // Every update succeeds; only building the BIGINT result fails.
         let mut group = Group::new(fixture.handle(AggregateKernelPhase::Single));
         group.update(&batch).unwrap();
-        assert!(is_operational(group.emit()), "{values:?}");
-        assert!(is_operational(two_phase(&fixture, &batch, &int64s(&[]))));
+        assert!(is_numeric_data(group.emit()), "{values:?}");
+        assert!(is_numeric_data(two_phase(&fixture, &batch, &int64s(&[]))));
     }
     // The partial state carries the exact out-of-range sum.
     let mut partial = Group::new(fixture.handle(AggregateKernelPhase::Partial));
@@ -531,7 +541,7 @@ fn decimal_sum_checks_38_digits_and_follows_the_frozen_overflow_policy() {
         ] {
             match policy {
                 DecimalOverflowPolicy::ReportError => {
-                    assert!(is_operational(result(&[decimal38(&values)])), "{values:?}")
+                    assert!(is_numeric_data(result(&[decimal38(&values)])), "{values:?}")
                 }
                 DecimalOverflowPolicy::OutputNull => {
                     assert_eq!(value(result(&[decimal38(&values)]).unwrap()), None)
@@ -573,7 +583,10 @@ fn largeint_sum_is_exact_and_reports_overflow_when_the_result_is_built() {
         i128::MAX
     );
     // LARGEINT has no NULL-on-overflow policy: the overflow is an error.
-    assert!(is_operational(single(&fixture, &[values(&[i128::MAX, 1])])));
+    assert!(is_numeric_data(single(
+        &fixture,
+        &[values(&[i128::MAX, 1])]
+    )));
     let mut partial = Group::new(fixture.handle(AggregateKernelPhase::Partial));
     partial.update(&values(&[i128::MAX, i128::MAX])).unwrap();
     let state = partial.emit().unwrap();

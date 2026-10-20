@@ -136,36 +136,25 @@ pub enum NativeAttemptTopologyRequirement {
 /// retains the query error for the caller-visible terminal result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeAttemptPreparationFailure {
-    topology_requirement: NativeAttemptTopologyRequirement,
-    class: AttemptFailureClass,
     error: QueryExecutionError,
 }
-
 impl NativeAttemptPreparationFailure {
-    pub const fn new(class: AttemptFailureClass, error: QueryExecutionError) -> Self {
+    pub fn from_input(input: crate::execution_error::ExecutionFailureInput) -> Self {
         Self {
-            class,
-            error,
-            topology_requirement: NativeAttemptTopologyRequirement::LiveSnapshot,
+            error: QueryExecutionError::from_execution(input),
         }
     }
-
-    pub const fn with_topology_requirement(
-        mut self,
-        requirement: NativeAttemptTopologyRequirement,
-    ) -> Self {
-        self.topology_requirement = requirement;
-        self
+    pub fn input(&self) -> &crate::execution_error::ExecutionFailureInput {
+        self.error
+            .execution_failure()
+            .expect("typed constructor retains its original failure input")
     }
-
-    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.topology_requirement
+    pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.input().topology_requirement()
     }
-
-    pub const fn class(&self) -> AttemptFailureClass {
-        self.class
+    pub fn class(&self) -> AttemptFailureClass {
+        self.input().attempt_class()
     }
-
     pub const fn error(&self) -> &QueryExecutionError {
         &self.error
     }
@@ -391,11 +380,59 @@ impl NativeAttemptConvergence {
 }
 
 /// Borrowed convergence future for an active Native owner. Resolution carries
-/// positive closure evidence for every scheduled context. Dropping the future
-/// or catching a poll panic retains the exact owner for a later idempotent
-/// retry.
-pub type NativeActiveAttemptConvergenceFuture<'a> =
-    Pin<Box<dyn Future<Output = NativeAttemptConvergence> + Send + 'a>>;
+/// local closure plus remote evidence or finite tracking termination. No caller
+/// may time out/drop this whole future and infer local exit. An unprovable exit
+/// returns a typed health failure while the original owner remains supervised.
+/// The original remote-observation budget is frozen at the Native terminal
+/// cut, before cleanup/handoff may yield. It never times out local holders.
+/// Reentry may only keep or shorten that deadline (for real role shutdown),
+/// never refresh it. Started operations and closure receipts remain in this
+/// same owner when its borrowed future is dropped and reentered.
+#[derive(Clone)]
+pub struct NativeActiveConvergenceRequest {
+    cancellation: CancellationView,
+    absolute_remote_deadline: std::time::Instant,
+}
+impl NativeActiveConvergenceRequest {
+    pub fn new(
+        cancellation: CancellationView,
+        absolute_remote_deadline: std::time::Instant,
+    ) -> Self {
+        Self {
+            cancellation,
+            absolute_remote_deadline,
+        }
+    }
+    pub fn cancellation(&self) -> &CancellationView {
+        &self.cancellation
+    }
+    pub const fn remote_observation_deadline(&self) -> std::time::Instant {
+        self.absolute_remote_deadline
+    }
+}
+
+/// Both variants require original FE-local holders to have actually exited or
+/// returned caller capabilities to their same pre-existing process records.
+/// Unknown is only the end of remote tracking, never WorkerStopped/RF evidence.
+#[derive(Clone, Debug)]
+pub enum NativeActiveConvergenceClosure {
+    Evidence(NativeAttemptConvergence),
+    RemoteTrackingEnded {
+        exact_contexts: Box<[QueryContextRef]>,
+    },
+}
+
+pub type NativeActiveAttemptConvergenceFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    NativeActiveConvergenceClosure,
+                    super::StatementNativeHealthFailure,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
 
 /// Move-only role owner for a prepared attempt that has not started any Task.
 ///
@@ -438,8 +475,11 @@ pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
 
 /// Opaque role owner for an attempt whose Native work may now be live.
 ///
-/// Query Application retains the owner while the borrowed run future is
-/// polled. A terminal outcome or panic is followed by consuming `converge`.
+/// Query Application retains the same owner while borrowed run/converge
+/// futures are polled. Its original runtime registration retains custody until
+/// actual local closure plus exact remote evidence/tracking termination. A
+/// typed unprovable exit or converge panic keeps that same Box and obligation
+/// under process supervision until explicit process exit.
 pub trait ActiveNativeAttemptOwner: fmt::Debug + Send + 'static {
     fn run<'a>(
         &'a mut self,
@@ -449,7 +489,7 @@ pub trait ActiveNativeAttemptOwner: fmt::Debug + Send + 'static {
 
     fn converge<'a>(
         &'a mut self,
-        cancellation: CancellationView,
+        request: NativeActiveConvergenceRequest,
     ) -> NativeActiveAttemptConvergenceFuture<'a>;
 }
 
@@ -554,6 +594,7 @@ pub enum NativeExecutionContractError {
     DifferentLogicalQuery,
     EmptyEligibleBackends,
     DuplicateEligibleBackend,
+    ExcludedBackendProcess,
     MissingScanWorkFact,
     DuplicateScanWorkFact,
     ForeignScanWorkFact,
@@ -562,9 +603,9 @@ pub enum NativeExecutionContractError {
     AttemptPreparationRetired,
 }
 
-impl fmt::Display for NativeExecutionContractError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
+impl NativeExecutionContractError {
+    fn safe_message(&self) -> &'static str {
+        match self {
             Self::ForeignLogicalSeedPlan => {
                 "Native logical execution seed belongs to another sealed preparation plan"
             }
@@ -584,6 +625,9 @@ impl fmt::Display for NativeExecutionContractError {
             Self::DuplicateEligibleBackend => {
                 "Native attempt repeats an eligible backend process identity"
             }
+            Self::ExcludedBackendProcess => {
+                "Native attempt includes the backend process excluded by its prepare request"
+            }
             Self::MissingScanWorkFact => {
                 "Native attempt scan work does not cover every sealed scan"
             }
@@ -595,8 +639,46 @@ impl fmt::Display for NativeExecutionContractError {
             Self::UnexpectedReplacementPort => {
                 "non-recoverable logical execution must not install a replacement qualification port"
             }
+        }
+    }
+
+    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        novarocks_execution_contract::SafeDetail::truncating(self.safe_message())
+    }
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for NativeExecutionContractError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
         };
-        formatter.write_str(message)
+        let code = match self {
+            Self::ForeignLogicalSeedPlan => 110,
+            Self::ForeignLogicalOpenTicket => 111,
+            Self::ForeignAttemptTicket => 112,
+            Self::DifferentLogicalQuery => 113,
+            Self::EmptyEligibleBackends => 114,
+            Self::DuplicateEligibleBackend => 115,
+            Self::ExcludedBackendProcess => 116,
+            Self::MissingScanWorkFact => 117,
+            Self::DuplicateScanWorkFact => 118,
+            Self::ForeignScanWorkFact => 119,
+            Self::MissingReplacementPort => 120,
+            Self::UnexpectedReplacementPort => 121,
+            Self::AttemptPreparationRetired => 122,
+        };
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        if matches!(self, Self::AttemptPreparationRetired) {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(FailureClass::Invariant, reason)
+        }
+    }
+}
+
+impl fmt::Display for NativeExecutionContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.safe_message())
     }
 }
 
@@ -891,6 +973,12 @@ impl NativeAttemptPreparationRequest {
             &eligible_backends,
             &scheduling,
         )?;
+        if let NativeAttemptTopologyRequirement::ExcludeProcess(excluded) =
+            self.topology_requirement
+            && eligible_backends.contains(&excluded)
+        {
+            return Err(NativeExecutionContractError::ExcludedBackendProcess);
+        }
         Ok(PreparedNativeAttempt {
             logical_ticket: self.logical_ticket,
             attempt_ticket: self.attempt_ticket,
@@ -1029,10 +1117,12 @@ mod tests {
         ExecutionEffect, PermanentlyBackpressuredAbortEffectPort,
         ReplacementQualificationEffectAdmission, ReplacementQualificationRequest,
     };
+    use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
     use crate::preparation::{
         ExecutionResourceRequirements, FrozenCostEstimate, FrozenEstimateUnknownReason,
         OutputContract,
     };
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
     use novarocks_types::identity::{AttemptId, BackendProcessId, QueryId};
     use novarocks_workload_control::{
         ResourceConfig, RootWork, WorkClass, WorkRequest, WorkScope, WorkloadConfig,
@@ -1070,9 +1160,13 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _cancellation: CancellationView,
+            _request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced() })
+            Box::pin(async {
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
+            })
         }
     }
 
@@ -1508,9 +1602,17 @@ mod tests {
         );
         assert_eq!(open.error().message(), "open timed out");
 
-        let attempt = NativeAttemptPreparationFailure::new(
-            AttemptFailureClass::RecoverableInfrastructure,
-            QueryExecutionError::new(QueryExecutionErrorKind::Failed, "worker disappeared"),
+        let backend = prepared_inputs()[0];
+        let input = ExecutionFailureInput::new(
+            QueryFailureReason::BackendLost.failure_fact(),
+            SafeDetail::truncating("worker disappeared"),
+            ExecutionFailureSite::Backend { process: backend },
+        );
+        let attempt = NativeAttemptPreparationFailure::from_input(input.clone());
+        assert_eq!(attempt.input(), &input);
+        assert_eq!(
+            attempt.topology_requirement(),
+            NativeAttemptTopologyRequirement::ExcludeProcess(backend),
         );
         assert_eq!(
             attempt.class(),
@@ -1518,6 +1620,40 @@ mod tests {
         );
         assert_eq!(attempt.error().kind(), QueryExecutionErrorKind::Failed);
         assert_eq!(attempt.error().message(), "worker disappeared");
+    }
+
+    #[test]
+    fn native_contract_facts_are_authored_by_the_closed_binding_domain() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureEvidence, domain};
+        for (error, code) in [
+            (NativeExecutionContractError::ForeignLogicalSeedPlan, 110),
+            (NativeExecutionContractError::ForeignLogicalOpenTicket, 111),
+            (NativeExecutionContractError::ForeignAttemptTicket, 112),
+            (NativeExecutionContractError::DifferentLogicalQuery, 113),
+            (NativeExecutionContractError::EmptyEligibleBackends, 114),
+            (NativeExecutionContractError::DuplicateEligibleBackend, 115),
+            (NativeExecutionContractError::ExcludedBackendProcess, 116),
+            (NativeExecutionContractError::MissingScanWorkFact, 117),
+            (NativeExecutionContractError::DuplicateScanWorkFact, 118),
+            (NativeExecutionContractError::ForeignScanWorkFact, 119),
+            (NativeExecutionContractError::MissingReplacementPort, 120),
+            (NativeExecutionContractError::UnexpectedReplacementPort, 121),
+            (NativeExecutionContractError::AttemptPreparationRetired, 122),
+        ] {
+            let fact = error.failure_fact();
+            assert_eq!(fact.reason().domain(), domain::QUERY.get());
+            assert_eq!(fact.reason().code(), code);
+            assert_eq!(fact.resource(), None);
+            assert_eq!(fact.representation(), None);
+            if error == NativeExecutionContractError::AttemptPreparationRetired {
+                assert_eq!(fact.class(), FailureClass::Control);
+                assert_eq!(fact.evidence(), FailureEvidence::StopObservation);
+            } else {
+                assert_eq!(fact.class(), FailureClass::Invariant);
+                assert_eq!(fact.evidence(), FailureEvidence::Originating);
+            }
+            assert_eq!(error.safe_detail().as_str(), error.to_string());
+        }
     }
 
     #[test]
@@ -1541,6 +1677,109 @@ mod tests {
             ),
             Err(NativeExecutionContractError::DuplicateEligibleBackend)
         ));
+    }
+
+    #[test]
+    fn prepare_binding_rejects_excluded_process_and_retains_the_original_funded_owner() {
+        use novarocks_workload_control::{AllocationCharge, LocalResourceAuthority, ResourceClass};
+
+        struct FundedDormant {
+            backend: BackendProcessId,
+            _data: Arc<Vec<u8>>,
+            _charge: AllocationCharge,
+        }
+        impl fmt::Debug for FundedDormant {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("FundedDormant")
+                    .field("backend", &self.backend)
+                    .finish_non_exhaustive()
+            }
+        }
+        impl DormantNativeAttemptOwner for FundedDormant {
+            fn eligible_backends(&self) -> &[BackendProcessId] {
+                std::slice::from_ref(&self.backend)
+            }
+            fn activate<'a>(
+                &'a mut self,
+                _schedule: &'a AttemptSchedule,
+                _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+                _cancellation: CancellationView,
+            ) -> NativeAttemptActivationFuture<'a> {
+                Box::pin(async { panic!("binding-only fixture must not activate") })
+            }
+            fn converge<'a>(
+                &'a mut self,
+                _cancellation: CancellationView,
+            ) -> NativeAttemptConvergenceFuture<'a> {
+                Box::pin(async {})
+            }
+        }
+        fn funded(
+            backend: BackendProcessId,
+            resources: &LocalResourceAuthority,
+            scope: &WorkScope,
+        ) -> (FundedDormant, std::sync::Weak<Vec<u8>>) {
+            let mut reservation = resources.reserve(scope, 64, ResourceClass::Data).unwrap();
+            let charge = reservation.charge(64).unwrap();
+            let data = Arc::new(vec![0x5a; 64]);
+            let weak = Arc::downgrade(&data);
+            (
+                FundedDormant {
+                    backend,
+                    _data: data,
+                    _charge: charge,
+                },
+                weak,
+            )
+        }
+
+        // Both original fixture identities exist before any refusal or failure.
+        let excluded = prepared_inputs()[0];
+        let alternate = BackendProcessId::try_from_bytes(process_bytes(3)).unwrap();
+        let exact = execution(1, 1);
+        let (governance, open, acceptance) = issue(exact, RecoveryMode::NoRecovery);
+        let scope = governance.scope();
+        let resources = governance._control.resources().unwrap();
+        let session = acceptance.accept(bind_no_recovery(open).unwrap()).unwrap();
+        let (request, _) = session.issue_attempt(exact).unwrap();
+        let (bad_owner, bad_data) = funded(excluded, &resources, &scope);
+        assert_eq!(resources.snapshot().data_used_bytes, 64);
+        let error = match request
+            .require_topology(NativeAttemptTopologyRequirement::ExcludeProcess(excluded))
+            .bind(scheduling_over(&[]), bad_owner)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the exact excluded process must be refused"),
+        };
+        assert_eq!(error, NativeExecutionContractError::ExcludedBackendProcess);
+        assert_eq!(error.failure_fact().reason().code(), 116);
+        assert_eq!(
+            error.failure_fact().class(),
+            novarocks_execution_contract::failure::FailureClass::Invariant
+        );
+        assert_eq!(error.failure_fact().resource(), None);
+        assert_eq!(
+            error.safe_detail().as_str(),
+            "Native attempt includes the backend process excluded by its prepare request"
+        );
+        assert!(bad_data.upgrade().is_none());
+        assert_eq!(resources.snapshot().data_used_bytes, 0);
+
+        let (request, accepted) = session.issue_attempt(exact).unwrap();
+        let (owner, data) = funded(alternate, &resources, &scope);
+        let prepared = request
+            .require_topology(NativeAttemptTopologyRequirement::ExcludeProcess(excluded))
+            .bind(scheduling_over(&[]), owner)
+            .unwrap();
+        assert_eq!(resources.snapshot().data_used_bytes, 64);
+        assert_eq!(data.upgrade().unwrap().as_slice(), &[0x5a; 64]);
+        let prepared = accepted.accept(prepared).unwrap();
+        assert_eq!(prepared.eligible_backends.as_ref(), &[alternate]);
+        assert_eq!(resources.snapshot().data_used_bytes, 64);
+        assert!(data.upgrade().is_some());
+        drop(prepared);
+        assert!(data.upgrade().is_none());
+        assert_eq!(resources.snapshot().data_used_bytes, 0);
     }
 
     /// Scheduling facts naming exactly these scans, with one fragment per
@@ -1643,10 +1882,19 @@ mod tests {
         session.retire_preparation();
         session.retire_preparation();
         assert_eq!(exits.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            session.issue_attempt(execution(1, 2)),
-            Err(NativeExecutionContractError::AttemptPreparationRetired)
-        ));
+        let retired = match session.issue_attempt(execution(1, 2)) {
+            Err(error) => error,
+            Ok(_) => panic!("retired preparation cannot issue a new request"),
+        };
+        assert_eq!(
+            retired,
+            NativeExecutionContractError::AttemptPreparationRetired
+        );
+        assert_eq!(
+            retired.failure_fact().evidence(),
+            novarocks_execution_contract::failure::FailureEvidence::StopObservation
+        );
+        assert_eq!(retired.failure_fact().reason().code(), 122);
         assert!(matches!(
             session.prepare(old_request).await,
             Err(NativeAttemptPreparationError::Contract(

@@ -398,7 +398,7 @@ fn observed_values_keep_every_actual_success_ordinary_and_parent_control_prefix(
                 assert!(baseline.iter().any(|(_, units)| *units > 0));
                 for at in 0..baseline.len() {
                     for cause in CAUSES {
-                        control.arm(Some((at, cause)));
+                        control.arm(Some((at, cause.clone())));
                         assert!(matches!(run(),Err(Error::Control(c)) if c==cause));
                         assert_eq!(control.trace(), baseline[..=at]);
                     }
@@ -550,7 +550,7 @@ fn observed_values_wide_actual_index_quantum_preserves_all_ordered_source_ids() 
             .expect("actual count-sized index fill observes 256 completed operations");
         for at in [0, quantum, baseline.len() - 1] {
             for cause in CAUSES {
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate);
                 let result = match work.as_mut() {
                     Ok(work) => {
@@ -578,7 +578,7 @@ fn observed_values_wide_actual_index_quantum_preserves_all_ordered_source_ids() 
                             .map(|_| ())
                         }
                     }
-                    Err(c) => Err(Error::Control(*c)),
+                    Err(c) => Err(Error::Control(c.clone())),
                 };
                 let result = match work {
                     Ok(work) => finish(result, work),
@@ -652,7 +652,7 @@ fn observed_normalized_binding_clones_allocate_nothing_and_real_containers_prese
     for cause in CAUSES {
         // The real index/output container requests are known together. Refuse
         // their one-under cap before any armed subsequent control callback.
-        control.arm(Some((1, cause)));
+        control.arm(Some((1, cause.clone())));
         let mut called = false;
         let mut cap = limits();
         cap.max_allocation_requests = 1;
@@ -690,7 +690,7 @@ fn observed_normalized_binding_clones_allocate_nothing_and_real_containers_prese
                 if facts.allocation_requests_upper_bound == 2 {
                     reached = true;
                     at_refusal = control.trace();
-                    Err(cause)
+                    Err(cause.clone())
                 } else {
                     Ok(())
                 }
@@ -725,7 +725,7 @@ fn original_decoded_values_header_floor_has_no_observer_and_keeps_dictionary_bac
                         + size_of::<p::ValueDef>()
             );
             for cause in CAUSES {
-                control.arm(Some((1, cause)));
+                control.arm(Some((1, cause.clone())));
                 let mut work =
                     CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
                 for _ in 0..255 {
@@ -801,7 +801,7 @@ fn actual_value_capture_keeps_original_loans_and_admits_before_matched_quantum()
                 }
                 for cause in CAUSES {
                     for id in [u32::MAX, 0] {
-                        control.arm(Some((1, cause)));
+                        control.arm(Some((1, cause.clone())));
                         let mut work =
                             CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
                         for _ in 0..255 {
@@ -821,7 +821,7 @@ fn actual_value_capture_keeps_original_loans_and_admits_before_matched_quantum()
                         let expected = if id == u32::MAX {
                             CompileControlError::ResourceExhausted
                         } else {
-                            cause
+                            cause.clone()
                         };
                         assert!(
                             matches!(finish(result, work), Err(Error::Control(actual)) if actual == expected)

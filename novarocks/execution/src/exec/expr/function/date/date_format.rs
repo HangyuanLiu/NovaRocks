@@ -16,7 +16,7 @@
 // under the License.
 use super::common::extract_datetime_array;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, StringArray};
 use chrono::{Datelike, NaiveDateTime};
 use std::collections::HashMap;
@@ -37,11 +37,11 @@ enum JodaFormatToken {
 }
 
 #[inline]
-fn invalid_joda_format_error(fmt: &str) -> String {
-    format!("The format parameter {} is invalid format", fmt)
+fn invalid_joda_format_error(fmt: &str) -> super::date::DateFormatFailure {
+    super::date::invalid_date_format(fmt)
 }
 
-fn compile_joda_format(fmt: &str) -> Result<Vec<JodaFormatToken>, String> {
+fn compile_joda_format(fmt: &str) -> Result<Vec<JodaFormatToken>, super::date::DateFormatFailure> {
     let bytes = fmt.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::with_capacity(bytes.len());
@@ -128,55 +128,97 @@ fn eval_date_format_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let date = arena.eval(args[0], chunk)?;
     let format = arena.eval(args[1], chunk)?;
     format
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "date_format expects string format".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "date_format expects string format",
+            )
+        })?;
     let rows = date.len();
-    Ok(
-        (novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
-            novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::DateFormat,
-            &[date, format],
-            &arrow::datatypes::DataType::Utf8,
-            rows,
-        ))?,
+    novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
+        novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::DateFormat,
+        &[date, format],
+        &arrow::datatypes::DataType::Utf8,
+        rows,
     )
+    .map_err(Into::into)
 }
 
 pub fn eval_date_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_date_format_inner(arena, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Utf8)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "datetime formatting requires two arguments",
+            )
+            .into(),
+        );
+    }
+    eval_date_format_inner(arena, args, chunk)
 }
 
 pub fn eval_strftime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_date_format_inner(arena, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Utf8)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "datetime formatting requires two arguments",
+            )
+            .into(),
+        );
+    }
+    eval_date_format_inner(arena, args, chunk)
 }
 
 pub fn eval_jodatime_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Utf8)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "datetime formatting requires two arguments",
+            )
+            .into(),
+        );
+    }
     let date_arr = arena.eval(args[0], chunk)?;
     let fmt_arr = arena.eval(args[1], chunk)?;
     let fmt_arr = fmt_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "jodatime_format expects string format".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "jodatime_format expects string format",
+            )
+        })?;
     let dts = extract_datetime_array(&date_arr)?;
+    if fmt_arr.len() != dts.len() {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "jodatime_format argument lengths differ",
+            )
+            .into(),
+        );
+    }
     let mut fmt_cache: HashMap<String, Vec<JodaFormatToken>> = HashMap::new();
     let mut out = Vec::with_capacity(dts.len());
     for (i, dt) in dts.into_iter().enumerate() {
@@ -186,7 +228,11 @@ pub fn eval_jodatime_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         }
         let fmt = fmt_arr.value(i);
         if !fmt_cache.contains_key(fmt) {
-            fmt_cache.insert(fmt.to_string(), compile_joda_format(fmt)?);
+            fmt_cache.insert(
+                fmt.to_string(),
+                compile_joda_format(fmt)
+                    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+            );
         }
         let tokens = fmt_cache
             .get(fmt)

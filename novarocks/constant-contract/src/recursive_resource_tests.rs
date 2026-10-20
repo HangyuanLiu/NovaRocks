@@ -57,7 +57,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.failure {
+        match self.failure.clone() {
             Some((refusal, cause)) if at == refusal => Err(cause),
             _ => Ok(()),
         }
@@ -125,7 +125,7 @@ fn check_prefixes(
     assert!(trace.iter().all(|(_, units)| *units <= 256));
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(project(field,lengths,input,policy,&control), Err(ConstantError::Control(actual)) if actual == cause)
             );

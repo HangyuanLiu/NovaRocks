@@ -33,7 +33,7 @@ fn evaluate(
     name: &'static str,
     columns: Vec<ArrayRef>,
     result: DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let fields = columns
         .iter()
         .enumerate()
@@ -168,21 +168,23 @@ fn original_mod_pmod_raw_unregistered_carriers_keep_full_admission_errors() {
         for name in ["mod", "pmod"] {
             let expected = format!("unsupported numeric type: {:?}", source.data_type());
             assert_eq!(
-                evaluate(
+                (evaluate(
                     name,
                     vec![source.clone(), ints(vec![Some(3)])],
                     DataType::Float64
                 )
-                .unwrap_err(),
+                .unwrap_err())
+                .to_string(),
                 expected
             );
             assert_eq!(
-                evaluate(
+                (evaluate(
                     name,
                     vec![ints(vec![Some(7)]), source.clone()],
                     DataType::Float64
                 )
-                .unwrap_err(),
+                .unwrap_err())
+                .to_string(),
                 expected
             );
         }

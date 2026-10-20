@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 
 pub fn eval_null_or_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,8 +24,14 @@ pub fn eval_null_or_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
-    let input = arena.eval(args[0], chunk)?;
-    Ok((novarocks_functions::builtin::string_null_or_empty::evaluate_legacy(&input))?)
+    let [argument] = args else {
+        return Err(expression_contract(
+            "null_or_empty requires exactly one prepared argument",
+        ));
+    };
+    let input = arena.eval(*argument, chunk)?;
+    novarocks_functions::builtin::string_null_or_empty::evaluate_required(&input)
+        .map_err(ExecutionFailure::from)
 }

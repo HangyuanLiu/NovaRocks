@@ -39,7 +39,11 @@ fn spec(name: &str, input: &DataType, intermediate: bool, output: DataType) -> A
         )
         .unwrap()
 }
-fn update(spec: &AggSpec, array: &ArrayRef, state: &mut DsHllState) -> Result<(), String> {
+fn update(
+    spec: &AggSpec,
+    array: &ArrayRef,
+    state: &mut DsHllState,
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let pointer = state as *mut DsHllState as AggStatePtr;
     DsHllAgg.update_batch(
         spec,
@@ -118,11 +122,11 @@ fn legacy_ds_hll_baseline_real_spec_names_alias_and_phase_dispatch() {
         .kind,
         AggKind::DsHllHash
     ));
-    assert_eq!(
-        DsHllAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(DsHllAgg
             .build_spec_from_type(&AggFunction::default(), None, false)
-            .unwrap_err(),
-        "ds_hll expects input"
+            .unwrap_err()),
+        &"ds_hll expects input",
     );
 }
 #[test]
@@ -180,7 +184,7 @@ fn legacy_ds_hll_baseline_parameters_null_order_wrap_and_first_handle_policy() {
         DataType::Int64,
     );
     assert_eq!(
-        update(&current, &bad, &mut state).unwrap_err(),
+        (update(&current, &bad, &mut state).unwrap_err()).to_string(),
         "ds_hll_count_distinct: ds_hll log_k expects integer input, got Float64"
     );
     assert!(state.handle.is_none());
@@ -264,7 +268,7 @@ fn legacy_ds_hll_baseline_unsupported_all_null_and_empty_are_distinct() {
             DataType::Int64,
         );
         assert_eq!(
-            update(&current, &values, &mut state).unwrap_err(),
+            (update(&current, &values, &mut state).unwrap_err()).to_string(),
             "ds_hll_count_distinct: unsupported sketch hash input type UInt32"
         );
         assert!(state.handle.is_none());
@@ -309,21 +313,22 @@ fn legacy_ds_hll_baseline_merge_latin1_bytes_null_and_exact_malformed_prefix() {
         let malformed = Arc::new(builder.finish()) as ArrayRef;
         let pointer = &mut state as *mut DsHllState as AggStatePtr;
         assert_eq!(
-            DsHllAgg
+            (DsHllAgg
                 .merge_batch(
                     &current,
                     0,
                     &[pointer, pointer],
                     &AggInputView::Any(&malformed)
                 )
-                .unwrap_err(),
+                .unwrap_err())
+            .to_string(),
             "ds_hll merge preflight: HLL payload requires 8 bytes, got 0"
         );
         assert_eq!(state.handle.as_ref().unwrap().estimate().unwrap(), 1);
     }
     let mut state = DsHllState::new(MemTracker::new_root("ds-hll-first-payload"));
     assert_eq!(
-        state.merge_payload(&[]).unwrap_err(),
+        (state.merge_payload(&[]).unwrap_err()).to_string(),
         "ds_hll preflight: HLL payload requires 8 bytes, got 0"
     );
     assert!(state.handle.is_none());

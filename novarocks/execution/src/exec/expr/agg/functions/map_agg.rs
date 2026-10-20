@@ -58,9 +58,9 @@ fn append_entry(
     state: &mut MapAggState,
     key: TrackedAggScalarValue,
     value: Option<TrackedAggScalarValue>,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     map_core::append_entry(&mut state.0, key, value, &mut ScalarWork::new(None))
-        .map_err(|error| error.to_string())
+        .map_err(crate::runtime::fragment::ExecutionFailure::from)
 }
 
 impl AggregateFunction for MapAggAgg {
@@ -69,10 +69,19 @@ impl AggregateFunction for MapAggAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let input_type = input_type.ok_or_else(|| "map_agg input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "map_agg input type missing",
+            )
+        })?;
         let Some(kind) = kind_from_name(func.name.as_str()) else {
-            return Err(format!("unsupported map agg function: {}", func.name));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "unsupported map agg function: {}",
+                    func.name
+                )),
+            );
         };
 
         if input_is_intermediate {
@@ -91,13 +100,19 @@ impl AggregateFunction for MapAggAgg {
         }
 
         let DataType::Struct(fields) = input_type else {
-            return Err(format!(
-                "map_agg expects struct input, got {:?}",
-                input_type
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "map_agg expects struct input, got {:?}",
+                    input_type
+                )),
+            );
         };
         if fields.len() != 2 {
-            return Err("map_agg expects 2 arguments".to_string());
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "map_agg expects 2 arguments",
+                ),
+            );
         }
 
         let output_type = func
@@ -134,10 +149,10 @@ impl AggregateFunction for MapAggAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "map_agg input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("map_agg input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -145,14 +160,15 @@ impl AggregateFunction for MapAggAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "map_agg merge input missing".to_string())?;
-        let _ = arr
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| "map_agg merge input must be MapArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("map_agg merge input missing")
+        })?;
+        let _ = arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "map_agg merge input must be MapArray",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -170,9 +186,12 @@ impl AggregateFunction for MapAggAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
-        let tracker = tracker
-            .ok_or_else(|| "allocation-tracked map_agg requires a memory tracker".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        let tracker = tracker.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked map_agg requires a memory tracker",
+            )
+        })?;
         unsafe { ptr.cast::<MapAggState>().write(MapAggState::new(tracker)) };
         Ok(())
     }
@@ -197,16 +216,19 @@ impl AggregateFunction for MapAggAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("map_agg batch input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "map_agg batch input type mismatch",
+            ));
         };
-        let input = map_core::update_input(array).map_err(|error| error.to_string())?;
+        let input = map_core::update_input(array)
+            .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         let mut work = ScalarWork::new(None);
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MapAggState) };
             map_core::update_row(&mut state.0, &input, row, &mut work)
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         }
         Ok(())
     }
@@ -217,11 +239,14 @@ impl AggregateFunction for MapAggAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("map_agg merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "map_agg merge input type mismatch",
+            ));
         };
-        let input = map_core::merge_input(array).map_err(|error| error.to_string())?;
+        let input = map_core::merge_input(array)
+            .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         let mut work = ScalarWork::new(None);
         for (row, &base) in state_ptrs.iter().enumerate() {
             // Do not dereference a mapped state for an original NULL partial row.
@@ -230,7 +255,7 @@ impl AggregateFunction for MapAggAgg {
             }
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MapAggState) };
             map_core::merge_row(&mut state.0, &input, row, &mut work)
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         }
         Ok(())
     }
@@ -241,7 +266,7 @@ impl AggregateFunction for MapAggAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let target_type = if output_intermediate {
             &spec.intermediate_type
         } else {
@@ -252,7 +277,7 @@ impl AggregateFunction for MapAggAgg {
             &state.0
         });
         map_core::build_array(target_type, states, &mut ScalarWork::new(None))
-            .map_err(|error| error.to_string())
+            .map_err(crate::runtime::fragment::ExecutionFailure::from)
     }
 }
 
@@ -264,8 +289,10 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
 }
 
 #[cfg(test)]
-fn parse_map_type(ty: &DataType) -> Result<(Arc<Field>, arrow::datatypes::Fields, bool), String> {
-    map_core::parse_map_type(ty).map_err(|error| error.to_string())
+fn parse_map_type(
+    ty: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<(Arc<Field>, arrow::datatypes::Fields, bool)> {
+    map_core::parse_map_type(ty).map_err(crate::runtime::fragment::ExecutionFailure::from)
 }
 
 fn build_default_map_type(key_field: Arc<Field>, value_field: Arc<Field>) -> DataType {

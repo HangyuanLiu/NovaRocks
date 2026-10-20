@@ -52,7 +52,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after originating refusal");
         }
         s.trace.push(units);
-        match s.stop {
+        match s.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -77,7 +77,7 @@ fn prefixes<T>(action: impl Fn(&mut CompileCheckpoints<'_>) -> Result<T, TypeCod
     assert!(!trace.is_empty());
     for at in 0..trace.len() {
         for cause in CAUSES {
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             assert!(
                 matches!(run(&c, &action), Err(TypeCodecError::Control(actual)) if actual == cause)
             );
@@ -212,7 +212,7 @@ fn empty_metadata_observes_actual_final_none_and_zero_capacity_reservations() {
 fn captured_real_reserve_refusal_is_resource_before_any_later_control() {
     for late in CAUSES {
         let c = Control::default();
-        c.arm(Some((2, late)));
+        c.arm(Some((2, late.clone())));
         assert!(matches!(
             run(&c, |w| reserve::<u8>(usize::MAX, w)),
             Err(TypeCodecError::Control(
@@ -221,7 +221,7 @@ fn captured_real_reserve_refusal_is_resource_before_any_later_control() {
         ));
         assert_eq!(c.trace(), [0, 0]);
         for at in 0..2 {
-            c.arm(Some((at, late)));
+            c.arm(Some((at, late.clone())));
             assert!(matches!(run(&c, |w| reserve::<u8>(usize::MAX, w)),
                 Err(TypeCodecError::Control(actual)) if actual == late));
             assert_eq!(c.trace(), vec![0; at + 1]);
@@ -248,7 +248,7 @@ fn wide_actual_ascii_append_and_byte_comparison_keep_real_quantum_prefixes() {
         let quantum = trace.iter().position(|units| *units == 256).unwrap();
         for at in [0, quantum, trace.len() - 1] {
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(run(&c, action), Err(TypeCodecError::Control(actual)) if actual == cause)
                 );

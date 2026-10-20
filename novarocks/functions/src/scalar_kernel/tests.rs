@@ -459,7 +459,7 @@ fn invalid_child_errors_and_interruption_never_reach_the_instance() {
     let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
     assert!(matches!(
         instance.evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     let (prepared, calls) = preparation(
@@ -920,6 +920,10 @@ fn primary_scalar_control_survives_retained_growth_and_latches_without_replay() 
         (Mode::GrowAndCancel, KernelFailure::Cancelled),
         (Mode::GrowAndDeadline, KernelFailure::DeadlineExceeded),
         (Mode::GrowAndResource, KernelFailure::ResourceExhausted),
+        (
+            Mode::GrowAndFail,
+            KernelFailure::Operational(KernelDiagnostic::new("fixture exit")),
+        ),
     ] {
         let (prepared, calls) = preparation(
             ArgumentControl::Eager,
@@ -947,7 +951,8 @@ fn primary_scalar_control_survives_retained_growth_and_latches_without_replay() 
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
-    for mode in [Mode::Grow, Mode::GrowAndFail] {
+    // A successful implementation still has to obey its retained contract.
+    for mode in [Mode::Grow] {
         let (prepared, calls) = preparation(
             ArgumentControl::Eager,
             mode,
@@ -967,4 +972,89 @@ fn primary_scalar_control_survives_retained_growth_and_latches_without_replay() 
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
+}
+
+#[test]
+fn scalar_original_source_survives_real_retained_growth_and_latches_without_replay() {
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    #[derive(Debug)]
+    struct OriginalPrepared {
+        contract: Arc<ScalarCallContract>,
+        source: KernelFailure,
+        calls: Arc<AtomicUsize>,
+        retained_reads: Arc<AtomicUsize>,
+    }
+    struct OriginalInstance {
+        source: KernelFailure,
+        calls: Arc<AtomicUsize>,
+        retained_reads: Arc<AtomicUsize>,
+        growth: Vec<u8>,
+    }
+    impl PreparedScalarKernel for OriginalPrepared {
+        fn contract(&self) -> &Arc<ScalarCallContract> {
+            &self.contract
+        }
+        fn instance_retained_upper_bound(&self) -> usize {
+            std::mem::size_of::<OriginalInstance>()
+        }
+        fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
+            Ok(Box::new(OriginalInstance {
+                source: self.source.clone(),
+                calls: self.calls.clone(),
+                retained_reads: self.retained_reads.clone(),
+                growth: Vec::new(),
+            }))
+        }
+    }
+    impl ScalarKernelInstance for OriginalInstance {
+        fn evaluate<'a>(
+            &mut self,
+            _: ScalarCallInput<'_, 'a>,
+            _: &dyn KernelEvaluationControl,
+        ) -> Result<SelectedValues<'a>, KernelFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // A real retained-contract fault after an originating domain
+            // failure, not a legal source invoice or allocation grant.
+            self.growth.push(1);
+            Err(self.source.clone())
+        }
+        fn retained_bytes(&self) -> usize {
+            self.retained_reads.fetch_add(1, Ordering::SeqCst);
+            std::mem::size_of::<Self>() + self.growth.capacity()
+        }
+    }
+    let expected = KernelFailure::from_domain(LayoutResourceError::SourceModel);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let retained_reads = Arc::new(AtomicUsize::new(0));
+    let prepared = Arc::new(OriginalPrepared {
+        contract: contract(
+            ArgumentControl::Eager,
+            FunctionIntrinsicRowError::NoRowError,
+            false,
+        ),
+        source: expected.clone(),
+        calls: calls.clone(),
+        retained_reads: retained_reads.clone(),
+    });
+    let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
+    let input: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let arguments = [EvaluatedArgument::Column(&input)];
+    let actual = instance
+        .evaluate(Selection::all(1), &arguments, &Control::default())
+        .unwrap_err();
+    // Source equality compares the original shared-cause Arc, not text/facts.
+    assert_eq!(actual, expected);
+    assert_eq!(retained_reads.load(Ordering::SeqCst), 1);
+    // An explicit diagnostic read still observes the real contract violation.
+    assert!(matches!(
+        instance.retained_bytes(),
+        Err(KernelFailure::Internal(_))
+    ));
+    assert_eq!(
+        instance
+            .evaluate(Selection::all(1), &arguments, &Control::default())
+            .unwrap_err(),
+        KernelFailure::InstanceFailed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

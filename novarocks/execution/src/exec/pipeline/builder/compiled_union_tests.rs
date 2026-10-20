@@ -175,11 +175,16 @@ fn compiled_union_all_refuses_a_branch_that_does_not_own_the_union_layout() {
     };
     let error = super::validate_union_branches(&program, union, &[*raw, inputs[1]]).unwrap_err();
     assert!(
-        error.contains("branch 0 is not a normalizer owning the union layout"),
+        error
+            .to_string()
+            .contains("branch 0 is not a normalizer owning the union layout"),
         "{error}"
     );
     let error =
         super::validate_union_branches(&program, union, &[ProgramNodeId::new(inputs[1].index())])
             .unwrap_err();
-    assert!(error.contains("fewer than two branches"), "{error}");
+    assert!(
+        error.to_string().contains("fewer than two branches"),
+        "{error}"
+    );
 }

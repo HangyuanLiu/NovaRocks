@@ -97,7 +97,9 @@ struct RegistryInner {
     id: u64,
     runtime: Handle,
     state: Mutex<RegistryState>,
-    progress: Notify,
+    progress: Arc<Notify>,
+    statement_native: super::StatementNativeResidualRegistry,
+    active_native: super::NativeActiveCustodyRegistry,
 }
 
 struct RegistryState {
@@ -199,6 +201,67 @@ impl fmt::Display for LogicalExecutionRuntimeRegistryError {
 }
 
 impl std::error::Error for LogicalExecutionRuntimeRegistryError {}
+
+impl novarocks_execution_contract::failure::FailureProjection
+    for LogicalExecutionRuntimeRegistryError
+{
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+        };
+        let (class, code, observed_stop) = match self {
+            Self::AlreadyRegistered => (FailureClass::Invariant, 61, false),
+            Self::RegistryClosing => (FailureClass::Control, 62, true),
+            Self::RegistryNotEmpty => (FailureClass::Control, 63, false),
+            Self::UnknownRegistration => (FailureClass::Control, 64, true),
+            Self::ForeignRegistry => (FailureClass::Invariant, 65, false),
+            Self::StaleGeneration => (FailureClass::Control, 66, true),
+            Self::InvalidContextSet => (FailureClass::Invariant, 67, false),
+            Self::ContextNotRegistered => (FailureClass::Invariant, 68, false),
+            Self::ConfigDoesNotMatchReservation => (FailureClass::Invariant, 69, false),
+            Self::JoinNotReady => (FailureClass::Control, 70, false),
+            Self::JoinAlreadyCompleted => (FailureClass::Control, 71, true),
+            Self::Actor(error) => return FailureProjection::failure_fact(error),
+        };
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        if observed_stop {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(class, reason)
+        }
+    }
+}
+
+impl LogicalExecutionRuntimeRegistryError {
+    /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
+    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        let message = match self {
+            Self::AlreadyRegistered => "logical query already has a runtime registration",
+            Self::RegistryClosing => "logical execution runtime registry is closing",
+            Self::RegistryNotEmpty => "logical execution runtime still has registered work",
+            Self::UnknownRegistration => {
+                "logical execution runtime registration is no longer present"
+            }
+            Self::ForeignRegistry => {
+                "logical execution registration belongs to a different registry"
+            }
+            Self::StaleGeneration => {
+                "logical execution registration generation is no longer current"
+            }
+            Self::InvalidContextSet => {
+                "runtime reservation has duplicate or foreign execution contexts"
+            }
+            Self::ContextNotRegistered => "context convergence names an unregistered query context",
+            Self::ConfigDoesNotMatchReservation => {
+                "actor configuration does not match its runtime reservation"
+            }
+            Self::JoinNotReady => "logical execution runtime join is not ready",
+            Self::JoinAlreadyCompleted => "logical execution runtime join already completed",
+            Self::Actor(error) => return error.safe_detail(),
+        };
+        novarocks_execution_contract::SafeDetail::truncating(message)
+    }
+}
 
 impl From<LogicalExecutionActorError> for LogicalExecutionRuntimeRegistryError {
     fn from(value: LogicalExecutionActorError) -> Self {
@@ -319,13 +382,20 @@ impl LogicalExecutionRuntimeRegistry {
                 current.checked_add(1)
             })
             .expect("logical execution runtime registry identity exhausted");
+        let statement_native = super::StatementNativeResidualRegistry::new(id);
+        let progress = Arc::new(Notify::new());
         Self {
             handle: LogicalExecutionRuntimeRegistryHandle {
                 inner: Arc::new(RegistryInner {
                     id,
                     runtime,
                     state: Mutex::new(RegistryState::default()),
-                    progress: Notify::new(),
+                    progress: Arc::clone(&progress),
+                    active_native: super::NativeActiveCustodyRegistry::new(
+                        statement_native.clone(),
+                        progress,
+                    ),
+                    statement_native,
                 }),
             },
             shutdown_complete: false,
@@ -402,6 +472,11 @@ impl LogicalExecutionRuntimeRegistry {
         self.handle.begin_shutdown();
         self.handle.request_close_for_installed();
         self.handle.lock().entries.clear();
+        self.handle.inner.active_native.abandon_for_process_exit();
+        self.handle
+            .inner
+            .statement_native
+            .abandon_for_process_exit();
         self.handle.inner.progress.notify_waiters();
         self.shutdown_complete = true;
     }
@@ -426,7 +501,7 @@ impl LogicalExecutionRuntimeRegistry {
         ),
     > {
         self.handle.begin_shutdown();
-        if !self.handle.lock().entries.is_empty() {
+        if self.handle.entry_count() != 0 {
             return Err((LogicalExecutionRuntimeRegistryError::RegistryNotEmpty, self));
         }
         self.shutdown_complete = true;
@@ -437,10 +512,190 @@ impl LogicalExecutionRuntimeRegistry {
 impl LogicalExecutionRuntimeRegistryHandle {
     fn begin_shutdown(&self) {
         self.lock().accepting = false;
+        self.inner.statement_native.close();
+    }
+
+    pub(crate) fn statement_native_residual_port(
+        &self,
+        budget: std::time::Duration,
+    ) -> super::StatementNativeResidualPort {
+        self.inner.statement_native.port(budget)
+    }
+
+    pub(crate) fn statement_native_ready_tasks(
+        &self,
+    ) -> Vec<Pin<Box<dyn Future<Output = Result<(), crate::api::QueryExecutionError>> + Send>>>
+    {
+        self.inner.statement_native.ready_tasks()
+    }
+
+    pub(crate) async fn statement_native_changed(&self) {
+        self.inner.statement_native.changed().await;
+    }
+
+    pub(crate) fn statement_native_count(&self) -> usize {
+        self.inner.statement_native.len()
+    }
+
+    pub(crate) fn close_statement_native_admission(&self) {
+        self.inner.statement_native.close();
+    }
+
+    pub(crate) fn statement_native_health(&self) -> Option<crate::api::QueryExecutionError> {
+        self.inner.statement_native.health()
+    }
+
+    /// Reserve the exact original registration/attempt custody before Native
+    /// activation. This grants no new work, actor, permit, or dispatch authority.
+    // Design: ADR-0187 (docs/adr/ADR-0187-receiver-owned-steps-and-single-task-conclusion.md)
+    pub(crate) fn reserve_active_native_owner(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        execution: QueryExecutionId,
+        contexts: &[QueryContextRef],
+    ) -> Result<super::NativeActiveCustodyReservation, LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        // Serialize the original custody insertion with begin_shutdown's
+        // admission cut. No Native activation can acquire a slot after close
+        // has observed that this exact registration has no retained owner.
+        // Lock order is Registry state -> Native custody; neither invokes
+        // foreign code or awaits while held.
+        let state = self.lock();
+        if !state.accepting {
+            return Err(LogicalExecutionRuntimeRegistryError::RegistryClosing);
+        }
+        let Some(RegistryEntry::Installed(entry)) = state
+            .entries
+            .get(&registration.initial_execution.query_id())
+        else {
+            return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+        };
+        validate_generation(entry.generation, registration.generation)?;
+        if execution.query_id() != registration.initial_execution.query_id() {
+            return Err(LogicalExecutionRuntimeRegistryError::InvalidContextSet);
+        }
+        let reserved = self.inner.active_native.reserve(
+            super::NativeActiveCustodyKey {
+                initial: registration.initial_execution,
+                generation: registration.generation,
+                execution,
+            },
+            contexts,
+            self.clone(),
+        );
+        drop(state);
+        reserved.ok_or(LogicalExecutionRuntimeRegistryError::InvalidContextSet)
+    }
+
+    pub(crate) async fn record_native_custody_closure(
+        &self,
+        key: super::NativeActiveCustodyKey,
+        closure: &crate::api::NativeActiveConvergenceClosure,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        let registration = LogicalExecutionRegistration {
+            registry_id: self.inner.id,
+            initial_execution: key.initial,
+            generation: key.generation,
+        };
+        let mut first_error = None;
+        match closure {
+            crate::api::NativeActiveConvergenceClosure::Evidence(
+                crate::api::NativeAttemptConvergence::AllWorkersStoppedAndContextsFenced,
+            ) => {
+                let contexts = self
+                    .inner
+                    .active_native
+                    .contexts(key)
+                    .ok_or(LogicalExecutionRuntimeRegistryError::UnknownRegistration)?;
+                for context in contexts {
+                    if let Err(error) = self
+                        .observe_worker_stopped_and_context_fenced(&registration, context)
+                        .await
+                    {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            crate::api::NativeActiveConvergenceClosure::Evidence(
+                crate::api::NativeAttemptConvergence::Contexts(facts),
+            ) => {
+                for fact in facts {
+                    let result = match fact.kind() {
+                        crate::api::NativeContextConvergenceKind::NeverEstablished => {
+                            self.observe_context_never_established(&registration, fact.context())
+                                .await
+                        }
+                        crate::api::NativeContextConvergenceKind::WorkerStoppedAndContextFenced => {
+                            self.observe_worker_stopped_and_context_fenced(
+                                &registration,
+                                fact.context(),
+                            )
+                            .await
+                        }
+                        crate::api::NativeContextConvergenceKind::WorkerProcessReplaced => {
+                            self.observe_worker_process_replaced(&registration, fact.context())
+                                .await
+                        }
+                    };
+                    if let Err(error) = result {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            crate::api::NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_contexts } => {
+                for &context in exact_contexts {
+                    if let Err(error) = self
+                        .end_remote_context_tracking(&registration, context)
+                        .await
+                    {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn wait_active_native_custody(&self, registration: &LogicalExecutionRegistration) {
+        loop {
+            let changed = self.inner.progress.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self
+                .inner
+                .active_native
+                .contains_registration(registration.initial_execution, registration.generation)
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn active_native_registration_health(
+        &self,
+        registration: &LogicalExecutionRegistration,
+    ) -> Option<crate::api::QueryExecutionError> {
+        self.inner
+            .active_native
+            .registration_health(registration.initial_execution, registration.generation)
+    }
+
+    pub(crate) fn record_native_supervision_join_failure(&self, error: tokio::task::JoinError) {
+        self.inner
+            .statement_native
+            .record_supervision_join_failure(error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_native_custody_count(&self) -> usize {
+        self.inner.active_native.len()
     }
 
     fn entry_count(&self) -> usize {
         self.lock().entries.len()
+            + self.inner.statement_native.len()
+            + self.inner.active_native.len()
     }
 
     fn request_close_for_installed(&self) {
@@ -450,17 +705,38 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 .entries
                 .values()
                 .filter_map(|entry| match entry {
-                    RegistryEntry::Installed(entry) => Some(entry.actor.clone()),
+                    RegistryEntry::Installed(entry) => Some((
+                        entry.initial_execution,
+                        entry.generation,
+                        entry.actor.clone(),
+                    )),
                     RegistryEntry::Reserved(_) | RegistryEntry::Joined(_) => None,
                 })
                 .collect::<Vec<_>>()
         };
-        for actor in actors {
-            drop(actor.request_registry_close_for_join(RegistryClose::Shutdown));
+        for (initial_execution, generation, actor) in actors {
+            // Closing actor ingress can complete its original WorkOwner even
+            // before its Registry join is polled. The same Native custody must
+            // therefore gate the close request itself, not only join().
+            if !self
+                .inner
+                .active_native
+                .contains_registration(initial_execution, generation)
+            {
+                drop(actor.request_registry_close_for_join(RegistryClose::Shutdown));
+            }
         }
     }
 
     async fn drain_for_shutdown(&self) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        let (actors, ()) = tokio::join!(
+            self.drain_actors_for_shutdown(),
+            self.inner.statement_native.drain(),
+        );
+        actors
+    }
+
+    async fn drain_actors_for_shutdown(&self) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         loop {
             let progress = self.inner.progress.notified();
             tokio::pin!(progress);
@@ -484,6 +760,18 @@ impl LogicalExecutionRuntimeRegistryHandle {
                     .collect::<Vec<_>>()
             };
 
+            // The original progress waiter was enabled before the snapshot.
+            // A normal custody removal wakes this same loop, including when
+            // the initial shutdown broadcast had to skip that registration.
+            let registrations = registrations
+                .into_iter()
+                .filter(|registration| {
+                    !self.inner.active_native.contains_registration(
+                        registration.initial_execution,
+                        registration.generation,
+                    )
+                })
+                .collect::<Vec<_>>();
             if registrations.is_empty() {
                 progress.await;
                 continue;
@@ -664,6 +952,13 @@ impl LogicalExecutionRuntimeRegistryHandle {
         registration: &LogicalExecutionRegistration,
     ) -> Result<LogicalExecutionJoinReadiness, LogicalExecutionRuntimeRegistryError> {
         self.validate_registry(registration)?;
+        if self
+            .inner
+            .active_native
+            .contains_registration(registration.initial_execution, registration.generation)
+        {
+            return Ok(LogicalExecutionJoinReadiness::WaitingForConvergence);
+        }
         {
             let state = self.lock();
             if let Some(RegistryEntry::Installed(entry)) = state
@@ -734,6 +1029,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         &self,
         registration: &mut LogicalExecutionRegistration,
     ) -> Result<LogicalExecutionJoinReceipt, LogicalExecutionRuntimeRegistryError> {
+        self.wait_active_native_custody(registration).await;
         self.close_ingress_for_join(registration).await?;
         let query = registration.initial_execution.query_id();
         let generation = registration.generation;
@@ -803,6 +1099,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
         &self,
         mut registration: LogicalExecutionRegistration,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        // The close request itself may complete the original actor WorkOwner.
+        // Preserve its same Native custody before closing ingress, as on the
+        // shutdown path; waiting only inside join() would already be too late.
+        self.wait_active_native_custody(&registration).await;
         let actor = self.actor(&registration)?;
         let mut closed = actor.request_registry_close_for_join(RegistryClose::Retire);
         while !*closed.borrow_and_update() {
@@ -1051,6 +1351,208 @@ mod tests {
         )
         .unwrap();
         (config, cancellation)
+    }
+
+    #[derive(Debug)]
+    struct DropTrackedActiveOwner(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for DropTrackedActiveOwner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl crate::api::ActiveNativeAttemptOwner for DropTrackedActiveOwner {
+        fn run<'a>(
+            &'a mut self,
+            _drive: &'a crate::coordination::NativeAttemptDrive,
+            _cancellation: novarocks_workload_control::CancellationView,
+        ) -> crate::api::NativeAttemptRunFuture<'a> {
+            Box::pin(async { panic!("custody fixture is not dispatched") })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _request: crate::api::NativeActiveConvergenceRequest,
+        ) -> crate::api::NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async { panic!("custody fixture returns original receipts explicitly") })
+        }
+    }
+
+    fn native_test_context(execution: QueryExecutionId) -> QueryContextRef {
+        QueryContextRef::new(
+            execution,
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        )
+    }
+
+    #[derive(Debug)]
+    struct NeverEstablishedAbortPort {
+        capacity: tokio::sync::watch::Sender<u64>,
+    }
+    impl crate::coordination::AbortQueryContextEffectPort for NeverEstablishedAbortPort {
+        fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
+            self.capacity.subscribe()
+        }
+        fn try_reserve(
+            &self,
+            identity: crate::coordination::AbortQueryContextIssueIdentity,
+        ) -> crate::coordination::AbortQueryContextEffectAdmission {
+            panic!("a never-established custody fixture must not issue Abort: {identity:?}")
+        }
+    }
+    fn native_custody_config(
+        execution: QueryExecutionId,
+        context: QueryContextRef,
+    ) -> LogicalExecutionActorConfig {
+        let (capacity, _) = tokio::sync::watch::channel(0);
+        // A real nonempty context manifest requires an Abort port before actor
+        // installation. These fixtures issue no admission or Establish, so any
+        // actual Abort request is a fixture violation, never a fabricated ACK.
+        config(execution, vec![context]).with_abort_query_context_effect_port(
+            Arc::new(NeverEstablishedAbortPort { capacity }),
+            NonZeroUsize::new(2).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn unpolled_active_residual_returns_same_box_without_blocking_another_registration() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(71);
+        let context = native_test_context(exact);
+        let installed = registry
+            .reserve(exact, vec![context])
+            .unwrap()
+            .spawn_and_install(native_custody_config(exact, context))
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = registry
+            .reserve_active_native_owner(&registration, exact, &[context])
+            .unwrap()
+            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
+        let actor = registry.actor(&registration).unwrap();
+        actor.initialization_failed(initial).await.unwrap();
+        // A queued residual can be dropped before its first poll. Its original
+        // Box must still be held by the pre-reserved original runtime record.
+        let unpolled = async move {
+            let _same_owner = owner;
+            std::future::pending::<()>().await;
+        };
+        drop(unpolled);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(registry.active_native_custody_count(), 1);
+        assert!(
+            registry
+                .active_native_registration_health(&registration)
+                .is_some()
+        );
+        assert_eq!(
+            registry.join_readiness(&registration).await.unwrap(),
+            LogicalExecutionJoinReadiness::WaitingForConvergence
+        );
+
+        // Process health reports the problem; it does not become a global
+        // barrier that prevents a different original actor from retiring.
+        let other = execution(72);
+        let installed = registry
+            .reserve(other, Vec::new())
+            .unwrap()
+            .spawn_and_install(config(other, Vec::new()))
+            .unwrap();
+        let (other_registration, initial, output) = installed.into_parts();
+        let _other_output = output.into_output();
+        let actor = registry.actor(&other_registration).unwrap();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        actor.complete_attempt(running).await.unwrap();
+        assert!(
+            registry
+                .active_native_registration_health(&other_registration)
+                .is_none()
+        );
+        registry.join_and_retire(other_registration).await.unwrap();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        registry.abandon_for_process_exit();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn original_active_custody_retires_only_after_exact_actor_observations() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(73);
+        let context = native_test_context(exact);
+        let installed = registry
+            .reserve(exact, vec![context])
+            .unwrap()
+            .spawn_and_install(native_custody_config(exact, context))
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut owner = registry
+            .reserve_active_native_owner(&registration, exact, &[context])
+            .unwrap()
+            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        owner
+            .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
+                crate::api::NativeAttemptConvergence::contexts(vec![
+                    crate::api::NativeContextConvergence::never_established(context),
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(registry.active_native_custody_count(), 0);
+        registry.join_and_retire(registration).await.unwrap();
+        drop(owner);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_active_closure_keeps_original_box_and_custody_until_process_exit() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(74);
+        let context = native_test_context(exact);
+        let installed = registry
+            .reserve(exact, vec![context])
+            .unwrap()
+            .spawn_and_install(native_custody_config(exact, context))
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut owner = registry
+            .reserve_active_native_owner(&registration, exact, &[context])
+            .unwrap()
+            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        let fact = crate::api::NativeContextConvergence::never_established(context);
+        assert!(
+            owner
+                .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
+                    crate::api::NativeAttemptConvergence::contexts(vec![fact, fact]),
+                ))
+                .await
+                .is_err()
+        );
+        drop(owner);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(registry.active_native_custody_count(), 1);
+        registry.abandon_for_process_exit();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1598,5 +2100,257 @@ mod tests {
         assert_eq!(receipt.outcome(), LogicalExecutionJoinOutcome::Cancelled);
         registry.retire(receipt).unwrap();
         registry.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_unknown_native_actor_work_while_a_healthy_registration_really_joins() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(75);
+        let context = native_test_context(exact);
+        let installed = registry
+            .reserve(exact, vec![context])
+            .unwrap()
+            .spawn_and_install(native_custody_config(exact, context))
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let original = registry
+            .reserve_active_native_owner(&registration, exact, &[context])
+            .unwrap()
+            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        // This real enclosing-drop seam returns the same original Box to its
+        // exact pre-reserved health slot; no foreign exit receipt is invented.
+        drop(original);
+
+        let healthy = execution(76);
+        let installed = registry
+            .reserve(healthy, Vec::new())
+            .unwrap()
+            .spawn_and_install(config(healthy, Vec::new()))
+            .unwrap();
+        let (healthy_registration, initial, output) = installed.into_parts();
+        let _healthy_output = output.into_output();
+        let actor = registry.actor(&healthy_registration).unwrap();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        actor.complete_attempt(running).await.unwrap();
+        let handle = registry.handle();
+        let mut shutdown =
+            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(1)));
+        // Poll the real Registry shutdown to actual healthy retirement. The
+        // one-second test cap is not a receipt; only removal after join is.
+        let healthy_retired = std::future::poll_fn(|cx| {
+            if let Poll::Ready(_) = shutdown.as_mut().poll(cx) {
+                return Poll::Ready(false);
+            }
+            if !handle.lock().entries.contains_key(&healthy.query_id()) {
+                Poll::Ready(true)
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        drop(shutdown);
+        let unknown_actor_still_live = match handle.lock().entries.get(&exact.query_id()) {
+            Some(RegistryEntry::Installed(entry)) => !entry.join.is_finished(),
+            _ => false,
+        };
+        let original_held = drops.load(Ordering::SeqCst) == 0;
+        let one_unknown = registry.active_native_custody_count() == 1;
+        let healthy_health_absent = registry
+            .active_native_registration_health(&healthy_registration)
+            .is_none();
+        registry.abandon_for_process_exit();
+        assert!(
+            healthy_retired,
+            "one unknown Native registration cannot strand a healthy sibling join"
+        );
+        assert!(
+            unknown_actor_still_live,
+            "RegistryClose must not finish the original actor WorkOwner before Native exit"
+        );
+        assert!(original_held);
+        assert!(one_unknown);
+        assert!(healthy_health_absent);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "only explicit process-exit abandonment retires the unknown Box"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_shutdown_wait_closes_an_initially_skipped_actor_after_original_native_receipt()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(77);
+        let context = native_test_context(exact);
+        let installed = registry
+            .reserve(exact, vec![context])
+            .unwrap()
+            .spawn_and_install(native_custody_config(exact, context))
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut original = registry
+            .reserve_active_native_owner(&registration, exact, &[context])
+            .unwrap()
+            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        let handle = registry.handle();
+        let mut shutdown =
+            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(1)));
+        let initially_pending = std::future::poll_fn(|cx| {
+            Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx).is_pending())
+        })
+        .await;
+        tokio::task::yield_now().await;
+        let actor_kept_before_receipt = match handle.lock().entries.get(&exact.query_id()) {
+            Some(RegistryEntry::Installed(entry)) => !entry.join.is_finished(),
+            _ => false,
+        };
+        // The original prepared fixture never dispatched admission/Establish.
+        // This exact author receipt settles its same pre-reserved Native slot.
+        original
+            .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
+                crate::api::NativeAttemptConvergence::contexts(vec![
+                    crate::api::NativeContextConvergence::never_established(context),
+                ]),
+            ))
+            .await
+            .unwrap();
+        // No second shutdown call, new service or polling timer is involved:
+        // Native slot removal wakes the original registered progress waiter.
+        let result = shutdown.await;
+        let retired = !handle.lock().entries.contains_key(&exact.query_id());
+        drop(original);
+        let owner_dropped = drops.load(Ordering::SeqCst);
+        if result.is_err() {
+            registry.abandon_for_process_exit();
+        }
+        assert!(initially_pending);
+        assert!(actor_kept_before_receipt);
+        result.expect("the same shutdown wait must resume after normal custody removal");
+        assert!(retired);
+        assert_eq!(owner_dropped, 1);
+    }
+    #[tokio::test]
+    async fn retire_wait_keeps_original_actor_until_the_same_native_receipt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(78);
+        let context = native_test_context(exact);
+        let installed = registry
+            .reserve(exact, vec![context])
+            .unwrap()
+            .spawn_and_install(native_custody_config(exact, context))
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut original = registry
+            .reserve_active_native_owner(&registration, exact, &[context])
+            .unwrap()
+            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        let handle = registry.handle();
+        let mut shutdown = Box::pin(handle.join_and_retire(registration));
+        let initially_pending = std::future::poll_fn(|cx| {
+            Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx).is_pending())
+        })
+        .await;
+        tokio::task::yield_now().await;
+        let actor_kept_before_receipt = match handle.lock().entries.get(&exact.query_id()) {
+            Some(RegistryEntry::Installed(entry)) => !entry.join.is_finished(),
+            _ => false,
+        };
+        // The original prepared fixture never dispatched admission/Establish.
+        // This exact author receipt settles its same pre-reserved Native slot.
+        original
+            .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
+                crate::api::NativeAttemptConvergence::contexts(vec![
+                    crate::api::NativeContextConvergence::never_established(context),
+                ]),
+            ))
+            .await
+            .unwrap();
+        // The same pending Retire wait observes the original custody receipt;
+        // no close request was allowed to race ahead of that receipt.
+        let result = shutdown.await;
+        let retired = !handle.lock().entries.contains_key(&exact.query_id());
+        drop(original);
+        let owner_dropped = drops.load(Ordering::SeqCst);
+        if result.is_err() {
+            registry.abandon_for_process_exit();
+        }
+        assert!(initially_pending);
+        assert!(actor_kept_before_receipt);
+        result.expect("Retire must resume only after original Native custody closes");
+        assert!(retired);
+        assert_eq!(owner_dropped, 1);
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cut_refuses_late_native_custody_before_activation() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(79);
+        let context = native_test_context(exact);
+        let installed = registry
+            .reserve(exact, vec![context])
+            .unwrap()
+            .spawn_and_install(native_custody_config(exact, context))
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let handle = registry.handle();
+        handle.begin_shutdown();
+        let refused = handle.reserve_active_native_owner(&registration, exact, &[context]);
+        assert!(matches!(
+            refused,
+            Err(LogicalExecutionRuntimeRegistryError::RegistryClosing)
+        ));
+        assert_eq!(registry.active_native_custody_count(), 0);
+        // This original fixture never dispatched Establish: the rejected
+        // reservation grants no Native activation or remote responsibility.
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        handle
+            .observe_context_never_established(&registration, context)
+            .await
+            .unwrap();
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(handle.lock().entries.is_empty());
+        assert_eq!(registry.active_native_custody_count(), 0);
     }
 }

@@ -1512,7 +1512,7 @@ mod selected_boolean_consumer_tests {
             assert!(units <= 256);
             let mut trace = self.trace.lock().unwrap();
             trace.push(units);
-            match self.refuse {
+            match self.refuse.clone() {
                 Some((at, error)) if trace.len() == at + 1 => Err(error),
                 _ => Ok(()),
             }

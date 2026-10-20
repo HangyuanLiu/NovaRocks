@@ -251,16 +251,21 @@ fn field_kernel_raw_step_keeps_complete_data_error_without_observer_footer() {
         state
             .step_observed(0, &candidate, Some(&mut observer))
             .unwrap()
-            .unwrap_err(),
-        expected
+            .unwrap_err()
+            .to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(&expected).to_string()
     );
     assert_eq!(
-        crate::field_shared::validate_arity(1).unwrap_err(),
+        crate::field_shared::validate_arity(1)
+            .unwrap_err()
+            .to_string(),
         "field requires a value and an INT-bounded candidate list"
     );
     if usize::BITS > 32 {
         assert_eq!(
-            crate::field_shared::validate_arity(i32::MAX as usize + 2).unwrap_err(),
+            crate::field_shared::validate_arity(i32::MAX as usize + 2)
+                .unwrap_err()
+                .to_string(),
             "field requires a value and an INT-bounded candidate list"
         );
     }
@@ -284,7 +289,7 @@ impl novarocks_type_contract::PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -317,7 +322,7 @@ fn field_kernel_actual_preparation_success_and_rejection_preserve_every_compile_
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = super::string_field_owner::prepared_for_test_with_control(
                     "field",
@@ -356,7 +361,9 @@ fn field_kernel_one_original_count_author_and_explicit_pure_shape_boundaries() {
     }
     for count in [0, 1, max_total + 1, usize::MAX] {
         assert_eq!(
-            crate::field_shared::validate_arity(count).unwrap_err(),
+            crate::field_shared::validate_arity(count)
+                .unwrap_err()
+                .to_string(),
             "field requires a value and an INT-bounded candidate list"
         );
         let crate::FunctionBindingError::InvalidBinding(message) =

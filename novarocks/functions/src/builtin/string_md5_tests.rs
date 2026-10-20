@@ -70,7 +70,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -368,7 +368,7 @@ fn string_md5_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "md5",
@@ -585,7 +585,7 @@ fn string_md5_empty_child_errors_bad_carrier_and_addresses_poison_without_replay
         let mut kernel = instance("md5");
         assert!(matches!(
             kernel.evaluate(Selection::all(1), &bad_arguments, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(

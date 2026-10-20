@@ -887,25 +887,21 @@ fn try_fold_node(
         work.control(),
     ) {
         Ok(value) => Ok(value),
+        Err(SqlConstantEvaluationError::Source(source)) => {
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            if source.failure_fact().class() == FailureClass::Data {
+                // Optional evaluation of data may decline folding. The
+                // original expression remains and owns runtime evaluation.
+                Err(source.detail().to_owned())
+            } else {
+                // Resource/control/invariant failures are not an optional
+                // data result, and must retain their actual projected source.
+                return Err(SqlCompileError::CompilationSource(source));
+            }
+        }
         Err(SqlConstantEvaluationError::Evaluation(error)) => Err(error),
         Err(SqlConstantEvaluationError::Control(error)) => return Err(error.into()),
         Err(SqlConstantEvaluationError::Constant(error)) => return Err(error.into()),
-        Err(SqlConstantEvaluationError::InvalidType(error)) => {
-            return Err(SqlCompileError::InvalidRequest(error.to_string()));
-        }
-        Err(SqlConstantEvaluationError::Preparation(error)) => {
-            use novarocks_functions::KernelFailure;
-            use novarocks_type_contract::CompileControlError;
-            return Err(match error {
-                KernelFailure::Cancelled => CompileControlError::Cancelled.into(),
-                KernelFailure::DeadlineExceeded => CompileControlError::DeadlineExceeded.into(),
-                KernelFailure::ResourceExhausted => CompileControlError::ResourceExhausted.into(),
-                error @ KernelFailure::InvalidProgram(_) => {
-                    SqlCompileError::InvalidRequest(error.to_string())
-                }
-                other => SqlCompileError::Compilation(other.to_string()),
-            });
-        }
     };
     work.step()?;
     Ok(match evaluated {
@@ -916,9 +912,9 @@ fn try_fold_node(
         )?),
         // The evaluator declined this shape.
         Ok(None) => None,
-        // Fail-open: keep the original expression and swallow the error. The
-        // runtime is still allowed to produce a value — or its own error — for
-        // this expression, so a failed fold must never become a planning error.
+        // Optional data evaluation keeps the original expression. Typed
+        // resource/control/invariant failures already returned above; they
+        // cannot silently become a missed optimization.
         Err(_) => None,
     })
 }
@@ -1258,7 +1254,7 @@ mod tests {
             let mut observations = self.observations.lock().unwrap();
             observations.push((phase, units));
             if observations.len() == self.fail_at
-                && let Some(error) = self.failure
+                && let Some(error) = self.failure.clone()
             {
                 return Err(error);
             }
@@ -1376,11 +1372,11 @@ mod tests {
                     *fixture.arena.borrow_mut() = original_arena.clone();
                     let owner = FoldControl {
                         observations: Default::default(),
-                        failure: Some(failure),
+                        failure: Some(failure.clone()),
                         fail_at,
                     };
                     assert!(
-                        matches!(apply_with_control(&fixture, plan.clone(), &owner), Err(error) if error == SqlCompileError::from(failure))
+                        matches!(apply_with_control(&fixture, plan.clone(), &owner), Err(error) if error == SqlCompileError::from(failure.clone()))
                     );
                     assert_eq!(*owner.observations.lock().unwrap(), observations[..fail_at]);
                     // A later successful observation cannot recover this result.
@@ -1408,11 +1404,11 @@ mod tests {
                 for fail_at in [1, 2] {
                     let owner = FoldControl {
                         observations: Default::default(),
-                        failure: Some(failure),
+                        failure: Some(failure.clone()),
                         fail_at,
                     };
                     assert!(
-                        matches!(apply_with_control(&fixture, project(sum), &owner), Err(error) if error == SqlCompileError::from(failure))
+                        matches!(apply_with_control(&fixture, project(sum), &owner), Err(error) if error == SqlCompileError::from(failure.clone()))
                     );
                     assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
                 }
@@ -1487,7 +1483,7 @@ mod tests {
                 let mut checks = self.checks.lock().unwrap();
                 let index = checks.len();
                 checks.push((phase, units));
-                if let Some((fail_at, error)) = self.failure
+                if let Some((fail_at, error)) = self.failure.clone()
                     && index == fail_at
                 {
                     return Err(error);
@@ -1538,11 +1534,11 @@ mod tests {
                 *fixture.arena.borrow_mut() = original_arena.clone();
                 let owner = Owner {
                     checks: Default::default(),
-                    failure: Some((fail_at, error)),
+                    failure: Some((fail_at, error.clone())),
                 };
                 assert!(
                     matches!(apply_with_evaluator(&fixture,project(sum),Some(&EVALUATOR),&owner),
-                    Err(actual) if actual == SqlCompileError::from(error))
+                    Err(actual) if actual == SqlCompileError::from(error.clone()))
                 );
                 assert_eq!(*owner.checks.lock().unwrap(), checks[..=fail_at]);
             }
@@ -2462,16 +2458,13 @@ mod complete_fold_type_tests {
             _: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
         {
-            Err(SqlConstantEvaluationError::Preparation(
-                self.0.lock().unwrap().as_ref().unwrap().clone(),
-            ))
+            Err(self.0.lock().unwrap().as_ref().unwrap().clone().into())
         }
     }
 
     #[test]
     fn preparation_failures_never_become_optional_fold_misses() {
         use novarocks_functions::{KernelDiagnostic, KernelFailure};
-        use novarocks_type_contract::CompileControlError;
         static EVALUATOR: PreparationFailure = PreparationFailure(Mutex::new(None));
         let mut arena = ScalarArena::new();
         let child = arena.intern(
@@ -2486,65 +2479,123 @@ mod complete_fold_type_tests {
             },
             FunctionValueType::new(DataType::Int32, true),
         );
-        for (failure, expected) in [
-            (KernelFailure::Cancelled, SqlCompileError::Cancelled),
-            (
-                KernelFailure::DeadlineExceeded,
-                SqlCompileError::DeadlineExceeded,
-            ),
-            (
-                KernelFailure::ResourceExhausted,
-                SqlCompileError::ResourceExhausted,
-            ),
-            (
-                KernelFailure::InvalidProgram(KernelDiagnostic::new("frozen binding mismatch")),
-                SqlCompileError::InvalidRequest(
-                    "invalid kernel program: frozen binding mismatch".into(),
-                ),
-            ),
-            (
-                KernelFailure::Internal(KernelDiagnostic::new(
-                    "unexpected pure preparation failure",
-                )),
-                SqlCompileError::Compilation(
-                    "kernel internal failure: unexpected pure preparation failure".into(),
-                ),
-            ),
+        use novarocks_failure_contract::FailureProjection;
+        for failure in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("frozen binding mismatch")),
+            KernelFailure::Internal(KernelDiagnostic::new("unexpected pure preparation failure")),
         ] {
-            let converted = SqlConstantEvaluationError::from(failure.clone());
-            match failure {
-                KernelFailure::Cancelled => assert_eq!(
-                    converted,
-                    SqlConstantEvaluationError::Control(CompileControlError::Cancelled)
-                ),
-                KernelFailure::DeadlineExceeded => assert_eq!(
-                    converted,
-                    SqlConstantEvaluationError::Control(CompileControlError::DeadlineExceeded)
-                ),
-                KernelFailure::ResourceExhausted => assert_eq!(
-                    converted,
-                    SqlConstantEvaluationError::Control(CompileControlError::ResourceExhausted)
-                ),
-                _ => assert_eq!(
-                    converted,
-                    SqlConstantEvaluationError::Preparation(failure.clone())
-                ),
-            }
-            *EVALUATOR.0.lock().unwrap() = Some(failure);
+            let SqlConstantEvaluationError::Source(converted) =
+                SqlConstantEvaluationError::from(failure.clone())
+            else {
+                panic!("kernel evidence must not mint controller intent");
+            };
+            assert_eq!(converted.downcast_ref::<KernelFailure>(), Some(&failure));
+            assert_eq!(converted.failure_fact(), failure.failure_fact());
+            *EVALUATOR.0.lock().unwrap() = Some(failure.clone());
             let mut work = CompileCheckpoints::try_new(
                 crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                 CompilePhase::Validate,
             )
             .unwrap();
-            assert_eq!(
-                try_fold_node(&mut arena, root, &EVALUATOR, &mut work),
-                Err(expected)
-            );
+            let Err(SqlCompileError::CompilationSource(source)) =
+                try_fold_node(&mut arena, root, &EVALUATOR, &mut work)
+            else {
+                panic!("non-data kernel source must propagate");
+            };
+            assert_eq!(source.downcast_ref::<KernelFailure>(), Some(&failure));
+            assert_eq!(source.failure_fact(), failure.failure_fact());
             assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
         }
     }
 
-    struct InvalidFrozenType;
+    #[derive(Debug)]
+    struct ProjectedFoldSource(novarocks_failure_contract::FailureClass);
+    impl std::fmt::Display for ProjectedFoldSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("identical data overflow / resource / cancellation words")
+        }
+    }
+    impl std::error::Error for ProjectedFoldSource {}
+    impl novarocks_failure_contract::FailureProjection for ProjectedFoldSource {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            use novarocks_failure_contract::*;
+            FailureFact::new(
+                self.0,
+                FailureReason::new(domain::SQL, std::num::NonZeroU16::new(65000).unwrap()),
+            )
+        }
+    }
+    struct ProjectedFoldEvaluator(Mutex<Option<novarocks_failure_contract::SharedFailureCause>>);
+    impl SqlConstantEvaluator for ProjectedFoldEvaluator {
+        fn eval_scalar(
+            &self,
+            _: &FoldRequest,
+            _: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+        {
+            Err(SqlConstantEvaluationError::Source(
+                self.0.lock().unwrap().as_ref().unwrap().clone(),
+            ))
+        }
+    }
+    #[test]
+    fn projected_fold_source_declines_only_data_and_retains_every_other_actual_source() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        static EVALUATOR: ProjectedFoldEvaluator = ProjectedFoldEvaluator(Mutex::new(None));
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            FunctionValueType::new(DataType::Int64, false),
+        );
+        let root = arena.intern(
+            ScalarNode::Cast {
+                child,
+                target: DataType::Int32,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            FunctionValueType::new(DataType::Int32, true),
+        );
+        for class in [
+            FailureClass::Data,
+            FailureClass::Resource,
+            FailureClass::Control,
+            FailureClass::Invariant,
+            FailureClass::Dependency,
+            FailureClass::Representation,
+            FailureClass::Unexpected,
+        ] {
+            let source = SharedFailureCause::new(ProjectedFoldSource(class));
+            *EVALUATOR.0.lock().unwrap() = Some(source.clone());
+            let mut work = CompileCheckpoints::try_new(
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                CompilePhase::Validate,
+            )
+            .unwrap();
+            let actual = try_fold_node(&mut arena, root, &EVALUATOR, &mut work);
+            if class == FailureClass::Data {
+                assert_eq!(actual.unwrap(), None);
+            } else {
+                let Err(SqlCompileError::CompilationSource(carried)) = actual else {
+                    panic!("non-data source must propagate");
+                };
+                assert_eq!(carried.failure_fact().class(), class);
+                assert_eq!(
+                    carried, source,
+                    "same shared actual source, not a rendered copy"
+                );
+                assert_eq!(
+                    carried.downcast_ref::<ProjectedFoldSource>().unwrap().0,
+                    class
+                );
+            }
+            assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
+        }
+    }
+
+    struct InvalidFrozenType(ValueTypeError);
     impl SqlConstantEvaluator for InvalidFrozenType {
         fn eval_scalar(
             &self,
@@ -2552,13 +2603,15 @@ mod complete_fold_type_tests {
             _: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
         {
-            Err(ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json).into())
+            Err(self.0.into())
         }
     }
 
     #[test]
     fn invalid_frozen_type_is_fatal_in_the_real_fold_rule() {
-        static EVALUATOR: InvalidFrozenType = InvalidFrozenType;
+        static EVALUATOR: InvalidFrozenType = InvalidFrozenType(
+            ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json),
+        );
         let mut arena = ScalarArena::new();
         let child = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
@@ -2574,12 +2627,29 @@ mod complete_fold_type_tests {
         );
         let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let Err(SqlCompileError::CompilationSource(source)) =
+            try_fold_node(&mut arena, root, &EVALUATOR, &mut work)
+        else {
+            panic!("invalid frozen type must propagate its source");
+        };
+        assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(
-            try_fold_node(&mut arena, root, &EVALUATOR, &mut work),
-            Err(SqlCompileError::InvalidRequest(
-                ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json).to_string(),
-            )),
+            source.downcast_ref::<ValueTypeError>(),
+            Some(&ValueTypeError::InvalidLogicalCarrier(
+                ValueLogicalType::Json
+            ))
         );
+        for original in [ValueTypeError::TooDeep, ValueTypeError::TooManyNodes] {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+            let Err(SqlCompileError::CompilationSource(source)) =
+                try_fold_node(&mut arena, root, &InvalidFrozenType(original), &mut work)
+            else {
+                panic!("type extent limits must remain resource failures");
+            };
+            assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+            assert_eq!(source.downcast_ref::<ValueTypeError>(), Some(&original));
+        }
         assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
     }
 }

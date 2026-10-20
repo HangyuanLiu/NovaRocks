@@ -30,8 +30,8 @@
 //! packed into one struct column with fields `f{i}`, and `count_if` with two
 //! arguments consumes only its second argument. The final results are
 //! compared for type, NULLs and values; aggregate owners have no row-error
-//! channel, so a failure must occur on both sides as an operational data
-//! failure. Intermediate states are implementation formats and are not
+//! channel. A failure must occur on both sides with the same original domain
+//! fact; a non-data contract failure cannot match invocation Data by its text. Intermediate states are implementation formats and are not
 //! compared; only their final interpretation is.
 
 use std::num::NonZeroUsize;
@@ -57,6 +57,7 @@ use novarocks_type_contract::{
     FunctionValueType, ValueLogicalType,
 };
 
+use super::ReferenceFixtureResult;
 use super::generate::InputGenerator;
 use super::{
     DiffArgument, DiffSemantics, DifferentialFailure, ErrorMessageCheck, FloatComparison,
@@ -493,7 +494,7 @@ fn run_aggregate_with_legacy_spec(
     let legacy = LegacyAggregate::try_new(legacy_spec, &legacy_signature);
     let legacy_status = match &legacy {
         Ok(_) => LegacyStatus::Available,
-        Err(error) => LegacyStatus::Unavailable(error.clone()),
+        Err(error) => LegacyStatus::Unavailable(error.to_string()),
     };
     let (abi, dependencies) = installed_declaration(
         catalog,
@@ -514,7 +515,7 @@ fn run_aggregate_with_legacy_spec(
     }
     let legacy = legacy.map_err(|reason| DifferentialFailure::LegacyUnavailable {
         name: spec.name.clone(),
-        reason,
+        reason: reason.to_string(),
     })?;
     let pure = PureAggregate::try_new(catalog, spec, &bound, &pure_state_type, &dependencies)?;
     let layout = Layout::new(spec, rows);
@@ -623,10 +624,10 @@ fn validate_n_split_result_types(
 /// Execution metadata stays empty; complete item semantics are checked above.
 /// Offsets, child buffers, values and NULLs remain borrowed unchanged.
 fn project_n_raw16_result(
-    result: Result<ArrayRef, String>,
+    result: Result<ArrayRef, LegacyAggregateFailure>,
     raw: &FunctionValueType,
     full: &FunctionValueType,
-) -> Result<Result<ArrayRef, String>, String> {
+) -> Result<Result<ArrayRef, LegacyAggregateFailure>, String> {
     validate_n_split_result_types(full, raw).map_err(|error| error.to_string())?;
     let values = match result {
         Ok(values) => values,
@@ -655,14 +656,15 @@ fn project_n_raw16_result(
     Ok(Ok(Arc::new(projected)))
 }
 
-fn guard_legacy(run: impl FnOnce() -> Result<ArrayRef, String>) -> Result<ArrayRef, String> {
-    catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|panic| {
-        Err(format!(
-            "{}{}",
-            super::LEGACY_PANIC_PREFIX,
-            panic_message(&panic)
-        ))
-    })
+use super::reference_failure::ReferenceFailure as LegacyAggregateFailure;
+
+fn guard_legacy(
+    run: impl FnOnce() -> ReferenceFixtureResult<ArrayRef>,
+) -> Result<ArrayRef, LegacyAggregateFailure> {
+    match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(result) => result.map_err(LegacyAggregateFailure::Source),
+        Err(panic) => Err(LegacyAggregateFailure::Panicked(panic_message(&panic))),
+    }
 }
 
 enum GuardedPureResult {
@@ -684,7 +686,7 @@ fn compare_shape(
     result_type: &FunctionValueType,
     shape: &str,
     groups: usize,
-    legacy: Result<ArrayRef, String>,
+    legacy: Result<ArrayRef, LegacyAggregateFailure>,
     pure: GuardedPureResult,
     summary: &mut AggregateDiffSummary,
     details: &mut Vec<String>,
@@ -693,9 +695,8 @@ fn compare_shape(
         GuardedPureResult::Finished(result) => result,
         GuardedPureResult::Panicked(payload) => {
             match legacy {
-                Err(message)
-                    if message.strip_prefix(super::LEGACY_PANIC_PREFIX)
-                        == Some(payload.as_str())
+                Err(LegacyAggregateFailure::Panicked(message))
+                    if message == payload
                         && spec.expected_panic_payload.as_deref() == Some(payload.as_str()) =>
                 {
                     summary.matched_panics += 1;
@@ -720,9 +721,13 @@ fn compare_shape(
                 ));
                 return;
             }
-            if !novarocks_type_contract::arrow_data_types_exact(pure.data_type(), &result_type.data_type())
-                || !novarocks_type_contract::arrow_data_types_exact(legacy.data_type(), pure.data_type())
-            {
+            if !novarocks_type_contract::arrow_data_types_exact(
+                pure.data_type(),
+                &result_type.data_type(),
+            ) || !novarocks_type_contract::arrow_data_types_exact(
+                legacy.data_type(),
+                pure.data_type(),
+            ) {
                 details.push(format!(
                     "{shape}: result type legacy {:?}, pure {:?}, selected {:?}",
                     legacy.data_type(),
@@ -742,37 +747,60 @@ fn compare_shape(
                 match compare_value(&legacy, group, &pure, group, spec.float_comparison) {
                     Ok(true) => summary.null_results += 1,
                     Ok(false) => {}
-                    Err(difference) => details.push(format!("{shape}: group {group}: {difference}")),
+                    Err(difference) => {
+                        details.push(format!("{shape}: group {group}: {difference}"))
+                    }
                 }
             }
         }
-        (Err(legacy), Err(novarocks_functions::EvaluationFailure::Kernel(KernelFailure::Operational(diagnostic)))) => {
-            if legacy.starts_with(super::LEGACY_PANIC_PREFIX) {
-                details.push(format!("{shape}: {legacy}"));
-            } else if spec.require_invocation_data_errors {
+        (Err(legacy), Err(failure)) => {
+            use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+            let Some((reference_fact, mut reference_detail)) = legacy.original() else {
                 details.push(format!(
-                    "{shape}: legacy `{legacy}` requires whole invocation Data, pure returned Kernel Operational `{}`",
-                    diagnostic.message()
+                    "{shape}: reference has no runtime domain fact: {legacy}; pure `{failure}`"
                 ));
-            } else if spec.error_messages == ErrorMessageCheck::LegacyContainsPure
-                && !legacy.contains(diagnostic.message())
+                return;
+            };
+            let (pure_fact, pure_detail, invocation_data) = match &failure {
+                novarocks_functions::EvaluationFailure::Kernel(error) => {
+                    (error.failure_fact(), error.to_string(), false)
+                }
+                novarocks_functions::EvaluationFailure::InvocationData(data) => {
+                    let original = std::error::Error::source(data)
+                        .and_then(|source| source.downcast_ref::<KernelFailure>());
+                    let diagnostic = match original {
+                        Some(original) => original.to_string(),
+                        None => {
+                            // This owner authors a stage-qualified capsule
+                            // directly; compare the same complete reference
+                            // stage observation, keeping the original fact.
+                            reference_detail = legacy.to_string();
+                            data.message().to_owned()
+                        }
+                    };
+                    (data.failure_fact(), diagnostic, true)
+                }
+            };
+            if reference_fact != pure_fact {
+                details.push(format!("{shape}: original domain facts differ: reference {reference_fact:?}, pure {pure_fact:?}; reference `{legacy}`, pure `{failure}`"));
+            } else if invocation_data && reference_fact.class() != FailureClass::Data {
+                details.push(format!(
+                    "{shape}: non-data reference failure was promoted to invocation Data"
+                ));
+            } else if spec.require_invocation_data_errors
+                && reference_fact.class() == FailureClass::Data
+                && !invocation_data
             {
-                details.push(format!(
-                    "{shape}: legacy diagnostic `{legacy}` does not contain pure `{}`",
-                    diagnostic.message()
-                ));
+                details.push(format!("{shape}: the original Data failure requires invocation Data, pure returned Kernel `{failure}`"));
+            } else if spec.error_messages == ErrorMessageCheck::LegacyContainsPure
+                && BoundedDetail::truncating_display(&reference_detail)
+                    != BoundedDetail::truncating_display(&pure_detail)
+            {
+                details.push(format!("{shape}: producer diagnostics differ: reference `{reference_detail}`, pure `{pure_detail}`"));
             } else {
                 summary.matched_failures += 1;
             }
         }
-        (Err(legacy), Err(novarocks_functions::EvaluationFailure::InvocationData(data))) => {
-            if legacy.starts_with(super::LEGACY_PANIC_PREFIX) || legacy != data.message() {
-                details.push(format!("{shape}: whole invocation Data differs: legacy `{legacy}`, pure `{data}`"));
-            } else { summary.matched_failures += 1; }
-        }
-        (Err(legacy), Err(other)) => details.push(format!(
-            "{shape}: legacy failed with `{legacy}`, pure outer failure `{other}` is not a data failure"
-        )),
         (Err(legacy), Ok(pure)) => details.push(format!(
             "{shape}: required error swallowed: legacy failed with `{legacy}`, pure emitted {}",
             (0..pure.len().min(4))
@@ -806,7 +834,7 @@ struct LegacyAggregate {
 pub(crate) fn plain_value_array(
     values: &ArrayRef,
     value_type: &FunctionValueType,
-) -> Result<ArrayRef, String> {
+) -> ReferenceFixtureResult<ArrayRef> {
     let values = crate::exec::chunk::normalize_execution_array(values)?;
     if !novarocks_type_contract::value_layout_matches_carrier_observed::<
         novarocks_type_contract::ValueTypeError,
@@ -814,9 +842,7 @@ pub(crate) fn plain_value_array(
         value_type.typed_binding().layout(),
         values.data_type(),
         |_| Ok(()),
-    )
-    .map_err(|error| error.to_string())?
-    {
+    )? {
         return Err("differential source differs from its explicitly authored value layout".into());
     }
     if values.data_type() == value_type.data_type() {
@@ -824,8 +850,10 @@ pub(crate) fn plain_value_array(
     } else {
         // The borrowed comparison above already ruled out value conversions.
         // Locked Arrow performs only the remaining encoding removal here.
-        arrow::compute::cast(values.as_ref(), value_type.data_type())
-            .map_err(|error| error.to_string())
+        Ok(arrow::compute::cast(
+            values.as_ref(),
+            value_type.data_type(),
+        )?)
     }
 }
 
@@ -833,7 +861,7 @@ impl LegacyAggregate {
     fn try_new(
         spec: &AggregateDiffSpec,
         signature: &ResolvedAggregateSignature,
-    ) -> Result<Self, String> {
+    ) -> ReferenceFixtureResult<Self> {
         let channels = if spec.name == "count_if" && spec.arguments.len() == 2 {
             vec![1]
         } else {
@@ -914,7 +942,7 @@ impl LegacyAggregate {
         spec: &AggregateDiffSpec,
         rows: Option<&[usize]>,
         all: usize,
-    ) -> Result<Option<ArrayRef>, String> {
+    ) -> ReferenceFixtureResult<Option<ArrayRef>> {
         let count = rows.map_or(all, <[_]>::len);
         let indices =
             rows.map(|rows| UInt64Array::from_iter_values(rows.iter().map(|row| *row as u64)));
@@ -922,14 +950,12 @@ impl LegacyAggregate {
         for channel in &self.channels {
             let column = match &spec.arguments[*channel] {
                 DiffArgument::Column { values, .. } => match &indices {
-                    Some(indices) => {
-                        take(values.as_ref(), indices, None).map_err(|e| e.to_string())?
-                    }
+                    Some(indices) => take(values.as_ref(), indices, None)?,
                     None => Arc::clone(values),
                 },
                 DiffArgument::Constant(value) => {
                     let repeat = UInt64Array::from(vec![u64::from(value.ordinal()); count]);
-                    take(value.pool().array().as_ref(), &repeat, None).map_err(|e| e.to_string())?
+                    take(value.pool().array().as_ref(), &repeat, None)?
                 }
             };
             columns.push(plain_value_array(
@@ -948,15 +974,19 @@ impl LegacyAggregate {
                         Field::new(format!("f{index}"), column.data_type().clone(), true)
                     })
                     .collect::<Vec<_>>();
-                Some(Arc::new(
-                    StructArray::try_new(Fields::from(fields), columns, None)
-                        .map_err(|error| error.to_string())?,
-                ) as ArrayRef)
+                Some(
+                    Arc::new(StructArray::try_new(Fields::from(fields), columns, None)?)
+                        as ArrayRef,
+                )
             }
         })
     }
 
-    fn single(&self, spec: &AggregateDiffSpec, layout: &Layout) -> Result<ArrayRef, String> {
+    fn single(
+        &self,
+        spec: &AggregateDiffSpec,
+        layout: &Layout,
+    ) -> ReferenceFixtureResult<ArrayRef> {
         let input = self.input(spec, None, layout.rows)?;
         let mut arena = LegacyArena::new();
         let states = LegacyStates::new(&self.update, &mut arena, layout.groups)?;
@@ -968,12 +998,16 @@ impl LegacyAggregate {
         let entry = &self.update.entries[0];
         entry.update_batch(
             &pointers,
-            AggregateInputBatch::try_new(input.as_ref(), layout.rows).map_err(|e| e.to_string())?,
+            AggregateInputBatch::try_new(input.as_ref(), layout.rows)?,
         )?;
-        entry.build_array(&states.pointers, false)
+        Ok(entry.build_array(&states.pointers, false)?)
     }
 
-    fn two_phase(&self, spec: &AggregateDiffSpec, layout: &Layout) -> Result<ArrayRef, String> {
+    fn two_phase(
+        &self,
+        spec: &AggregateDiffSpec,
+        layout: &Layout,
+    ) -> ReferenceFixtureResult<ArrayRef> {
         let mut arena = LegacyArena::new();
         let mut partials = Vec::with_capacity(layout.partitions.len());
         for partition in &layout.partitions {
@@ -990,8 +1024,7 @@ impl LegacyAggregate {
             let entry = &self.update.entries[0];
             entry.update_batch(
                 &pointers,
-                AggregateInputBatch::try_new(input.as_ref(), partition.rows.len())
-                    .map_err(|e| e.to_string())?,
+                AggregateInputBatch::try_new(input.as_ref(), partition.rows.len())?,
             )?;
             partials.push((partition, entry.build_array(&states.pointers, true)?));
         }
@@ -1005,11 +1038,10 @@ impl LegacyAggregate {
                 .collect::<Vec<_>>();
             entry.merge_batch(
                 &pointers,
-                AggregateInputBatch::try_new(Some(partial), partial.len())
-                    .map_err(|e| e.to_string())?,
+                AggregateInputBatch::try_new(Some(partial), partial.len())?,
             )?;
         }
-        entry.build_array(&states.pointers, false)
+        Ok(entry.build_array(&states.pointers, false)?)
     }
 }
 
@@ -1040,7 +1072,7 @@ impl<'a> LegacyStates<'a> {
         kernels: &'a AggKernelSet,
         arena: &mut LegacyArena,
         count: usize,
-    ) -> Result<Self, String> {
+    ) -> ReferenceFixtureResult<Self> {
         let entry = &kernels.entries[0];
         let mut states = Self {
             kernels,
@@ -1106,7 +1138,7 @@ impl PureAggregate {
     ) -> Result<AggregateStateColumn, KernelFailure> {
         let mut column = AggregateStateColumn::try_new(
             handle.clone(),
-            crate::exec::operators::compiled_aggregate::differential_aggregate_state_allocator(
+            crate::runtime::tracked_state_allocator::differential_aggregate_state_allocator(
                 MemTracker::new_root("pure-differential-aggregate-state"),
             ),
             NonZeroUsize::new(64).expect("nonzero block"),
@@ -1146,7 +1178,7 @@ impl PureAggregate {
                         .map(Some)
                         .map_err(|message| {
                             KernelFailure::InvalidProgram(
-                                novarocks_functions::KernelDiagnostic::new(&message),
+                                novarocks_functions::KernelDiagnostic::new(&message.to_string()),
                             )
                         })
                 }
@@ -1348,7 +1380,7 @@ pub(crate) fn aggregate_pure_owner_status(
         .map_err(|error| DifferentialFailure::InvalidSpec(error.to_string()))?;
     let legacy = match LegacyAggregate::try_new(spec, &signature) {
         Ok(_) => LegacyStatus::Available,
-        Err(error) => LegacyStatus::Unavailable(error),
+        Err(error) => LegacyStatus::Unavailable(error.to_string()),
     };
     installed_declaration(catalog, &spec.name, &bound, CatalogKind::Aggregate, legacy)?;
     Ok((bound.function_id, bound.selected.overload))
@@ -1360,7 +1392,7 @@ mod panic_comparison_tests {
     use arrow::array::Int64Array;
     use novarocks_functions::KernelDiagnostic;
     const PAYLOAD: &str = "frozen original library panic";
-    fn legacy_panic() -> Result<ArrayRef, String> {
+    fn legacy_panic() -> Result<ArrayRef, LegacyAggregateFailure> {
         guard_legacy(|| panic!("{PAYLOAD}"))
     }
     fn pure_panic(payload: &str) -> GuardedPureResult {
@@ -1368,7 +1400,7 @@ mod panic_comparison_tests {
     }
     fn compare(
         spec: AggregateDiffSpec,
-        legacy: Result<ArrayRef, String>,
+        legacy: Result<ArrayRef, LegacyAggregateFailure>,
         pure: GuardedPureResult,
     ) -> (AggregateDiffSummary, Vec<String>) {
         let result = FunctionValueType::new(DataType::Int64, true);
@@ -1397,6 +1429,53 @@ mod panic_comparison_tests {
             &mut details,
         );
         (summary, details)
+    }
+    #[test]
+    fn aggregate_original_facts_distinguish_equal_text_and_fixture_failures() {
+        fn reference(error: KernelFailure) -> Result<ArrayRef, LegacyAggregateFailure> {
+            guard_legacy(|| {
+                Err(Box::new(
+                    crate::runtime::fragment::ExecutionFailure::from_domain(error),
+                ))
+            })
+        }
+        let same = "same producer diagnostic";
+        let (summary, differences) = compare(
+            AggregateDiffSpec::new("min_n").invocation_data_errors(),
+            reference(KernelFailure::Internal(KernelDiagnostic::new(same))),
+            GuardedPureResult::Finished(Err(
+                KernelFailure::Internal(KernelDiagnostic::new(same)).into()
+            )),
+        );
+        assert_eq!(summary.matched_failures, 1);
+        assert!(differences.is_empty());
+        for reference in [
+            reference(KernelFailure::Operational(KernelDiagnostic::new(same))),
+            Err(LegacyAggregateFailure::Fixture(same.into())),
+        ] {
+            let (summary, differences) = compare(
+                AggregateDiffSpec::new("min_n"),
+                reference,
+                GuardedPureResult::Finished(Err(KernelFailure::Internal(KernelDiagnostic::new(
+                    same,
+                ))
+                .into())),
+            );
+            assert_eq!(summary.matched_failures, 0);
+            assert!(!differences.is_empty());
+        }
+        let (summary, differences) = compare(
+            AggregateDiffSpec::new("min_n"),
+            reference(KernelFailure::Internal(KernelDiagnostic::new(
+                "original detail",
+            ))),
+            GuardedPureResult::Finished(Err(KernelFailure::Internal(KernelDiagnostic::new(
+                "different detail",
+            ))
+            .into())),
+        );
+        assert_eq!(summary.matched_failures, 0);
+        assert!(!differences.is_empty());
     }
     #[test]
     fn aggregate_same_panic_without_explicit_opt_in_is_rejected() {
@@ -1537,7 +1616,7 @@ fn assert_encoded_with_legacy_spec(
                 &states.pointers,
                 AggregateInputBatch::try_new(Some(&encoded), groups).map_err(|e| e.to_string())?,
             )?;
-            entry.build_array(&states.pointers, intermediate)
+            Ok(entry.build_array(&states.pointers, intermediate)?)
         });
         let pure_result = guard_pure(|| {
             let mut column = PureAggregate::column(&handle, groups)?;
@@ -1625,7 +1704,7 @@ mod n_largeint_split_oracle_contract_tests {
         )
     }
     fn compare(
-        legacy: Result<ArrayRef, String>,
+        legacy: Result<ArrayRef, LegacyAggregateFailure>,
         pure: Result<ArrayRef, EvaluationFailure>,
     ) -> Vec<String> {
         let (raw, full) = types();

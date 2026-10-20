@@ -141,17 +141,17 @@ pub(crate) fn materialize_compiled_scan_bindings(
     instance: &FragmentInstanceSpec,
 ) -> Result<ScanBindings, FragmentLaunchError> {
     validate_compiled_scan_sources(program, sources, instance).map_err(|error| {
-        FragmentLaunchError::new(
+        FragmentLaunchError::from_failure(
             FragmentLaunchStage::Materialize,
             FragmentLaunchErrorKind::Materialization,
-            error.to_string(),
+            error.into(),
         )
     })?;
     let nodes = compiled_scan_nodes(program).map_err(|error| {
-        FragmentLaunchError::new(
+        FragmentLaunchError::from_failure(
             FragmentLaunchStage::Materialize,
             FragmentLaunchErrorKind::Materialization,
-            error.to_string(),
+            error.into(),
         )
     })?;
     let mut bindings = ScanBindings::default();
@@ -171,17 +171,22 @@ fn bind_scan(
         .scan_assignments()
         .get(&FragmentNodeId::new(node_id))
         .ok_or_else(|| {
-            FragmentLaunchError::new(
+            FragmentLaunchError::from_failure(
                 FragmentLaunchStage::Materialize,
                 FragmentLaunchErrorKind::Materialization,
-                format!("missing scan assignment for node {node_id}"),
+                FragmentBindingError::new(
+                    FragmentBindingTarget::ScanNode(node_id),
+                    FragmentBindingErrorKind::MissingAssignment,
+                    format!("missing scan assignment for node {node_id}"),
+                )
+                .into(),
             )
         })?;
     let op = source.bind(assignment.ranges().clone()).map_err(|error| {
-        FragmentLaunchError::new(
+        FragmentLaunchError::from_failure(
             FragmentLaunchStage::Materialize,
             FragmentLaunchErrorKind::Materialization,
-            format!("scan node {node_id} bind failed: {error}"),
+            error,
         )
     })?;
     bindings.insert(node_id, op);
@@ -210,10 +215,18 @@ mod tests {
     struct CountingSource;
     struct CountingOp;
     impl ScanSource for CountingSource {
-        fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        fn bind(
+            &self,
+            ranges: BoundScanRanges,
+        ) -> crate::runtime::fragment::ExecutionResult<Arc<dyn ScanOp>> {
             match ranges {
                 BoundScanRanges::None => Ok(Arc::new(CountingOp)),
-                other => Err(format!("counting source expects no ranges, got {other:?}")),
+                other => Err(novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(&format!(
+                        "counting source expects no ranges, got {other:?}"
+                    )),
+                )
+                .into()),
             }
         }
     }

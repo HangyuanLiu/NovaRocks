@@ -24,6 +24,7 @@ pub enum SqlErrorPhase {
     Validate,
     Analyze,
     Admit,
+    Execution,
 }
 
 impl SqlErrorPhase {
@@ -34,6 +35,7 @@ impl SqlErrorPhase {
             "Validate" => Some(Self::Validate),
             "Analyze" => Some(Self::Analyze),
             "Admit" => Some(Self::Admit),
+            "Execution" => Some(Self::Execution),
             _ => None,
         }
     }
@@ -45,6 +47,7 @@ impl SqlErrorPhase {
             Self::Validate => "Validate",
             Self::Analyze => "Analyze",
             Self::Admit => "Admit",
+            Self::Execution => "Execution",
         }
     }
 }
@@ -62,6 +65,17 @@ pub fn lookup_sql_error_descriptor<'a>(
     descriptors
         .iter()
         .find(|descriptor| descriptor.code == code)
+}
+
+/// Accept only the explicitly registered compiled legacy identity in addition
+/// to ordinary SQL code grammar. Registration and the Execution phase are
+/// required; this does not admit other EngineErrorCode names.
+pub fn is_sql_error_identity(candidate: &str, descriptors: &[SqlErrorDescriptor]) -> bool {
+    is_sql_error_code_token(candidate)
+        || (candidate
+            == crate::engine_error_codes::EngineErrorCode::UnsupportedCompiledShape.as_str()
+            && lookup_sql_error_descriptor(descriptors, candidate)
+                .is_some_and(|entry| entry.phase == SqlErrorPhase::Execution))
 }
 
 /// SQL error codes are lower-case dotted tokens.  This separates their wire
@@ -106,6 +120,52 @@ pub const TEST_SQL_ERROR_DESCRIPTORS: &[SqlErrorDescriptor] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_phase_roundtrips_as_explicit_descriptor_data() {
+        assert_eq!(
+            SqlErrorPhase::parse("Execution"),
+            Some(SqlErrorPhase::Execution)
+        );
+        assert_eq!(SqlErrorPhase::Execution.as_str(), "Execution");
+        assert_eq!(SqlErrorPhase::parse("execution"), None);
+    }
+
+    #[test]
+    fn compiled_identity_requires_exact_registered_execution_descriptor() {
+        let registered = [SqlErrorDescriptor {
+            code: "UnsupportedCompiledShape",
+            phase: SqlErrorPhase::Execution,
+        }];
+        assert!(is_sql_error_identity(
+            "UnsupportedCompiledShape",
+            &registered
+        ));
+        assert!(!is_sql_error_code_token("UnsupportedCompiledShape"));
+        assert!(!is_sql_error_identity("UnsupportedCompiledShape", &[]));
+        for phase in [SqlErrorPhase::Parse, SqlErrorPhase::Analyze] {
+            assert!(!is_sql_error_identity(
+                "UnsupportedCompiledShape",
+                &[SqlErrorDescriptor {
+                    code: "UnsupportedCompiledShape",
+                    phase,
+                }]
+            ));
+        }
+        for bad in [
+            "CommitUnknown",
+            "InternalInvariantViolation",
+            "NotARealCode",
+            "unsupportedcompiledshape",
+            "UnsupportedcompiledShape",
+            "UnsupportedCompiledShapeX",
+            "UnsupportedCompiledShape.foo",
+            " UnsupportedCompiledShape",
+            "UnsupportedCompiledShape ",
+        ] {
+            assert!(!is_sql_error_identity(bad, &registered), "{bad}");
+        }
+    }
 
     #[test]
     fn recognizes_lowercase_dotted_sql_error_codes_only() {

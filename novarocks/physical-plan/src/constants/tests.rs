@@ -52,7 +52,7 @@ impl PureCompileControl for Control {
         let mut events = self.events.lock().unwrap();
         let index = events.len();
         events.push((phase, units));
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && index == at
         {
             Err(cause)
@@ -184,7 +184,7 @@ fn missing_pool_and_bad_ordinal_return_exact_errors_and_observed_ordinary_tails(
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..trace.len() {
-                let control = Control::at(Some((at, cause)));
+                let control = Control::at(Some((at, cause.clone())));
                 assert_eq!(
                     completed(&control, |work| table.resolve_observed(
                         reference,
@@ -192,7 +192,7 @@ fn missing_pool_and_bad_ordinal_return_exact_errors_and_observed_ordinary_tails(
                         work
                     ))
                     .unwrap_err(),
-                    ConstantReferenceError::Control(cause)
+                    ConstantReferenceError::Control(cause.clone())
                 );
                 assert_eq!(control.trace(), trace[..=at]);
             }
@@ -502,14 +502,14 @@ fn source_metadata_is_retained_without_semantic_projection_copy_and_controls_pre
         CompileControlError::ResourceExhausted,
     ] {
         for at in 0..trace.len() {
-            let control = Control::at(Some((at, cause)));
+            let control = Control::at(Some((at, cause.clone())));
             assert_eq!(
                 completed(&control, |w| table.project_observed(
                     [(reference(u32::MAX, 0), &ty), (reference(u32::MAX, 0), &ty)],
                     w
                 ))
                 .unwrap_err(),
-                ConstantReferenceError::Control(cause)
+                ConstantReferenceError::Control(cause.clone())
             );
             assert_eq!(control.trace(), trace[..=at]);
             assert_eq!(table.entries().len(), 1);
@@ -903,7 +903,7 @@ fn actual_publication_keeps_primary_control_every_callback_and_ordinary_tail() {
         CompileControlError::ResourceExhausted,
     ] {
         for at in 0..plan_trace.len() {
-            let control = Control::at(Some((at, cause)));
+            let control = Control::at(Some((at, cause.clone())));
             assert!(
                 matches!(plan_builder(std::slice::from_ref(&fragment), table.clone()).finish_observed(&control),
                 Err(crate::PlanConstructionError::Constants(ConstantReferenceError::Control(actual))) if actual == cause)
@@ -911,7 +911,7 @@ fn actual_publication_keeps_primary_control_every_callback_and_ordinary_tail() {
             assert_eq!(control.trace(), plan_trace[..=at]);
         }
         for at in 0..package_trace.len() {
-            let control = Control::at(Some((at, cause)));
+            let control = Control::at(Some((at, cause.clone())));
             assert!(
                 matches!(crate::FragmentPackage::try_new(input.clone(), package_admission(),  &control),
                 Err(crate::FragmentPackageError::Control(actual)) if actual == cause)
@@ -943,7 +943,7 @@ fn actual_publication_keeps_primary_control_every_callback_and_ordinary_tail() {
         CompileControlError::ResourceExhausted,
     ] {
         for at in 0..trace.len() {
-            let control = Control::at(Some((at, cause)));
+            let control = Control::at(Some((at, cause.clone())));
             assert!(
                 matches!(crate::FragmentPackage::try_new(input.clone(), package_admission(),  &control),
                 Err(crate::FragmentPackageError::Control(actual)) if actual == cause)
@@ -1010,7 +1010,7 @@ fn actual_publication_observes_structure_success_and_ordinary_error_completion()
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..trace.len() {
-                let control = Control::at(Some((at, cause)));
+                let control = Control::at(Some((at, cause.clone())));
                 assert!(matches!(author(invalid_result).finish_observed(&control),
                     Err(crate::PlanConstructionError::Constants(
                         ConstantReferenceError::Control(actual))) if actual == cause));
@@ -1061,7 +1061,7 @@ fn optional_constant_projection_observes_nonconstant_prefixes_and_definition_gap
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..trace.len() {
-                let control = Control::at(Some((at, cause)));
+                let control = Control::at(Some((at, cause.clone())));
                 assert!(matches!(completed(&control, |work| {
                     table.project_optional_references_observed(definitions.iter().copied(), work)
                 }), Err(ConstantReferenceError::Control(actual)) if actual == cause));
@@ -1215,7 +1215,7 @@ fn captured_source_missing_and_ordinal_errors_keep_plain_observations_and_contro
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let c = Control::at(Some((stop, cause)));
+                let c = Control::at(Some((stop, cause.clone())));
                 let result = completed(&c, |work| {
                     table.resolve_source_captured_observed(
                         address,
@@ -1234,4 +1234,16 @@ fn captured_source_missing_and_ordinal_errors_keep_plain_observations_and_contro
 
 mod borrowed_validation_tests {
     include!("borrowed_validation_tests.rs");
+}
+
+#[test]
+fn reference_admission_keeps_constant_policy_source_instead_of_relabeling_control() {
+    use std::error::Error;
+    let original = ConstantError::Limit("original constant owner policy");
+    let error = ConstantReferenceError::from(original.clone());
+    assert!(matches!(&error, ConstantReferenceError::Constant(_)));
+    assert_eq!(
+        error.source().unwrap().downcast_ref::<ConstantError>(),
+        Some(&original)
+    );
 }

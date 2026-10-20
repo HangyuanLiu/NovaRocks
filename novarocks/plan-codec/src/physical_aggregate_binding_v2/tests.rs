@@ -56,7 +56,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -560,7 +560,7 @@ fn aggregate_original_control_prefixes_cover_quantum_success_and_ordinary_tails(
         for cause in CAUSES {
             for at in 0..trace.len() {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -581,7 +581,7 @@ fn aggregate_original_control_prefixes_cover_quantum_success_and_ordinary_tails(
         assert_eq!(*units, 256);
         for cause in CAUSES {
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(

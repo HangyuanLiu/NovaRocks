@@ -24,34 +24,9 @@ use arrow_cast::cast;
 use arrow_schema::DataType;
 use std::sync::Arc;
 
-#[derive(Debug)]
-pub enum BitArrayError {
-    CastArgument {
-        index: usize,
-        cause: String,
-    },
-    ArgumentCarrier {
-        index: usize,
-        expected: &'static str,
-    },
-    CastOutput(String),
-    Raw(String),
-}
-impl BitArrayError {
-    /// Compatibility projection only: the label never selects computation.
-    pub fn legacy_message(self, label: &str) -> String {
-        match self {
-            Self::CastArgument { index, cause } => {
-                format!("{label}: failed to cast arg{index} to BIGINT: {cause}")
-            }
-            Self::ArgumentCarrier { index, expected } => {
-                format!("{label}: arg{index} is not {expected}")
-            }
-            Self::CastOutput(cause) => format!("{label}: failed to cast output: {cause}"),
-            Self::Raw(cause) => cause,
-        }
-    }
-}
+#[path = "bit_array/failure.rs"]
+mod failure;
+pub use failure::BitArrayError;
 #[derive(Clone, Copy, Debug)]
 pub enum BitArrayObservation {
     Step,
@@ -59,18 +34,13 @@ pub enum BitArrayObservation {
 }
 
 pub fn to_i64_array(array: &ArrayRef, arg_idx: usize) -> Result<Int64Array, BitArrayError> {
-    let casted = cast(array, &DataType::Int64).map_err(|e| BitArrayError::CastArgument {
-        index: arg_idx,
-        cause: e.to_string(),
-    })?;
+    let casted =
+        cast(array, &DataType::Int64).map_err(|e| BitArrayError::cast_argument(arg_idx, e))?;
     casted
         .as_any()
         .downcast_ref::<Int64Array>()
         .cloned()
-        .ok_or(BitArrayError::ArgumentCarrier {
-            index: arg_idx,
-            expected: "BIGINT",
-        })
+        .ok_or(BitArrayError::carrier(arg_idx, "BIGINT"))
 }
 
 pub fn to_i128_values(
@@ -82,29 +52,24 @@ pub fn to_i128_values(
             let arr = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or(BitArrayError::ArgumentCarrier {
-                    index: arg_idx,
-                    expected: "LARGEINT",
-                })?;
+                .ok_or(BitArrayError::carrier(arg_idx, "LARGEINT"))?;
             let mut out = Vec::with_capacity(arr.len());
             for row in 0..arr.len() {
                 if arr.is_null(row) {
                     out.push(None);
                 } else {
-                    out.push(Some(
-                        largeint::i128_from_be_bytes(arr.value(row)).map_err(BitArrayError::Raw)?,
-                    ));
+                    out.push(Some(i128::from_be_bytes(
+                        arr.value(row).try_into().map_err(BitArrayError::slice)?,
+                    )));
                 }
             }
             Ok(out)
         }
         DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().ok_or(
-                BitArrayError::ArgumentCarrier {
-                    index: arg_idx,
-                    expected: "UINT64",
-                },
-            )?;
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or(BitArrayError::carrier(arg_idx, "UINT64"))?;
             let mut out = Vec::with_capacity(arr.len());
             for row in 0..arr.len() {
                 if arr.is_null(row) {
@@ -116,12 +81,10 @@ pub fn to_i128_values(
             Ok(out)
         }
         DataType::Decimal128(_, scale) if *scale == 0 => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().ok_or(
-                BitArrayError::ArgumentCarrier {
-                    index: arg_idx,
-                    expected: "DECIMAL128",
-                },
-            )?;
+            let arr = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or(BitArrayError::carrier(arg_idx, "DECIMAL128"))?;
             let mut out = Vec::with_capacity(arr.len());
             for row in 0..arr.len() {
                 if arr.is_null(row) {
@@ -218,7 +181,7 @@ pub fn cast_output(
     if out.data_type() == target {
         return Ok(out);
     }
-    cast(&out, target).map_err(|e| BitArrayError::CastOutput(e.to_string()))
+    cast(&out, target).map_err(BitArrayError::cast_output)
 }
 pub fn cast_output_observed<E>(
     out: ArrayRef,
@@ -285,5 +248,5 @@ fn build_largeint<E>(
             }
         })
     })
-    .map(|result| result.map_err(BitArrayError::Raw))
+    .map(Ok)
 }

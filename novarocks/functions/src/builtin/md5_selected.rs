@@ -219,7 +219,6 @@ pub(super) fn evaluate<'a>(
                 }
             },
             Some(input.contract().result_type().data_type()),
-            false,
             &mut |event| md5_shared::observe(&mut work, event),
         )
         .map_err(|error| core_failure(op, error))?;
@@ -234,11 +233,5 @@ pub(super) fn evaluate<'a>(
     work.finish_result(result)
 }
 fn core_failure(op: Operation, error: CoreError) -> KernelFailure {
-    match error {
-        CoreError::Kernel(failure) => failure,
-        diagnostic => internal(&md5_shared::compatibility::error_text(
-            diagnostic,
-            md5_shared::compatibility::diagnostic_label(op),
-        )),
-    }
+    md5_shared::into_kernel(error, md5_shared::diagnostic_label(op))
 }

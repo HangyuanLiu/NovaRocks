@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original Unix epoch/format computation; Local authority stays in the v1 input shell.
-use super::calendar_extended_shared::legacy_to_timestamp_value;
+use super::calendar_timestamp::timestamp_value;
 use crate::datetime_value::{naive_to_date32, parse_date, parse_datetime};
 use crate::{KernelFailure, kernel_input::EvaluationCheckpoints};
 use arrow_array::{
@@ -137,14 +137,13 @@ fn epoch_value_to_datetime(
 fn build_timestamp_array(
     values: Vec<Option<i64>>,
     output_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, KernelFailure> {
     let (unit, tz) = match output_type {
         DataType::Timestamp(unit, tz) => (*unit, tz.as_deref().map(|s| s.to_string())),
         other => {
-            return Err(format!(
-                "from_unixtime unsupported output type: {:?}",
-                other
-            ));
+            return Err(super::calendar_parts_shared::part_contract(format_args!(
+                "from_unixtime unsupported output type: {other:?}"
+            )));
         }
     };
 
@@ -233,14 +232,14 @@ fn project_date(value: UnixtimeValue) -> Option<i32> {
             .or_else(|| parse_date(&s).map(naive_to_date32)),
     }
 }
-fn project_timestamp(value: UnixtimeValue, ty: &DataType) -> Option<i64> {
+fn project_timestamp(value: UnixtimeValue, unit: TimeUnit) -> Option<i64> {
     let dt = match value {
         UnixtimeValue::Direct(d) => Some(d),
         UnixtimeValue::Formatted(s) => {
             parse_datetime(&s).or_else(|| parse_date(&s).and_then(|d| d.and_hms_opt(0, 0, 0)))
         }
     };
-    dt.and_then(|d| legacy_to_timestamp_value(d, ty).ok())
+    dt.and_then(|d| timestamp_value(d, unit).ok())
 }
 /// Raw admission/whole-array decoding has already been performed by the original shell.
 pub fn evaluate_legacy_from_unixtime(
@@ -251,8 +250,25 @@ pub fn evaluate_legacy_from_unixtime(
     units: i64,
     output: &DataType,
     project_local: fn(DateTime<Utc>) -> NaiveDateTime,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, KernelFailure> {
     use arrow_array::Array;
+    if !matches!(
+        output,
+        DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _)
+    ) {
+        return Err(super::calendar_parts_shared::part_contract(format_args!(
+            "from_unixtime unsupported output type: {output:?}"
+        )));
+    }
+    if [format.map(Array::len), timezone.map(Array::len)]
+        .into_iter()
+        .flatten()
+        .any(|length| length != values.len())
+    {
+        return Err(super::calendar_parts_shared::part_contract(
+            "from_unixtime argument lengths differ",
+        ));
+    }
     let rows = values
         .iter()
         .copied()
@@ -279,16 +295,15 @@ pub fn evaluate_legacy_from_unixtime(
                 .map(|r| r.and_then(project_date))
                 .collect::<Vec<_>>(),
         ))),
-        DataType::Timestamp(_, _) => build_timestamp_array(
+        DataType::Timestamp(unit, _) => build_timestamp_array(
             rows.into_iter()
-                .map(|r| r.and_then(|r| project_timestamp(r, output)))
+                .map(|r| r.and_then(|r| project_timestamp(r, *unit)))
                 .collect(),
             output,
         ),
-        other => Err(format!(
-            "from_unixtime unsupported output type: {:?}",
-            other
-        )),
+        other => Err(super::calendar_parts_shared::part_contract(format_args!(
+            "from_unixtime unsupported output type: {other:?}"
+        ))),
     }
 }
 fn hour_from_unixtime_row(
@@ -349,7 +364,10 @@ pub fn realize_legacy_hour_public_result<H>(
     }
     observe(true).map_err(CopyConstructionError::Creator)?;
     creation
-        .request_layout(Layout::array::<i32>(source.len()).map_err(|_| CopyError::Extent)?)
+        .request_layout(
+            Layout::array::<i32>(source.len())
+                .map_err(|layout_error| CopyError::layout::<i32>(source.len(), layout_error))?,
+        )
         .map_err(CopyConstructionError::Creator)?;
     crate::selected_copy::preflight_primitive_vec_adoption_construction_observed(
         creation, observe,
@@ -579,3 +597,52 @@ pub(super) fn evaluate_selected<'a>(
 #[cfg(test)]
 #[path = "calendar_unixtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod raw_projection_tests {
+    use super::*;
+    use arrow_array::{Array, Int64Array};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    fn project_utc(utc: DateTime<Utc>) -> NaiveDateTime {
+        utc.naive_utc()
+    }
+
+    #[test]
+    fn calendar_unixtime_frozen_timestamp_units_match_the_actual_arrow_carrier() {
+        let zone = TimeZoneSpec::Fixed(FixedOffset::east_opt(0).unwrap());
+        for (unit, expected) in [
+            (TimeUnit::Second, 1),
+            (TimeUnit::Millisecond, 1_000),
+            (TimeUnit::Microsecond, 1_000_000),
+            (TimeUnit::Nanosecond, 1_000_000_000),
+        ] {
+            let ty = DataType::Timestamp(unit, Some("UTC".into()));
+            let output = evaluate_legacy_from_unixtime(
+                &[Some(1), None],
+                None,
+                None,
+                zone,
+                1,
+                &ty,
+                project_utc,
+            )
+            .unwrap();
+            assert_eq!(output.data_type(), &ty);
+            let actual = arrow_cast::cast(output.as_ref(), &DataType::Int64).unwrap();
+            let actual = actual.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(actual.value(0), expected);
+            assert!(actual.is_null(1));
+        }
+        let wrong = evaluate_legacy_from_unixtime(
+            &[Some(1)],
+            None,
+            None,
+            zone,
+            1,
+            &DataType::Int64,
+            |_| panic!("foreign result must be rejected before evaluation"),
+        )
+        .unwrap_err();
+        assert_eq!(wrong.failure_fact().class(), FailureClass::Invariant);
+    }
+}

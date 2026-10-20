@@ -16,6 +16,29 @@
 // under the License.
 //! Flat build-row match tracking and broadcast merge accumulator.
 
+use crate::runtime::fragment::ExecutionFailure;
+#[derive(Debug)]
+struct JoinMatchContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinMatchContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinMatchContract {}
+impl novarocks_failure_contract::FailureProjection for JoinMatchContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinMatchContract.reason(),
+        )
+    }
+}
+fn contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinMatchContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BuildMatchFlags {
     flags: Vec<bool>,
@@ -32,14 +55,14 @@ impl BuildMatchFlags {
         }
     }
 
-    pub(crate) fn mark(&mut self, build_row: u32) -> Result<bool, String> {
+    pub(crate) fn mark(&mut self, build_row: u32) -> Result<bool, ExecutionFailure> {
         let row = build_row as usize;
         let len = self.flags.len();
         let Some(slot) = self.flags.get_mut(row) else {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "join build match row out of bounds: row={} len={}",
                 row, len
-            ));
+            )));
         };
         let was_new = !*slot;
         *slot = true;
@@ -89,16 +112,19 @@ impl BuildMatchMerge {
         }
     }
 
-    pub(crate) fn merge_one(&mut self, local: Vec<bool>) -> Result<Option<Vec<bool>>, String> {
+    pub(crate) fn merge_one(
+        &mut self,
+        local: Vec<bool>,
+    ) -> Result<Option<Vec<bool>>, ExecutionFailure> {
         if self.drivers_merged >= self.total_drivers {
-            return Err("join build match merge already complete".to_string());
+            return Err(contract("join build match merge already complete"));
         }
         if local.len() != self.merged.len() {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "join build match merge length mismatch: local={} merged={}",
                 local.len(),
                 self.merged.len()
-            ));
+            )));
         }
         for (slot, matched) in self.merged.iter_mut().zip(local.into_iter()) {
             *slot = *slot || matched;
@@ -115,6 +141,7 @@ impl BuildMatchMerge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_failure_contract::FailureProjection;
 
     #[test]
     fn flat_flags_mark_and_emit_matched_and_unmatched_indices() {
@@ -164,7 +191,11 @@ mod tests {
             .merge_one(vec![false, true])
             .expect_err("already complete");
 
-        assert_eq!(err, "join build match merge already complete");
+        assert_eq!(err.detail(), "join build match merge already complete");
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
     }
 
     #[test]
@@ -175,6 +206,10 @@ mod tests {
             .merge_one(vec![false, true])
             .expect_err("already complete");
 
-        assert_eq!(err, "join build match merge already complete");
+        assert_eq!(err.detail(), "join build match merge already complete");
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
     }
 }

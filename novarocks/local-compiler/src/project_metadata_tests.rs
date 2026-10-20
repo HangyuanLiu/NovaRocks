@@ -32,6 +32,19 @@ impl std::fmt::Display for Refusal {
     }
 }
 impl std::error::Error for Refusal {}
+impl novarocks_failure_contract::FailureProjection for Refusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(
+                domain::LOCAL_COMPILER,
+                std::num::NonZeroU16::new(1000).unwrap(),
+            ),
+        )
+    }
+}
+
 struct Host<'a> {
     calls: usize,
     requests: Option<ProjectOutputRequestFacts>,

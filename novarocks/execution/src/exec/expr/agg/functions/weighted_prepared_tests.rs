@@ -305,7 +305,9 @@ fn prepared_weighted_negative_weight_is_rejected_without_digest_contribution() {
         )
         .unwrap_err();
     assert!(
-        error.contains("percentile weight must be non-negative"),
+        error
+            .to_string()
+            .contains("percentile weight must be non-negative"),
         "{error}"
     );
     assert_eq!(scalar_result(&local, ptr), None);

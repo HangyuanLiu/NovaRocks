@@ -64,25 +64,33 @@ pub(super) fn evaluate_crc32<'a>(
         .ok_or_else(|| internal("crc32 selected Utf8 carrier cannot be downcast"))?;
     let selection = input.selection();
     output_capacity(selection.len())?;
-    let output = evaluate_bytes(*argument, selection, source.nullable(), true, control).map_err(
-        |error| match error {
-            CoreError::Legacy(message) => internal(&message),
-            CoreError::Kernel(failure) => failure,
-        },
-    )?;
+    let output = evaluate_bytes(*argument, selection, source.nullable(), true, control)?;
     SelectedValues::try_new(selection, target.data_type(), output, Box::default())
         .map_err(|_| internal("crc32 compact output violates its selected contract"))
 }
 
-/// The original carrier admission errors remain full owned Strings for v1.
-enum CoreError {
-    Legacy(String),
-    Kernel(KernelFailure),
-}
-impl From<KernelFailure> for CoreError {
-    fn from(failure: KernelFailure) -> Self {
-        Self::Kernel(failure)
+#[derive(Debug)]
+struct CrcFailure(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for CrcFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
+}
+impl std::error::Error for CrcFailure {}
+impl novarocks_failure_contract::FailureProjection for CrcFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(360).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for CrcFailure {}
+fn carrier_failure(detail: impl std::fmt::Display) -> KernelFailure {
+    KernelFailure::from_domain(CrcFailure(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
 }
 enum Bytes<'a> {
     Utf8(&'a StringArray),
@@ -91,8 +99,8 @@ enum Bytes<'a> {
     LargeBinary(&'a LargeBinaryArray),
 }
 impl<'a> Bytes<'a> {
-    fn from_array(array: &'a ArrayRef) -> Result<Self, CoreError> {
-        let failure = |message: &str| CoreError::Legacy(message.to_string());
+    fn from_array(array: &'a ArrayRef) -> Result<Self, KernelFailure> {
+        let failure = |message: &str| carrier_failure(message);
         match array.data_type() {
             DataType::Utf8 => array
                 .as_any()
@@ -114,7 +122,7 @@ impl<'a> Bytes<'a> {
                 .downcast_ref::<LargeBinaryArray>()
                 .map(Self::LargeBinary)
                 .ok_or_else(|| failure("downcast LargeBinaryArray failed")),
-            other => Err(CoreError::Legacy(format!(
+            other => Err(carrier_failure(format_args!(
                 "crc32 expects VARCHAR/BINARY input, got {:?}",
                 other
             ))),
@@ -152,11 +160,10 @@ fn evaluate_bytes(
     nullable: bool,
     selected: bool,
     control: &dyn KernelEvaluationControl,
-) -> Result<ArrayRef, CoreError> {
-    // Preserve v1 builder allocation before carrier admission and pure's
-    // existing allocation position after exact output representability checks.
-    let mut builder = Int64Builder::with_capacity(selection.len());
+) -> Result<ArrayRef, KernelFailure> {
+    // Reject an invalid physical carrier before constructing result storage.
     let values = Bytes::from_array(argument.array())?;
+    let mut builder = Int64Builder::with_capacity(selection.len());
     let mut work = EvaluationCheckpoints::new(control);
     for (ordinal, batch_row) in selection.iter().enumerate() {
         work.step()?;
@@ -177,27 +184,24 @@ fn evaluate_bytes(
     work.finish()?;
     Ok(output)
 }
-/// The v1 shell evaluates only its first argument; output metadata is ignored.
-pub fn evaluate_legacy(input: &ArrayRef) -> Result<ArrayRef, String> {
+/// Direct arguments retain the same IEEE calculation and physical byte carriers.
+pub fn evaluate_required(input: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
+    output_capacity(input.len())?;
     evaluate_bytes(
         EvaluatedArgument::Column(input),
         Selection::all(input.len()),
         true,
         false,
-        &LegacyControl,
+        &DirectControl,
     )
-    .map_err(|error| match error {
-        CoreError::Legacy(message) => message,
-        CoreError::Kernel(failure) => failure.to_string(),
-    })
 }
-struct LegacyControl;
-impl KernelEvaluationControl for LegacyControl {
+struct DirectControl;
+impl KernelEvaluationControl for DirectControl {
     fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
         Ok(())
     }
     fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
-        panic!("CRC32 calculation never waits")
+        Err(internal("direct CRC32 calculation must not wait"))
     }
 }
 

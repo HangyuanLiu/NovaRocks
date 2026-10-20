@@ -35,6 +35,41 @@
 use novarocks_functions::WindowRowRange;
 use novarocks_local_program::{WindowBoundary, WindowFrame, WindowType};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowGeometryError {
+    NegativeOffset { value: i64 },
+    RangeOffset,
+}
+impl std::fmt::Display for WindowGeometryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NegativeOffset { value } => write!(f, "window frame offset {value} is negative"),
+            Self::RangeOffset => {
+                f.write_str("RANGE window frame with an offset has no compiled geometry")
+            }
+        }
+    }
+}
+impl std::error::Error for WindowGeometryError {}
+impl novarocks_failure_contract::FailureProjection for WindowGeometryError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        let reason = match self {
+            Self::NegativeOffset { .. } => ExecutionReason::WindowNegativeOffset,
+            Self::RangeOffset => ExecutionReason::WindowRangeOffset,
+        };
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            reason.reason(),
+        )
+    }
+}
+impl From<WindowGeometryError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(cause: WindowGeometryError) -> Self {
+        Self::from_domain(cause)
+    }
+}
+
 /// Peer groups of one partition of `rows` rows. `peer(row)` states whether
 /// `row` (at least 1) has the same ORDER BY keys as `row - 1`.
 pub(crate) fn peer_groups(rows: usize, peer: impl Fn(usize) -> bool) -> Vec<WindowRowRange> {
@@ -53,25 +88,23 @@ pub(crate) fn peer_groups(rows: usize, peer: impl Fn(usize) -> bool) -> Vec<Wind
     groups
 }
 
-fn offset(value: i64) -> Result<usize, String> {
+fn offset(value: i64) -> Result<usize, WindowGeometryError> {
     // A larger offset than the host can address reaches past every partition.
     u64::try_from(value)
         .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-        .map_err(|_| format!("window frame offset {value} is negative"))
+        .map_err(|_| WindowGeometryError::NegativeOffset { value })
 }
 
 /// Refuse a frame this geometry cannot compute: a RANGE offset or a negative
 /// ROWS offset. The operator checks every call's frame before it runs.
-pub(crate) fn admit_frame(frame: &WindowFrame) -> Result<(), String> {
+pub(crate) fn admit_frame(frame: &WindowFrame) -> Result<(), WindowGeometryError> {
     for bound in [frame.start, frame.end].into_iter().flatten() {
         match bound {
             WindowBoundary::CurrentRow => {}
             WindowBoundary::Preceding(_) | WindowBoundary::Following(_)
                 if frame.window_type == WindowType::Range =>
             {
-                return Err(
-                    "RANGE window frame with an offset has no compiled geometry".to_string()
-                );
+                return Err(WindowGeometryError::RangeOffset);
             }
             WindowBoundary::Preceding(value) | WindowBoundary::Following(value) => {
                 offset(value)?;
@@ -85,7 +118,7 @@ pub(crate) fn admit_frame(frame: &WindowFrame) -> Result<(), String> {
 pub(crate) fn frame_table(
     frame: &WindowFrame,
     peers: &[WindowRowRange],
-) -> Result<Vec<WindowRowRange>, String> {
+) -> Result<Vec<WindowRowRange>, WindowGeometryError> {
     match frame_table_authored::<_, std::convert::Infallible>(
         frame,
         peers,
@@ -96,18 +129,18 @@ pub(crate) fn frame_table(
         },
     ) {
         Ok(frames) => Ok(frames),
-        Err(WindowGeometryFailure::Original(message)) => Err(message),
+        Err(WindowGeometryFailure::Geometry(message)) => Err(message),
         Err(WindowGeometryFailure::Host(never)) => match never {},
     }
 }
 
 enum WindowGeometryFailure<E> {
-    Original(String),
+    Geometry(WindowGeometryError),
     Host(E),
 }
 
 /// SAME frame arithmetic with host-owned structural output backing. Callback
-/// failure stays typed; original geometry errors retain their full String.
+/// failure stays typed; geometry errors retain their typed cause.
 pub(crate) fn frame_table_tracked(
     frame: &WindowFrame,
     peers: &[WindowRowRange],
@@ -129,7 +162,7 @@ pub(crate) fn frame_table_tracked(
         |frames, range| frames.try_push(range, control),
     ) {
         Ok(frames) => Ok(frames),
-        Err(WindowGeometryFailure::Original(message)) => Err(message.into()),
+        Err(WindowGeometryFailure::Geometry(message)) => Err(message.into()),
         Err(WindowGeometryFailure::Host(cause)) => Err(cause.into()),
     }
 }
@@ -140,20 +173,20 @@ fn frame_table_authored<T, E>(
     mut initialize: impl FnMut(usize) -> Result<T, E>,
     mut push: impl FnMut(&mut T, WindowRowRange) -> Result<(), E>,
 ) -> Result<T, WindowGeometryFailure<E>> {
-    admit_frame(frame).map_err(WindowGeometryFailure::Original)?;
+    admit_frame(frame).map_err(WindowGeometryFailure::Geometry)?;
     let rows = peers.last().map_or(0, |peer| peer.end);
     let range = frame.window_type == WindowType::Range;
     let start = match frame.start {
         None => None,
         Some(WindowBoundary::Preceding(value) | WindowBoundary::Following(value)) => {
-            Some(offset(value).map_err(WindowGeometryFailure::Original)?)
+            Some(offset(value).map_err(WindowGeometryFailure::Geometry)?)
         }
         Some(WindowBoundary::CurrentRow) => Some(0),
     };
     let end = match frame.end {
         None => None,
         Some(WindowBoundary::Preceding(value) | WindowBoundary::Following(value)) => {
-            Some(offset(value).map_err(WindowGeometryFailure::Original)?)
+            Some(offset(value).map_err(WindowGeometryFailure::Geometry)?)
         }
         Some(WindowBoundary::CurrentRow) => Some(0),
     };

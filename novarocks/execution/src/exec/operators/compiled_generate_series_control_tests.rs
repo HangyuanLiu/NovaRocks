@@ -20,9 +20,19 @@ use crate::exec::chunk::ChunkSchema;
 use crate::runtime::fragment::ExecutionFailureCause;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
+use novarocks_failure_contract::FailureProjection;
+use novarocks_functions::{KernelDiagnostic, generate_series_core::SeriesError};
 use novarocks_types::SlotId;
 use std::sync::Mutex;
 
+fn assert_failed_instance(error: ExecutionFailure) {
+    assert!(matches!(error.cause(), ExecutionFailureCause::Domain(cause)
+        if matches!(cause.downcast_ref::<CompiledSeriesFailure>(), Some(CompiledSeriesFailure::AlreadyFailed))));
+}
+fn assert_zero_step(error: &ExecutionFailure) {
+    assert!(matches!(error.cause(), ExecutionFailureCause::Domain(cause)
+        if matches!(cause.downcast_ref::<SeriesError>(), Some(SeriesError::ZeroStep))));
+}
 struct Control {
     trace: Mutex<Vec<u32>>,
     fail_at: Option<usize>,
@@ -77,7 +87,7 @@ fn instance(values: [i64; 3], control: Arc<Control>) -> (CompiledGenerateSeriesP
             Arc::from([SlotId::new(71)]),
         )
         .unwrap(),
-        // This fixture isolates legacy lifecycle callbacks; typed construction
+        // This fixture isolates the kernel control journal; typed construction
         // ownership is verified through the production factory tests.
         output: Some(output),
         construction: None,
@@ -85,7 +95,7 @@ fn instance(values: [i64; 3], control: Arc<Control>) -> (CompiledGenerateSeriesP
         pending: None,
         offset: 0,
         accepted: false,
-        finishing: false,
+        batch_rows: Some(std::num::NonZeroUsize::new(4096).unwrap()),
         failed: false,
     };
     (processor, chunk)
@@ -97,13 +107,40 @@ fn control(fail_at: Option<usize>, cause: KernelFailure) -> Arc<Control> {
         cause,
     })
 }
+fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+    let error = state.error_state();
+    let mut work =
+        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    action(&mut StepContext::new(&error, &mut work))
+}
+fn apply(
+    processor: &mut CompiledGenerateSeriesProcessor,
+    state: &RuntimeState,
+    input: Chunk,
+) -> ExecutionResult<StepResult> {
+    with_context(state, |ctx| {
+        processor.apply(ctx, PreparedInput::for_test(input))
+    })
+}
+fn drive(
+    processor: &mut CompiledGenerateSeriesProcessor,
+    state: &RuntimeState,
+) -> ExecutionResult<StepResult> {
+    with_context(state, |ctx| processor.drive(ctx))
+}
+fn finish(
+    processor: &mut CompiledGenerateSeriesProcessor,
+    state: &RuntimeState,
+) -> ExecutionResult<StepResult> {
+    with_context(state, |ctx| processor.finish(ctx))
+}
 #[test]
 fn compiled_generate_series_control_seven_causes_exact_prefix_no_tail_and_failed_latch() {
     let state = RuntimeState::default();
     let values = [-600, 600, 1];
     let baseline = control(None, KernelFailure::Cancelled);
     let (mut original, chunk) = instance(values, Arc::clone(&baseline));
-    original.push_chunk(&state, chunk).unwrap();
+    apply(&mut original, &state, chunk).unwrap();
     let trace = baseline.trace.lock().unwrap().clone();
     assert!(trace.contains(&MAX_UNOBSERVED_KERNEL_WORK));
     assert!(
@@ -123,25 +160,19 @@ fn compiled_generate_series_control_seven_causes_exact_prefix_no_tail_and_failed
         for at in 0..trace.len() {
             let injection = control(Some(at), cause.clone());
             let (mut processor, chunk) = instance(values, Arc::clone(&injection));
-            let error = processor.push_chunk(&state, chunk.clone()).unwrap_err();
+            let error = apply(&mut processor, &state, chunk.clone()).unwrap_err();
             assert_eq!(error.cause(), &ExecutionFailureCause::Kernel(cause.clone()));
             assert_eq!(*injection.trace.lock().unwrap(), trace[..=at]);
-            assert!(!processor.has_output());
-            assert!(processor.is_finished());
+            assert!(processor.pending.is_none());
+            assert!(processor.failed);
             let before = injection.trace.lock().unwrap().len();
             for result in [
-                processor.push_chunk(&state, chunk),
-                processor.set_finishing(&state),
+                apply(&mut processor, &state, chunk),
+                finish(&mut processor, &state),
             ] {
-                assert_eq!(
-                    result.unwrap_err().cause(),
-                    &ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
-                );
+                assert_failed_instance(result.unwrap_err());
             }
-            assert_eq!(
-                processor.pull_chunk(&state).unwrap_err().cause(),
-                &ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
-            );
+            assert_failed_instance(drive(&mut processor, &state).unwrap_err());
             assert_eq!(injection.trace.lock().unwrap().len(), before);
         }
     }
@@ -151,36 +182,44 @@ fn compiled_generate_series_control_original_whole_data_has_no_late_footer_or_ro
     let state = RuntimeState::default();
     let baseline = control(None, KernelFailure::Cancelled);
     let (mut processor, chunk) = instance([1, 3, 0], Arc::clone(&baseline));
-    let original = processor.push_chunk(&state, chunk).unwrap_err();
-    assert_eq!(
-        original.cause(),
-        &ExecutionFailureCause::Pipeline(
-            "table function generate_series step size cannot equal zero".to_owned()
-        )
-    );
+    let original = apply(&mut processor, &state, chunk).unwrap_err();
+    assert_zero_step(&original);
     let trace = baseline.trace.lock().unwrap().clone();
     let next = control(Some(trace.len()), KernelFailure::DeadlineExceeded);
     let (mut processor, chunk) = instance([1, 3, 0], Arc::clone(&next));
-    assert_eq!(processor.push_chunk(&state, chunk).unwrap_err(), original);
+    let next_error = apply(&mut processor, &state, chunk).unwrap_err();
+    assert_zero_step(&next_error);
+    assert_eq!(next_error.failure_fact(), original.failure_fact());
+    assert!(!next_error.same_occurrence(&original));
     assert_eq!(*next.trace.lock().unwrap(), trace);
-    assert_eq!(
-        processor.pull_chunk(&state).unwrap_err().cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
-    );
+    assert_failed_instance(drive(&mut processor, &state).unwrap_err());
     assert_eq!(*next.trace.lock().unwrap(), trace);
 }
 #[test]
 fn compiled_generate_series_control_finishing_owes_exact_output_then_latches_finished() {
+    use crate::exec::pipeline::{
+        input::RawInput, shape::StepOperator, step::InputResult, step_context::TurnWork,
+    };
     let state = RuntimeState::default();
+    let error = state.error_state();
     let control = control(None, KernelFailure::Cancelled);
-    let (mut processor, chunk) = instance([1, 9, 2], control);
-    assert!(processor.need_input());
-    processor.push_chunk(&state, chunk).unwrap();
-    assert!(!processor.need_input());
-    processor.set_finishing(&state).unwrap();
-    assert_eq!(processor.finishing_wait(), FinishingWait::OwedOutput);
-    assert!(!processor.is_finished());
-    let out = processor.pull_chunk(&state).unwrap().unwrap();
+    let (kernel, chunk) = instance([1, 9, 2], control);
+    let mut processor = Transform::hydrating(kernel);
+    let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut ctx = StepContext::new(&error, &mut work);
+    assert!(matches!(processor.initial_step(), NextStep::NeedInput));
+    assert!(matches!(
+        processor.try_push(&mut ctx, RawInput::for_test(chunk)),
+        InputResult::Accepted(Ok(_))
+    ));
+    processor.finish(&mut ctx).unwrap();
+    let installed = processor.drive(&mut ctx).unwrap();
+    assert!(installed.output.is_none());
+    assert!(matches!(installed.next, NextStep::Runnable));
+    assert!(matches!(installed.next, NextStep::Runnable));
+    let result = processor.drive(&mut ctx).unwrap();
+    assert!(matches!(result.next, NextStep::Finished));
+    let out = result.output.expect("the bounds port's final output");
     assert_eq!(
         out.column_by_slot_id(SlotId::new(71))
             .unwrap()
@@ -193,7 +232,8 @@ fn compiled_generate_series_control_finishing_owes_exact_output_then_latches_fin
     );
     assert!(!out.schema().field(0).is_nullable());
     assert_eq!(out.schema().field(0).name(), "public-series");
-    assert!(processor.is_finished());
-    assert_eq!(processor.finishing_wait(), FinishingWait::Complete);
-    assert!(processor.pull_chunk(&state).unwrap().is_none());
+    assert!(matches!(result.next, NextStep::Finished));
+    let ended = processor.drive(&mut ctx).unwrap();
+    assert!(ended.output.is_none());
+    assert!(matches!(ended.next, NextStep::Finished));
 }

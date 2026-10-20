@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryBuilder};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use crate::exec::percentile;
 
 pub fn eval_percentile_hash<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -27,26 +27,36 @@ pub fn eval_percentile_hash<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let input = arena.eval(args[0], chunk)?;
-    let mut builder = BinaryBuilder::new();
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(crate::exec::expr::expression_contract(
+            "percentile_hash expects exactly one argument",
+        ));
+    };
+    let input = arena.eval(*argument, chunk)?;
+    let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
     for row in 0..input.len() {
-        builder.append_value(novarocks_functions::percentile_hash_core::row(&input, row)?);
+        builder.append_value(novarocks_functions::percentile_hash_core::row(&input, row)?)?;
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    Ok(Arc::new(builder.finish()?) as ArrayRef)
 }
 
 pub fn eval_percentile_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _arena: &__Eval,
     _expr: ExprId,
-    _args: &[ExprId],
+    args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let mut builder = BinaryBuilder::new();
-    for _ in 0..chunk.len() {
-        builder.append_value(percentile::encode_empty_state());
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if !args.is_empty() {
+        return Err(crate::exec::expr::expression_contract(
+            "percentile_empty expects no arguments",
+        ));
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
+    for _ in 0..chunk.len() {
+        builder.append_value(percentile::encode_empty_state()?)?;
+    }
+    Ok(Arc::new(builder.finish()?) as ArrayRef)
 }
 
 pub fn eval_percentile_approx_raw<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -54,31 +64,19 @@ pub fn eval_percentile_approx_raw<__Eval: crate::exec::expr::ExprEvaluation + ?S
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let payloads = arena.eval(args[0], chunk)?;
-    let quantiles = arena.eval(args[1], chunk)?;
-    Ok((novarocks_functions::percentile_approx_raw_core::evaluate_legacy(&payloads, &quantiles))?)
-}
-
-pub fn numeric_value_at(
-    array: &ArrayRef,
-    row: usize,
-    context: &str,
-) -> Result<Option<f64>, String> {
-    novarocks_functions::percentile_input::numeric_value_at(
-        array,
-        row,
-        novarocks_functions::percentile_input::PercentileInputDiagnostic::LegacyLabel(context),
-    )
-}
-pub fn payload_bytes_at<'a>(
-    array: &'a ArrayRef,
-    row: usize,
-    context: &str,
-) -> Result<Option<&'a [u8]>, String> {
-    novarocks_functions::percentile_input::payload_bytes_at(
-        array,
-        row,
-        novarocks_functions::percentile_input::PercentileInputDiagnostic::LegacyLabel(context),
-    )
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let [payload, quantile] = args else {
+        return Err(crate::exec::expr::expression_contract(
+            "percentile_approx_raw expects exactly two arguments",
+        ));
+    };
+    let payloads = arena.eval(*payload, chunk)?;
+    let quantiles = arena.eval(*quantile, chunk)?;
+    if payloads.len() != quantiles.len() {
+        return Err(crate::exec::expr::expression_contract(
+            "percentile_approx_raw input row domains differ",
+        ));
+    }
+    novarocks_functions::percentile_approx_raw_core::evaluate_required(&payloads, &quantiles)
+        .map_err(Into::into)
 }

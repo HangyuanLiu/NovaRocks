@@ -125,22 +125,16 @@ fn original_decimal256_min_payload_preserves_double_negative_formatter_bug() {
 }
 
 #[test]
-fn original_decimal128_min_payload_preserves_build_profile_panic_or_wrapping() {
+fn decimal128_min_payload_formats_the_full_signed_magnitude() {
     let input: ArrayRef = Arc::new(
         Decimal128Array::from(vec![Some(i128::MIN)])
             .with_precision_and_scale(38, 2)
             .unwrap(),
     );
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original_text(&input)));
-    if cfg!(debug_assertions) {
-        assert!(result.is_err());
-    } else {
-        let actual = result.unwrap();
-        assert_eq!(
-            actual.as_any().downcast_ref::<StringArray>().unwrap(),
-            &StringArray::from(vec![Some("--1701411834604692317316873037158841057.28")])
-        );
-    }
+    assert_text(
+        &input,
+        vec![Some("-1701411834604692317316873037158841057.28")],
+    );
     let scale_zero: ArrayRef = Arc::new(
         Decimal128Array::from(vec![Some(i128::MIN), None])
             .with_precision_and_scale(38, 0)

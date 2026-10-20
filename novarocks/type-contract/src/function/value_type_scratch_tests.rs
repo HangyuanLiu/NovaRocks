@@ -125,7 +125,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, error)) if at == stop => Err(error),
             _ => Ok(()),
         }
@@ -184,7 +184,7 @@ fn actual_nested_success_and_ordinary_tail_preserve_every_three_cause_control_pr
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert_eq!(run(ty, &control), Err(Error::Control(cause)));

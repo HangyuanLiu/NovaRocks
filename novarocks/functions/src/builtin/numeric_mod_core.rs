@@ -42,7 +42,37 @@ impl std::fmt::Display for NumericModError {
         }
     }
 }
-impl std::error::Error for NumericModError {}
+impl std::error::Error for NumericModError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(cause) => Some(cause),
+            Self::RangeInvariant => None,
+        }
+    }
+}
+impl NumericModError {
+    pub fn into_kernel(self) -> KernelFailure {
+        match self {
+            Self::Control(cause) => cause,
+            cause => KernelFailure::from_domain(cause),
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for NumericModError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Control(cause) => cause.failure_fact(),
+            Self::RangeInvariant => novarocks_failure_contract::FailureFact::new(
+                novarocks_failure_contract::FailureClass::Invariant,
+                novarocks_failure_contract::FailureReason::new(
+                    novarocks_failure_contract::domain::KERNEL,
+                    std::num::NonZeroU16::new(247).unwrap(),
+                ),
+            ),
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for NumericModError {}
 /// The original legacy order reads both numeric values before deciding NULL.
 /// Raw legacy callers retain unchecked indexing/broadcast; pure callers provide
 /// exact selected addresses and validate their non-null promises in `address`.

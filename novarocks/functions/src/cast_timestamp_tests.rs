@@ -39,7 +39,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -289,6 +289,7 @@ fn timestamp_widening_boundaries_and_us_ns_error_ignore_allow_and_decimal_policy
                             panic!("us->ns must keep its original error")
                         };
                         assert_eq!(error.selected_ordinal(), row);
+                        assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
                         let raw = match row {
                             2 => lo - 1,
                             3 => hi + 1,
@@ -682,7 +683,7 @@ fn timestamp_compile_all_actual_callbacks_keep_original_three_causes_and_ordinar
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = PreparedCastRecipe::try_new(
                     CastOperation::Carrier,

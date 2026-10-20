@@ -54,7 +54,7 @@ impl PureCompileControl for Control {
             assert!(index <= stop, "callback after originating control refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if index == stop => Err(cause),
             _ => Ok(()),
         }
@@ -170,7 +170,7 @@ fn prefixes(
         for cause in causes() {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(PhysicalFragmentEffectsError::Control(actual)) if actual == cause)
@@ -908,7 +908,7 @@ fn real_writer_wide_fresh_calls_sample_actual_control_quantums_without_losing_sp
             for cause in causes() {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 let result = author_sql_fragment_effects_observed(
                     &owner,

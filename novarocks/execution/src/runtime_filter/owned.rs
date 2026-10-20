@@ -34,9 +34,9 @@ use super::contribution::{
     visit_borrowed_ordered_bound,
 };
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
-use crate::exec::operators::compiled_aggregate::expression_allocation_host;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 
 struct ByteBacking {
     bytes: AggregateVec<u8>,
@@ -265,9 +265,10 @@ impl OrderedTopNAllocationHost {
         let mut work = EvaluationCheckpoints::new(control);
         work.flush()?;
         let mut slots = AggregateVec::new_in(self.allocator.clone());
-        slots
-            .try_reserve_exact(1)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        slots.try_reserve_exact(1).map_err(|source| {
+            self.allocator
+                .allocation_error("reserve ordered key slots", source)
+        })?;
         work.flush()?;
         let value_type = key.value_type.clone_observed(|| work.step())?;
         slots.push(RuntimeOrderKey::with_value_type(
@@ -299,6 +300,7 @@ impl OrderedTopNAllocationHost {
         )
         .map_err(|failure| match failure {
             RuntimeOrderContractValidationFailure::Contract(cause) => ExecutionFailure::from(cause),
+            RuntimeOrderContractValidationFailure::Schema(cause) => ExecutionFailure::from(cause),
             RuntimeOrderContractValidationFailure::Work(cause) => ExecutionFailure::from(cause),
         })?;
         let owner = SourceBackingOwner::try_from_owned_direct(
@@ -354,9 +356,9 @@ impl OrderedTopNAllocationHost {
         let owner = self.retain_bytes(control, |allocator, work| {
             work.flush()?;
             let mut bytes = AggregateVec::new_in(allocator.clone());
-            bytes
-                .try_reserve_exact(text.len())
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            bytes.try_reserve_exact(text.len()).map_err(|source| {
+                allocator.allocation_error("reserve ordered UTF-8 payload", source)
+            })?;
             for chunk in text.as_bytes().chunks(MAX_UNOBSERVED_KERNEL_WORK as usize) {
                 control.checkpoint(chunk.len() as u32)?;
                 bytes.extend_from_slice(chunk);
@@ -400,9 +402,9 @@ impl OrderedTopNAllocationHost {
             }
             work.flush()?;
             let mut bytes = AggregateVec::new_in(allocator.clone());
-            bytes
-                .try_reserve_exact(len)
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            bytes.try_reserve_exact(len).map_err(|source| {
+                allocator.allocation_error("reserve ordered contribution payload", source)
+            })?;
             // All output remains private until the complete visitor succeeds.
             // It supplies bounded slices and preserves the first sink/control cause.
             visit_borrowed_ordered_bound(tuple, contract, cap, control, |chunk| {

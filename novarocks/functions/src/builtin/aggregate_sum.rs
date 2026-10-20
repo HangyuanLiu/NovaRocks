@@ -26,10 +26,10 @@
 //!   `Decimal256(76, s)` intermediate.
 //!
 //! The only overflow is the result's, checked once when the final value is
-//! built: BIGINT and LARGEINT report an Operational error; DECIMAL checks 38
-//! digits and follows the call's frozen overflow policy, an Operational error
+//! built: BIGINT and LARGEINT report an unmaskable numeric Data failure; DECIMAL checks 38
+//! digits and follows the call's frozen overflow policy, a numeric Data failure
 //! or NULL for that group. The running add is checked too; it can only fail
-//! past 2^64 rows of one group and then reports an Operational error.
+//! past 2^64 rows of one group and then reports a numeric Data failure.
 //!
 //! FLOAT and DOUBLE accumulate IEEE doubles. Their rounding depends on the
 //! accumulation order, which this owner declares unordered: equal inputs in
@@ -107,20 +107,50 @@ fn observed<T>(
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
     let result = f(&mut work);
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
+    if result.as_ref().is_err_and(KernelFailure::is_interruption) {
         return result;
     }
     work.finish()?;
     result
 }
 
-fn operational(message: &'static str) -> KernelFailure {
-    KernelFailure::Operational(KernelDiagnostic::new(message))
+/// The SUM owner authors numeric value failures at the actual operation.
+/// Result overflow is required aggregate work, with no row-error channel.
+#[derive(Debug)]
+enum SumNumericFailure {
+    ExactState,
+    BigInt(std::num::TryFromIntError),
+    LargeInt,
+    Decimal38,
+}
+impl std::fmt::Display for SumNumericFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExactState => "sum exact state overflow",
+            Self::BigInt(_) => "sum result overflows BIGINT",
+            Self::LargeInt => "sum result overflows LARGEINT",
+            Self::Decimal38 => "sum result overflows DECIMAL(38)",
+        })
+    }
+}
+impl std::error::Error for SumNumericFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BigInt(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for SumNumericFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        DataFailureReason::NumericOutOfRange.failure_fact()
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for SumNumericFailure {}
+impl From<SumNumericFailure> for KernelFailure {
+    fn from(source: SumNumericFailure) -> Self {
+        Self::from_domain(source)
+    }
 }
 
 /// One non-NULL input or merged state contribution.
@@ -237,12 +267,12 @@ fn accumulate(
         (SumState::Empty, Contribution::Narrow(value)) => SumState::Narrow(value),
         (SumState::Narrow(sum), Contribution::Narrow(value)) => SumState::Narrow(
             sum.checked_add(value)
-                .ok_or_else(|| operational("SUM exact state overflow"))?,
+                .ok_or_else(|| KernelFailure::from(SumNumericFailure::ExactState))?,
         ),
         (SumState::Empty, Contribution::Wide(value)) => SumState::Wide(value),
         (SumState::Wide(sum), Contribution::Wide(value)) => SumState::Wide(
             sum.checked_add(value)
-                .ok_or_else(|| operational("SUM exact state overflow"))?,
+                .ok_or_else(|| KernelFailure::from(SumNumericFailure::ExactState))?,
         ),
         (SumState::Empty, Contribution::Float(value)) => SumState::Float(value),
         (SumState::Float(sum), Contribution::Float(value)) => SumState::Float(sum + value),
@@ -440,10 +470,9 @@ impl PreparedAggregateKernel for SumKernel {
                     for state in states {
                         values.push(match state {
                             SumState::Empty => None,
-                            SumState::Narrow(sum) => Some(
-                                i64::try_from(*sum)
-                                    .map_err(|_| operational("sum result overflows BIGINT"))?,
-                            ),
+                            SumState::Narrow(sum) => {
+                                Some(i64::try_from(*sum).map_err(SumNumericFailure::BigInt)?)
+                            }
                             _ => return Err(internal("SUM state differs from its domain")),
                         });
                         work.step()?;
@@ -458,7 +487,9 @@ impl PreparedAggregateKernel for SumKernel {
                             SumState::Empty => None,
                             SumState::Wide(sum) => Some(
                                 sum.to_i128()
-                                    .ok_or_else(|| operational("sum result overflows LARGEINT"))?
+                                    .ok_or_else(|| {
+                                        KernelFailure::from(SumNumericFailure::LargeInt)
+                                    })?
                                     .to_be_bytes(),
                             ),
                             _ => return Err(internal("SUM state differs from its domain")),
@@ -485,9 +516,7 @@ impl PreparedAggregateKernel for SumKernel {
                                 Some(value) => Some(value),
                                 None => match policy {
                                     DecimalOverflowPolicy::ReportError => {
-                                        return Err(operational(
-                                            "sum result overflows DECIMAL(38)",
-                                        ));
+                                        return Err(SumNumericFailure::Decimal38.into());
                                     }
                                     DecimalOverflowPolicy::OutputNull => None,
                                 },

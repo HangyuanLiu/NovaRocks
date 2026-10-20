@@ -30,7 +30,19 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
+use super::table_finish_failure::{
+    FinishArrowOperation, FinishContractSite, FinishOutputBound, finish_arrow, finish_contract,
+};
+fn finish_connector(source: novarocks_spi::connector::ConnectorError) -> ExecutionFailure {
+    crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
+        crate::runtime::fragment::connector_failure::ConnectorOperation::ValidateWriteRelation,
+        source,
+    )
+    .into()
+}
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -74,14 +86,21 @@ use crate::exec::node::table_write_relation::{
 use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
+use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 #[cfg(test)]
 use crate::exec::operators::unpivot_processor::UnpivotFixtureFactory;
+use crate::exec::pipeline::input::{PreparedInput, RawInput};
 use crate::exec::pipeline::operator::{
-    FinishWatch, InputConstructionFactory, Operator, ProcessorOperator, forward_observable,
+    FinishWatch, InputConstructionFactory, InputEncodingPolicy, Operator, forward_observable,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::shape::{ControlStep, HydrateInput, Transform, TransformKernel};
+use crate::exec::pipeline::shape::{Source, SourceKernel, child::ChildStep};
+use crate::exec::pipeline::step::{AdmissionNext, WaitFact, WaitReason};
+use crate::exec::pipeline::step::{NextStep, StepResult};
+use crate::exec::pipeline::step_context::StepContext;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -191,7 +210,7 @@ pub(crate) trait FinishStatisticsFactory: Send + Sync {
     /// artifact rows.
     fn grouped_unpivot(
         &self,
-        state: &RuntimeState,
+        control: &RuntimeKernelControl,
         final_chunk: Chunk,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
@@ -200,22 +219,77 @@ pub(crate) trait FinishStatisticsFactory: Send + Sync {
 }
 
 /// The Root artifact rows of one final aggregate batch, one target at a time.
-pub(crate) trait GroupedUnpivotSource: Send {
-    /// The batch's targets, each at most once.
-    fn targets(&self) -> Vec<u32>;
-    /// Explicit legacy adapter; the modern source overrides this borrowed walk.
+pub(crate) trait GroupedUnpivotSource: Operator {
+    fn visit_targets(
+        &self,
+        visit: &mut dyn FnMut(u32) -> ExecutionResult<()>,
+    ) -> ExecutionResult<()>;
+}
+pub(crate) trait GroupedUnpivotKernel: SourceKernel + OperatorLifecycle {
+    fn visit_targets(
+        &self,
+        visit: &mut dyn FnMut(u32) -> ExecutionResult<()>,
+    ) -> ExecutionResult<()>;
+}
+impl<K: GroupedUnpivotKernel> GroupedUnpivotSource for Source<K> {
     fn visit_targets(
         &self,
         visit: &mut dyn FnMut(u32) -> ExecutionResult<()>,
     ) -> ExecutionResult<()> {
-        for target in self.targets() {
-            visit(target)?;
-        }
-        Ok(())
+        self.kernel().visit_targets(visit)
     }
-    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>>;
-    fn is_finished(&self) -> bool;
-    fn source_observable(&self) -> Arc<Observable>;
+}
+struct GroupedOutput {
+    child: ChildStep,
+    next: NextStep,
+    retiring: bool,
+}
+impl GroupedOutput {
+    fn new(
+        operator: Box<dyn GroupedUnpivotSource>,
+        observable: Arc<Observable>,
+        failures: Arc<RuntimeErrorState>,
+    ) -> ExecutionResult<Self> {
+        let mut child = ChildStep::new(operator, observable);
+        child.bind_failure_port(failures)?;
+        child.prepare()?;
+        Ok(Self {
+            child,
+            next: NextStep::Runnable,
+            retiring: false,
+        })
+    }
+    fn runnable(&self) -> bool {
+        match &self.next {
+            NextStep::Wait(wait) => wait.is_ready(),
+            NextStep::NeedInput => false,
+            _ => true,
+        }
+    }
+    fn step(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let NextStep::Wait(wait) = &self.next
+            && !wait.is_ready()
+        {
+            return Ok(StepResult::new(None, self.next.clone(), 0));
+        }
+        if self.retiring {
+            self.next = self.child.retire(ctx)?;
+            return Ok(StepResult::new(None, self.next.clone(), 0));
+        }
+        let output = self.child.advance(ctx)?;
+        if self.child.is_complete() {
+            self.retiring = true;
+            self.next = NextStep::Runnable;
+        } else {
+            self.next = self.child.work_next();
+            if matches!(self.next, NextStep::NeedInput) {
+                return Err(crate::exec::pipeline::shape::source_contract_failure(
+                    crate::exec::pipeline::shape::SourceContractFailure::RequestedInput,
+                ));
+            }
+        }
+        Ok(StepResult::new(output, self.next.clone(), 0))
+    }
 }
 
 /// Construction state only; type meaning remains in the frozen template.
@@ -292,7 +366,7 @@ impl TableFinishOperatorFactory {
         #[cfg(test)] final_plan: WriterFinalAggregatePlan,
         binding: &TableFinishRuntimeBinding,
         #[cfg(test)] arena: Arc<ExprArena>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Self::new_core(
             node_id,
             expected_targets,
@@ -321,9 +395,9 @@ impl TableFinishOperatorFactory {
         #[cfg(test)] final_plan: WriterFinalAggregatePlan,
         binding: &TableFinishRuntimeBinding,
         #[cfg(test)] arena: Arc<ExprArena>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         novarocks_spi::connector::write_stack::validate_query_target_ordinals(&expected_targets)
-            .map_err(|error| error.to_string())?;
+            .map_err(finish_connector)?;
         let name = if node_id >= 0 {
             format!("TABLE_FINISH (id={node_id})")
         } else {
@@ -361,7 +435,7 @@ impl TableFinishOperatorFactory {
         root_template: RootWriteResultRelationTemplate,
         statistics: Option<(FinishStatisticsCoverage, Arc<dyn FinishStatisticsFactory>)>,
         binding: &TableFinishRuntimeBinding,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let mut factory = Self::new_core(
             node_id,
             expected_targets,
@@ -410,19 +484,19 @@ impl TableFinishOperatorFactory {
         }
     }
 
-    fn create_operator(&self, dop: i32, driver_id: i32) -> TableFinishOperator {
+    fn create_operator(&self, dop: i32, driver_id: i32) -> TableFinishStep {
         // The builder creates this factory's pipeline at DOP 1, converging every
         // writer input into it first, so any other degree of parallelism means
         // the plan and the pipeline disagree about who owns the complete
         // prepared write set. A second driver would each see a partial set and
         // each believe it was complete, so fail closed at `prepare` rather than
         // silently aggregating a partial set per driver.
-        let parallelism_error = (dop.max(1) != 1 || driver_id != 0).then(|| {
-            format!(
+        let parallelism_error = (dop != 1 || driver_id != 0).then(|| {
+            finish_contract(FinishContractSite::Binding, format_args!(
                 "table finish must run at DOP 1 on a single driver, but was created with dop={dop} driver_id={driver_id}"
-            )
+            ))
         });
-        TableFinishOperator {
+        Transform::hydrating(TableFinishOperator {
             name: self.name.clone(),
             expected_targets: Arc::clone(&self.expected_targets),
             fragment_validator: Arc::clone(&self.fragment_validator),
@@ -464,10 +538,12 @@ impl TableFinishOperatorFactory {
             output_tracker: None,
             profiles: None,
             runtime_error: None,
+            grouped_control: None,
             final_aggregate_blocked_time: BlockedDuration::default(),
             source_observable: Arc::new(Observable::new()),
-            sink_observable: Arc::new(Observable::new()),
-        }
+            input: None,
+            pending_rows: 0,
+        })
     }
 }
 
@@ -512,9 +588,8 @@ impl PrefixOutputDriver {
         fragments: Vec<BufferedFragment>,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<Self, String> {
-        let summary_rows = row_count_to_wire(rows)
-            .map_err(|error| format!("table finish summary row count: {error}"))?;
+    ) -> ExecutionResult<Self> {
+        let summary_rows = row_count_to_wire(rows).map_err(|error| finish_connector(error))?;
         validate_root_write_result_row(
             RootRowKind::Summary,
             RootWriteResultRowShape {
@@ -522,7 +597,7 @@ impl PrefixOutputDriver {
                 ..RootWriteResultRowShape::default()
             },
         )
-        .map_err(|error| format!("table finish summary row shape: {error}"))?;
+        .map_err(|error| finish_connector(error))?;
         Ok(Self {
             summary_rows: Some(summary_rows),
             fragments: fragments.into(),
@@ -539,7 +614,7 @@ impl PrefixOutputDriver {
         !self.has_output()
     }
 
-    fn pull(&mut self) -> Result<Option<Chunk>, String> {
+    fn pull(&mut self) -> ExecutionResult<Option<Chunk>> {
         if let Some(summary_rows) = self.summary_rows.take() {
             let root_arrow = self.root_schema.arrow_schema_ref();
             let batch = RecordBatch::try_new(
@@ -555,7 +630,7 @@ impl PrefixOutputDriver {
                     new_null_array(self.root_schema.arrow_schema_ref().field(7).data_type(), 1),
                 ],
             )
-            .map_err(|error| format!("build table finish summary batch: {error}"))?;
+            .map_err(|error| finish_arrow(FinishArrowOperation::Summary, error))?;
             return self.track_batch(batch).map(Some);
         }
         if self.fragments.is_empty() {
@@ -573,7 +648,7 @@ impl PrefixOutputDriver {
             let next_payload = selected_payload
                 .checked_add(fragment.bytes.len())
                 .ok_or_else(|| {
-                    "ResourceExhausted: table finish fragment batch size overflow".to_string()
+                    crate::exec::pipeline::operator::ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)
                 })?;
             let next_rows = selected + 1;
             let estimate = FIXED_BATCH_ALLOWANCE
@@ -586,10 +661,10 @@ impl PrefixOutputDriver {
             selected_payload = next_payload;
         }
         if selected == 0 {
-            return Err(format!(
-                "ResourceExhausted: one prepared fragment cannot fit the {} byte Root output batch limit",
-                MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
-            ));
+            return Err(ExecutionFailure::from_domain(FinishOutputBound {
+                required: None,
+                limit: MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
+            }));
         }
 
         // The conservative estimate should normally fit on the first attempt.
@@ -609,22 +684,21 @@ impl PrefixOutputDriver {
                 return Ok(Some(output));
             }
             if selected == 1 {
-                return Err(format!(
-                    "ResourceExhausted: one prepared fragment produces a {size} byte Root output batch, exceeding the {} byte limit",
-                    MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
-                ));
+                return Err(ExecutionFailure::from_domain(FinishOutputBound {
+                    required: Some(size),
+                    limit: MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
+                }));
             }
             selected = selected.div_ceil(2);
         }
     }
 
-    fn build_fragment_batch(&self, rows: usize) -> Result<RecordBatch, String> {
+    fn build_fragment_batch(&self, rows: usize) -> ExecutionResult<RecordBatch> {
         let mut kinds = Vec::with_capacity(rows);
         let mut ordinals = Vec::with_capacity(rows);
         let mut payloads = BinaryBuilder::new();
         for fragment in self.fragments.iter().take(rows) {
-            let target = target_ordinal_to_wire(fragment.target)
-                .map_err(|error| format!("table finish target ordinal: {error}"))?;
+            let target = target_ordinal_to_wire(fragment.target);
             validate_root_write_result_row(
                 RootRowKind::PreparedFragment,
                 RootWriteResultRowShape {
@@ -633,7 +707,7 @@ impl PrefixOutputDriver {
                     ..RootWriteResultRowShape::default()
                 },
             )
-            .map_err(|error| format!("table finish prepared fragment row shape: {error}"))?;
+            .map_err(|error| finish_connector(error))?;
             kinds.push(RootRowKind::PreparedFragment.to_wire());
             ordinals.push(Some(target));
             payloads.append_value(&fragment.bytes);
@@ -667,15 +741,15 @@ impl PrefixOutputDriver {
                 ),
             ],
         )
-        .map_err(|error| format!("build table finish fragment batch: {error}"))
+        .map_err(|error| finish_arrow(FinishArrowOperation::Fragment, error))
     }
 
-    fn track_batch(&self, batch: RecordBatch) -> Result<Chunk, String> {
+    fn track_batch(&self, batch: RecordBatch) -> ExecutionResult<Chunk> {
         let mut output = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.root_schema))?;
         if let Some(tracker) = self.tracker.as_ref() {
-            output.try_transfer_to(tracker).map_err(|error| {
-                format!("ResourceExhausted: table finish output memory admission failed: {error}")
-            })?;
+            output
+                .try_transfer_to(tracker)
+                .map_err(ExecutionFailure::from_domain)?;
         }
         Ok(output)
     }
@@ -684,31 +758,30 @@ impl PrefixOutputDriver {
 fn root_output_size(
     batch: &RecordBatch,
     tracker: Option<&Arc<MemTracker>>,
-) -> Result<usize, String> {
+) -> ExecutionResult<usize> {
     let retained = batch.get_array_memory_size();
     let logical = crate::exec::chunk::record_batch_bytes(batch);
     let mut encoded = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut encoded, &batch.schema())
-            .map_err(|error| format!("table finish output size encoding failed: {error}"))?;
+            .map_err(|error| finish_arrow(FinishArrowOperation::Encoding, error))?;
         writer
             .write(batch)
-            .map_err(|error| format!("table finish output size encoding failed: {error}"))?;
+            .map_err(|error| finish_arrow(FinishArrowOperation::Encoding, error))?;
         writer
             .finish()
-            .map_err(|error| format!("table finish output size encoding failed: {error}"))?;
+            .map_err(|error| finish_arrow(FinishArrowOperation::Encoding, error))?;
     }
     let _encoded_accounting = tracker
         .map(|tracker| {
-            TrackedBytes::try_new(encoded.capacity(), Arc::clone(tracker)).map_err(|error| {
-                format!(
-                    "ResourceExhausted: table finish size probe memory admission failed: {error}"
-                )
-            })
+            TrackedBytes::try_new(encoded.capacity(), Arc::clone(tracker))
+                .map_err(ExecutionFailure::from_domain)
         })
         .transpose()?;
     Ok(retained.max(logical).max(encoded.len()))
 }
+
+type TableFinishStep = Transform<TableFinishOperator, HydrateInput>;
 
 struct TableFinishOperator {
     name: String,
@@ -725,15 +798,15 @@ struct TableFinishOperator {
     channel_to_call: Vec<Option<usize>>,
     #[cfg(test)]
     arena: Arc<ExprArena>,
-    parallelism_error: Option<String>,
+    parallelism_error: Option<ExecutionFailure>,
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
     fragments: Vec<BufferedFragment>,
-    aggregate: Option<Box<dyn Operator>>,
+    aggregate: Option<ChildStep>,
     construction: Option<Arc<dyn InputConstructionFactory>>,
     aggregate_coverage: HashMap<u32, Vec<bool>>,
     final_groups_seen: HashSet<u32>,
-    grouped_unpivot: Option<Box<dyn GroupedUnpivotSource>>,
+    grouped_unpivot: Option<GroupedOutput>,
     prefix_output: Option<PrefixOutputDriver>,
     phase: FinishPhase,
     mem_tracker: Option<Arc<MemTracker>>,
@@ -741,9 +814,11 @@ struct TableFinishOperator {
     output_tracker: Option<Arc<MemTracker>>,
     profiles: Option<OperatorProfiles>,
     runtime_error: Option<Arc<RuntimeErrorState>>,
+    grouped_control: Option<RuntimeKernelControl>,
     final_aggregate_blocked_time: BlockedDuration,
     source_observable: Arc<Observable>,
-    sink_observable: Arc<Observable>,
+    input: Option<Chunk>,
+    pending_rows: u64,
 }
 
 impl TableFinishOperator {
@@ -756,60 +831,109 @@ impl TableFinishOperator {
         })
     }
 
-    fn install_aggregate(&mut self, aggregate: Box<dyn Operator>) {
-        if let Some(processor) = aggregate.as_processor_ref() {
-            if let Some(observable) = processor.source_observable() {
-                forward_observable(&observable, &self.source_observable);
-            }
-            if let Some(observable) = processor.sink_observable() {
-                forward_observable(&observable, &self.sink_observable);
-            }
+    fn install_aggregate(&mut self, aggregate: Box<dyn Operator>) -> ExecutionResult<()> {
+        let mut child = ChildStep::new(aggregate, self.source_observable.clone());
+        child.bind_failure_port(self.runtime_error.as_ref().cloned().ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::Binding,
+                "table finish final child has no original runtime failure binding",
+            )
+        })?)?;
+        child.prepare()?;
+        self.aggregate = Some(child);
+        Ok(())
+    }
+    fn begin_aggregate_exit(&mut self) -> ExecutionResult<()> {
+        if let Some(aggregate) = self.aggregate.as_mut() {
+            aggregate.begin_exit()?;
         }
-        self.aggregate = Some(aggregate);
+        Ok(())
+    }
+    fn close_aggregate(&mut self) -> ExecutionResult<()> {
+        if let Some(aggregate) = self.aggregate.as_mut() {
+            aggregate.close()?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
-    fn install_grouped_unpivot(&mut self, driver: impl GroupedUnpivotSource + 'static) {
-        self.install_grouped_unpivot_source(Box::new(driver));
+    fn install_grouped_unpivot(
+        &mut self,
+        driver: impl GroupedUnpivotKernel + 'static,
+        failures: Arc<RuntimeErrorState>,
+    ) {
+        self.grouped_unpivot = Some(
+            GroupedOutput::new(
+                Box::new(Source::new(driver)),
+                self.source_observable.clone(),
+                failures,
+            )
+            .unwrap(),
+        );
     }
 
-    fn install_grouped_unpivot_source(&mut self, driver: Box<dyn GroupedUnpivotSource>) {
-        forward_observable(&driver.source_observable(), &self.source_observable);
-        self.grouped_unpivot = Some(driver);
+    fn install_grouped_unpivot_source(
+        &mut self,
+        driver: Box<dyn GroupedUnpivotSource>,
+    ) -> ExecutionResult<()> {
+        let failures = self.runtime_error.as_ref().cloned().ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::Binding,
+                "table finish grouped output has no original runtime failure binding",
+            )
+        })?;
+        self.grouped_unpivot = Some(GroupedOutput::new(
+            driver,
+            self.source_observable.clone(),
+            failures,
+        )?);
+        Ok(())
     }
 
     fn release_buffer(&mut self) {
+        self.input = None;
         self.fragments.clear();
         self.prefix_output = None;
-        self.grouped_unpivot = None;
-        if let Some(aggregate) = self.aggregate.as_mut() {
-            aggregate.cancel();
+        if let Some(grouped) = self.grouped_unpivot.as_mut() {
+            grouped.child.cancel();
         }
-        self.aggregate = None;
+        if self.phase != FinishPhase::Failed {
+            self.phase = FinishPhase::Failed;
+            if let Some(aggregate) = self.aggregate.as_mut() {
+                aggregate.cancel();
+            }
+        }
+        // Preserve both original child owners until their actual exits.
         self.aggregate_coverage.clear();
         self.final_groups_seen.clear();
     }
 
     fn fail<T>(&mut self, error: impl Into<ExecutionFailure>) -> ExecutionResult<T> {
+        let failure = error.into();
+        if let Some(signal) = &self.runtime_error {
+            signal.set_error(failure.clone());
+        }
         self.release_buffer();
         self.phase = FinishPhase::Failed;
         self.finish_final_aggregate_blocked_interval();
         self.sync_metrics();
-        Err(error.into())
+        Err(failure)
     }
 
     /// Read one target ordinal off the signed carrier. A negative value is
     /// corrupt data, never a very large unsigned ordinal.
-    fn target_in_sealed_set(&self, raw: i32) -> Result<WriteTargetOrdinal, String> {
-        let target = target_ordinal_from_wire(raw)
-            .map_err(|error| format!("table finish write target ordinal: {error}"))?;
+    fn target_in_sealed_set(&self, raw: i32) -> ExecutionResult<WriteTargetOrdinal> {
+        let target = target_ordinal_from_wire(raw).map_err(|error| finish_connector(error))?;
         // An exact set test, not a bound: the query's expected set need not be
         // dense from zero, so "at or below the highest ordinal" would admit a
         // target this query compiled no writer for.
         if !self.expected_targets.contains(&target) {
-            return Err(format!(
-                "table finish received a write target ordinal {raw} outside the sealed set of {} targets",
-                self.expected_targets.len()
+            return Err(finish_contract(
+                FinishContractSite::Relation,
+                format_args!(
+                    "table finish received a write target ordinal {raw} outside the sealed set of {} targets",
+                    self.expected_targets.len()
+                ),
             ));
         }
         Ok(target)
@@ -820,16 +944,15 @@ impl TableFinishOperator {
         chunk: &Chunk,
         columns: &TableWriteRelationColumns<'_>,
         row: usize,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         if columns.kinds.is_null(row) {
-            return Err("table finish received a writer row with a null kind".to_string());
+            return Err(finish_contract(
+                FinishContractSite::Relation,
+                "table finish received a writer row with a null kind",
+            ));
         }
-        let kind = WriterRowKind::from_wire(columns.kinds.value(row)).map_err(|error| {
-            format!(
-                "table finish writer row kind {}: {error}",
-                columns.kinds.value(row)
-            )
-        })?;
+        let kind = WriterRowKind::from_wire(columns.kinds.value(row))
+            .map_err(|error| finish_connector(error))?;
         let row_count = (!columns.row_counts.is_null(row)).then(|| columns.row_counts.value(row));
         let fragment_len =
             (!columns.fragments.is_null(row)).then(|| columns.fragments.value(row).len());
@@ -855,48 +978,44 @@ impl TableFinishOperator {
             fragment_len,
             &auxiliary_non_null,
         )
-        .map_err(|error| format!("table finish writer row shape: {error}"))?;
+        .map_err(|error| finish_connector(error))?;
 
         if columns.ordinals.is_null(row) {
-            return Err(
-                "table finish received a writer row with a null write target ordinal".to_string(),
-            );
+            return Err(finish_contract(
+                FinishContractSite::Relation,
+                "table finish received a writer row with a null write target ordinal",
+            ));
         }
         let target = self.target_in_sealed_set(columns.ordinals.value(row))?;
 
         match kind {
             WriterRowKind::RowCount => {
                 let rows = row_count.ok_or_else(|| {
-                    "table finish ROW_COUNT row lost its validated row count".to_string()
+                    finish_contract(
+                        FinishContractSite::Relation,
+                        "table finish ROW_COUNT row lost its validated row count",
+                    )
                 })?;
-                // A negative row count is corrupt data, never a huge unsigned
-                // one: it would become the statement's affected row count.
-                let rows = row_count_from_wire(rows)
-                    .map_err(|error| format!("table finish row count: {error}"))?;
-                self.rows
-                    .add(rows)
-                    .map_err(|error| format!("table finish row count: {error}"))
+                // The SPI count owner rejects a negative trusted protocol count
+                // before it can become the statement's affected row count.
+                let rows = row_count_from_wire(rows).map_err(|error| finish_connector(error))?;
+                self.rows.add(rows).map_err(|error| finish_connector(error))
             }
             WriterRowKind::CommitFragment => {
                 let encoded = columns.fragments.value(row);
                 self.fragment_validator
                     .validate(target, encoded)
-                    .map_err(|error| format!("table finish commit fragment carrier: {error}"))?;
+                    .map_err(|error| finish_connector(error))?;
                 self.ledger
                     .reserve_fragment(encoded.len())
-                    .map_err(|error| format!("table finish prepared write set: {error}"))?;
+                    .map_err(|error| finish_connector(error))?;
                 let bytes = encoded.to_vec();
                 let accounting = self
                     .fragment_tracker
                     .as_ref()
                     .map(|tracker| {
-                        TrackedBytes::try_new(bytes.capacity(), Arc::clone(tracker)).map_err(
-                            |error| {
-                                format!(
-                                    "ResourceExhausted: table finish fragment memory admission failed: {error}"
-                                )
-                            },
-                        )
+                        TrackedBytes::try_new(bytes.capacity(), Arc::clone(tracker))
+                            .map_err(ExecutionFailure::from_domain)
                     })
                     .transpose()?;
                 self.fragments.push(BufferedFragment {
@@ -908,10 +1027,10 @@ impl TableFinishOperator {
             }
             WriterRowKind::AggregatePartial => {
                 if self.coverage.calls.is_empty() {
-                    return Err(
-                        "table finish received aggregate partials without a final aggregate plan"
-                            .to_string(),
-                    );
+                    return Err(finish_contract(
+                        FinishContractSite::Coverage,
+                        "table finish received aggregate partials without a final aggregate plan",
+                    ));
                 }
                 let coverage = self
                     .aggregate_coverage
@@ -920,8 +1039,10 @@ impl TableFinishOperator {
                 for (channel, non_null) in auxiliary_non_null.into_iter().enumerate() {
                     if non_null {
                         let index = self.channel_to_call[channel].ok_or_else(|| {
-                            "table finish writer auxiliary channel has no final aggregate"
-                                .to_string()
+                            finish_contract(
+                                FinishContractSite::Coverage,
+                                "table finish writer auxiliary channel has no final aggregate",
+                            )
                         })?;
                         coverage[index] = true;
                     }
@@ -931,12 +1052,15 @@ impl TableFinishOperator {
         }
     }
 
-    fn validate_coverage(&self) -> Result<(), String> {
+    fn validate_coverage(&self) -> ExecutionResult<()> {
         let Some(mappings) = self.coverage.mappings.as_ref() else {
             return if self.coverage.calls.is_empty() {
                 Ok(())
             } else {
-                Err("table finish final aggregates are missing grouped Unpivot".to_string())
+                Err(finish_contract(
+                    FinishContractSite::Coverage,
+                    "table finish final aggregates are missing grouped Unpivot",
+                ))
             };
         };
         let call_by_output = self
@@ -951,7 +1075,10 @@ impl TableFinishOperator {
                 .get(input_value_slot_id)
                 .copied()
                 .ok_or_else(|| {
-                    "table finish grouped Unpivot references an unknown final output".to_string()
+                    finish_contract(
+                        FinishContractSite::Coverage,
+                        "table finish grouped Unpivot references an unknown final output",
+                    )
                 })?;
             if !self
                 .aggregate_coverage
@@ -960,26 +1087,33 @@ impl TableFinishOperator {
                 .copied()
                 .unwrap_or(false)
             {
-                return Err(format!(
-                    "table finish target {} has no non-null aggregate partial for channel {}",
-                    grouping_key, call
+                return Err(finish_contract(
+                    FinishContractSite::Coverage,
+                    format_args!(
+                        "table finish target {} has no non-null aggregate partial for channel {}",
+                        grouping_key, call
+                    ),
                 ));
             }
         }
         Ok(())
     }
 
-    fn filter_aggregate_rows(&self, chunk: &Chunk, partial_rows: &[bool]) -> Result<Chunk, String> {
+    fn filter_aggregate_rows(
+        &self,
+        chunk: &Chunk,
+        partial_rows: &[bool],
+    ) -> ExecutionResult<Chunk> {
         let mask = BooleanArray::from(partial_rows.to_vec());
         let batch = filter_record_batch(&chunk.record_batch(), &mask)
-            .map_err(|error| format!("table finish filters aggregate partial rows: {error}"))?;
-        Chunk::try_new_with_chunk_schema(
+            .map_err(|error| finish_arrow(FinishArrowOperation::Filter, error))?;
+        Ok(Chunk::try_new_with_chunk_schema(
             batch,
             Arc::clone(self.writer_schema.schema()?.chunk_schema()),
-        )
+        )?)
     }
 
-    fn begin_finalize(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+    fn begin_finalize(&mut self) -> ExecutionResult<()> {
         self.validate_coverage()?;
         self.prefix_output = Some(PrefixOutputDriver::try_new(
             self.rows.get(),
@@ -991,10 +1125,7 @@ impl TableFinishOperator {
             self.phase = FinishPhase::Producing;
             return Ok(());
         };
-        let processor = aggregate
-            .as_processor_mut()
-            .ok_or_else(|| "table finish final aggregate is not a processor".to_string())?;
-        processor.set_finishing(state)?;
+        aggregate.finish_input();
         // The child may now be asynchronously finalizing while already
         // producing zero or more ordinary aggregate batches. TableFinish
         // streams those batches instead of imposing a scalar/single-batch ABI.
@@ -1002,76 +1133,83 @@ impl TableFinishOperator {
         Ok(())
     }
 
-    fn start_grouped_unpivot(
-        &mut self,
-        state: &RuntimeState,
-        final_chunk: Chunk,
-    ) -> ExecutionResult<()> {
-        let driver: Box<dyn GroupedUnpivotSource> =
-            match self.statistics.as_ref() {
-                Some(statistics) => statistics.grouped_unpivot(
-                    state,
+    fn start_grouped_unpivot(&mut self, final_chunk: Chunk) -> ExecutionResult<()> {
+        let driver: Box<dyn GroupedUnpivotSource> = match self.statistics.as_ref() {
+            Some(statistics) => {
+                statistics.grouped_unpivot(
+                    self.grouped_control.as_ref().ok_or(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                    )?,
                     final_chunk,
                     Arc::clone(self.prepared_root_schema()?.chunk_schema()),
                     self.output_tracker.as_ref().map(Arc::clone),
                     Arc::clone(self.construction.as_ref().ok_or(
                         crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                     )?),
-                )?,
-                #[cfg(test)]
-                None if self.final_plan.prepared.is_some() => {
-                    let factory = Arc::clone(self.construction.as_ref().ok_or(
+                )?
+            }
+            #[cfg(test)]
+            None if self.final_plan.prepared.is_some() => {
+                let factory =
+                    Arc::clone(self.construction.as_ref().ok_or(
                         crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                     )?);
-                    let plan = self.final_plan.unpivot.as_ref().ok_or_else(|| {
-                        crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
-                            "writer grouped Unpivot declaration is absent".into(),
-                        )
-                    })?;
-                    super::compiled_writer_statistics::create_prepared_grouped_in(
-                        &self.arena,
-                        plan,
-                        final_chunk,
-                        Arc::clone(self.prepared_root_schema()?.chunk_schema()),
-                        self.output_tracker.as_ref().map(Arc::clone),
-                        factory,
-                        state.error_state(),
-                    )?
-                }
-                #[cfg(test)]
-                None => {
-                    let arena = Arc::clone(&self.arena);
-                    let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
-                        "table finish final aggregate is missing grouped Unpivot".to_string()
-                    })?;
-                    Box::new(GroupedUnpivotFixture::try_new(
-                        #[cfg(test)]
-                        arena,
-                        self.construction.clone(),
-                        plan,
-                        Arc::clone(self.prepared_root_schema()?.chunk_schema()),
-                        final_chunk,
-                        self.output_tracker.as_ref().map(Arc::clone),
-                    )?)
-                }
-                #[cfg(not(test))]
-                None => {
-                    return Err(
-                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
-                    );
-                }
-            };
+                let plan = self.final_plan.unpivot.as_ref().ok_or_else(|| {
+                    crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                        "writer grouped Unpivot declaration is absent".into(),
+                    )
+                })?;
+                super::compiled_writer_statistics::create_prepared_grouped_in(
+                    &self.arena,
+                    plan,
+                    final_chunk,
+                    Arc::clone(self.prepared_root_schema()?.chunk_schema()),
+                    self.output_tracker.as_ref().map(Arc::clone),
+                    factory,
+                    self.grouped_control.as_ref().ok_or(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                    )?,
+                )?
+            }
+            #[cfg(test)]
+            None => {
+                let arena = Arc::clone(&self.arena);
+                let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
+                    finish_contract(
+                        FinishContractSite::FinalGroups,
+                        "table finish final aggregate is missing grouped Unpivot",
+                    )
+                })?;
+                Box::new(Source::new(GroupedUnpivotFixtureKernel::try_new(
+                    arena,
+                    plan,
+                    Arc::clone(self.prepared_root_schema()?.chunk_schema()),
+                    final_chunk,
+                    self.output_tracker.as_ref().map(Arc::clone),
+                    self.grouped_control
+                        .as_ref()
+                        .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+                        .for_receiver(),
+                    self.construction.clone(),
+                )?))
+            }
+            #[cfg(not(test))]
+            None => {
+                return Err(
+                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
+                );
+            }
+        };
         driver.visit_targets(&mut |target| {
             if !self.final_groups_seen.insert(target) {
-                return Err(format!("table finish final aggregate produced duplicate target {target} across output batches").into());
+                return Err(finish_contract(FinishContractSite::FinalGroups, format_args!("table finish final aggregate produced duplicate target {target} across output batches")));
             }
             Ok(())
         })?;
-        self.install_grouped_unpivot_source(driver);
-        Ok(())
+        self.install_grouped_unpivot_source(driver)
     }
 
-    fn validate_final_groups_complete(&self) -> Result<(), String> {
+    fn validate_final_groups_complete(&self) -> ExecutionResult<()> {
         let expected = self
             .coverage
             .mappings
@@ -1091,8 +1229,11 @@ impl TableFinishOperator {
             .difference(&expected)
             .copied()
             .collect::<Vec<_>>();
-        Err(format!(
-            "table finish final aggregate target coverage mismatch: missing={missing:?}, unexpected={unexpected:?}"
+        Err(finish_contract(
+            FinishContractSite::FinalGroups,
+            format_args!(
+                "table finish final aggregate target coverage mismatch: missing={missing:?}, unexpected={unexpected:?}"
+            ),
         ))
     }
 
@@ -1139,11 +1280,13 @@ fn build_final_aggregate(
     arena: &Arc<ExprArena>,
     function_set: Arc<crate::exec::expr::agg::SealedExecutionFunctionSet>,
     node_id: i32,
-) -> Result<Box<dyn Operator>, String> {
-    let unpivot = plan
-        .unpivot
-        .as_ref()
-        .ok_or_else(|| "table finish final aggregates require grouped Unpivot".to_string())?;
+) -> ExecutionResult<Box<dyn Operator>> {
+    let unpivot = plan.unpivot.as_ref().ok_or_else(|| {
+        finish_contract(
+            FinishContractSite::Relation,
+            "table finish final aggregates require grouped Unpivot",
+        )
+    })?;
     let mut aggregate_arena = arena.as_ref().clone();
     let grouping = aggregate_arena.push_typed(
         ExprNode::SlotId(unpivot.grouping_input_slot_id),
@@ -1199,57 +1342,68 @@ fn build_final_aggregate(
 }
 
 #[cfg(test)]
-struct GroupedUnpivotFixture {
+struct GroupedUnpivotFixtureKernel {
     #[cfg(test)]
     arena: Arc<ExprArena>,
-    construction: Option<Arc<dyn InputConstructionFactory>>,
     plan: WriterGroupedUnpivotPlan,
     root_schema: crate::exec::chunk::ChunkSchemaRef,
     final_chunk: Chunk,
     rows: Vec<(u32, usize)>,
     next_row: usize,
     mappings: BTreeMap<u32, Vec<WriterGroupedUnpivotMapping>>,
-    active: Option<Box<dyn Operator>>,
+    active: Option<ChildStep>,
+    active_exit_started: bool,
     tracker: Option<Arc<MemTracker>>,
     source_observable: Arc<Observable>,
+    control: RuntimeKernelControl,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
 }
 
 #[cfg(test)]
-impl GroupedUnpivotFixture {
+impl GroupedUnpivotFixtureKernel {
     fn try_new(
-        #[cfg(test)] arena: Arc<ExprArena>,
-        construction: Option<Arc<dyn InputConstructionFactory>>,
+        arena: Arc<ExprArena>,
         plan: WriterGroupedUnpivotPlan,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         mut final_chunk: Chunk,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<Self, String> {
+        control: RuntimeKernelControl,
+        construction: Option<Arc<dyn InputConstructionFactory>>,
+    ) -> ExecutionResult<Self> {
         if let Some(tracker) = tracker.as_ref() {
-            final_chunk.try_transfer_to(tracker).map_err(|error| {
-                format!(
-                    "ResourceExhausted: table finish final aggregate output memory admission failed: {error}"
-                )
-            })?;
+            final_chunk
+                .try_transfer_to(tracker)
+                .map_err(ExecutionFailure::from_domain)?;
         }
         let groups = final_chunk
             .column_by_slot_id(plan.grouping_output_slot_id)?
             .as_any()
             .downcast_ref::<Int32Array>()
-            .ok_or_else(|| "table finish final aggregate grouping output is not Int32".to_string())?
+            .ok_or_else(|| {
+                finish_contract(
+                    FinishContractSite::Relation,
+                    "table finish final aggregate grouping output is not Int32",
+                )
+            })?
             .clone();
         let mut rows = Vec::with_capacity(groups.len());
         let mut seen = std::collections::HashSet::with_capacity(groups.len());
         for row in 0..groups.len() {
             if groups.is_null(row) {
-                return Err("table finish final aggregate produced a null grouping key".to_string());
+                return Err(finish_contract(
+                    FinishContractSite::Relation,
+                    "table finish final aggregate produced a null grouping key",
+                ));
             }
             let raw = groups.value(row);
-            let target = target_ordinal_from_wire(raw)
-                .map_err(|error| format!("table finish final aggregate grouping key: {error}"))?;
+            let target = target_ordinal_from_wire(raw).map_err(|error| finish_connector(error))?;
             if !seen.insert(target.get()) {
-                return Err(format!(
-                    "table finish final aggregate produced duplicate target {}",
-                    target.get()
+                return Err(finish_contract(
+                    FinishContractSite::Relation,
+                    format_args!(
+                        "table finish final aggregate produced duplicate target {}",
+                        target.get()
+                    ),
                 ));
             }
             rows.push((target.get(), row));
@@ -1263,15 +1417,17 @@ impl GroupedUnpivotFixture {
         }
         for (target, _) in &rows {
             if !mappings.contains_key(target) {
-                return Err(format!(
-                    "table finish final aggregate produced target {target} with no grouped Unpivot mapping"
+                return Err(finish_contract(
+                    FinishContractSite::Relation,
+                    format_args!(
+                        "table finish final aggregate produced target {target} with no grouped Unpivot mapping"
+                    ),
                 ));
             }
         }
         Ok(Self {
             #[cfg(test)]
             arena,
-            construction,
             plan,
             root_schema,
             final_chunk,
@@ -1279,22 +1435,24 @@ impl GroupedUnpivotFixture {
             next_row: 0,
             mappings,
             active: None,
+            active_exit_started: false,
             tracker,
             source_observable: Arc::new(Observable::new()),
+            control,
+            construction,
         })
     }
 
-    fn install_active(&mut self, active: Box<dyn Operator>) {
-        if let Some(observable) = active
-            .as_processor_ref()
-            .and_then(ProcessorOperator::source_observable)
-        {
-            forward_observable(&observable, &self.source_observable);
-        }
-        self.active = Some(active);
+    fn install_active(&mut self, active: Box<dyn Operator>) -> ExecutionResult<()> {
+        let mut child = ChildStep::new(active, self.source_observable.clone());
+        child.bind_failure_port(self.control.failure_port())?;
+        child.prepare()?;
+        self.active = Some(child);
+        self.active_exit_started = false;
+        Ok(())
     }
 
-    fn output_schema(&self, target: u32) -> Result<crate::exec::chunk::ChunkSchemaRef, String> {
+    fn output_schema(&self, target: u32) -> ExecutionResult<crate::exec::chunk::ChunkSchemaRef> {
         let slots = [
             self.plan.passthrough_output_slot_id,
             self.plan.literal_output_slot_ids[0],
@@ -1305,17 +1463,21 @@ impl GroupedUnpivotFixture {
         let mut fields = slots
             .iter()
             .map(|slot| {
-                self.root_schema
-                    .slot(*slot)
-                    .cloned()
-                    .ok_or_else(|| format!("table finish Root schema is missing slot {slot}"))
+                self.root_schema.slot(*slot).cloned().ok_or_else(|| {
+                    finish_contract(
+                        FinishContractSite::FinalGroups,
+                        format_args!("table finish Root schema is missing slot {slot}"),
+                    )
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         fields[0] = fields[0].with_nullable(false);
-        let mappings = self
-            .mappings
-            .get(&target)
-            .ok_or_else(|| format!("table finish target {target} has no grouped mappings"))?;
+        let mappings = self.mappings.get(&target).ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::FinalGroups,
+                format_args!("table finish target {target} has no grouped mappings"),
+            )
+        })?;
         let literal_positions = [1usize, 2, 4];
         for (literal_index, position) in literal_positions
             .iter()
@@ -1337,24 +1499,37 @@ impl GroupedUnpivotFixture {
                 .slot(mapping.input_value_slot_id)
                 .map(|slot| nullable || slot.nullable())
                 .ok_or_else(|| {
-                    format!(
-                        "table finish final aggregate is missing value slot {}",
-                        mapping.input_value_slot_id
+                    finish_contract(
+                        FinishContractSite::FinalGroups,
+                        format_args!(
+                            "table finish final aggregate is missing value slot {}",
+                            mapping.input_value_slot_id
+                        ),
                     )
                 })
         })?;
         fields[3] = fields[3].with_nullable(value_nullable);
-        ChunkSchema::try_new(fields).map(Arc::new)
+        ChunkSchema::try_new(fields)
+            .map(Arc::new)
+            .map_err(ExecutionFailure::from)
     }
 
-    fn start_next(&mut self, state: &RuntimeState) -> ExecutionResult<bool> {
+    fn start_next(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<bool> {
         let Some((target, row)) = self.rows.get(self.next_row).copied() else {
             return Ok(false);
         };
         let mappings = self
             .mappings
             .get(&target)
-            .ok_or_else(|| format!("table finish target {target} lost its grouped mappings"))?
+            .ok_or_else(|| {
+                finish_contract(
+                    FinishContractSite::Relation,
+                    format_args!("table finish target {target} lost its grouped mappings"),
+                )
+            })?
             .iter()
             .map(|mapping| UnpivotValueMapping {
                 input_value_slot_id: mapping.input_value_slot_id,
@@ -1375,67 +1550,137 @@ impl GroupedUnpivotFixture {
             self.plan.max_output_rows,
             self.plan.max_output_bytes,
         )?;
-        let mut active = factory.create(1, 0);
-        if let Some(construction) = self.construction.as_ref() {
-            active.set_construction_factory(Arc::clone(construction));
+        let mut active = factory.create_bound(self.control.for_receiver());
+        if let Some(factory) = self.construction.as_ref() {
+            active.set_construction_factory(factory.clone());
         }
         if let Some(tracker) = self.tracker.as_ref() {
             active.set_mem_tracker(Arc::clone(tracker));
         }
-        active.prepare()?;
-        active.bind_runtime_state(state)?;
-        active.activate(state)?;
-        let processor = active
-            .as_processor_mut()
-            .ok_or_else(|| "table finish grouped Unpivot is not a processor".to_string())?;
-        processor.push_chunk(state, self.final_chunk.slice(row, 1))?;
-        processor.set_finishing(state)?;
-        self.install_active(active);
+        self.install_active(active)?;
+        let input = if self.final_chunk.chunk_schema().is_typed() {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let owner = factory.begin_input_construction(&self.final_chunk)?;
+            self.final_chunk
+                .slice_typed_observed::<crate::exec::pipeline::operator::ConstructionFailure, _>(
+                    row,
+                    1,
+                    owner.storage_lifetime(),
+                    |step| owner.observe(0, &[], step),
+                )?
+        } else {
+            self.final_chunk.slice(row, 1)
+        };
+        let child = self.active.as_mut().expect("installed grouped Unpivot");
+        child.offer(input)?;
+        child.finish_input();
         Ok(true)
     }
 
-    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        loop {
-            if self.active.is_none() && !self.start_next(state)? {
-                return Ok(None);
-            }
-            let active = self.active.as_mut().expect("started grouped Unpivot");
-            if let Some(chunk) = active
-                .as_processor_mut()
-                .expect("grouped Unpivot processor")
-                .pull_chunk(state)?
-            {
-                return Ok(root_artifact_chunk(
-                    chunk,
-                    &self.root_schema,
-                    self.tracker.as_ref(),
-                )?);
-            }
-            if !active.is_finished() {
-                return Ok(None);
+    fn step(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.active.as_ref().is_some_and(ChildStep::is_complete) {
+            self.active_exit_started = true;
+        }
+        if self.active_exit_started {
+            let next = self
+                .active
+                .as_mut()
+                .expect("retiring grouped child")
+                .retire(ctx)?;
+            if !matches!(next, NextStep::Finished) {
+                return Ok(StepResult::new(None, next, 0));
             }
             self.active = None;
+            self.active_exit_started = false;
             self.next_row += 1;
+            return Ok(StepResult::new(
+                None,
+                if self.next_row == self.rows.len() {
+                    NextStep::Finished
+                } else {
+                    NextStep::Runnable
+                },
+                0,
+            ));
         }
+        if self.active.is_none() && self.next_row == self.rows.len() {
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
+        }
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        if self.active.is_none() {
+            self.start_next(ctx)?;
+            return Ok(StepResult::new(None, NextStep::Runnable, 0));
+        }
+        let active = self.active.as_mut().expect("started grouped Unpivot");
+        let output = active.advance(ctx)?;
+        let next = if active.is_complete() {
+            self.active_exit_started = true;
+            NextStep::Runnable
+        } else {
+            active.work_next()
+        };
+        let output = match output {
+            Some(chunk) => root_artifact_chunk(chunk, &self.root_schema, self.tracker.as_ref())?,
+            None => None,
+        };
+        Ok(StepResult::new(output, next, 0))
     }
 }
-
 #[cfg(test)]
-impl GroupedUnpivotSource for GroupedUnpivotFixture {
-    fn targets(&self) -> Vec<u32> {
-        self.rows.iter().map(|(target, _)| *target).collect()
+impl GroupedUnpivotKernel for GroupedUnpivotFixtureKernel {
+    fn visit_targets(
+        &self,
+        visit: &mut dyn FnMut(u32) -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        for (target, _) in &self.rows {
+            visit(*target)?;
+        }
+        Ok(())
     }
-
-    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        GroupedUnpivotFixture::pull(self, state)
+}
+#[cfg(test)]
+impl SourceKernel for GroupedUnpivotFixtureKernel {
+    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        self.step(ctx)
     }
-
-    fn is_finished(&self) -> bool {
-        self.next_row == self.rows.len() && self.active.is_none()
+    fn control_observable(&self) -> Option<Arc<Observable>> {
+        Some(self.source_observable.clone())
     }
-
-    fn source_observable(&self) -> Arc<Observable> {
-        Arc::clone(&self.source_observable)
+}
+#[cfg(test)]
+impl OperatorLifecycle for GroupedUnpivotFixtureKernel {
+    fn name(&self) -> &str {
+        "GROUPED_WRITER_UNPIVOT"
+    }
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        if let Some(active) = self.active.as_mut() {
+            active.begin_exit()?;
+        }
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        if let Some(active) = self.active.as_mut() {
+            active.close()?;
+        }
+        Ok(())
+    }
+    fn cancel(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.cancel();
+        }
+    }
+    fn visit_exits(
+        &mut self,
+        visit: &mut dyn FnMut(crate::exec::pipeline::operator::ExitObservation),
+    ) {
+        if let Some(active) = self.active.as_mut() {
+            active.visit_exits(visit);
+        }
     }
 }
 
@@ -1456,7 +1701,7 @@ pub(crate) fn root_artifact_chunk(
     artifact: Chunk,
     root_schema: &crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<&Arc<MemTracker>>,
-) -> Result<Option<Chunk>, String> {
+) -> ExecutionResult<Option<Chunk>> {
     // The explicit legacy adapter shares the exact validation/column body.
     root_artifact_chunk_core(
         artifact,
@@ -1470,14 +1715,12 @@ pub(crate) fn root_artifact_chunk(
         },
         |_, columns, rows| {
             let batch = RecordBatch::try_new(root_schema.arrow_schema_ref(), columns)
-                .map_err(|error| format!("build table finish artifact Root batch: {error}"))?;
+                .map_err(|error| finish_arrow(FinishArrowOperation::Artifact, error))?;
             let mut output = Chunk::try_new_with_chunk_schema(batch, Arc::clone(root_schema))?;
             if let Some(tracker) = tracker {
-                output.try_transfer_to(tracker).map_err(|error| {
-                    format!(
-                        "ResourceExhausted: table finish artifact output admission failed: {error}"
-                    )
-                })?;
+                output
+                    .try_transfer_to(tracker)
+                    .map_err(ExecutionFailure::from_domain)?;
             }
             assert_eq!(output.len(), rows);
             Ok(Some(output))
@@ -1504,24 +1747,34 @@ pub(crate) fn root_artifact_chunk_with_construction(
     // The protocol explicitly widens NULL promises on these existing value
     // roles. It does not infer a domain from the source Arrow carrier.
     for ordinal in [1, 4, 5, 6, 7] {
-        let expected = root_schema
-            .slots()
-            .get(ordinal)
-            .ok_or_else(|| "Root artifact declaration is absent".to_owned())?;
+        let expected = root_schema.slots().get(ordinal).ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "Root artifact declaration is absent",
+            )
+        })?;
         let source = artifact
             .chunk_schema()
             .slot(expected.slot_id())
-            .ok_or_else(|| "artifact source declaration is absent".to_owned())?;
+            .ok_or_else(|| {
+                finish_contract(
+                    FinishContractSite::RootArtifact,
+                    "artifact source declaration is absent",
+                )
+            })?;
         let source = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
             source.typed_binding().clone(),
         )
-        .map_err(|_| "artifact source declaration is invalid".to_owned())?;
+        .map_err(ExecutionFailure::from_domain)?;
         let expected = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
             expected.typed_binding().clone(),
         )
-        .map_err(|_| "Root artifact declaration is invalid".to_owned())?;
+        .map_err(ExecutionFailure::from_domain)?;
         if !source.fits_physical_binding_observed(&expected, || control.checkpoint(1))? {
-            return Err("artifact source differs from its complete Root declaration".into());
+            return Err(finish_contract(
+                FinishContractSite::RootArtifact,
+                "artifact source differs from its complete Root declaration",
+            ));
         }
     }
     let owner = factory.begin_typed_construction(root_schema)?;
@@ -1596,7 +1849,7 @@ pub(crate) fn root_artifact_chunk_with_construction(
                 )?;
             if let Some(tracker) = tracker {
                 output
-                    .try_transfer_to_typed(tracker)
+                    .try_transfer_to(tracker)
                     .map_err(ConstructionFailure::Memory)?;
             }
             Ok(Some(output))
@@ -1604,13 +1857,13 @@ pub(crate) fn root_artifact_chunk_with_construction(
     )
 }
 
-fn root_artifact_chunk_core<E: From<String>>(
+fn root_artifact_chunk_core(
     artifact: Chunk,
     root_schema: &crate::exec::chunk::ChunkSchemaRef,
-    mut before: impl FnMut(RootArtifactStep) -> Result<(), E>,
-    mut null_array: impl FnMut(usize, usize) -> Result<ArrayRef, E>,
-    construct: impl FnOnce(Chunk, Vec<ArrayRef>, usize) -> Result<Option<Chunk>, E>,
-) -> Result<Option<Chunk>, E> {
+    mut before: impl FnMut(RootArtifactStep) -> ExecutionResult<()>,
+    mut null_array: impl FnMut(usize, usize) -> ExecutionResult<ArrayRef>,
+    construct: impl FnOnce(Chunk, Vec<ArrayRef>, usize) -> ExecutionResult<Option<Chunk>>,
+) -> ExecutionResult<Option<Chunk>> {
     let rows = artifact.len();
     if rows == 0 {
         return Ok(None);
@@ -1624,34 +1877,72 @@ fn root_artifact_chunk_core<E: From<String>>(
     let input_lists = input_fields
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()
-        .ok_or_else(|| "table finish artifact input_fields is not List<Int32>".to_string())?;
+        .ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact input_fields is not List<Int32>",
+            )
+        })?;
     let blob_types = blob_type
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| "table finish artifact blob_type is not Utf8".to_string())?;
+        .ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact blob_type is not Utf8",
+            )
+        })?;
     let bodies = body
         .as_any()
         .downcast_ref::<arrow::array::BinaryArray>()
-        .ok_or_else(|| "table finish artifact body is not Binary".to_string())?;
+        .ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact body is not Binary",
+            )
+        })?;
     let maps = properties
         .as_any()
         .downcast_ref::<arrow::array::MapArray>()
-        .ok_or_else(|| "table finish artifact properties is not Map<Utf8,Utf8>".to_string())?;
+        .ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact properties is not Map<Utf8,Utf8>",
+            )
+        })?;
     let targets = target
         .as_any()
         .downcast_ref::<Int32Array>()
-        .ok_or_else(|| "table finish artifact target is not Int32".to_string())?;
+        .ok_or_else(|| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact target is not Int32",
+            )
+        })?;
     for row in 0..rows {
         before(RootArtifactStep::Work)?;
         let ids = input_lists
             .values()
             .as_any()
             .downcast_ref::<Int32Array>()
-            .ok_or_else(|| "table finish artifact input_fields values are not Int32".to_string())?;
-        let begin = usize::try_from(input_lists.value_offsets()[row])
-            .map_err(|_| "table finish artifact input_fields offset is negative".to_owned())?;
-        let end = usize::try_from(input_lists.value_offsets()[row + 1])
-            .map_err(|_| "table finish artifact input_fields offset is negative".to_owned())?;
+            .ok_or_else(|| {
+                finish_contract(
+                    FinishContractSite::RootArtifact,
+                    "table finish artifact input_fields values are not Int32",
+                )
+            })?;
+        let begin = usize::try_from(input_lists.value_offsets()[row]).map_err(|_| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact input_fields offset is negative",
+            )
+        })?;
+        let end = usize::try_from(input_lists.value_offsets()[row + 1]).map_err(|_| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact input_fields offset is negative",
+            )
+        })?;
         before(RootArtifactStep::IdScratch(end - begin))?;
         let ids = (begin..end)
             .map(|index| (!ids.is_null(index)).then(|| ids.value(index)))
@@ -1661,16 +1952,34 @@ fn root_artifact_chunk_core<E: From<String>>(
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or_else(|| "table finish artifact property keys are not Utf8".to_owned())?;
+            .ok_or_else(|| {
+                finish_contract(
+                    FinishContractSite::RootArtifact,
+                    "table finish artifact property keys are not Utf8",
+                )
+            })?;
         let values = entries
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or_else(|| "table finish artifact property values are not Utf8".to_owned())?;
-        let begin = usize::try_from(maps.value_offsets()[row])
-            .map_err(|_| "table finish artifact properties offset is negative".to_owned())?;
-        let end = usize::try_from(maps.value_offsets()[row + 1])
-            .map_err(|_| "table finish artifact properties offset is negative".to_owned())?;
+            .ok_or_else(|| {
+                finish_contract(
+                    FinishContractSite::RootArtifact,
+                    "table finish artifact property values are not Utf8",
+                )
+            })?;
+        let begin = usize::try_from(maps.value_offsets()[row]).map_err(|_| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact properties offset is negative",
+            )
+        })?;
+        let end = usize::try_from(maps.value_offsets()[row + 1]).map_err(|_| {
+            finish_contract(
+                FinishContractSite::RootArtifact,
+                "table finish artifact properties offset is negative",
+            )
+        })?;
         before(RootArtifactStep::PairScratch(end - begin))?;
         let pairs = (begin..end)
             .map(|index| {
@@ -1681,7 +1990,7 @@ fn root_artifact_chunk_core<E: From<String>>(
             })
             .collect::<Vec<_>>();
         validate_artifact_draft_nested_values(&ids, &pairs)
-            .map_err(|error| format!("table finish artifact nested values: {error}"))?;
+            .map_err(|error| finish_connector(error))?;
         validate_root_write_result_row(
             RootRowKind::ArtifactDraft,
             RootWriteResultRowShape {
@@ -1693,7 +2002,7 @@ fn root_artifact_chunk_core<E: From<String>>(
                 ..RootWriteResultRowShape::default()
             },
         )
-        .map_err(|error| format!("table finish artifact row shape: {error}"))?;
+        .map_err(|error| finish_connector(error))?;
     }
     let root_arrow = root_schema.arrow_schema_ref();
     // The reused upstream nested arrays name the upstream layout's child
@@ -1724,9 +2033,12 @@ fn root_artifact_chunk_core<E: From<String>>(
     construct(artifact, columns, rows)
 }
 
-fn rebind_list(list: &arrow::array::ListArray, root: &DataType) -> Result<ArrayRef, String> {
+fn rebind_list(list: &arrow::array::ListArray, root: &DataType) -> ExecutionResult<ArrayRef> {
     let DataType::List(item) = root else {
-        return Err("table finish Root input_fields is not a List".to_string());
+        return Err(finish_contract(
+            FinishContractSite::RootArtifact,
+            "table finish Root input_fields is not a List",
+        ));
     };
     arrow::array::ListArray::try_new(
         Arc::clone(item),
@@ -1735,22 +2047,28 @@ fn rebind_list(list: &arrow::array::ListArray, root: &DataType) -> Result<ArrayR
         list.nulls().cloned(),
     )
     .map(|list| Arc::new(list) as ArrayRef)
-    .map_err(|error| format!("rebind table finish artifact input_fields: {error}"))
+    .map_err(|error| finish_arrow(FinishArrowOperation::List, error))
 }
 
-fn rebind_map(map: &arrow::array::MapArray, root: &DataType) -> Result<ArrayRef, String> {
+fn rebind_map(map: &arrow::array::MapArray, root: &DataType) -> ExecutionResult<ArrayRef> {
     let DataType::Map(entries, sorted) = root else {
-        return Err("table finish Root properties is not a Map".to_string());
+        return Err(finish_contract(
+            FinishContractSite::RootArtifact,
+            "table finish Root properties is not a Map",
+        ));
     };
     let DataType::Struct(fields) = entries.data_type() else {
-        return Err("table finish Root property entries are not a Struct".to_string());
+        return Err(finish_contract(
+            FinishContractSite::RootArtifact,
+            "table finish Root property entries are not a Struct",
+        ));
     };
     let rebound = arrow::array::StructArray::try_new(
         fields.clone(),
         map.entries().columns().to_vec(),
         map.entries().nulls().cloned(),
     )
-    .map_err(|error| format!("rebind table finish artifact entries: {error}"))?;
+    .map_err(|error| finish_arrow(FinishArrowOperation::Map, error))?;
     arrow::array::MapArray::try_new(
         Arc::clone(entries),
         map.offsets().clone(),
@@ -1759,10 +2077,10 @@ fn rebind_map(map: &arrow::array::MapArray, root: &DataType) -> Result<ArrayRef,
         *sorted,
     )
     .map(|map| Arc::new(map) as ArrayRef)
-    .map_err(|error| format!("rebind table finish artifact properties: {error}"))
+    .map_err(|error| finish_arrow(FinishArrowOperation::Map, error))
 }
 
-impl Operator for TableFinishOperator {
+impl OperatorLifecycle for TableFinishOperator {
     fn creates_typed_storage(&self) -> bool {
         self.writer_schema.is_compiled()
             || self.root_schema.is_compiled()
@@ -1787,20 +2105,19 @@ impl Operator for TableFinishOperator {
         }
         if self.coverage.calls.is_empty() != self.coverage.mappings.is_none() {
             self.phase = FinishPhase::Failed;
-            return Err(
-                "table finish final aggregate and grouped Unpivot must be both empty or both present"
-                    .to_string().into(),
-            );
+            return Err(finish_contract(
+                FinishContractSite::Coverage,
+                "table finish final aggregate and grouped Unpivot must be both empty or both present",
+            ));
         }
         if self.channel_to_call.iter().any(Option::is_none)
             || self.channel_to_call.len() != self.coverage.calls.len()
         {
             self.phase = FinishPhase::Failed;
-            return Err(
-                "table finish final aggregates do not exactly cover the frozen writer tail"
-                    .to_string()
-                    .into(),
-            );
+            return Err(finish_contract(
+                FinishContractSite::Coverage,
+                "table finish final aggregates do not exactly cover the frozen writer tail",
+            ));
         }
         if let Err(error) = self.writer_schema.prepare(self.construction.as_ref()) {
             return self.fail(error);
@@ -1824,6 +2141,15 @@ impl Operator for TableFinishOperator {
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.runtime_error = Some(state.error_state());
+        let mut control = RuntimeKernelControl::new(state.error_state());
+        control.bind_runtime_memory(state);
+        if let Some(factory) = self.construction.as_ref() {
+            control.bind_construction_factory(factory.clone());
+        }
+        if let Some(tracker) = self.mem_tracker.as_ref() {
+            control.bind_mem_tracker(tracker.clone());
+        }
+        self.grouped_control = Some(control);
         if self.coverage.calls.is_empty() {
             return Ok(());
         }
@@ -1891,8 +2217,10 @@ impl Operator for TableFinishOperator {
                     .execution_runtime()
                     .map(|runtime| Arc::clone(runtime.function_set()))
                     .ok_or_else(|| {
-                        "table finish aggregate plan requires the execution function set"
-                            .to_string()
+                        finish_contract(
+                            FinishContractSite::Binding,
+                            "table finish aggregate plan requires the execution function set",
+                        )
                     })?;
                 build_final_aggregate(&self.final_plan, &arena, function_set, -1)?
             }
@@ -1918,9 +2246,8 @@ impl Operator for TableFinishOperator {
         } else if aggregate.creates_typed_storage() {
             return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
         }
-        aggregate.prepare()?;
         aggregate.bind_runtime_state(state)?;
-        self.install_aggregate(aggregate);
+        self.install_aggregate(aggregate)?;
         Ok(())
     }
 
@@ -1938,129 +2265,187 @@ impl Operator for TableFinishOperator {
         self.sync_metrics();
     }
 
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        let aggregate = self.begin_aggregate_exit();
+        let grouped = self
+            .grouped_unpivot
+            .as_mut()
+            .map(|grouped| grouped.child.begin_exit())
+            .unwrap_or(Ok(()));
+        // Ordinary child cleanup failures were consumed by each exact binding;
+        // even a binding invariant cannot prevent the sibling hook attempt.
+        aggregate.and(grouped)
+    }
+    fn visit_exits(
+        &mut self,
+        visit: &mut dyn FnMut(crate::exec::pipeline::operator::ExitObservation),
+    ) {
+        if let Some(aggregate) = self.aggregate.as_mut() {
+            aggregate.visit_exits(visit);
+        }
+        if let Some(grouped) = self.grouped_unpivot.as_mut() {
+            grouped.child.visit_exits(visit);
+        }
+    }
     fn close(&mut self) -> ExecutionResult<()> {
         self.finish_final_aggregate_blocked_interval();
         self.sync_metrics();
-        Ok(())
+        let aggregate = self.close_aggregate();
+        let grouped = self
+            .grouped_unpivot
+            .as_mut()
+            .map(|grouped| grouped.child.close())
+            .unwrap_or(Ok(()));
+        aggregate.and(grouped)
     }
 
     fn on_driver_failure(&mut self) {
         self.cancel();
     }
-
-    fn is_finished(&self) -> bool {
-        let finished = matches!(self.phase, FinishPhase::Failed | FinishPhase::Finished);
-        if finished {
-            self.finish_final_aggregate_blocked_interval();
-            self.sync_metrics();
-        }
-        finished
-    }
-
-    fn pending_finish(&self) -> Option<FinishWatch> {
-        // Only the final aggregate owns asynchronous finish work here, so its
-        // own watch is the one to wait on.
-        let watch = if matches!(self.phase, FinishPhase::Finalizing | FinishPhase::Producing) {
-            self.aggregate
-                .as_ref()
-                .and_then(|aggregate| aggregate.pending_finish())
-        } else {
-            None
-        };
-        let pending = watch.is_some();
-        // PipelineDriver parks an EOS'd pipeline solely through this callback;
-        // it does not call `has_output` while an asynchronous final aggregate
-        // still reports pending finish. Observe that real scheduler boundary
-        // here, keeping repeated polls inside one continuous interval. Do not
-        // disturb a pre-EOS input-backpressure interval while still Consuming.
-        if self.phase != FinishPhase::Consuming {
-            self.final_aggregate_blocked_time
-                .observe(pending && self.runtime_error().is_none());
-        }
-        watch
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
 
-impl ProcessorOperator for TableFinishOperator {
-    fn need_input(&self) -> bool {
-        let aggregate_ready = self
-            .aggregate
-            .as_ref()
-            .and_then(|aggregate| aggregate.as_processor_ref())
-            .is_none_or(ProcessorOperator::need_input);
-        let consuming = self.phase == FinishPhase::Consuming && self.runtime_error().is_none();
-        if self.phase == FinishPhase::Consuming {
-            self.final_aggregate_blocked_time
-                .observe(consuming && !aggregate_ready);
-        } else {
-            self.finish_final_aggregate_blocked_interval();
-        }
-        consuming && aggregate_ready
+#[derive(Debug)]
+enum TableFinishStepFailure {
+    FinalInputClosed,
+    EarlyFinalOutput,
+}
+impl std::fmt::Display for TableFinishStepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FinalInputClosed => "table finish final aggregate closed before writer input EOS",
+            Self::EarlyFinalOutput => {
+                "table finish final aggregate produced output before writer input EOS"
+            }
+        })
     }
-
-    /// Nothing is available before every sender reached EOS.
-    fn has_output(&self) -> bool {
-        let aggregate_ready = self.aggregate.as_ref().is_some_and(|aggregate| {
-            aggregate.is_finished()
-                || aggregate
-                    .as_processor_ref()
-                    .is_some_and(ProcessorOperator::has_output)
-        });
-        let producing = self.phase == FinishPhase::Producing;
-        let other_output = self.prefix_output.is_some() || self.grouped_unpivot.is_some();
-        if producing {
-            self.final_aggregate_blocked_time.observe(
-                !other_output
-                    && self.aggregate.is_some()
-                    && !aggregate_ready
-                    && self.runtime_error().is_none(),
-            );
-        } else if self.phase != FinishPhase::Consuming {
-            self.finish_final_aggregate_blocked_interval();
-        }
-        self.runtime_error().is_some() || (producing && (other_output || aggregate_ready))
+}
+impl std::error::Error for TableFinishStepFailure {}
+impl novarocks_failure_contract::FailureProjection for TableFinishStepFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            (match self {
+                Self::FinalInputClosed => ExecutionReason::TableFinishFinalInputClosed,
+                Self::EarlyFinalOutput => ExecutionReason::TableFinishEarlyFinalOutput,
+            })
+            .reason(),
+        )
     }
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        if self.phase != FinishPhase::Consuming {
-            return Err("table finish received a writer row after EOS"
-                .to_string()
-                .into());
-        }
+}
+impl InputEncodingPolicy for TableFinishOperator {}
+impl TransformKernel for TableFinishOperator {
+    fn control_observable(&self) -> Option<Arc<Observable>> {
+        Some(self.source_observable.clone())
+    }
+    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = self.runtime_error() {
-            return self.fail(error);
+            return Err(error);
         }
-        if self.aggregate.as_ref().is_some_and(|aggregate| {
-            !aggregate
-                .as_processor_ref()
-                .expect("final aggregate processor")
-                .need_input()
-        }) {
-            return self.fail(
-                "table finish received input while its final aggregate was not ready".to_string(),
-            );
+        if let Some(aggregate) = self.aggregate.as_mut() {
+            let control = aggregate.poll_control(ctx)?;
+            if aggregate.is_complete() && self.phase == FinishPhase::Consuming {
+                return Err(ExecutionFailure::from_domain(
+                    TableFinishStepFailure::FinalInputClosed,
+                ));
+            }
+            if (matches!(control, ControlStep::Runnable) || aggregate.runnable())
+                && (self.phase == FinishPhase::Consuming
+                    || self.prefix_output.is_none() && self.grouped_unpivot.is_none())
+            {
+                return Ok(ControlStep::Runnable);
+            }
         }
+        Ok(ControlStep::Active)
+    }
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let generation = self.source_observable.generation();
+        if let Some(error) = self.runtime_error() {
+            return Err(error);
+        }
+        if self.aggregate.as_ref().is_some_and(ChildStep::is_complete) {
+            return Err(ExecutionFailure::from_domain(
+                TableFinishStepFailure::FinalInputClosed,
+            ));
+        }
+        let ready = self.phase == FinishPhase::Consuming
+            && self.input.is_none()
+            && self.aggregate.as_ref().is_none_or(ChildStep::can_accept);
+        self.final_aggregate_blocked_time.observe(!ready);
+        Ok((!ready).then(|| {
+            AdmissionNext::Wait(WaitFact {
+                reason: WaitReason::Output,
+                observable: self.source_observable.clone(),
+                observed_generation: generation,
+                deadline: self
+                    .aggregate
+                    .as_ref()
+                    .and_then(ChildStep::wait)
+                    .and_then(|wait| wait.deadline),
+            })
+        }))
+    }
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        self.input = Some(input.into_uncovered_chunk()?);
+        self.drive(ctx)
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        let generation = self.source_observable.generation();
+        let result = self.advance(ctx);
+        match result {
+            Ok(mut step) => {
+                if let NextStep::Wait(wait) = &step.next {
+                    step.next =
+                        if wait.is_ready() || self.source_observable.generation() != generation {
+                            NextStep::Runnable
+                        } else {
+                            NextStep::Wait(WaitFact {
+                                reason: wait.reason,
+                                observable: self.source_observable.clone(),
+                                observed_generation: generation,
+                                deadline: wait.deadline,
+                            })
+                        };
+                }
+                self.final_aggregate_blocked_time
+                    .observe(matches!(&step.next,NextStep::Wait(wait) if !wait.is_ready()));
+                Ok(step)
+            }
+            Err(error) => {
+                let error = ctx.locate(error);
+                ctx.report_failure(error.clone());
+                self.fail(error)
+            }
+        }
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        self.phase = FinishPhase::Finalizing;
+        self.finish_final_aggregate_blocked_interval();
+        self.drive(ctx)
+    }
+}
+impl TableFinishOperator {
+    fn consume_relation(&mut self, chunk: &Chunk) -> ExecutionResult<()> {
         if chunk.chunk_schema() != self.writer_schema.schema()?.chunk_schema().as_ref() {
-            return self.fail(
-                "table finish writer relation schema drifted from the frozen plan".to_string(),
-            );
+            return Err(finish_contract(
+                FinishContractSite::Relation,
+                "table finish writer relation schema drifted from the frozen plan",
+            ));
         }
         // The chunk is exactly the frozen relation (checked above), so its
         // prefix is read at the relation's positions, whatever its slots.
         let columns = match TableWriteRelationColumns::try_from_relation(&chunk) {
             Ok(columns) => columns,
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         };
         let mut partial_rows = vec![false; chunk.len()];
         for (row, is_partial) in partial_rows.iter_mut().enumerate() {
@@ -2070,7 +2455,7 @@ impl ProcessorOperator for TableFinishOperator {
                 Some(columns.kinds.value(row))
             };
             if let Err(error) = self.accept_row(&chunk, &columns, row) {
-                return self.fail(error);
+                return Err(error.into());
             }
             *is_partial = raw_kind == Some(WriterRowKind::AGGREGATE_PARTIAL);
         }
@@ -2081,30 +2466,15 @@ impl ProcessorOperator for TableFinishOperator {
                 .aggregate_guard
                 .check(TableWriteAggregateBoundary::FinalMerge)
             {
-                return self.fail(format!("table finish final aggregate merge: {error}"));
+                return Err(ExecutionFailure::from_domain(error));
             }
             let Some(aggregate) = self.aggregate.as_mut() else {
-                return self.fail(
-                    "table finish aggregate partials arrived before aggregate binding".to_string(),
-                );
+                return Err(finish_contract(
+                    FinishContractSite::Binding,
+                    "table finish aggregate partials arrived before aggregate binding",
+                ));
             };
-            if !aggregate
-                .as_processor_ref()
-                .expect("final aggregate processor")
-                .need_input()
-            {
-                return self.fail(
-                    "table finish received input while its final aggregate was not ready"
-                        .to_string(),
-                );
-            }
-            if let Err(error) = aggregate
-                .as_processor_mut()
-                .expect("final aggregate processor")
-                .push_chunk(state, filtered)
-            {
-                return self.fail(error);
-            }
+            aggregate.offer(filtered)?;
         }
         if let Some(profiles) = self.profiles.as_ref() {
             profiles
@@ -2117,63 +2487,107 @@ impl ProcessorOperator for TableFinishOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+    fn result(&mut self, output: Option<Chunk>, next: NextStep) -> StepResult {
+        if let Some(output) = output.as_ref() {
+            self.record_output(output);
+        }
+        let rows = if matches!(next, NextStep::NeedInput) {
+            std::mem::take(&mut self.pending_rows)
+        } else {
+            0
+        };
+        StepResult::new(output, next, rows)
+    }
+    fn advance(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = self.runtime_error() {
-            return self.fail(error);
+            return Err(error);
+        }
+        if !ctx.work().try_consume(1) {
+            return Ok(self.result(None, NextStep::Yield));
+        }
+        if self.phase == FinishPhase::Finalizing {
+            ctx.perform(
+                crate::runtime::fragment::PipelineOperation::Finishing,
+                |_| {
+                    #[cfg(novarocks_dev_controls)]
+                    if self.aggregate.is_some() {
+                        self.aggregate_guard
+                            .check(TableWriteAggregateBoundary::FinalFinalize)
+                            .map_err(ExecutionFailure::from_domain)?;
+                    }
+                    self.begin_finalize()
+                },
+            )?;
+        }
+        if let Some(chunk) = self.input.take() {
+            let result = ctx.perform(crate::runtime::fragment::PipelineOperation::Push, |_| {
+                self.consume_relation(&chunk)
+            });
+            if let Err(error) = result {
+                ctx.report_failure(error.clone());
+                self.input = Some(chunk);
+                return Err(error);
+            }
+            self.pending_rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        }
+        if self.phase == FinishPhase::Consuming {
+            let next = if let Some(aggregate) = self.aggregate.as_mut() {
+                if aggregate.runnable() {
+                    let output = aggregate.advance(ctx)?;
+                    if let Some(error) = self
+                        .runtime_error
+                        .as_ref()
+                        .and_then(|control| control.error())
+                    {
+                        return Err(error);
+                    }
+                    if output.is_some() {
+                        return Err(ExecutionFailure::from_domain(
+                            TableFinishStepFailure::EarlyFinalOutput,
+                        ));
+                    }
+                }
+                if aggregate.can_accept() {
+                    NextStep::NeedInput
+                } else {
+                    aggregate.work_next()
+                }
+            } else {
+                NextStep::NeedInput
+            };
+            return Ok(self.result(None, next));
         }
         if self.phase != FinishPhase::Producing {
-            return Ok(None);
+            return Ok(self.result(None, NextStep::Finished));
         }
-
-        loop {
-            if let Some(prefix) = self.prefix_output.as_mut() {
-                match prefix.pull() {
-                    Ok(Some(output)) => {
-                        self.finish_final_aggregate_blocked_interval();
-                        self.record_output(&output);
-                        return Ok(Some(output));
-                    }
-                    Ok(None) if prefix.is_finished() => {
-                        self.prefix_output = None;
-                    }
-                    Ok(None) => return Ok(None),
-                    Err(error) => return self.fail(error),
-                }
+        if let Some(prefix) = self.prefix_output.as_mut() {
+            let output = prefix.pull()?;
+            if prefix.is_finished() {
+                self.prefix_output = None;
             }
-
-            if let Some(unpivot) = self.grouped_unpivot.as_mut() {
-                match unpivot.pull(state) {
-                    Ok(Some(output)) => {
-                        self.finish_final_aggregate_blocked_interval();
-                        self.record_output(&output);
-                        return Ok(Some(output));
-                    }
-                    Ok(None) if unpivot.is_finished() => {
-                        self.grouped_unpivot = None;
-                    }
-                    Ok(None) => return Ok(None),
-                    Err(error) => return self.fail(error),
-                }
-            }
-
-            let Some(aggregate) = self.aggregate.as_ref() else {
-                self.aggregate_coverage.clear();
-                self.final_groups_seen.clear();
-                self.phase = FinishPhase::Finished;
-                return Ok(None);
+            return Ok(self.result(output, NextStep::Runnable));
+        }
+        if let Some(grouped) = self.grouped_unpivot.as_mut() {
+            let result = grouped.step(ctx)?;
+            let next = if matches!(result.next, NextStep::Finished) {
+                self.grouped_unpivot = None;
+                NextStep::Runnable
+            } else {
+                result.next
             };
-            let has_output = aggregate
-                .as_processor_ref()
-                .expect("final aggregate processor")
-                .has_output();
-            if has_output {
-                self.finish_final_aggregate_blocked_interval();
+            return Ok(self.result(result.output, next));
+        }
+        if let Some(aggregate) = self.aggregate.as_mut() {
+            if aggregate.runnable() {
                 let started = Instant::now();
-                let aggregate = self.aggregate.as_mut().expect("final aggregate");
-                let result = aggregate
-                    .as_processor_mut()
-                    .expect("final aggregate processor")
-                    .pull_chunk(state);
+                let output = aggregate.advance(ctx)?;
+                if let Some(error) = self
+                    .runtime_error
+                    .as_ref()
+                    .and_then(|control| control.error())
+                {
+                    return Err(error);
+                }
                 if let Some(profiles) = self.profiles.as_ref() {
                     profiles.common.counter_add(
                         "FinalAggregateCpuTime",
@@ -2181,101 +2595,38 @@ impl ProcessorOperator for TableFinishOperator {
                         i64::try_from(started.elapsed().as_nanos()).unwrap_or(i64::MAX),
                     );
                 }
-                match result {
-                    Ok(Some(final_chunk)) => {
-                        if let Err(error) = self.start_grouped_unpivot(state, final_chunk) {
-                            return self.fail(error);
-                        }
-                        continue;
-                    }
-                    Ok(None) if aggregate.is_finished() => {}
-                    Ok(None) => {
-                        return self.fail(
-                            "table finish final aggregate advertised output but produced none"
-                                .to_string(),
-                        );
-                    }
-                    Err(error) => {
-                        return self.fail(error);
-                    }
+                if let Some(output) = output {
+                    self.start_grouped_unpivot(output)?;
+                    return Ok(self.result(None, NextStep::Runnable));
                 }
             }
-
-            if self
-                .aggregate
-                .as_ref()
-                .is_some_and(|aggregate| aggregate.is_finished())
-            {
-                if let Err(error) = self.validate_final_groups_complete() {
-                    return self.fail(error);
+            if self.aggregate.as_ref().unwrap().is_complete() {
+                self.validate_final_groups_complete()?;
+                let next = self.aggregate.as_mut().unwrap().retire(ctx)?;
+                if matches!(next, NextStep::Finished) {
+                    self.aggregate = None;
+                    return Ok(self.result(None, NextStep::Runnable));
                 }
-                self.aggregate = None;
-                self.finish_final_aggregate_blocked_interval();
-                continue;
+                return Ok(self.result(None, next));
             }
-            self.final_aggregate_blocked_time.observe(true);
-            return Ok(None);
+            let next = self.aggregate.as_ref().unwrap().work_next();
+            self.final_aggregate_blocked_time
+                .observe(matches!(next, NextStep::Wait(_)));
+            return Ok(self.result(None, next));
         }
-    }
-
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if matches!(
-            self.phase,
-            FinishPhase::Finalizing | FinishPhase::Producing | FinishPhase::Finished
-        ) {
-            return Ok(());
-        }
-        if self.phase == FinishPhase::Failed {
-            return Err("table finish cannot finalize a failed write stream"
-                .to_string()
-                .into());
-        }
-        self.phase = FinishPhase::Finalizing;
-        self.finish_final_aggregate_blocked_interval();
-        #[cfg(novarocks_dev_controls)]
-        if self.aggregate.is_some()
-            && let Err(error) = self
-                .aggregate_guard
-                .check(TableWriteAggregateBoundary::FinalFinalize)
-        {
-            return self.fail(format!("table finish final aggregate finalize: {error}"));
-        }
-        let started = Instant::now();
-        let result = self.begin_finalize(state);
-        if let Some(profiles) = self.profiles.as_ref() {
-            profiles.common.counter_add(
-                "FinalAggregateCpuTime",
-                ProfileUnit::TimeNs,
-                i64::try_from(started.elapsed().as_nanos()).unwrap_or(i64::MAX),
-            );
-        }
-        if let Err(error) = result {
-            return self.fail(error);
-        }
-        Ok(())
-    }
-
-    fn sink_observable(
-        &self,
-    ) -> Option<Arc<crate::exec::pipeline::schedule::observer::Observable>> {
-        if self.phase != FinishPhase::Consuming {
-            return None;
-        }
-        Some(Arc::clone(&self.sink_observable))
-    }
-
-    fn source_observable(
-        &self,
-    ) -> Option<Arc<crate::exec::pipeline::schedule::observer::Observable>> {
-        if matches!(self.phase, FinishPhase::Failed | FinishPhase::Finished) {
-            return None;
-        }
-        Some(Arc::clone(&self.source_observable))
+        self.aggregate_coverage.clear();
+        self.final_groups_seen.clear();
+        self.phase = FinishPhase::Finished;
+        Ok(self.result(None, NextStep::Finished))
     }
 }
 
 #[cfg(test)]
+pub(crate) use tests::complete_input as complete_table_finish_input;
+
+#[cfg(test)]
 mod tests {
+    use crate::exec::pipeline::{shape::StepOperator, test_driver::TestDriver};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2324,7 +2675,7 @@ mod tests {
     }
 
     fn install_compiled_root_creator(
-        operator: &mut TableFinishOperator,
+        operator: &mut TableFinishStep,
         state: &RuntimeState,
     ) -> Arc<MemTracker> {
         let tracker = MemTracker::new_root("compiled-outer-root-creator");
@@ -2342,7 +2693,13 @@ mod tests {
     fn compiled_outer_root_prepare_retains_creator_until_last_schema_slot() {
         let (factory, program, state) = compiled_root_owner_fixture();
         let mut operator = factory.create_operator(1, 0);
-        assert!(operator.root_schema.prepared().is_none());
+        assert!(
+            operator
+                .kernel_for_test_mut()
+                .root_schema
+                .prepared()
+                .is_none()
+        );
         let tracker = install_compiled_root_creator(&mut operator, &state);
         let installed = tracker.current();
         operator
@@ -2352,7 +2709,13 @@ mod tests {
             tracker.current() > installed,
             "real Root schema construction is observed"
         );
-        let root = Arc::clone(operator.prepared_root_schema().unwrap().chunk_schema());
+        let root = Arc::clone(
+            operator
+                .kernel_for_test_mut()
+                .prepared_root_schema()
+                .unwrap()
+                .chunk_schema(),
+        );
         assert!(root.is_typed());
         let slot = root.slots()[0].clone();
         let declared = program.graph().nodes()[program.graph().root().index()].output_layout();
@@ -2396,10 +2759,14 @@ mod tests {
             "original caller memory cause: {failure:?}"
         );
         assert!(
-            operator.root_schema.prepared().is_none(),
+            operator
+                .kernel_for_test_mut()
+                .root_schema
+                .prepared()
+                .is_none(),
             "no partially prepared Root is published"
         );
-        assert_eq!(operator.phase, FinishPhase::Failed);
+        assert_eq!(operator.kernel_for_test_mut().phase, FinishPhase::Failed);
         assert_eq!(
             tracker.current(),
             installed,
@@ -2552,6 +2919,58 @@ mod tests {
         }
     }
 
+    fn with_step<T>(
+        state: &RuntimeState,
+        units: u32,
+        action: impl FnOnce(&mut StepContext<'_>) -> T,
+    ) -> T {
+        let error = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, units);
+        action(&mut StepContext::new(&error, &mut work))
+    }
+    pub(crate) fn complete_input(
+        step: &mut dyn Operator,
+        state: &RuntimeState,
+        chunk: Chunk,
+    ) -> ExecutionResult<()> {
+        TestDriver::new(step, state).input_without_output(chunk)
+    }
+    fn finish_failure(
+        operator: &mut dyn crate::exec::pipeline::shape::StepOperator,
+        state: &RuntimeState,
+    ) -> ExecutionFailure {
+        with_step(state, 64, |ctx| {
+            if let Err(error) = operator.finish(ctx) {
+                return error;
+            }
+            for _ in 0..32 {
+                if let Some(error) = state.error() {
+                    return error;
+                }
+                match operator.drive(ctx) {
+                    Err(error) => return error,
+                    Ok(result) => assert!(
+                        !matches!(result.next, NextStep::Finished),
+                        "injected finalization cannot succeed"
+                    ),
+                }
+            }
+            panic!("fixture finalization failure must be reported");
+        })
+    }
+    fn await_final_wait(
+        operator: &mut dyn crate::exec::pipeline::shape::StepOperator,
+        state: &RuntimeState,
+    ) -> WaitFact {
+        for _ in 0..16 {
+            let result = with_step(state, 64, |ctx| operator.drive(ctx)).unwrap();
+            if let NextStep::Wait(wait) = result.next {
+                return wait;
+            }
+        }
+        panic!("final aggregate must report the exact work wait");
+    }
     struct ScriptedFinalAggregate {
         outputs: VecDeque<Chunk>,
         accepting: Arc<AtomicBool>,
@@ -2567,154 +2986,132 @@ mod tests {
                 outputs: outputs.into(),
                 accepting: Arc::new(AtomicBool::new(accepting)),
                 ready: Arc::new(AtomicBool::new(ready)),
-                observable: Arc::new(crate::exec::pipeline::schedule::observer::Observable::new()),
+                observable: Arc::new(Observable::try_bounded(1).unwrap()),
                 finishing: false,
                 pushed_rows: 0,
             }
         }
     }
 
-    impl Operator for ScriptedFinalAggregate {
+    impl OperatorLifecycle for ScriptedFinalAggregate {
         fn name(&self) -> &str {
             "SCRIPTED_FINAL_AGGREGATE"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finishing && self.ready.load(Ordering::Acquire) && self.outputs.is_empty()
-        }
-
-        fn pending_finish(&self) -> Option<FinishWatch> {
-            (self.finishing && !self.ready.load(Ordering::Acquire))
-                .then(|| FinishWatch::Notify(Arc::clone(&self.observable)))
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for ScriptedFinalAggregate {
-        fn need_input(&self) -> bool {
-            !self.finishing && self.accepting.load(Ordering::Acquire)
+    impl InputEncodingPolicy for ScriptedFinalAggregate {}
+    impl TransformKernel for ScriptedFinalAggregate {
+        fn control_observable(&self) -> Option<Arc<Observable>> {
+            Some(self.observable.clone())
         }
-
-        fn has_output(&self) -> bool {
-            self.finishing && self.ready.load(Ordering::Acquire) && !self.outputs.is_empty()
+        fn admission(
+            &self,
+            _: &mut StepContext<'_>,
+            _: &RawInput,
+        ) -> ExecutionResult<Option<AdmissionNext>> {
+            let generation = self.observable.generation();
+            Ok((!self.accepting.load(Ordering::Acquire)).then(|| {
+                AdmissionNext::Wait(WaitFact {
+                    reason: WaitReason::Output,
+                    observable: self.observable.clone(),
+                    observed_generation: generation,
+                    deadline: None,
+                })
+            }))
         }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-            if !self.need_input() {
-                return Err("scripted final aggregate is blocked".to_string().into());
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            input: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            self.pushed_rows += input.chunk().len();
+            Ok(StepResult::new(None, NextStep::NeedInput, 0))
+        }
+        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            let generation = self.observable.generation();
+            if !self.ready.load(Ordering::Acquire) {
+                return Ok(StepResult::new(
+                    None,
+                    NextStep::Wait(WaitFact {
+                        reason: WaitReason::Finish,
+                        observable: self.observable.clone(),
+                        observed_generation: generation,
+                        deadline: None,
+                    }),
+                    0,
+                ));
             }
-            self.pushed_rows += chunk.len();
-            Ok(())
+            let output = self.outputs.pop_front();
+            Ok(StepResult::new(
+                output,
+                if self.outputs.is_empty() {
+                    NextStep::Finished
+                } else {
+                    NextStep::Runnable
+                },
+                0,
+            ))
         }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            if !self.has_output() {
-                return Ok(None);
-            }
-            Ok(self.outputs.pop_front())
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             self.finishing = true;
-            Ok(())
-        }
-
-        fn source_observable(
-            &self,
-        ) -> Option<Arc<crate::exec::pipeline::schedule::observer::Observable>> {
-            Some(Arc::clone(&self.observable))
-        }
-
-        fn sink_observable(
-            &self,
-        ) -> Option<Arc<crate::exec::pipeline::schedule::observer::Observable>> {
-            Some(Arc::clone(&self.observable))
+            self.drive(ctx)
         }
     }
 
     struct ErrorOnlyFinalAggregate;
 
-    impl Operator for ErrorOnlyFinalAggregate {
+    impl OperatorLifecycle for ErrorOnlyFinalAggregate {
         fn name(&self) -> &str {
             "ERROR_ONLY_FINAL_AGGREGATE"
         }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for ErrorOnlyFinalAggregate {
-        fn need_input(&self) -> bool {
-            true
+    impl InputEncodingPolicy for ErrorOnlyFinalAggregate {}
+    impl TransformKernel for ErrorOnlyFinalAggregate {
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            Ok(StepResult::new(None, NextStep::NeedInput, 0))
         }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-            state
-                .error_state()
-                .set_error("scripted final aggregate failed asynchronously".to_string());
-            Ok(())
+        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            let failure: ExecutionFailure = novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(
+                    "scripted final aggregate failed asynchronously",
+                ),
+            )
+            .into();
+            ctx.report_failure(failure);
+            Ok(StepResult::new(None, NextStep::Finished, 0))
         }
     }
 
     struct FinalizeErrorAggregate;
 
-    impl Operator for FinalizeErrorAggregate {
+    impl OperatorLifecycle for FinalizeErrorAggregate {
         fn name(&self) -> &str {
             "FINALIZE_ERROR_AGGREGATE"
         }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for FinalizeErrorAggregate {
-        fn need_input(&self) -> bool {
-            true
+    impl InputEncodingPolicy for FinalizeErrorAggregate {}
+    impl TransformKernel for FinalizeErrorAggregate {
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            Ok(StepResult::new(None, NextStep::NeedInput, 0))
         }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Err("scripted synchronous finalize failure".to_string().into())
+        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            let failure: ExecutionFailure = novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(
+                    "scripted final aggregate synchronous finalize failure",
+                ),
+            )
+            .into();
+            Err(failure)
         }
     }
 
@@ -2835,7 +3232,20 @@ mod tests {
             )
             .expect("composite test runtime"),
         );
-        RuntimeState::new(None, None, None, None, None, tracker, Some(runtime))
+        RuntimeState::for_local_execution(None, None, None, None, None, tracker, Some(runtime))
+    }
+
+    fn install_composite_construction(
+        operator: &mut dyn Operator,
+        state: &RuntimeState,
+        tracker: Arc<MemTracker>,
+    ) {
+        operator.set_construction_factory(
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker, state.error_state(),
+            ).unwrap(),
+        );
     }
 
     fn composite_fixture(
@@ -3062,26 +3472,18 @@ mod tests {
 
     fn run(operator: &mut Box<dyn Operator>, chunks: Vec<Chunk>) -> ExecutionResult<Vec<Chunk>> {
         let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut calls = TestDriver::new(operator.as_mut(), &state);
         for chunk in chunks {
-            processor.push_chunk(&state, chunk)?;
+            calls.input_without_output(chunk)?;
         }
+        let idle = calls.drive()?;
         assert!(
-            !processor.has_output(),
+            idle.output.is_none(),
             "table finish must emit nothing before EOS"
         );
-        processor.set_finishing(&state)?;
-        let mut outputs = Vec::new();
-        while !operator.is_finished() {
-            if let Some(output) = operator
-                .as_processor_mut()
-                .expect("processor")
-                .pull_chunk(&state)?
-            {
-                outputs.push(output);
-            }
-        }
-        Ok(outputs)
+        assert!(matches!(idle.next, NextStep::NeedInput));
+        calls.signal_eos()?;
+        calls.collect_until_finished()
     }
 
     #[test]
@@ -3218,10 +3620,7 @@ mod tests {
             let mut operator = factory.create(1, 0);
             operator.prepare().expect("prepare");
             let state = RuntimeState::default();
-            let error = operator
-                .as_processor_mut()
-                .expect("processor")
-                .push_chunk(&state, writer_rows(rows))
+            let error = complete_input(operator.as_mut(), &state, writer_rows(rows))
                 .expect_err("invalid row shape");
             assert!(
                 error.detail().contains(expected),
@@ -3236,11 +3635,12 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(&state, writer_rows(vec![row_count_row(2, 1)]))
-            .expect_err("ordinal outside the sealed set");
+        let error = complete_input(
+            operator.as_mut(),
+            &state,
+            writer_rows(vec![row_count_row(2, 1)]),
+        )
+        .expect_err("ordinal outside the sealed set");
         assert!(
             error
                 .detail()
@@ -3256,11 +3656,12 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(&state, writer_rows(vec![fragment_row(0, b"junk".to_vec())]))
-            .expect_err("foreign carrier");
+        let error = complete_input(
+            operator.as_mut(),
+            &state,
+            writer_rows(vec![fragment_row(0, b"junk".to_vec())]),
+        )
+        .expect_err("foreign carrier");
         assert!(
             error
                 .detail()
@@ -3274,16 +3675,16 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
         // The accumulator stays unsigned and checked, so two maximal signed
         // row counts fit and the third must fail rather than wrap.
         for _ in 0..2 {
             processor
-                .push_chunk(&state, writer_rows(vec![row_count_row(0, i64::MAX)]))
+                .input_without_output(writer_rows(vec![row_count_row(0, i64::MAX)]))
                 .expect("within the unsigned accumulator");
         }
         let error = processor
-            .push_chunk(&state, writer_rows(vec![row_count_row(0, i64::MAX)]))
+            .input_without_output(writer_rows(vec![row_count_row(0, i64::MAX)]))
             .expect_err("row count overflow");
         assert!(error.detail().contains("row count overflowed"));
     }
@@ -3297,11 +3698,12 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(&state, writer_rows(vec![row_count_row(0, -1)]))
-            .expect_err("a negative row count is corrupt data");
+        let error = complete_input(
+            operator.as_mut(),
+            &state,
+            writer_rows(vec![row_count_row(0, -1)]),
+        )
+        .expect_err("a negative row count is corrupt data");
         assert!(
             error.detail().contains("payload does not match"),
             "unexpected error {error:?}"
@@ -3314,11 +3716,12 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(&state, writer_rows(vec![row_count_row(-1, 1)]))
-            .expect_err("a negative target ordinal is corrupt data");
+        let error = complete_input(
+            operator.as_mut(),
+            &state,
+            writer_rows(vec![row_count_row(-1, 1)]),
+        )
+        .expect_err("a negative target ordinal is corrupt data");
         assert!(
             error.detail().contains("target ordinal is negative"),
             "unexpected error {error:?}"
@@ -3331,32 +3734,28 @@ mod tests {
         let at_limit = factory(1);
         let mut operator = at_limit.create(1, 0);
         operator.prepare().expect("prepare");
-        operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(
-                &state,
-                writer_rows(vec![fragment_row(
-                    0,
-                    vec![7; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
-                )]),
-            )
-            .expect("the exact single-fragment budget is legal");
+        complete_input(
+            operator.as_mut(),
+            &state,
+            writer_rows(vec![fragment_row(
+                0,
+                vec![7; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
+            )]),
+        )
+        .expect("the exact single-fragment budget is legal");
 
         let over_limit = factory(1);
         let mut operator = over_limit.create(1, 0);
         operator.prepare().expect("prepare");
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(
-                &state,
-                writer_rows(vec![fragment_row(
-                    0,
-                    vec![7; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1],
-                )]),
-            )
-            .expect_err("over the single-fragment budget");
+        let error = complete_input(
+            operator.as_mut(),
+            &state,
+            writer_rows(vec![fragment_row(
+                0,
+                vec![7; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1],
+            )]),
+        )
+        .expect_err("over the single-fragment budget");
         assert!(
             error
                 .detail()
@@ -3370,21 +3769,18 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
         let full = MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES / MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES;
         for _ in 0..full {
             processor
-                .push_chunk(
-                    &state,
-                    writer_rows(vec![fragment_row(
-                        0,
-                        vec![1; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
-                    )]),
-                )
+                .input_without_output(writer_rows(vec![fragment_row(
+                    0,
+                    vec![1; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
+                )]))
                 .expect("within the set byte budget");
         }
         let error = processor
-            .push_chunk(&state, writer_rows(vec![fragment_row(0, vec![1])]))
+            .input_without_output(writer_rows(vec![fragment_row(0, vec![1])]))
             .expect_err("over the set byte budget");
         assert!(error.detail().contains("exceeds the frozen byte budget"));
     }
@@ -3395,15 +3791,15 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
         let rows = (0..MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES)
             .map(|_| fragment_row(0, vec![1]))
             .collect::<Vec<_>>();
         processor
-            .push_chunk(&state, writer_rows(rows))
+            .input_without_output(writer_rows(rows))
             .expect("the exact entry budget is legal");
         let error = processor
-            .push_chunk(&state, writer_rows(vec![fragment_row(0, vec![1])]))
+            .input_without_output(writer_rows(vec![fragment_row(0, vec![1])]))
             .expect_err("over the entry budget");
         assert!(error.detail().contains("exceeds the frozen entry budget"));
     }
@@ -3417,30 +3813,22 @@ mod tests {
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         for index in 0..40u8 {
-            operator
-                .as_processor_mut()
-                .expect("processor")
-                .push_chunk(
-                    &state,
-                    writer_rows(vec![fragment_row(
-                        0,
-                        vec![index; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
-                    )]),
-                )
-                .expect("bounded prepared fragment");
+            complete_input(
+                operator.as_mut(),
+                &state,
+                writer_rows(vec![fragment_row(
+                    0,
+                    vec![index; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
+                )]),
+            )
+            .expect("bounded prepared fragment");
         }
-        operator
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
-            .expect("gather EOS");
+        operator.finish_for_test(&state).expect("gather EOS");
         let mut outputs = Vec::new();
-        while !operator.is_finished() {
-            if let Some(output) = operator
-                .as_processor_mut()
-                .expect("processor")
-                .pull_chunk(&state)
-                .expect("stream prefix")
+        for output in TestDriver::new(operator.as_mut(), &state)
+            .collect_until_finished()
+            .expect("stream prefix")
+        {
             {
                 assert!(
                     root_output_size(&output.record_batch(), None).expect("output size")
@@ -3497,36 +3885,144 @@ mod tests {
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         {
-            let processor = operator.as_processor_mut().expect("processor");
+            let mut processor = TestDriver::new(operator.as_mut(), &state);
             processor
-                .push_chunk(
-                    &state,
-                    writer_rows(vec![
-                        row_count_row(0, 11),
-                        fragment_row(0, vec![3; 4096]),
-                        fragment_row(0, vec![4; 4096]),
-                    ]),
-                )
+                .input_without_output(writer_rows(vec![
+                    row_count_row(0, 11),
+                    fragment_row(0, vec![3; 4096]),
+                    fragment_row(0, vec![4; 4096]),
+                ]))
                 .expect("accumulate");
-            assert!(!processor.has_output());
+            assert!(matches!(
+                processor.next(),
+                NextStep::NeedInput | NextStep::Finished
+            ));
             assert!(
                 processor
-                    .pull_chunk(&state)
+                    .drive()
+                    .map(|step| step.output)
                     .expect("pull before EOS")
                     .is_none()
             );
         }
 
         operator.cancel();
-        let processor = operator.as_processor_mut().expect("processor");
-        assert!(!processor.has_output());
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
         assert!(
             processor
-                .pull_chunk(&state)
+                .drive()
+                .map(|step| step.output)
                 .expect("pull after abort")
                 .is_none()
         );
-        assert!(operator.is_finished());
+        let ended = operator.drive_for_test(&state).unwrap();
+        assert!(ended.output.is_none());
+        assert!(matches!(ended.next, NextStep::Finished));
+    }
+
+    #[test]
+    fn native_finish_retains_accepted_rows_across_zero_quota_and_signals_eos_once() {
+        use crate::exec::pipeline::{
+            shape::StepOperator, step::InputResult, step_context::TurnWork,
+        };
+        let tracker = MemTracker::new_root("native finish quantum custody");
+        let factory = factory(1);
+        let mut operator = factory.create_operator(1, 0);
+        operator.set_mem_tracker(tracker.clone());
+        operator.prepare().unwrap();
+        let state = RuntimeState::default();
+        operator.bind_runtime_state(&state).unwrap();
+        let error = state.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
+        let mut ctx = StepContext::new(&error, &mut work);
+        assert!(matches!(
+            operator.try_push(
+                &mut ctx,
+                RawInput::for_test(writer_rows(vec![
+                    row_count_row(0, 9),
+                    fragment_row(0, vec![3; 2048])
+                ]))
+            ),
+            InputResult::Accepted(Ok(_))
+        ));
+        operator.finish(&mut ctx).unwrap();
+        let paused = operator.drive(&mut ctx).unwrap();
+        assert!(paused.output.is_none());
+        assert!(matches!(paused.next, NextStep::Yield));
+        assert_eq!(operator.kernel_for_test().rows.get(), 0);
+        assert!(operator.kernel_for_test().prefix_output.is_none());
+        ctx.work().begin_turn(1).unwrap();
+        let applied = operator.drive(&mut ctx).unwrap();
+        assert!(applied.output.is_none());
+        assert!(matches!(applied.next, NextStep::Runnable));
+        assert_eq!(operator.kernel_for_test().rows.get(), 9);
+        assert_eq!(operator.kernel_for_test().fragments.len(), 1);
+        let finalizing = operator.drive(&mut ctx).unwrap();
+        assert!(finalizing.output.is_none());
+        assert!(matches!(finalizing.next, NextStep::Yield));
+        assert_eq!(operator.kernel_for_test().phase, FinishPhase::Finalizing);
+        assert!(
+            operator.kernel_for_test().prefix_output.is_none(),
+            "EOS alone never constructs the root prefix"
+        );
+        ctx.work().begin_turn(1).unwrap();
+        let summary = operator.drive(&mut ctx).unwrap().output.unwrap();
+        assert_eq!(
+            summary.columns()[0]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            RootRowKind::Summary.to_wire()
+        );
+        assert_eq!(
+            summary.columns()[2]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            9
+        );
+        operator.finish(&mut ctx).unwrap();
+        let empty = operator.drive(&mut ctx).unwrap();
+        assert!(empty.output.is_none());
+        assert!(matches!(empty.next, NextStep::Yield));
+        ctx.work().begin_turn(8).unwrap();
+        let mut outputs = vec![summary];
+        let mut finished = false;
+        for _ in 0..8 {
+            let result = operator.drive(&mut ctx).unwrap();
+            if let Some(output) = result.output {
+                outputs.push(output);
+            }
+            if matches!(result.next, NextStep::Finished) {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            outputs[1].columns()[0]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            RootRowKind::PreparedFragment.to_wire()
+        );
+        assert_eq!(
+            outputs[1].columns()[3]
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            vec![3; 2048]
+        );
+        operator.begin_exit().unwrap();
+        operator.close().unwrap();
+        drop(outputs);
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
     }
 
     #[test]
@@ -3535,20 +4031,17 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
         processor
-            .push_chunk(&state, writer_rows(vec![fragment_row(0, vec![1; 1024])]))
+            .input_without_output(writer_rows(vec![fragment_row(0, vec![1; 1024])]))
             .expect("first fragment");
         let error = processor
-            .push_chunk(
-                &state,
-                writer_rows(vec![(
-                    WriterRowKind::CommitFragment.to_wire(),
-                    Some(0),
-                    Some(1),
-                    Some(vec![2; 1024]),
-                )]),
-            )
+            .input_without_output(writer_rows(vec![(
+                WriterRowKind::CommitFragment.to_wire(),
+                Some(0),
+                Some(1),
+                Some(vec![2; 1024]),
+            )]))
             .expect_err("invalid row");
         assert!(
             error
@@ -3556,28 +4049,42 @@ mod tests {
                 .contains("payload does not match its row kind")
         );
         let finish_error = processor
-            .set_finishing(&state)
+            .signal_eos()
             .expect_err("a failed stream cannot be repaired into a summary");
         assert!(
-            finish_error
-                .detail()
-                .contains("cannot finalize a failed write stream")
+            finish_error.same_occurrence(&error),
+            "EOS preserves the original accepted failure"
         );
-        assert!(!processor.has_output());
+        assert!(processor.drive().unwrap_err().same_occurrence(&error));
     }
 
     #[test]
     fn table_finish_rejects_a_writer_row_that_arrives_after_eos() {
+        use crate::exec::pipeline::step::InputResult;
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
-        operator.prepare().expect("prepare");
+        operator.prepare().unwrap();
         let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("processor");
-        processor.set_finishing(&state).expect("finish");
-        let error = processor
-            .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
-            .expect_err("a row after EOS is a contract violation");
-        assert!(error.detail().contains("after EOS"));
+        with_step(&state, 64, |ctx| {
+            let step = operator.as_mut();
+            step.finish(ctx).unwrap();
+            let raw = RawInput::for_test(writer_rows(vec![row_count_row(0, 1)]));
+            let original = raw.original_for_test().columns()[0].clone();
+            match step.try_push(ctx, raw) {
+                InputResult::Rejected { input, failure } => {
+                    use novarocks_failure_contract::FailureProjection;
+                    assert!(Arc::ptr_eq(
+                        &original,
+                        &input.original_for_test().columns()[0]
+                    ));
+                    assert_eq!(
+                        failure.failure_fact().class(),
+                        novarocks_failure_contract::FailureClass::Invariant
+                    );
+                }
+                _ => panic!("input EOS cannot accept or defer another raw value"),
+            }
+        });
     }
 
     #[test]
@@ -3617,12 +4124,12 @@ mod tests {
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
         processor
-            .push_chunk(&state, writer_rows(vec![row_count_row(2, 5)]))
+            .input_without_output(writer_rows(vec![row_count_row(2, 5)]))
             .expect("its own writer's rows are accepted");
         let error = processor
-            .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
+            .input_without_output(writer_rows(vec![row_count_row(0, 1)]))
             .expect_err("a target this query never compiled a writer for");
         assert!(error.detail().contains("outside the sealed set"), "{error}");
     }
@@ -3632,103 +4139,110 @@ mod tests {
     {
         let (factory, state, writer_schema) = composite_fixture(2, 2, 1);
         let mut operator = factory.create(1, 0);
-        install_composite_input_creator(
+        install_composite_construction(
             operator.as_mut(),
             &state,
-            MemTracker::new_root("table-finish-interleaved-input-creator"),
+            MemTracker::new_root("composite finish construction"),
         );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind aggregate");
-        let processor = operator.as_processor_mut().expect("processor");
+        complete_input(
+            operator.as_mut(),
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![
+                    (
+                        WriterRowKind::CommitFragment.to_wire(),
+                        1,
+                        None,
+                        Some(b"fragment-one".to_vec()),
+                        vec![None, None],
+                    ),
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"zero-a".to_vec()), None],
+                    ),
+                    (
+                        WriterRowKind::RowCount.to_wire(),
+                        1,
+                        Some(7),
+                        None,
+                        vec![None, None],
+                    ),
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        1,
+                        None,
+                        None,
+                        vec![Some(b"one-a".to_vec()), None],
+                    ),
+                ],
+            ),
+        )
+        .expect("first interleaved batch");
+        complete_input(
+            operator.as_mut(),
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![
+                    (
+                        WriterRowKind::RowCount.to_wire(),
+                        0,
+                        Some(5),
+                        None,
+                        vec![None, None],
+                    ),
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![None, Some(b"zero-b".to_vec())],
+                    ),
+                    (
+                        WriterRowKind::CommitFragment.to_wire(),
+                        0,
+                        None,
+                        Some(b"fragment-zero".to_vec()),
+                        vec![None, None],
+                    ),
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        1,
+                        None,
+                        None,
+                        vec![None, Some(b"one-b".to_vec())],
+                    ),
+                ],
+            ),
+        )
+        .expect("second interleaved batch");
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
+        assert!(
+            matches!(processor.next(), NextStep::NeedInput | NextStep::Finished),
+            "Gather has not reached EOS"
+        );
+        assert!(
+            processor
+                .drive()
+                .map(|step| step.output)
+                .expect("early pull")
+                .is_none()
+        );
         processor
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![
-                        (
-                            WriterRowKind::CommitFragment.to_wire(),
-                            1,
-                            None,
-                            Some(b"fragment-one".to_vec()),
-                            vec![None, None],
-                        ),
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            0,
-                            None,
-                            None,
-                            vec![Some(b"zero-a".to_vec()), None],
-                        ),
-                        (
-                            WriterRowKind::RowCount.to_wire(),
-                            1,
-                            Some(7),
-                            None,
-                            vec![None, None],
-                        ),
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            1,
-                            None,
-                            None,
-                            vec![Some(b"one-a".to_vec()), None],
-                        ),
-                    ],
-                ),
-            )
-            .expect("first interleaved batch");
-        processor
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![
-                        (
-                            WriterRowKind::RowCount.to_wire(),
-                            0,
-                            Some(5),
-                            None,
-                            vec![None, None],
-                        ),
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            0,
-                            None,
-                            None,
-                            vec![None, Some(b"zero-b".to_vec())],
-                        ),
-                        (
-                            WriterRowKind::CommitFragment.to_wire(),
-                            0,
-                            None,
-                            Some(b"fragment-zero".to_vec()),
-                            vec![None, None],
-                        ),
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            1,
-                            None,
-                            None,
-                            vec![None, Some(b"one-b".to_vec())],
-                        ),
-                    ],
-                ),
-            )
-            .expect("second interleaved batch");
-        assert!(!processor.has_output(), "Gather has not reached EOS");
-        assert!(processor.pull_chunk(&state).expect("early pull").is_none());
-        processor
-            .set_finishing(&state)
+            .signal_eos()
             .expect("all gather inputs reached EOS");
 
         let mut outputs = Vec::new();
-        while !operator.is_finished() {
-            if let Some(chunk) = operator
-                .as_processor_mut()
-                .expect("processor")
-                .pull_chunk(&state)
-                .expect("root output")
+        for chunk in TestDriver::new(operator.as_mut(), &state)
+            .collect_until_finished()
+            .expect("root output")
+        {
             {
                 outputs.push(chunk);
             }
@@ -3824,43 +4338,57 @@ mod tests {
             scripted_final_chunk(&factory, vec![(1, vec![Some(b"one".to_vec())])]),
         ];
         let mut operator = factory.create_operator(1, 0);
+        install_composite_construction(
+            &mut operator,
+            &state,
+            MemTracker::new_root("composite finish construction"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.install_aggregate(Box::new(ScriptedFinalAggregate::new(
-            final_batches,
-            true,
-            true,
-        )));
         operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            0,
-                            None,
-                            None,
-                            vec![Some(b"partial-zero".to_vec())],
-                        ),
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            1,
-                            None,
-                            None,
-                            vec![Some(b"partial-one".to_vec())],
-                        ),
-                    ],
-                ),
-            )
-            .expect("partial input");
-        operator.set_finishing(&state).expect("gather EOS");
+            .kernel_for_test_mut()
+            .install_aggregate(Box::new(Transform::hydrating(ScriptedFinalAggregate::new(
+                final_batches,
+                true,
+                true,
+            ))))
+            .unwrap();
+        complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"partial-zero".to_vec())],
+                    ),
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        1,
+                        None,
+                        None,
+                        vec![Some(b"partial-one".to_vec())],
+                    ),
+                ],
+            ),
+        )
+        .expect("partial input");
+        operator.finish_for_test(&state).expect("gather EOS");
 
         let mut artifacts = BTreeMap::new();
         let mut summaries = 0;
-        while !operator.is_finished() {
-            let Some(output) = operator.pull_chunk(&state).expect("root output") else {
+        let mut calls = TestDriver::new(&mut operator, &state);
+        loop {
+            let step = calls.advance_to_boundary().expect("root output");
+            let finished = matches!(step.next, NextStep::Finished);
+            let Some(output) = step.output else {
+                if finished {
+                    break;
+                }
                 continue;
             };
             let kinds = output.columns()[0]
@@ -3889,6 +4417,9 @@ mod tests {
                     }
                 }
             }
+            if finished {
+                break;
+            }
         }
         assert_eq!(summaries, 1);
         assert_eq!(artifacts.len(), 2);
@@ -3898,86 +4429,131 @@ mod tests {
 
     #[test]
     fn composite_finish_forwards_child_readiness_before_and_after_gather_eos() {
+        use crate::exec::pipeline::{shape::StepOperator, step::InputResult};
         let (factory, state, writer_schema) = composite_fixture(1, 1, 8);
         let final_batch =
             scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
         let scripted = ScriptedFinalAggregate::new(vec![final_batch], false, false);
-        let accepting = Arc::clone(&scripted.accepting);
-        let ready = Arc::clone(&scripted.ready);
-        let observable = Arc::clone(&scripted.observable);
+        let accepting = scripted.accepting.clone();
+        let ready = scripted.ready.clone();
+        let observable = scripted.observable.clone();
         let mut operator = factory.create_operator(1, 0);
         let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
             "final-aggregate-blocked-metrics",
         ));
         operator.set_profiles(profiles.clone());
-        operator.prepare().expect("prepare");
-        operator.bind_runtime_state(&state).expect("bind");
-        operator.install_aggregate(Box::new(scripted));
-
-        assert!(
-            !operator.need_input(),
-            "blocked child must stop Gather input"
+        install_composite_construction(
+            &mut operator,
+            &state,
+            MemTracker::new_root("composite finish construction"),
         );
-        let source_identity = operator
-            .source_observable()
-            .expect("stable source observable while consuming");
-        let sink_identity = operator
-            .sink_observable()
-            .expect("stable sink observable while consuming");
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
+        operator
+            .kernel_for_test_mut()
+            .install_aggregate(Box::new(Transform::hydrating(scripted)))
+            .unwrap();
+        let source_identity = operator.control_observable().unwrap();
         assert!(Arc::ptr_eq(
             &source_identity,
-            &operator.source_observable().expect("source identity")
+            &operator.control_observable().unwrap()
         ));
-        assert!(Arc::ptr_eq(
-            &sink_identity,
-            &operator.sink_observable().expect("sink identity")
-        ));
-        let source_generation = source_identity.generation();
-        let sink_generation = sink_identity.generation();
-        std::thread::sleep(Duration::from_millis(1));
-        accepting.store(true, Ordering::Release);
-        observable.notify_observers();
-        assert_eq!(source_identity.generation(), source_generation + 1);
-        assert_eq!(sink_identity.generation(), sink_generation + 1);
-        assert!(operator.need_input());
-        operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
+        with_step(&state, 64, |ctx| {
+            let input = composite_rows(
+                &writer_schema,
+                vec![
+                    (
+                        WriterRowKind::RowCount.to_wire(),
+                        0,
+                        Some(7),
+                        None,
+                        vec![None],
+                    ),
+                    (
                         WriterRowKind::AggregatePartial.to_wire(),
                         0,
                         None,
                         None,
                         vec![Some(b"partial".to_vec())],
-                    )],
-                ),
-            )
-            .expect("partial input");
-        operator.set_finishing(&state).expect("gather EOS");
-        assert!(operator.pending_finish().is_some());
-        assert!(Arc::ptr_eq(
-            &source_identity,
-            &operator
-                .source_observable()
-                .expect("same source observable after gather EOS")
-        ));
-        assert!(operator.sink_observable().is_none());
-        let source_generation = source_identity.generation();
+                    ),
+                ],
+            );
+            assert!(matches!(
+                operator.try_push(ctx, RawInput::for_test(input)),
+                InputResult::Accepted(Ok(_))
+            ));
+            let result = operator.drive(ctx).unwrap();
+            let NextStep::Wait(wait) = result.next else {
+                panic!("the accepted parent retains a blocked child raw");
+            };
+            assert!(!wait.is_ready());
+            assert!(Arc::ptr_eq(&wait.observable, &source_identity));
+            let coverage = operator.kernel_for_test().aggregate_coverage.clone();
+            assert_eq!(operator.kernel_for_test().rows.get(), 7);
+            std::thread::sleep(Duration::from_millis(1));
+            accepting.store(true, Ordering::Release);
+            observable.notify_observers();
+            assert!(wait.is_ready());
+            for _ in 0..8 {
+                let result = operator.drive(ctx).unwrap();
+                assert!(result.output.is_none());
+                if matches!(result.next, NextStep::NeedInput) {
+                    break;
+                }
+            }
+            assert_eq!(
+                operator.kernel_for_test().aggregate_coverage,
+                coverage,
+                "resume cannot accept writer rows again"
+            );
+            assert_eq!(
+                operator.kernel_for_test().rows.get(),
+                7,
+                "a child admission retry never re-applies the parent row count"
+            );
+            operator.finish(ctx).unwrap();
+        });
+        let mut summaries = 0;
+        let mut parked = None;
+        for _ in 0..12 {
+            let result = with_step(&state, 64, |ctx| operator.drive(ctx)).unwrap();
+            if let Some(output) = result.output {
+                summaries += output.len();
+            }
+            if let NextStep::Wait(wait) = result.next {
+                parked = Some(wait);
+                break;
+            }
+        }
+        let wait =
+            parked.expect("finalization reports its exact event instead of pending physical exit");
+        assert!(!wait.is_ready());
+        assert!(Arc::ptr_eq(&source_identity, &wait.observable));
+        assert!(
+            operator.pending_finish().is_none(),
+            "waiting computation remains normal dataflow"
+        );
         ready.store(true, Ordering::Release);
         observable.notify_observers();
-        assert_eq!(source_identity.generation(), source_generation + 1);
-        assert!(operator.pending_finish().is_none());
-        while !operator.is_finished() {
-            let _ = operator.pull_chunk(&state).expect("root output");
+        assert!(wait.is_ready());
+        let mut artifacts = 0;
+        for _ in 0..32 {
+            let result = with_step(&state, 64, |ctx| operator.drive(ctx)).unwrap();
+            if let Some(output) = result.output {
+                artifacts += output.len();
+            }
+            if matches!(result.next, NextStep::Finished) {
+                break;
+            }
         }
-        operator.close().expect("close");
+        assert_eq!(summaries, 1);
+        assert_eq!(artifacts, 1);
+        operator.close().unwrap();
         assert!(
             profiles
                 .common
                 .counter_value("FinalAggregateBlockedCount")
-                .is_some_and(|intervals| intervals >= 1)
+                .is_some_and(|count| count >= 1)
         );
         assert!(
             profiles
@@ -3992,9 +4568,8 @@ mod tests {
         let (factory, _state, _writer_schema) = composite_fixture(1, 1, 8);
         let final_chunk =
             scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
-        let mut grouped = GroupedUnpivotFixture::try_new(
+        let mut grouped = GroupedUnpivotFixtureKernel::try_new(
             Arc::clone(&factory.arena),
-            None,
             factory
                 .final_plan
                 .unpivot
@@ -4010,18 +4585,27 @@ mod tests {
             ),
             final_chunk,
             None,
+            RuntimeKernelControl::new(_state.error_state()),
+            None,
         )
         .expect("grouped Unpivot driver");
-        let child = ScriptedFinalAggregate::new(Vec::new(), true, false);
-        let child_observable = Arc::clone(&child.observable);
-        grouped.install_active(Box::new(child));
+        let child = crate::exec::pipeline::shape::fanout::test_support::Probe::new(true);
+        let child_observable = child.event.clone();
+        grouped
+            .install_active(crate::exec::pipeline::shape::fanout::test_support::sink(
+                child,
+            ))
+            .unwrap();
 
         let mut operator = factory.create_operator(1, 0);
+        use crate::exec::pipeline::shape::StepOperator;
         let source_identity = operator
-            .source_observable()
+            .control_observable()
             .expect("stable source observable while consuming");
-        operator.install_grouped_unpivot(grouped);
-        operator.phase = FinishPhase::Producing;
+        operator
+            .kernel_for_test_mut()
+            .install_grouped_unpivot(grouped, _state.error_state());
+        operator.kernel_for_test_mut().phase = FinishPhase::Producing;
         let generation = source_identity.generation();
 
         child_observable.notify_observers();
@@ -4029,73 +4613,88 @@ mod tests {
         assert!(Arc::ptr_eq(
             &source_identity,
             &operator
-                .source_observable()
+                .control_observable()
                 .expect("same source observable while producing")
         ));
         assert_eq!(source_identity.generation(), generation + 1);
     }
 
     #[test]
-    fn composite_finish_counts_driver_pending_finalize_as_one_wait_interval() {
+    fn composite_finish_counts_final_aggregate_work_wait_as_one_interval() {
         let (factory, state, writer_schema) = composite_fixture(1, 1, 8);
         let final_batch =
             scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
         let scripted = ScriptedFinalAggregate::new(vec![final_batch], true, false);
         let ready = Arc::clone(&scripted.ready);
+        let observable = scripted.observable.clone();
         let mut operator = factory.create_operator(1, 0);
         let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
             "driver-pending-finalize-metrics",
         ));
         operator.set_profiles(profiles.clone());
+        install_composite_construction(
+            &mut operator,
+            &state,
+            MemTracker::new_root("composite finish construction"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.install_aggregate(Box::new(scripted));
         operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        vec![Some(b"partial".to_vec())],
-                    )],
-                ),
-            )
-            .expect("partial input");
+            .kernel_for_test_mut()
+            .install_aggregate(Box::new(Transform::hydrating(scripted)))
+            .unwrap();
+        complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    vec![Some(b"partial".to_vec())],
+                )],
+            ),
+        )
+        .expect("partial input");
 
-        // This is PipelineDriver's EOS sequence: set finishing once, then
-        // poll only pending_finish while the asynchronous owner is parked.
-        operator.set_finishing(&state).expect("gather EOS");
-        assert!(operator.pending_finish().is_some());
-        assert!(operator.pending_finish().is_some());
-        std::thread::sleep(Duration::from_millis(1));
-        assert!(operator.pending_finish().is_some());
-        ready.store(true, Ordering::Release);
-        assert!(operator.pending_finish().is_none());
-
-        while !operator.is_finished() {
-            let _ = operator.pull_chunk(&state).expect("root output");
+        with_step(&state, 64, |ctx| operator.finish(ctx)).unwrap();
+        let wait = await_final_wait(&mut operator, &state);
+        for _ in 0..3 {
+            assert!(matches!(
+                with_step(&state, 64, |ctx| operator.drive(ctx))
+                    .unwrap()
+                    .next,
+                NextStep::Wait(_)
+            ));
         }
+        std::thread::sleep(Duration::from_millis(1));
+        ready.store(true, Ordering::Release);
+        observable.notify_observers();
+        assert!(wait.is_ready());
+        assert!(
+            TestDriver::new(&mut operator, &state)
+                .collect_until_finished()
+                .is_ok()
+        );
         operator.close().expect("close");
         assert_eq!(
             profiles.common.counter_value("FinalAggregateBlockedCount"),
             Some(1),
-            "repeated pending_finish polls belong to one continuous wait"
+            "repeated work-wait observations belong to one continuous wait"
         );
         assert!(
             profiles
                 .common
                 .counter_value("FinalAggregateBlockedTime")
                 .is_some_and(|elapsed| elapsed > 0),
-            "the EOS pending-finish wait must contribute wall time"
+            "the finalization work wait contributes wall time"
         );
     }
 
     #[test]
-    fn composite_finish_closes_driver_pending_finalize_on_failure() {
+    fn composite_finish_closes_final_aggregate_work_wait_on_failure() {
         let (factory, state, writer_schema) = composite_fixture(1, 1, 8);
         let scripted = ScriptedFinalAggregate::new(Vec::new(), true, false);
         let mut operator = factory.create_operator(1, 0);
@@ -4103,31 +4702,41 @@ mod tests {
             "failed-driver-pending-finalize-metrics",
         ));
         operator.set_profiles(profiles.clone());
+        install_composite_construction(
+            &mut operator,
+            &state,
+            MemTracker::new_root("composite finish construction"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.install_aggregate(Box::new(scripted));
         operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        vec![Some(b"partial".to_vec())],
-                    )],
-                ),
-            )
-            .expect("partial input");
-        operator.set_finishing(&state).expect("gather EOS");
-        assert!(operator.pending_finish().is_some());
-        assert!(operator.pending_finish().is_some());
+            .kernel_for_test_mut()
+            .install_aggregate(Box::new(Transform::hydrating(scripted)))
+            .unwrap();
+        complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    vec![Some(b"partial".to_vec())],
+                )],
+            ),
+        )
+        .expect("partial input");
+        with_step(&state, 64, |ctx| operator.finish(ctx)).unwrap();
+        let wait = await_final_wait(&mut operator, &state);
+        assert!(!wait.is_ready());
         std::thread::sleep(Duration::from_millis(1));
 
         operator.on_driver_failure();
-        assert!(operator.is_finished());
+        let ended = operator.drive_for_test(&state).unwrap();
+        assert!(ended.output.is_none());
+        assert!(matches!(ended.next, NextStep::Finished));
         assert!(operator.pending_finish().is_none());
         let elapsed_after_failure = profiles
             .common
@@ -4150,34 +4759,40 @@ mod tests {
     fn composite_finish_surfaces_error_only_finalization_without_waiting_for_output() {
         let (factory, state, writer_schema) = composite_fixture(1, 1, 8);
         let mut operator = factory.create_operator(1, 0);
+        install_composite_construction(
+            &mut operator,
+            &state,
+            MemTracker::new_root("composite finish construction"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.install_aggregate(Box::new(ErrorOnlyFinalAggregate));
         operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        vec![Some(b"partial".to_vec())],
-                    )],
-                ),
-            )
-            .expect("partial input");
-        operator.set_finishing(&state).expect("async finish starts");
-        assert!(
-            operator.has_output(),
-            "runtime error must make the wrapper runnable"
-        );
-        let error = operator
-            .pull_chunk(&state)
-            .expect_err("runtime finalization error");
+            .kernel_for_test_mut()
+            .install_aggregate(Box::new(Transform::hydrating(ErrorOnlyFinalAggregate)))
+            .unwrap();
+        complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    vec![Some(b"partial".to_vec())],
+                )],
+            ),
+        )
+        .expect("partial input");
+        let error = finish_failure(&mut operator, &state);
         assert!(error.detail().contains("failed asynchronously"), "{error}");
-        assert!(operator.is_finished());
+        assert!(
+            operator
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error)
+        );
     }
 
     #[test]
@@ -4186,41 +4801,51 @@ mod tests {
         let tracker = MemTracker::new_root("table-finish-finalize-error");
         let mut operator = factory.create_operator(1, 0);
         operator.set_mem_tracker(Arc::clone(&tracker));
+        install_composite_construction(&mut operator, &state, tracker.clone());
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.install_aggregate(Box::new(FinalizeErrorAggregate));
         operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![
-                        (
-                            WriterRowKind::CommitFragment.to_wire(),
-                            0,
-                            None,
-                            Some(vec![7; 4096]),
-                            vec![None],
-                        ),
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            0,
-                            None,
-                            None,
-                            vec![Some(b"partial".to_vec())],
-                        ),
-                    ],
-                ),
-            )
-            .expect("writer input");
-        let error = operator
-            .set_finishing(&state)
-            .expect_err("final aggregate rejects finalize");
+            .kernel_for_test_mut()
+            .install_aggregate(Box::new(Transform::hydrating(FinalizeErrorAggregate)))
+            .unwrap();
+        complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![
+                    (
+                        WriterRowKind::CommitFragment.to_wire(),
+                        0,
+                        None,
+                        Some(vec![7; 4096]),
+                        vec![None],
+                    ),
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"partial".to_vec())],
+                    ),
+                ],
+            ),
+        )
+        .expect("writer input");
+        let error = finish_failure(&mut operator, &state);
         assert!(
             error.detail().contains("synchronous finalize failure"),
             "{error}"
         );
-        assert!(operator.is_finished());
+        assert!(
+            operator
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error)
+        );
+        operator.begin_exit().unwrap();
+        operator.close().unwrap();
+        drop(operator);
         assert_eq!(tracker.current(), 0, "failed finalize releases all buffers");
     }
 
@@ -4232,36 +4857,51 @@ mod tests {
             TableWriteAggregateBoundary::FinalMerge,
         ));
         let mut operator = factory.create_operator(1, 0);
+        install_composite_construction(
+            &mut operator,
+            &state,
+            MemTracker::new_root("composite finish construction"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
 
-        let error = operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        vec![Some(b"partial".to_vec())],
-                    )],
-                ),
-            )
-            .expect_err("final merge fault");
+        let error = complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    vec![Some(b"partial".to_vec())],
+                )],
+            ),
+        )
+        .expect_err("final merge fault");
 
         assert!(error.detail().contains("FinalMerge"), "{error}");
-        assert!(operator.is_finished(), "the Root operator must fail closed");
+        let expected = ConnectorError::new(ConnectorErrorKind::Internal, "rejected FinalMerge");
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&error),
+            novarocks_failure_contract::FailureProjection::failure_fact(&expected),
+            "the final merge keeps the original Connector category and reason"
+        );
         assert!(
-            !operator.has_output(),
-            "a failed Root cannot expose EOF data"
+            matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Domain(source)
+                if source.downcast_ref::<ConnectorError>() == Some(&expected)),
+            "the original typed Connector source survives the final merge boundary"
+        );
+        assert!(
+            matches!(operator.initial_step(), NextStep::Finished),
+            "the Root operator must fail closed"
         );
         assert!(
             operator
-                .pull_chunk(&state)
-                .expect("failed Root pull")
-                .is_none(),
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error),
             "a failed Root cannot emit a successful result row"
         );
     }
@@ -4274,44 +4914,41 @@ mod tests {
             TableWriteAggregateBoundary::FinalFinalize,
         ));
         let mut operator = factory.create_operator(1, 0);
-        install_composite_input_creator(
+        install_composite_construction(
             &mut operator,
             &state,
-            MemTracker::new_root("table-finish-finalize-guard-input-creator"),
+            MemTracker::new_root("composite finish construction"),
         );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        vec![Some(b"partial".to_vec())],
-                    )],
-                ),
-            )
-            .expect("partial input before finalize fault");
+        complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    vec![Some(b"partial".to_vec())],
+                )],
+            ),
+        )
+        .expect("partial input before finalize fault");
 
-        let error = operator
-            .set_finishing(&state)
-            .expect_err("final finalize fault");
+        let error = finish_failure(&mut operator, &state);
 
         assert!(error.detail().contains("FinalFinalize"), "{error}");
-        assert!(operator.is_finished(), "the Root operator must fail closed");
         assert!(
-            !operator.has_output(),
-            "a failed Root cannot expose EOF data"
+            matches!(operator.initial_step(), NextStep::Finished),
+            "the Root operator must fail closed"
         );
         assert!(
             operator
-                .pull_chunk(&state)
-                .expect("failed Root pull")
-                .is_none(),
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error),
             "a failed Root cannot emit a successful result row"
         );
     }
@@ -4322,32 +4959,40 @@ mod tests {
         let (factory, state, writer_schema) = composite_fixture(1, channels, 64);
         let tracker = MemTracker::new_root("table-finish-wide-unpivot");
         let mut operator = factory.create_operator(1, 0);
-        install_composite_input_creator(&mut operator, &state, Arc::clone(&tracker));
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        install_composite_construction(&mut operator, &state, tracker.clone());
         let creator_bytes = tracker.current();
+        assert!(
+            creator_bytes > 0,
+            "the original construction owner is tracked"
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        (0..channels)
-                            .map(|index| Some(vec![u8::try_from(index % 251).expect("byte")]))
-                            .collect(),
-                    )],
-                ),
-            )
-            .expect("wide partial input");
-        operator.set_finishing(&state).expect("gather EOS");
+        complete_input(
+            &mut operator,
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    (0..channels)
+                        .map(|index| Some(vec![u8::try_from(index % 251).expect("byte")]))
+                        .collect(),
+                )],
+            ),
+        )
+        .expect("wide partial input");
+        operator.finish_for_test(&state).expect("gather EOS");
 
         let mut outputs = Vec::new();
-        while !operator.is_finished() {
-            if let Some(output) = operator.pull_chunk(&state).expect("root output") {
+        for output in TestDriver::new(&mut operator, &state)
+            .collect_until_finished()
+            .expect("root output")
+        {
+            {
                 outputs.push(output);
             }
         }
@@ -4370,6 +5015,8 @@ mod tests {
             "wide Unpivot must emit multiple batches"
         );
         drop(outputs);
+        operator.begin_exit().unwrap();
+        operator.close().unwrap();
         assert_eq!(
             tracker.current(),
             creator_bytes,
@@ -4388,80 +5035,90 @@ mod tests {
     fn composite_finish_fails_closed_on_missing_channel_coverage_at_eos() {
         let (factory, state, writer_schema) = composite_fixture(1, 2, 16);
         let mut operator = factory.create(1, 0);
-        install_composite_input_creator(
+        install_composite_construction(
             operator.as_mut(),
             &state,
-            MemTracker::new_root("table-finish-channel-coverage-input-creator"),
+            MemTracker::new_root("composite finish construction"),
         );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind aggregate");
-        operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        vec![Some(b"present".to_vec()), None],
-                    )],
-                ),
-            )
-            .expect("one sparse partial");
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
-            .expect_err("the second channel never arrived");
+        complete_input(
+            operator.as_mut(),
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    vec![Some(b"present".to_vec()), None],
+                )],
+            ),
+        )
+        .expect("one sparse partial");
+        let error = finish_failure(operator.as_mut(), &state);
         assert!(
             error
                 .detail()
                 .contains("no non-null aggregate partial for channel 1")
         );
-        assert!(operator.is_finished());
+        assert!(
+            operator
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error)
+        );
     }
 
     #[test]
     fn composite_finish_rejects_all_null_partial_and_schema_drift_at_nearest_ingress() {
         let (factory, state, writer_schema) = composite_fixture(1, 2, 16);
         let mut all_null = factory.create(1, 0);
+        install_composite_construction(
+            all_null.as_mut(),
+            &state,
+            MemTracker::new_root("composite finish construction"),
+        );
         all_null.prepare().expect("prepare");
         all_null.bind_runtime_state(&state).expect("bind aggregate");
-        let error = all_null
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![(
-                        WriterRowKind::AggregatePartial.to_wire(),
-                        0,
-                        None,
-                        None,
-                        vec![None, None],
-                    )],
-                ),
-            )
-            .expect_err("an all-null partial carries no contribution");
+        let error = complete_input(
+            all_null.as_mut(),
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    0,
+                    None,
+                    None,
+                    vec![None, None],
+                )],
+            ),
+        )
+        .expect_err("an all-null partial carries no contribution");
         assert!(
             error
                 .detail()
                 .contains("payload does not match its row kind")
         );
 
+        // An independent invalid invocation has its own Task failure scope.
+        let (factory, state, _) = composite_fixture(1, 2, 16);
         let mut drifted = factory.create(1, 0);
+        install_composite_construction(
+            drifted.as_mut(),
+            &state,
+            MemTracker::new_root("composite finish construction"),
+        );
         drifted.prepare().expect("prepare");
         drifted.bind_runtime_state(&state).expect("bind aggregate");
-        let error = drifted
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
-            .expect_err("the four-column legacy schema is not the frozen multiplex schema");
+        let error = complete_input(
+            drifted.as_mut(),
+            &state,
+            writer_rows(vec![row_count_row(0, 1)]),
+        )
+        .expect_err("the four-column legacy schema is not the frozen multiplex schema");
         assert!(
             error
                 .detail()
@@ -4483,43 +5140,255 @@ mod tests {
             Some(Arc::clone(&tracker)),
         );
         let mut operator = factory.create(1, 0);
-        install_composite_input_creator(operator.as_mut(), &state, Arc::clone(&tracker));
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        install_composite_construction(operator.as_mut(), &state, tracker.clone());
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind aggregate");
-        operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(
-                &state,
-                composite_rows(
-                    &writer_schema,
-                    vec![
-                        (
-                            WriterRowKind::CommitFragment.to_wire(),
-                            0,
-                            None,
-                            Some(vec![7; 4096]),
-                            vec![None],
-                        ),
-                        (
-                            WriterRowKind::AggregatePartial.to_wire(),
-                            0,
-                            None,
-                            None,
-                            vec![Some(vec![8; 4096])],
-                        ),
-                    ],
-                ),
-            )
-            .expect("buffer input");
+        complete_input(
+            operator.as_mut(),
+            &state,
+            composite_rows(
+                &writer_schema,
+                vec![
+                    (
+                        WriterRowKind::CommitFragment.to_wire(),
+                        0,
+                        None,
+                        Some(vec![7; 4096]),
+                        vec![None],
+                    ),
+                    (
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(vec![8; 4096])],
+                    ),
+                ],
+            ),
+        )
+        .expect("buffer input");
         assert!(tracker.current() > 0);
-        operator
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
-            .expect("finalize");
+        operator.finish_for_test(&state).expect("finalize");
         operator.cancel();
         drop(operator);
         assert_eq!(tracker.current(), 0, "cancel releases every retained owner");
+    }
+    #[test]
+    fn composite_cleanup_errors_keep_actual_grouped_exit_and_original_failure_binding() {
+        use crate::exec::pipeline::operator::{
+            ExitObservation, ExitProgress, FinishWatch, InputEncodingPolicy,
+        };
+        struct CleanupAggregate {
+            failure: ExecutionFailure,
+            begins: Arc<AtomicUsize>,
+            closes: Arc<AtomicUsize>,
+        }
+        impl OperatorLifecycle for CleanupAggregate {
+            fn name(&self) -> &str {
+                "ACTUAL_TABLE_FINISH_CLEANUP"
+            }
+            fn begin_exit(&mut self) -> ExecutionResult<()> {
+                self.begins.fetch_add(1, Ordering::SeqCst);
+                Err(self.failure.clone())
+            }
+            fn close(&mut self) -> ExecutionResult<()> {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+                Err(self.failure.clone())
+            }
+        }
+        impl InputEncodingPolicy for CleanupAggregate {}
+        impl crate::exec::pipeline::shape::TransformKernel for CleanupAggregate {
+            fn apply(
+                &mut self,
+                _: &mut StepContext<'_>,
+                _: crate::exec::pipeline::input::PreparedInput,
+            ) -> ExecutionResult<StepResult> {
+                unreachable!("lifecycle test has no aggregate data work")
+            }
+        }
+        struct Resource {
+            data: Vec<u64>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Release(Arc<tokio::sync::Semaphore>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.add_permits(1);
+            }
+        }
+        struct Wake(Arc<Observable>);
+        impl futures::task::ArcWake for Wake {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.notify_observers();
+            }
+        }
+        struct GatedGrouped {
+            join: Option<tokio::task::JoinHandle<()>>,
+            event: Arc<Observable>,
+            joined: Arc<AtomicBool>,
+            begins: Arc<AtomicUsize>,
+            closes: Arc<AtomicUsize>,
+        }
+        impl OperatorLifecycle for GatedGrouped {
+            fn name(&self) -> &str {
+                "ACTUAL_GATED_GROUPED_EXIT"
+            }
+            fn begin_exit(&mut self) -> ExecutionResult<()> {
+                self.begins.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn close(&mut self) -> ExecutionResult<()> {
+                assert!(
+                    self.joined.load(Ordering::Acquire),
+                    "real grouped task must join before close"
+                );
+                self.closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn observe_exit(&mut self) -> ExitObservation {
+                use std::{
+                    future::Future,
+                    task::{Context, Poll},
+                };
+                let Some(join) = self.join.as_mut() else {
+                    return ExitObservation::exited();
+                };
+                let wake = Arc::new(Wake(self.event.clone()));
+                let waker = futures::task::waker_ref(&wake);
+                let mut cx = Context::from_waker(&waker);
+                match std::pin::Pin::new(join).poll(&mut cx) {
+                    Poll::Pending => {
+                        ExitObservation::pending(FinishWatch::Notify(self.event.clone()))
+                    }
+                    Poll::Ready(result) => {
+                        result.expect("actual grouped task exit");
+                        self.join = None;
+                        self.joined.store(true, Ordering::Release);
+                        ExitObservation::exited()
+                    }
+                }
+            }
+        }
+        impl SourceKernel for GatedGrouped {
+            fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+                Ok(StepResult::new(None, NextStep::Finished, 0))
+            }
+        }
+        impl GroupedUnpivotKernel for GatedGrouped {
+            fn visit_targets(
+                &self,
+                _: &mut dyn FnMut(u32) -> ExecutionResult<()>,
+            ) -> ExecutionResult<()> {
+                Ok(())
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (factory, state, _) = composite_fixture(1, 1, 8);
+        let failures = state.error_state();
+        let mut operator = factory.create_operator(1, 0);
+        install_composite_construction(
+            &mut operator,
+            &state,
+            MemTracker::new_root("actual table finish exit construction"),
+        );
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
+        let begin = Arc::new(AtomicUsize::new(0));
+        let close = Arc::new(AtomicUsize::new(0));
+        let cleanup = finish_contract(FinishContractSite::Binding, "actual child cleanup error");
+        operator
+            .kernel_for_test_mut()
+            .install_aggregate(Box::new(Transform::hydrating(CleanupAggregate {
+                failure: cleanup,
+                begins: begin.clone(),
+                closes: close.clone(),
+            })))
+            .unwrap();
+        let gate = Release(Arc::new(tokio::sync::Semaphore::new(0)));
+        let task_gate = gate.0.clone();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource = Arc::new(Resource {
+            data: vec![5, 8, 13],
+            drops: drops.clone(),
+        });
+        let weak = Arc::downgrade(&resource);
+        let event = Arc::new(Observable::new());
+        let joined = Arc::new(AtomicBool::new(false));
+        let grouped_begins = Arc::new(AtomicUsize::new(0));
+        let grouped_closes = Arc::new(AtomicUsize::new(0));
+        let grouped = GatedGrouped {
+            join: Some(runtime.spawn(async move {
+                let original = resource;
+                task_gate.acquire().await.unwrap().forget();
+                assert_eq!(original.data, [5, 8, 13]);
+            })),
+            event: event.clone(),
+            joined: joined.clone(),
+            begins: grouped_begins.clone(),
+            closes: grouped_closes.clone(),
+        };
+        operator
+            .kernel_for_test_mut()
+            .install_grouped_unpivot(grouped, failures.clone());
+        operator.begin_exit().unwrap();
+        assert_eq!(begin.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            grouped_begins.load(Ordering::SeqCst),
+            1,
+            "aggregate cleanup error cannot skip grouped sibling"
+        );
+        let mut observations = Vec::new();
+        operator.visit_exits(&mut |observation| observations.push(observation));
+        assert!(
+            observations
+                .iter()
+                .any(|observation| matches!(observation.progress, ExitProgress::Pending(_)))
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.failure.is_none())
+        );
+        assert!(failures.error().is_none());
+        assert_eq!(weak.upgrade().unwrap().data, [5, 8, 13]);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(!joined.load(Ordering::Acquire));
+        gate.0.add_permits(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut pending = false;
+            operator.visit_exits(&mut |observation| {
+                assert!(observation.failure.is_none());
+                pending |= !matches!(observation.progress, ExitProgress::Exited);
+            });
+            if !pending {
+                break;
+            }
+            assert!(Instant::now() < deadline, "actual grouped join must exit");
+            std::thread::yield_now();
+        }
+        assert!(joined.load(Ordering::Acquire));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        operator.close().unwrap();
+        operator.close().unwrap();
+        operator.begin_exit().unwrap();
+        assert_eq!(begin.load(Ordering::SeqCst), 1);
+        assert_eq!(close.load(Ordering::SeqCst), 1);
+        assert_eq!(grouped_begins.load(Ordering::SeqCst), 1);
+        assert_eq!(grouped_closes.load(Ordering::SeqCst), 1);
+        assert!(
+            failures.error().is_none(),
+            "cleanup never enters original Runtime originating error"
+        );
     }
 }

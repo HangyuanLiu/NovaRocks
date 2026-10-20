@@ -45,7 +45,10 @@ impl<T> ChildScratchVec<T> {
     ) -> Result<Self, E> {
         if allocator.is_none() && capacity != 0 && size_of::<T>() != 0 {
             if let Some(request) = request {
-                request(std::alloc::Layout::array::<T>(capacity).map_err(|_| CopyError::Extent)?)?;
+                request(
+                    std::alloc::Layout::array::<T>(capacity)
+                        .map_err(|source| CopyError::layout::<T>(capacity, source))?,
+                )?;
             }
         }
         Self::try_with_capacity(capacity, allocator).map_err(Into::into)
@@ -67,14 +70,20 @@ impl<T> ChildScratchVec<T> {
                     } else {
                         1
                     };
-                    let required = values.len().checked_add(1).ok_or(CopyError::Extent)?;
+                    let required = values
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| CopyError::arithmetic(Some(values.len() as u128 + 1)))?;
                     let count = values
                         .capacity()
                         .checked_mul(2)
-                        .ok_or(CopyError::Extent)?
+                        .ok_or_else(|| CopyError::arithmetic(Some(values.capacity() as u128 * 2)))?
                         .max(required)
                         .max(minimum);
-                    request(std::alloc::Layout::array::<T>(count).map_err(|_| CopyError::Extent)?)?;
+                    request(
+                        std::alloc::Layout::array::<T>(count)
+                            .map_err(|source| CopyError::layout::<T>(count, source))?,
+                    )?;
                 }
             }
         }
@@ -85,13 +94,31 @@ impl<T> ChildScratchVec<T> {
         allocator: Option<&HostAggregateAllocator>,
     ) -> Result<Self, CopyError> {
         match allocator {
-            None => Ok(Self::Original(Vec::with_capacity(capacity))),
+            None => {
+                std::alloc::Layout::array::<T>(capacity)
+                    .map_err(|source| CopyError::layout::<T>(capacity, source))?;
+                let mut values = Vec::new();
+                values.try_reserve_exact(capacity).map_err(|source| {
+                    CopyError::Control(crate::KernelFailure::from_domain(
+                        crate::allocation_failure::AllocationRefusal::new(
+                            "copy child scratch allocation",
+                            source,
+                        ),
+                    ))
+                })?;
+                Ok(Self::Original(values))
+            }
             Some(allocator) => {
                 let mut values = HostVec::new_in(allocator.clone());
-                if values.try_reserve_exact(capacity).is_err() {
+                if let Err(error) = values.try_reserve_exact(capacity) {
                     return Err(match values.allocator().recorded_failure() {
                         Some(cause) => CopyError::Control(cause),
-                        None => CopyError::Extent,
+                        None => CopyError::Control(crate::KernelFailure::from_domain(
+                            crate::allocation_failure::AllocationRefusal::new(
+                                "copy hosted child scratch allocation",
+                                error,
+                            ),
+                        )),
                     });
                 }
                 Ok(Self::Hosted(values))
@@ -130,16 +157,31 @@ impl<T> ChildScratchVec<T> {
     }
     pub(super) fn try_push(&mut self, value: T) -> Result<(), CopyError> {
         match self {
-            Self::Original(values) => values.push(value),
+            Self::Original(values) => {
+                values.try_reserve(1).map_err(|source| {
+                    CopyError::Control(crate::KernelFailure::from_domain(
+                        crate::allocation_failure::AllocationRefusal::new(
+                            "copy child scratch growth",
+                            source,
+                        ),
+                    ))
+                })?;
+                values.push(value);
+            }
             Self::Hosted(values) => {
                 // Child validation and its first Data have already completed,
                 // exactly at the original push site. Admission happens now.
-                if let Err(_error) = values.try_reserve(1) {
+                if let Err(error) = values.try_reserve(1) {
                     return Err(match values.allocator().recorded_failure() {
                         Some(cause) => CopyError::Control(cause),
-                        // No host refusal means the container layout overflowed.
-                        // Representability is not retyped as a host MEM cause.
-                        None => CopyError::Extent,
+                        // The real container error remains the source when its
+                        // allocator did not publish a nominal host refusal.
+                        None => CopyError::Control(crate::KernelFailure::from_domain(
+                            crate::allocation_failure::AllocationRefusal::new(
+                                "copy hosted child scratch growth",
+                                error,
+                            ),
+                        )),
                     });
                 }
                 values.push(value);

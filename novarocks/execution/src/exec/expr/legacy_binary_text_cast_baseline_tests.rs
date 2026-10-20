@@ -30,7 +30,7 @@ pub(super) fn actual(
     input: &ArrayRef,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slot = SlotId::new(1);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -148,11 +148,11 @@ fn legacy_binary_text_cast_original_fixedsize16_is_largeint_and_other_widths_err
                     .unwrap_err()
                     .to_string();
                 assert_eq!(
-                    cast_array_to_target(&array, &DataType::Utf8).unwrap_err(),
+                    (cast_array_to_target(&array, &DataType::Utf8).unwrap_err()).to_string(),
                     inner
                 );
                 assert_eq!(
-                    actual(&array, policy, allow).unwrap_err(),
+                    (actual(&array, policy, allow).unwrap_err()).to_string(),
                     format!(
                         "CAST failed: from {:?} to {:?}: {inner}",
                         array.data_type(),

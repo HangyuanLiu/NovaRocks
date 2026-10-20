@@ -21,6 +21,7 @@ use crate::exec::node::sort::{SortExpression, SortTopNType};
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause, PipelineOperation};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
@@ -77,7 +78,7 @@ struct Source {
     creator: Arc<dyn InputConstructionFactory>,
 }
 fn source_fixture() -> Source {
-    let state = RuntimeState::new(None, None, None, None, None, None, None);
+    let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
     let tracker = MemTracker::new_root("default-sort-actual-owner");
     let creator = try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
@@ -199,11 +200,14 @@ fn keys(chunk: &Chunk) -> Vec<Option<i32>> {
         .collect()
 }
 fn finish(operator: &mut dyn Operator, state: &RuntimeState) -> Chunk {
-    let processor = operator.as_processor_mut().unwrap();
-    processor.set_finishing(state).unwrap();
-    let output = processor.pull_chunk(state).unwrap().unwrap();
-    assert!(processor.is_finished());
-    assert!(processor.pull_chunk(state).unwrap().is_none());
+    let mut calls = TestDriver::new(operator, state);
+    calls.signal_eos().unwrap();
+    let mut output = calls.collect_until_finished().unwrap();
+    assert_eq!(output.len(), 1);
+    let output = output.pop().unwrap();
+    let ended = calls.drive().unwrap();
+    assert!(matches!(ended.next, NextStep::Finished));
+    assert!(ended.output.is_none());
     output
 }
 fn assert_retired(source: Source, operator: Box<dyn Operator>, output: Chunk) {
@@ -251,15 +255,11 @@ fn default_sort_global_nulls_ties_offset_and_last_projection_keep_exact_declarat
             .map(|s| format!("\"{s}\""))
             .into(),
     );
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, first)
+    TestDriver::new(operator.as_mut(), &source.state)
+        .input_without_output(first)
         .unwrap();
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, second)
+    TestDriver::new(operator.as_mut(), &source.state)
+        .input_without_output(second)
         .unwrap();
     let output = finish(operator.as_mut(), &source.state);
     assert_eq!(keys(&output), vec![Some(1), Some(1), Some(1), Some(2)]);
@@ -309,21 +309,11 @@ fn default_sort_rank_and_dense_rank_keep_cross_batch_boundary_peers_after_prunin
         let (factory, _) = sort_factory(&source, true, Some(2), 0, kind, Some(3));
         let mut operator = make_operator(&source, &factory);
         drop(factory);
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(
-                &source.state,
-                chunk(&source, vec![Some(4), Some(2), Some(2), Some(1)]),
-            )
+        TestDriver::new(operator.as_mut(), &source.state)
+            .input_without_output(chunk(&source, vec![Some(4), Some(2), Some(2), Some(1)]))
             .unwrap();
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(
-                &source.state,
-                chunk(&source, vec![Some(2), Some(1), Some(3)]),
-            )
+        TestDriver::new(operator.as_mut(), &source.state)
+            .input_without_output(chunk(&source, vec![Some(2), Some(1), Some(3)]))
             .unwrap();
         let output = finish(operator.as_mut(), &source.state);
         assert_eq!(keys(&output), expected);
@@ -352,16 +342,12 @@ fn default_sort_heap_threshold_sides_preserve_offset_and_late_best_rows() {
             .rev()
             .map(Some)
             .collect::<Vec<_>>();
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&source.state, chunk(&source, original.clone()))
+        TestDriver::new(operator.as_mut(), &source.state)
+            .input_without_output(chunk(&source, original.clone()))
             .unwrap();
         let late = (-6..0).map(Some).collect::<Vec<_>>();
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&source.state, chunk(&source, late.clone()))
+        TestDriver::new(operator.as_mut(), &source.state)
+            .input_without_output(chunk(&source, late.clone()))
             .unwrap();
         original.extend(late);
         original.sort_unstable();
@@ -393,10 +379,8 @@ fn default_sort_rejects_same_carrier_wrong_complete_domain_before_buffering() {
     );
     let original = input.into_batch_projection();
     let before = source.tracker.allocated();
-    let failure = operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, original.clone().into_chunk())
+    let failure = TestDriver::new(operator.as_mut(), &source.state)
+        .input_without_output(original.clone().into_chunk())
         .unwrap_err();
     assert!(matches!(
         failure.cause(),
@@ -425,6 +409,8 @@ fn default_sort_requires_installed_prepare_owner_and_preserves_first_memory_refu
         operator.prepare().unwrap_err().cause(),
         ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
     ));
+    drop(operator);
+    let mut operator = factory.create(1, 0);
     operator.set_construction_factory(source.creator.clone());
     let before = source.tracker.current();
     source.tracker.install_limit_once(before).unwrap();
@@ -452,18 +438,15 @@ fn default_sort_materialization_keeps_first_memory_caller_and_original_input() {
     let mut operator = make_operator(&source, &factory);
     drop(factory);
     let original_input = chunk(&source, vec![Some(2), Some(1)]).into_batch_projection();
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, original_input.clone().into_chunk())
+    TestDriver::new(operator.as_mut(), &source.state)
+        .input_without_output(original_input.clone().into_chunk())
         .unwrap();
     let baseline = source.tracker.current();
     source.tracker.install_limit_once(baseline).unwrap();
-    let failure = operator
-        .as_processor_mut()
-        .unwrap()
-        .set_finishing(&source.state)
-        .unwrap_err();
+    let mut calls = TestDriver::new(operator.as_mut(), &source.state);
+    calls.signal_eos().unwrap();
+    let failure = calls.collect_until_finished().unwrap_err();
+    drop(calls);
     assert!(matches!(
         failure.cause(),
         ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
@@ -485,23 +468,27 @@ fn default_sort_materialization_keeps_first_memory_caller_and_original_input() {
     let mut operator = make_operator(&source, &factory);
     drop(factory);
     let input = chunk(&source, vec![Some(2), Some(1)]).into_batch_projection();
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, input.clone().into_chunk())
+    TestDriver::new(operator.as_mut(), &source.state)
+        .input_without_output(input.clone().into_chunk())
         .unwrap();
-    let original =
-        ExecutionFailure::from("original default sort materialization caller".to_owned())
-            .at_operator(71, PipelineOperation::Admission);
+    let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new(
+            &("original default sort materialization caller".to_owned()),
+        ),
+    ))
+    .at_operator(71, PipelineOperation::Admission);
     source.state.error_state().set_error(original.clone());
     let before = source.tracker.allocated();
+    use crate::exec::pipeline::step_context::{StepContext, TurnWork};
+    let control = source.state.error_state();
+    let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let failure = operator
-        .as_processor_mut()
-        .unwrap()
-        .set_finishing(&source.state)
+        .as_mut()
+        .finish(&mut StepContext::new(&control, &mut work))
         .unwrap_err();
-    assert_eq!(failure.cause(), original.cause());
+    assert!(failure.same_occurrence(&original));
     assert_eq!(failure.context(), original.context());
+    assert_eq!(control.error(), Some(original));
     assert_eq!(
         source.tracker.allocated(),
         before,
@@ -582,10 +569,8 @@ fn default_sort_fixed16_largeint_and_uuid_keep_their_declared_order_through_real
         )
         .unwrap();
         drop(owner);
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&source.state, input)
+        TestDriver::new(operator.as_mut(), &source.state)
+            .input_without_output(input)
             .unwrap();
         let output = finish(operator.as_mut(), &source.state);
         let values = output.columns()[0]

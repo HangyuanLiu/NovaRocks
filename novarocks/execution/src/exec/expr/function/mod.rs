@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 // Function implementations
 pub mod array;
+mod arrow_operation;
 pub mod bit;
 pub mod conditional;
 pub mod date;

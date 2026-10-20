@@ -62,7 +62,15 @@ impl fmt::Display for LogicalTypeCodecError {
         }
     }
 }
-impl std::error::Error for LogicalTypeCodecError {}
+impl std::error::Error for LogicalTypeCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::ValueType(source) => Some(source),
+            Self::InvalidShape(_) | Self::ResourceSource(_) => None,
+        }
+    }
+}
 impl From<CompileControlError> for LogicalTypeCodecError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)

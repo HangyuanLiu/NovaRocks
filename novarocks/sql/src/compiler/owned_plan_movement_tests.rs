@@ -226,7 +226,7 @@ impl PureCompileControl for TraceControl {
             );
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((index, cause)) if trace.len() == index + 1 => Err(cause),
             _ => Ok(()),
         }
@@ -277,7 +277,7 @@ fn journal_moved_owner_preserves_each_original_control_prefix_and_ordinary_tail(
             ] {
                 let control = TraceControl {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((index, cause)),
+                    refusal: Some((index, cause.clone())),
                 };
                 let result = loan(&owner, fragment, node, attempted, call, &control);
                 assert!(

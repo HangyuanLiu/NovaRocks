@@ -103,6 +103,54 @@ pub(crate) trait TurnPump: Send {
     /// an abort -- so a pump that means "nothing happened" must say zero rather
     /// than fail.
     fn drive(&mut self, execution: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError>;
+
+    /// Stop normal production. This is an idempotent metadata request, never
+    /// a synchronous Connector close or evidence that its work exited.
+    fn begin_close(&mut self);
+    /// Advance only the original close/join owner. A new error is observed
+    /// once by TaskRound without starving ACK/status/cleanup progress.
+    fn close_turn(&mut self) -> Result<usize, TaskExecutionError>;
+    /// The original local work and its actual close job have exited.
+    fn is_closed(&self) -> bool;
+    /// A genuine original job/capture exit was not proven. This goes only to
+    /// the enclosing process-health supervision owner, never the Task latch.
+    fn take_close_unresolved(&mut self) -> Option<PumpCloseUnresolved>;
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PumpCloseUnresolved {
+    pub(crate) owner: &'static str,
+    pub(crate) cause: Arc<dyn std::error::Error + Send + Sync>,
+}
+impl std::fmt::Display for PumpCloseUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the original {} close job did not exit normally",
+            self.owner
+        )
+    }
+}
+impl std::error::Error for PumpCloseUnresolved {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+struct RoundPump {
+    owner: Box<dyn TurnPump>,
+    closing: bool,
+    close_error: Option<TaskExecutionError>,
+    close_error_observed: bool,
+    close_unresolved: bool,
+}
+impl RoundPump {
+    fn begin_close(&mut self) {
+        if !self.closing {
+            self.closing = true;
+            self.owner.begin_close();
+        }
+    }
 }
 
 /// The one thing the runner asks of the status transport.
@@ -219,7 +267,7 @@ pub(crate) struct TaskRound {
     covered_subscriber: Option<Arc<CoveredTaskStatusSubscriber>>,
     observation_intake: Option<Arc<ObservationIntake>>,
     observers: Vec<Arc<dyn AcknowledgementObserver>>,
-    pumps: Vec<Box<dyn TurnPump>>,
+    pumps: Vec<RoundPump>,
     pumps_sealed: bool,
     connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
     root_status_sender: Option<AcceptedRootStatusSender>,
@@ -355,6 +403,25 @@ impl TaskRound {
             .covered_subscription_request(context, generation)
     }
 
+    /// Cleanup stops producers, not the original residual evidence owner.
+    /// A logical closure ACK must not destroy the stream that can still prove
+    /// actual Worker exit. No new subscription authority or recovery budget is
+    /// introduced here; reconnect uses the same scope and applied cursors.
+    fn needs_covered_observation(&self, context: QueryContextRef) -> bool {
+        // `needs_establish` becomes false during cleanup even for an unknown
+        // Establish outcome. Only its actual acknowledgement permits opening
+        // the existing stream, including when that ACK arrives after cleanup.
+        self.execution
+            .owner(context)
+            .is_some_and(|owner| owner.establish_acknowledged())
+            && (!self.terminal_cleanup_started
+                || (!self.execution.context_never_established(context)
+                    && self
+                        .execution
+                        .context_convergence_receipt(context)
+                        .is_none()))
+    }
+
     fn covered_subscription_failure(&self, context: QueryContextRef) -> Option<SubscriptionState> {
         let state = self.covered_subscriber.as_ref()?.state(context)?;
         self.classify_covered_subscription_state(context, state)
@@ -465,7 +532,13 @@ impl TaskRound {
     /// needs the attempt's frozen credential table.
     pub(crate) fn add_pump(&mut self, pump: Box<dyn TurnPump>) {
         crate::native::task_transport::observe_attempt_pump_installed(pump.name());
-        self.pumps.push(pump);
+        self.pumps.push(RoundPump {
+            owner: pump,
+            closing: false,
+            close_error: None,
+            close_error_observed: false,
+            close_unresolved: false,
+        });
     }
 
     /// Declares that this attempt's per-turn owners are all installed.
@@ -519,13 +592,31 @@ impl TaskRound {
     /// of sitting in the dispatcher for a whole turn while the credential it
     /// replaces keeps expiring.
     pub(crate) fn turn(&mut self) -> Result<TurnReport, TaskExecutionError> {
+        let mut report = TurnReport::default();
+        if self.normal_drain_started
+            || self.terminal_cleanup_started
+            || self.execution.failure_cause().is_some()
+        {
+            // Local close must still advance even when an unrelated ACK or
+            // observation below returns an error on this turn.
+            for pump in &mut self.pumps {
+                pump.begin_close();
+                // A completed local job may publish a new domain error at
+                // the same cut as its exit proof. Observe that once too.
+                match pump.owner.close_turn() {
+                    Ok(moved) => report.pumped += moved,
+                    Err(error) if !pump.close_error_observed && pump.close_error.is_none() => {
+                        pump.close_error = Some(error);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
         if !self.pumps_sealed {
             return Err(TaskExecutionError::Schedule(
                 "the attempt's per-turn owners were never declared".to_owned(),
             ));
         }
-        let mut report = TurnReport::default();
-
         let mut first_ack_error = None;
         for event in self.acks.drain_events() {
             let ack = match event {
@@ -555,8 +646,11 @@ impl TaskRound {
         }
 
         for context in self.execution.take_status_reconciliations() {
-            if self.terminal_cleanup_started {
+            if self.terminal_cleanup_started && self.covered_subscriber.is_none() {
                 break;
+            }
+            if !self.needs_covered_observation(context) {
+                continue;
             }
             if let Some(subscriber) = &self.covered_subscriber {
                 subscriber
@@ -597,10 +691,12 @@ impl TaskRound {
                 .collect::<BTreeSet<_>>();
             let status = self.execution.apply_covered_entries(entries)?;
             intake.acknowledge_applied();
-            if !self.terminal_cleanup_started
-                && let Some(subscriber) = &self.covered_subscriber
-            {
+            if let Some(subscriber) = &self.covered_subscriber {
                 for context in applied_contexts {
+                    if !self.needs_covered_observation(context) {
+                        subscriber.stop(context);
+                        continue;
+                    }
                     if !subscriber
                         .state(context)
                         .is_some_and(|state| !state.is_fatal())
@@ -663,22 +759,27 @@ impl TaskRound {
         if !status.resubscribe {
             self.try_settle_success_seal()?;
         }
-        if !self.terminal_cleanup_started {
-            for context in self.execution.take_covered_reconciliations() {
-                if let Some(subscriber) = &self.covered_subscriber {
-                    subscriber
-                        .reconcile(self.covered_request(context)?)
-                        .map_err(TaskExecutionError::Schedule)?;
-                    report.resubscriptions += 1;
-                }
+        for context in self.execution.take_covered_reconciliations() {
+            if self.needs_covered_observation(context)
+                && let Some(subscriber) = &self.covered_subscriber
+            {
+                subscriber
+                    .reconcile(self.covered_request(context)?)
+                    .map_err(TaskExecutionError::Schedule)?;
+                report.resubscriptions += 1;
             }
         }
-        if status.resubscribe && !self.terminal_cleanup_started {
+        if status.resubscribe
+            && (!self.terminal_cleanup_started || self.covered_subscriber.is_some())
+        {
             for &context in self.execution.graph().contexts() {
+                if !self.needs_covered_observation(context) {
+                    continue;
+                }
                 if self
                     .execution
                     .owner(context)
-                    .is_none_or(QueryContextOwner::needs_establish)
+                    .is_none_or(|owner| !owner.establish_acknowledged())
                 {
                     continue;
                 }
@@ -711,7 +812,9 @@ impl TaskRound {
             && self.execution.failure_cause().is_none()
         {
             for pump in &mut self.pumps {
-                report.pumped += pump.drive(&mut self.execution)?;
+                if !pump.closing {
+                    report.pumped += pump.owner.drive(&mut self.execution)?;
+                }
             }
         }
 
@@ -737,14 +840,20 @@ impl TaskRound {
         // status. Waiting for the acknowledgement is the ordering every other
         // operation on this protocol already obeys; tolerating the refusal
         // instead would make an observation loss the normal case.
-        if self.terminal_cleanup_started {
+        if self.terminal_cleanup_started && self.covered_subscriber.is_none() {
             return Ok(report);
         }
         for &context in self.execution.graph().contexts() {
+            if !self.needs_covered_observation(context) {
+                if let Some(subscriber) = &self.covered_subscriber {
+                    subscriber.stop(context);
+                }
+                continue;
+            }
             if self
                 .execution
                 .owner(context)
-                .is_none_or(QueryContextOwner::needs_establish)
+                .is_none_or(|owner| !owner.establish_acknowledged())
             {
                 continue;
             }
@@ -807,6 +916,15 @@ impl TaskRound {
         self.execution.acknowledge(ack)
     }
 
+    /// Freeze only FE producers after the exact accepted Root completion.
+    /// The original status, normal destination-close and Cancel path still
+    /// runs. Profile may finish terminal info before Quiesce/Release starts.
+    pub(crate) fn begin_input_close(&mut self) {
+        for pump in &mut self.pumps {
+            pump.begin_close();
+        }
+    }
+
     /// Stops input-producing pumps after the accepted root success seal while
     /// keeping status observation, cancellation, renewal, and Release live.
     pub(crate) fn begin_normal_drain(&mut self) {
@@ -814,18 +932,25 @@ impl TaskRound {
             return;
         }
         self.normal_drain_started = true;
+        for pump in &mut self.pumps {
+            pump.begin_close();
+        }
         self.execution.begin_normal_drain();
     }
 
     /// Freezes normal attempt progress before remote convergence. Status and
     /// acknowledgements remain consumable, and actor-owned Abort effects keep
-    /// their priority path, but this round cannot resubscribe or run a pump
-    /// that would create a successor request.
+    /// their priority path. The original covered stream remains responsible
+    /// for real exit evidence; only input-producing pumps and normal requests
+    /// are frozen. Legacy status-only streams cannot supply that proof.
     pub(crate) fn begin_terminal_cleanup(&mut self) {
         if self.terminal_cleanup_started {
             return;
         }
         self.terminal_cleanup_started = true;
+        for pump in &mut self.pumps {
+            pump.begin_close();
+        }
         self.pending_success_seal.take().map(|request| {
             request.reject(QueryExecutionError::new(
                 QueryExecutionErrorKind::Failed,
@@ -834,12 +959,28 @@ impl TaskRound {
         });
         for &context in self.execution.graph().contexts() {
             if let Some(subscriber) = &self.covered_subscriber {
-                subscriber.stop(context);
+                if !self.needs_covered_observation(context) {
+                    subscriber.stop(context);
+                }
             } else {
                 self.legacy_subscriber().stop(context);
             }
         }
         self.execution.begin_terminal_cleanup();
+    }
+
+    /// Return the caller's observation leases to the same original Native
+    /// process records. Their original futures, child work and actual joins
+    /// remain with the process owner; this is not an IO-exited receipt.
+    pub(crate) fn return_native_observation_custody(&mut self) {
+        self.begin_terminal_cleanup();
+        for &context in self.execution.graph().contexts() {
+            if let Some(subscriber) = &self.covered_subscriber {
+                subscriber.stop(context);
+            } else {
+                self.legacy_subscriber().stop(context);
+            }
+        }
     }
 
     fn drive_actor_abort_effect(&mut self) -> Result<usize, TaskExecutionError> {
@@ -1178,8 +1319,10 @@ impl TaskRound {
         let Some(status) = task.status().cloned() else {
             return Ok(());
         };
-        let attempt_failure = match self.execution.failure_cause() {
-            Some(cause) if cause.is_derived() => AcceptedAttemptFailure::DerivedPending,
+        let attempt_failure = match self.execution.selected_task_failure() {
+            Some(selected) if selected.detail().is_derived() => {
+                AcceptedAttemptFailure::DerivedPending
+            }
             Some(authoritative) => AcceptedAttemptFailure::Authoritative(authoritative.clone()),
             None => AcceptedAttemptFailure::None,
         };
@@ -1357,6 +1500,44 @@ impl TaskRound {
     /// Whether every task terminated and every context was released.
     pub(crate) fn attempt_drained(&self) -> bool {
         self.execution.attempt_drained()
+    }
+
+    /// Local pump proof is independent of remote Task/context receipts.
+    pub(crate) fn pumps_closed(&self) -> bool {
+        self.pumps.iter().all(|pump| pump.owner.is_closed())
+    }
+
+    /// Observe one new typed local cleanup error without changing the Task
+    /// conclusion or preventing the same turn from draining its other owners.
+    pub(crate) fn take_pump_close_error(&mut self) -> Option<TaskExecutionError> {
+        for pump in &mut self.pumps {
+            if let Some(error) = pump.close_error.take() {
+                pump.close_error_observed = true;
+                return Some(error);
+            }
+        }
+        None
+    }
+
+    /// A one-shot local health observation. The original pump continues to
+    /// retain the same actual error/payload backing after this is observed.
+    pub(crate) fn take_pump_close_unresolved(&mut self) -> Option<PumpCloseUnresolved> {
+        self.pumps.iter_mut().find_map(|pump| {
+            if pump.close_unresolved {
+                return None;
+            }
+            let unresolved = pump.owner.take_close_unresolved()?;
+            pump.close_unresolved = true;
+            Some(unresolved)
+        })
+    }
+
+    /// Only a process-health wait predicate: every healthy pump has joined,
+    /// while a named unresolved pump remains retained. NEVER exit evidence.
+    pub(crate) fn pump_close_progress_settled(&self) -> bool {
+        self.pumps
+            .iter()
+            .all(|pump| pump.owner.is_closed() || pump.close_unresolved)
     }
 
     /// The first termination cause this attempt latched.

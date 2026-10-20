@@ -118,8 +118,10 @@ pub struct BoundedMysqlError {
     pub payload_hex: String,
 }
 
-/// Exactly three metadata packets followed by one complete ERR, never rows/EOF.
-/// All allocations are capped before reading their payload (4 KiB per packet).
+/// A bounded observation ending in one complete ERR. The original contract
+/// entrypoint requires exactly three metadata packets and no rows; the opt-in
+/// execution entrypoint records only its explicitly expected finite prefix.
+/// Every packet allocation is capped before reading its payload (4 KiB).
 #[derive(Debug, Default, Serialize)]
 pub struct BoundedNegativeTextObservation {
     pub text: TextResultObservation,
@@ -129,6 +131,23 @@ pub struct BoundedNegativeTextObservation {
     pub completed_metadata: bool,
     pub pending_packet: Option<BoundedPartialMysqlPacket>,
 }
+
+/// The exact finite prefix expected before one complete protocol-41 ERR.
+/// This does not weaken the metadata-only Root contract observer.
+#[derive(Clone, Copy, Debug)]
+pub enum BoundedErrorPrefix<'a> {
+    BeforeSchema,
+    /// A refusal may precede or follow the exact metadata, but no row is legal.
+    /// This is an explicit stage set for admission failures, never a phase proof.
+    BeforeRows,
+    AfterMetadata {
+        /// One nullable UTF-8 cell per row; at most 32 complete bounded packets.
+        rows: &'a [Option<&'a str>],
+    },
+}
+
+const BOUNDED_ERROR_MAX_ROWS: usize = 32;
+const BOUNDED_ERROR_MAX_CELL_BYTES: usize = 4093;
 
 /// Last unfinished packet, bounded to a 4-byte header and 4 KiB payload.
 #[derive(Debug, Default, Serialize)]
@@ -158,74 +177,16 @@ impl AsyncMysqlStream {
             );
             self.send_query(sql).await?;
             let mut sequence = 1u8;
-            for ordinal in 0..3 {
-                let phase = ["metadata-count", "metadata-column", "metadata-eof"][ordinal];
-                let payload = self
-                    .negative_packet(&mut sequence, &mut observed, &mut wire, phase)
-                    .await?;
-                metadata.update(&payload);
-                observed
-                    .metadata_payload_hex
-                    .push(bounded_packet_hex(&payload));
-                match ordinal {
-                    0 => {
-                        ensure!(
-                            payload == [1],
-                            "negative result requires one complete metadata column"
-                        );
-                        observed.text.columns = 1;
-                    }
-                    1 => {
-                        let column = parse_text_column(&payload)?;
-                        ensure!(
-                            column.name == "payload" && column.mysql_type == 253,
-                            "negative result metadata schema differs from scalar SQL"
-                        );
-                        // Full encoding other than nullable flag is independent of runtime output.
-                        let mut expected = vec![3, b'd', b'e', b'f', 0, 0, 0, 7];
-                        expected.extend_from_slice(b"payload");
-                        expected.extend_from_slice(&[0, 12, 33, 0, 0, 4, 0, 0, 253, 0, 0, 0, 0, 0]);
-                        ensure!(
-                            payload.len() == expected.len(),
-                            "unexpected metadata byte length"
-                        );
-                        let flag_index = expected.len() - 5;
-                        ensure!(payload[flag_index] <= 1, "unexpected scalar metadata flags");
-                        expected[flag_index] = payload[flag_index];
-                        ensure!(payload == expected, "unexpected complete metadata encoding");
-                        observed.text.schema.push(column);
-                    }
-                    _ => ensure!(
-                        payload == [0xfe, 0, 0, 0, 0],
-                        "unexpected metadata EOF encoding"
-                    ),
-                }
-            }
-            observed.completed_metadata = true;
+            self.negative_metadata(&mut sequence, &mut observed, &mut wire, &mut metadata)
+                .await?;
             ready
                 .send(())
                 .map_err(|_| anyhow::anyhow!("metadata controller disappeared"))?;
             let payload = self
                 .negative_packet(&mut sequence, &mut observed, &mut wire, "terminal")
                 .await?;
-            let length = payload.len();
             observed.terminal_payload_hex = Some(bounded_packet_hex(&payload));
-            ensure!(length >= 9, "terminal ERR shorter than protocol-41 prefix");
-            ensure!(
-                payload[0] == 0xff,
-                "negative query leaked a Data/OK/EOF terminal instead of ERR"
-            );
-            ensure!(payload[3] == b'#', "ERR has no protocol-41 SQLSTATE");
-            let sqlstate = std::str::from_utf8(&payload[4..9])?.to_owned();
-            let message = std::str::from_utf8(&payload[9..])?.to_owned();
-            observed.terminal = Some(BoundedMysqlError {
-                sequence: sequence - 1,
-                payload_bytes: length,
-                code: u16::from_le_bytes([payload[1], payload[2]]),
-                sqlstate,
-                message,
-                payload_hex: bounded_packet_hex(&payload),
-            });
+            observed.terminal = Some(parse_bounded_mysql_error(sequence - 1, &payload)?);
             observed.pending_packet = None;
             Ok::<(), anyhow::Error>(())
         })
@@ -240,6 +201,183 @@ impl AsyncMysqlStream {
         observed.text.wire_prefix_sha256 = format!("{:x}", wire.finalize());
         observed
     }
+    /// Observe only the explicitly chosen finite prefix, then require ERR.
+    /// The same caller-owned absolute deadline covers send, metadata, all rows,
+    /// and the full ERR. Ready means that the chosen prefix has been verified:
+    /// immediately after COM_QUERY for BeforeSchema, or after all expected rows.
+    pub async fn observe_bounded_execution_error(
+        &mut self,
+        sql: &str,
+        prefix: BoundedErrorPrefix<'_>,
+        prefix_ready: tokio::sync::oneshot::Sender<()>,
+        deadline: std::time::Instant,
+    ) -> BoundedNegativeTextObservation {
+        let started = std::time::Instant::now();
+        let mut observed = BoundedNegativeTextObservation::default();
+        let mut wire = Sha256::new();
+        let mut metadata = Sha256::new();
+        let mut rows_digest = Sha256::new();
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "absolute client deadline elapsed before query send"
+            );
+            if let BoundedErrorPrefix::AfterMetadata { rows } = prefix {
+                ensure!(
+                    rows.len() <= BOUNDED_ERROR_MAX_ROWS,
+                    "expected row prefix exceeds bounded limit"
+                );
+                ensure!(
+                    rows.iter()
+                        .flatten()
+                        .all(|value| value.len() <= BOUNDED_ERROR_MAX_CELL_BYTES),
+                    "expected UTF-8 cell exceeds bounded packet limit"
+                );
+            }
+            self.send_query(sql).await?;
+            let mut sequence = 1u8;
+            if matches!(prefix, BoundedErrorPrefix::BeforeRows) {
+                let first = self
+                    .negative_packet(&mut sequence, &mut observed, &mut wire, "before-rows")
+                    .await?;
+                if first.first() == Some(&0xff) {
+                    prefix_ready
+                        .send(())
+                        .map_err(|_| anyhow::anyhow!("expected-prefix controller disappeared"))?;
+                    observed.terminal_payload_hex = Some(bounded_packet_hex(&first));
+                    observed.terminal = Some(parse_bounded_mysql_error(sequence - 1, &first)?);
+                    observed.pending_packet = None;
+                    return Ok(());
+                }
+                self.negative_metadata_first(
+                    &mut sequence,
+                    &mut observed,
+                    &mut wire,
+                    &mut metadata,
+                    Some(first),
+                )
+                .await?;
+            }
+            if let BoundedErrorPrefix::AfterMetadata { rows } = prefix {
+                self.negative_metadata(&mut sequence, &mut observed, &mut wire, &mut metadata)
+                    .await?;
+                for expected in rows {
+                    let payload = self
+                        .negative_packet(&mut sequence, &mut observed, &mut wire, "expected-row")
+                        .await?;
+                    let actual = bounded_single_text_cell(&payload)?;
+                    ensure!(
+                        actual == *expected,
+                        "negative query row differs from its exact expected value"
+                    );
+                    observed.text.rows += 1;
+                    observed.text.row_payload_bytes += payload.len() as u64;
+                    observed
+                        .text
+                        .first_row_micros
+                        .get_or_insert_with(|| started.elapsed().as_micros());
+                    rows_digest.update(&payload);
+                    observed.pending_packet = None;
+                }
+            }
+            prefix_ready
+                .send(())
+                .map_err(|_| anyhow::anyhow!("expected-prefix controller disappeared"))?;
+            let payload = self
+                .negative_packet(&mut sequence, &mut observed, &mut wire, "terminal")
+                .await?;
+            observed.terminal_payload_hex = Some(bounded_packet_hex(&payload));
+            observed.terminal = Some(parse_bounded_mysql_error(sequence - 1, &payload)?);
+            observed.pending_packet = None;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        observed.text.error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}").chars().take(512).collect()),
+            Err(_) => Some("absolute negative query deadline exceeded".to_owned()),
+        };
+        observed.text.elapsed_micros = started.elapsed().as_micros();
+        observed.text.metadata_sha256 = format!("{:x}", metadata.finalize());
+        observed.text.wire_prefix_sha256 = format!("{:x}", wire.finalize());
+        observed.text.row_sha256 = format!("{:x}", rows_digest.finalize());
+        observed
+    }
+
+    async fn negative_metadata(
+        &mut self,
+        sequence: &mut u8,
+        observed: &mut BoundedNegativeTextObservation,
+        wire: &mut Sha256,
+        metadata: &mut Sha256,
+    ) -> Result<()> {
+        self.negative_metadata_first(sequence, observed, wire, metadata, None)
+            .await
+    }
+    async fn negative_metadata_first(
+        &mut self,
+        sequence: &mut u8,
+        observed: &mut BoundedNegativeTextObservation,
+        wire: &mut Sha256,
+        metadata: &mut Sha256,
+        mut first: Option<Vec<u8>>,
+    ) -> Result<()> {
+        for ordinal in 0..3 {
+            let phase = ["metadata-count", "metadata-column", "metadata-eof"][ordinal];
+            let payload = if ordinal == 0 {
+                match first.take() {
+                    Some(first) => first,
+                    None => {
+                        self.negative_packet(sequence, observed, wire, phase)
+                            .await?
+                    }
+                }
+            } else {
+                self.negative_packet(sequence, observed, wire, phase)
+                    .await?
+            };
+            metadata.update(&payload);
+            observed
+                .metadata_payload_hex
+                .push(bounded_packet_hex(&payload));
+            match ordinal {
+                0 => {
+                    ensure!(
+                        payload == [1],
+                        "negative result requires one complete metadata column"
+                    );
+                    observed.text.columns = 1;
+                }
+                1 => {
+                    let column = parse_text_column(&payload)?;
+                    ensure!(
+                        column.name == "payload" && column.mysql_type == 253,
+                        "negative result metadata schema differs from scalar SQL"
+                    );
+                    // Full encoding other than nullable flag is independent of runtime output.
+                    let mut expected = vec![3, b'd', b'e', b'f', 0, 0, 0, 7];
+                    expected.extend_from_slice(b"payload");
+                    expected.extend_from_slice(&[0, 12, 33, 0, 0, 4, 0, 0, 253, 0, 0, 0, 0, 0]);
+                    ensure!(
+                        payload.len() == expected.len(),
+                        "unexpected metadata byte length"
+                    );
+                    let flag_index = expected.len() - 5;
+                    ensure!(payload[flag_index] <= 1, "unexpected scalar metadata flags");
+                    expected[flag_index] = payload[flag_index];
+                    ensure!(payload == expected, "unexpected complete metadata encoding");
+                    observed.text.schema.push(column);
+                }
+                _ => ensure!(
+                    payload == [0xfe, 0, 0, 0, 0],
+                    "unexpected metadata EOF encoding"
+                ),
+            }
+        }
+        observed.completed_metadata = true;
+        Ok(())
+    }
+
     async fn negative_packet(
         &mut self,
         expected: &mut u8,
@@ -296,6 +434,53 @@ impl AsyncMysqlStream {
         }
         Ok(payload)
     }
+}
+
+/// The original bounded negative ERR decoder, shared by both strict entrypoints.
+fn parse_bounded_mysql_error(sequence: u8, payload: &[u8]) -> Result<BoundedMysqlError> {
+    ensure!(
+        payload.len() >= 9,
+        "terminal ERR shorter than protocol-41 prefix"
+    );
+    ensure!(
+        payload[0] == 0xff,
+        "negative query leaked a Data/OK/EOF terminal instead of ERR"
+    );
+    ensure!(payload[3] == b'#', "ERR has no protocol-41 SQLSTATE");
+    let sqlstate = std::str::from_utf8(&payload[4..9])?.to_owned();
+    let message = std::str::from_utf8(&payload[9..])?.to_owned();
+    Ok(BoundedMysqlError {
+        sequence,
+        payload_bytes: payload.len(),
+        code: u16::from_le_bytes([payload[1], payload[2]]),
+        sqlstate,
+        message,
+        payload_hex: bounded_packet_hex(payload),
+    })
+}
+
+/// Reuse the ordinary text-row validator and length decoder. No row payload
+/// allocation or lossy UTF-8 conversion is needed for the bounded single cell.
+fn bounded_single_text_cell(payload: &[u8]) -> Result<Option<&str>> {
+    let mut validator = TextRowValidator::default();
+    validator.consume(payload, 1)?;
+    validator.finish(1)?;
+    if payload == [0xfb] {
+        return Ok(None);
+    }
+    let prefix = match payload[0] {
+        0..=250 => 1,
+        0xfc => 3,
+        0xfd => 4,
+        0xfe => 9,
+        _ => bail!("invalid bounded text row prefix"),
+    };
+    let length = usize::try_from(decode_column_count(&payload[..prefix])?)?;
+    let value = &payload[prefix..];
+    ensure!(value.len() == length, "bounded text cell length mismatch");
+    Ok(Some(
+        std::str::from_utf8(value).context("invalid bounded text cell UTF-8")?,
+    ))
 }
 
 fn bounded_packet_hex(bytes: &[u8]) -> String {
@@ -1790,7 +1975,7 @@ pub(crate) mod root_reply_test_peer {
 
     const BUDGET: Duration = Duration::from_secs(1);
     const WATCHDOG: Duration = Duration::from_secs(3);
-    const REASON: &str = "unsupported root-result profile";
+    const REASON: &str = "[query.execution.invariant] root response violates its contract";
     const SQL: &str = "SELECT REPEAT('x',64) AS payload";
 
     #[derive(Clone, Copy, Debug)]
@@ -2017,6 +2202,454 @@ pub(crate) mod root_reply_test_peer {
             format!("{:x}", Sha256::digest(&result.response_wire))
         );
         assert!(observed.terminal.is_none());
+    }
+
+    mod bounded_execution_error_tests {
+        use super::*;
+
+        struct ActualWire {
+            observed: BoundedNegativeTextObservation,
+            response_prefix: Vec<u8>,
+            prefix_ready: bool,
+            handshake_elapsed: Duration,
+        }
+
+        // The original handshake/packet helpers run on actual loopback sockets.
+        // Release and join the one peer before returning an oracle to the test.
+        async fn observe(
+            prefix: BoundedErrorPrefix<'_>,
+            response: Vec<u8>,
+            partial: Option<usize>,
+            close_after_write: bool,
+            legacy: bool,
+            handshake_delay: Duration,
+            query_expected: bool,
+        ) -> Result<ActualWire> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            let started = Instant::now();
+            let deadline = started + BUDGET;
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let peer = tokio::spawn(async move {
+                tokio::time::timeout(WATCHDOG, async move {
+                    let (mut peer, _) = listener.accept().await?;
+                    tokio::time::sleep(handshake_delay).await;
+                    let mut handshake = vec![10, b'8', b'.', b'0', 0];
+                    handshake.extend_from_slice(&12345u32.to_le_bytes());
+                    write_packet_async(&mut peer, 0, &handshake, WATCHDOG).await?;
+                    let (sequence, handshake_response) =
+                        read_wire_packet_async(&mut peer, WATCHDOG).await?;
+                    ensure!(
+                        sequence == 1 && handshake_response.len() < 256,
+                        "unexpected handshake response"
+                    );
+                    write_packet_async(&mut peer, 2, &[0], WATCHDOG).await?;
+                    if !query_expected {
+                        let mut byte = [0];
+                        ensure!(
+                            peer.read(&mut byte).await? == 0,
+                            "invalid expectation sent COM_QUERY"
+                        );
+                        return Ok::<_, anyhow::Error>(Vec::new());
+                    }
+                    let (sequence, query) = read_wire_packet_async(&mut peer, WATCHDOG).await?;
+                    ensure!(
+                        sequence == 0 && query.first() == Some(&3) && &query[1..] == SQL.as_bytes(),
+                        "unexpected scripted COM_QUERY"
+                    );
+                    let sent = partial.unwrap_or(response.len());
+                    peer.write_all(&response[..sent]).await?;
+                    peer.flush().await?;
+                    let mut actual = response[..sent].to_vec();
+                    if close_after_write {
+                        peer.shutdown().await?;
+                    } else if partial.is_some() {
+                        // A renewed clock would read this late tail as success.
+                        tokio::select! {
+                            _ = release_rx => {},
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                                deadline + Duration::from_millis(100),
+                            )) => {
+                                peer.write_all(&response[sent..]).await?;
+                                peer.flush().await?;
+                                actual.extend_from_slice(&response[sent..]);
+                            }
+                        }
+                    } else {
+                        let _ = release_rx.await;
+                    }
+                    Ok::<_, anyhow::Error>(actual)
+                })
+                .await
+                .context("bounded execution peer watchdog")?
+            });
+            let result = async {
+                let mut stream = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    AsyncMysqlStream::connect("root", port, BUDGET),
+                )
+                .await
+                .context("bounded execution absolute connect deadline")??;
+                let handshake_elapsed = started.elapsed();
+                let (ready, mut ready_rx) = tokio::sync::oneshot::channel();
+                let observed = if legacy {
+                    stream
+                        .observe_bounded_contract_error(SQL, ready, deadline)
+                        .await
+                } else {
+                    stream
+                        .observe_bounded_execution_error(SQL, prefix, ready, deadline)
+                        .await
+                };
+                let prefix_ready = ready_rx.try_recv().is_ok();
+                drop(stream);
+                Ok::<_, anyhow::Error>((observed, prefix_ready, handshake_elapsed))
+            }
+            .await;
+            let _ = release_tx.send(());
+            let response_prefix = peer.await.context("bounded execution peer actual join")??;
+            let (observed, prefix_ready, handshake_elapsed) = result?;
+            Ok(ActualWire {
+                observed,
+                response_prefix,
+                prefix_ready,
+                handshake_elapsed,
+            })
+        }
+
+        fn metadata_wire() -> Vec<u8> {
+            metadata_payloads()
+                .into_iter()
+                .enumerate()
+                .flat_map(|(index, payload)| framed(index as u8 + 1, &payload))
+                .collect()
+        }
+
+        fn result_wire(rows: &[&[u8]], terminal: &[u8]) -> Vec<u8> {
+            let mut wire = metadata_wire();
+            for (index, row) in rows.iter().enumerate() {
+                wire.extend_from_slice(&framed(index as u8 + 4, row));
+            }
+            wire.extend_from_slice(&framed(rows.len() as u8 + 4, terminal));
+            wire
+        }
+
+        #[tokio::test]
+        async fn before_rows_admission_stage_set_still_refuses_every_row_and_success_terminal() {
+            for (response, metadata, valid) in [
+                (framed(1, &error_payload(1041)), false, true),
+                (result_wire(&[], &error_payload(1041)), true, true),
+                (
+                    result_wire(&[&[1, b'7']], &error_payload(1041)),
+                    true,
+                    false,
+                ),
+                (result_wire(&[], &[0xfe, 0, 0, 0, 0]), true, false),
+                (framed(1, &[0]), false, false),
+            ] {
+                let actual = observe(
+                    BoundedErrorPrefix::BeforeRows,
+                    response,
+                    None,
+                    false,
+                    false,
+                    Duration::ZERO,
+                    true,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    actual.observed.text.error.is_none(),
+                    valid,
+                    "{:#?}",
+                    actual.observed
+                );
+                assert_eq!(actual.observed.completed_metadata, metadata);
+                assert_eq!(actual.observed.text.rows, 0);
+                if valid {
+                    assert!(actual.prefix_ready);
+                    assert_eq!(actual.observed.terminal.unwrap().code, 1041);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn exact_before_schema_and_finite_utf8_null_rows_then_full_err() {
+            let response = framed(1, &error_payload(1105));
+            let before = observe(
+                BoundedErrorPrefix::BeforeSchema,
+                response,
+                None,
+                false,
+                false,
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+            let row_payloads = [
+                &[1, b'7'][..],
+                &[3, 0xe9, 0x9b, 0xaa][..],
+                &[0xfb][..],
+                &[0][..],
+            ];
+            let expected = [Some("7"), Some("雪"), None, Some("")];
+            let mut numeric_error = error_payload(1690);
+            numeric_error[4..9].copy_from_slice(b"22003");
+            let after = observe(
+                BoundedErrorPrefix::AfterMetadata { rows: &expected },
+                result_wire(&row_payloads, &numeric_error),
+                None,
+                false,
+                false,
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+            let zero = observe(
+                BoundedErrorPrefix::AfterMetadata { rows: &[] },
+                result_wire(&[], &error_payload(1105)),
+                None,
+                false,
+                false,
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+            // All actual peer joins completed before the first assertion.
+            for (actual, rows, code, state, complete) in [
+                (&before, 0, 1105, "HY000", false),
+                (&after, 4, 1690, "22003", true),
+                (&zero, 0, 1105, "HY000", true),
+            ] {
+                assert_eq!(actual.observed.text.error, None);
+                assert!(actual.prefix_ready);
+                assert_eq!(actual.observed.completed_metadata, complete);
+                assert_eq!(actual.observed.text.rows, rows);
+                let terminal = actual.observed.terminal.as_ref().unwrap();
+                assert_eq!(terminal.code, code);
+                assert_eq!(terminal.sqlstate, state);
+                assert_eq!(terminal.message, REASON);
+                assert_eq!(terminal.sequence, if complete { 4 + rows as u8 } else { 1 });
+                let mut expected_error = error_payload(code);
+                expected_error[4..9].copy_from_slice(state.as_bytes());
+                assert_eq!(terminal.payload_hex, bounded_packet_hex(&expected_error));
+                assert!(actual.observed.pending_packet.is_none());
+                assert_eq!(
+                    actual.observed.text.wire_bytes as usize,
+                    actual.response_prefix.len()
+                );
+                assert_eq!(
+                    actual.observed.text.wire_prefix_sha256,
+                    format!("{:x}", Sha256::digest(&actual.response_prefix))
+                );
+            }
+            assert_eq!(before.observed.text.columns, 0);
+            assert!(before.observed.text.schema.is_empty());
+            assert_eq!(after.observed.text.row_payload_bytes, 8);
+            let mut row_digest = Sha256::new();
+            for row in row_payloads {
+                row_digest.update(row);
+            }
+            assert_eq!(
+                after.observed.text.row_sha256,
+                format!("{:x}", row_digest.finalize())
+            );
+            assert_eq!(after.observed.metadata_payload_hex.len(), 3);
+        }
+
+        #[tokio::test]
+        async fn exact_prefix_refuses_wrong_values_stage_eof_ok_and_invalid_utf8() {
+            let valid = error_payload(1105);
+            let mut invalid_state = valid.clone();
+            invalid_state[4] = 0xff;
+            let mut invalid_message = valid.clone();
+            invalid_message.push(0xff);
+            let mut no_state = valid.clone();
+            no_state[3] = b'!';
+            let after_one = [Some("7")];
+            let cases = [
+                (BoundedErrorPrefix::BeforeSchema, result_wire(&[], &valid)),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    framed(1, &valid),
+                ),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    result_wire(&[&[1, b'8']], &valid),
+                ),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    result_wire(&[], &valid),
+                ),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    result_wire(&[&[0xfb]], &valid),
+                ),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    result_wire(&[&[1, 0xff]], &valid),
+                ),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    result_wire(&[&[1, b'7'], &[1, b'8']], &valid),
+                ),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    result_wire(&[&[1, b'7']], &[0xfe, 0, 0, 0, 0]),
+                ),
+                (
+                    BoundedErrorPrefix::AfterMetadata { rows: &after_one },
+                    result_wire(&[&[1, b'7']], &[0; 9]),
+                ),
+                (BoundedErrorPrefix::BeforeSchema, framed(1, &invalid_state)),
+                (
+                    BoundedErrorPrefix::BeforeSchema,
+                    framed(1, &invalid_message),
+                ),
+                (BoundedErrorPrefix::BeforeSchema, framed(1, &no_state)),
+                (BoundedErrorPrefix::BeforeSchema, framed(1, &[0xff, 1, 0])),
+                (BoundedErrorPrefix::BeforeSchema, framed(2, &valid)),
+            ];
+            for (prefix, response) in cases {
+                let actual = observe(prefix, response, None, false, false, Duration::ZERO, true)
+                    .await
+                    .unwrap();
+                assert!(actual.observed.text.error.is_some(), "{prefix:?}");
+                assert!(actual.observed.terminal.is_none(), "{prefix:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn original_contract_error_entrypoint_still_rejects_every_row() {
+            let actual = observe(
+                BoundedErrorPrefix::AfterMetadata { rows: &[] },
+                result_wire(&[&[1, b'7']], &error_payload(1105)),
+                None,
+                false,
+                true,
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(actual.prefix_ready);
+            assert!(actual.observed.completed_metadata);
+            assert_eq!(actual.observed.text.rows, 0);
+            assert!(actual.observed.terminal.is_none());
+            assert!(actual.observed.text.error.as_deref().is_some_and(|error| {
+                error.contains("terminal ERR shorter than protocol-41 prefix")
+            }));
+        }
+
+        #[tokio::test]
+        async fn original_deadline_and_socket_eof_keep_incomplete_err_without_accepting_tail() {
+            let row = [Some("7")];
+            let response = result_wire(&[&[1, b'7']], &error_payload(1105));
+            let terminal_start = response.len() - framed(5, &error_payload(1105)).len();
+            for close in [false, true] {
+                for terminal_bytes in [2, 7] {
+                    let actual = observe(
+                        BoundedErrorPrefix::AfterMetadata { rows: &row },
+                        response.clone(),
+                        Some(terminal_start + terminal_bytes),
+                        close,
+                        false,
+                        Duration::from_millis(300),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(actual.prefix_ready);
+                    assert!(actual.handshake_elapsed >= Duration::from_millis(300));
+                    assert!(actual.observed.completed_metadata);
+                    assert_eq!(actual.observed.text.rows, 1);
+                    assert!(actual.observed.terminal.is_none());
+                    let error = actual.observed.text.error.as_deref().unwrap();
+                    if close {
+                        assert!(error.contains(if terminal_bytes == 2 {
+                            "truncated negative packet header"
+                        } else {
+                            "truncated negative packet payload"
+                        }));
+                    } else {
+                        assert_eq!(error, "absolute negative query deadline exceeded");
+                    }
+                    let partial = actual.observed.pending_packet.as_ref().unwrap();
+                    assert_eq!(partial.phase, "terminal");
+                    assert_eq!(
+                        partial.received_payload_bytes,
+                        terminal_bytes.saturating_sub(4)
+                    );
+                    assert_eq!(
+                        actual.observed.text.wire_bytes as usize,
+                        terminal_start + terminal_bytes
+                    );
+                    assert_eq!(
+                        actual.response_prefix.len(),
+                        terminal_start + terminal_bytes
+                    );
+                    assert_eq!(
+                        actual.observed.text.wire_prefix_sha256,
+                        format!("{:x}", Sha256::digest(&actual.response_prefix))
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn packet_and_expected_prefix_limits_refuse_before_payload_or_query() {
+            let mut response = metadata_wire();
+            response.extend_from_slice(&[1, 16, 0, 4]); // 4097, no body.
+            let oversized = observe(
+                BoundedErrorPrefix::AfterMetadata { rows: &[] },
+                response,
+                None,
+                false,
+                false,
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(oversized.prefix_ready);
+            let pending = oversized.observed.pending_packet.as_ref().unwrap();
+            assert_eq!(pending.expected_payload_bytes, Some(4097));
+            assert_eq!(pending.received_payload_bytes, 0);
+            assert!(pending.payload_prefix_hex.is_empty());
+            assert!(oversized.observed.terminal.is_none());
+            assert!(
+                oversized
+                    .observed
+                    .text
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("negative packet exceeds 4 KiB cap"))
+            );
+
+            let too_many = [Some(""); 33];
+            let too_wide = "x".repeat(4094);
+            for rows in [&too_many[..], &[Some(too_wide.as_str())][..]] {
+                let actual = observe(
+                    BoundedErrorPrefix::AfterMetadata { rows },
+                    Vec::new(),
+                    None,
+                    false,
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+                .await
+                .unwrap();
+                assert!(!actual.prefix_ready);
+                assert_eq!(actual.observed.text.wire_bytes, 0);
+                assert_eq!(actual.observed.text.packets, 0);
+                assert!(actual.observed.terminal.is_none());
+                assert!(actual.observed.text.error.is_some());
+            }
+        }
     }
 }
 

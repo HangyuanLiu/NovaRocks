@@ -25,7 +25,7 @@ use novarocks_connector_contract::{
 use novarocks_spi::connector::{
     ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
     ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
-    ConnectorErrorKind, ConnectorFieldPath,
+    ConnectorFieldPath,
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
@@ -51,11 +51,7 @@ impl ConnectorReadProgramCompiler for IcebergReadRecipeCompiler {
     ) -> Result<ConnectorReadRelationRecipeDraft, Failure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
         let result = compile(frozen, control, &mut work);
-        if matches!(&result, Err(Failure::Control(_))) {
-            return result;
-        }
-        work.finish()?;
-        result
+        work.finish_result(result, Failure::Control)
     }
 }
 
@@ -104,15 +100,12 @@ fn compile(
         iceberg_final_static_facts_for_compile(&relation, control).map_err(
             |error| match error {
                 ReadStaticFactsError::Control(error) => Failure::Control(error),
-                ReadStaticFactsError::Source(error) => Failure::Provider(ConnectorCodecError::new(
-                    ConnectorFieldPath::root("iceberg_read").field("source"),
-                    match error.kind() {
-                        ConnectorErrorKind::Unsupported => ConnectorCodecErrorKind::Unsupported,
-                        ConnectorErrorKind::ResourceExhausted => ConnectorCodecErrorKind::Capacity,
-                        _ => ConnectorCodecErrorKind::InvalidValue,
-                    },
-                    error.to_string(),
-                )),
+                ReadStaticFactsError::Source(error) => {
+                    Failure::Provider(ConnectorCodecError::from_domain(
+                        ConnectorFieldPath::root("iceberg_read").field("source"),
+                        error,
+                    ))
+                }
             },
         )?;
     work.step()?;
@@ -324,7 +317,7 @@ fn bytes_equal(a: &[u8], b: &[u8], work: &mut CompileCheckpoints<'_>) -> Result<
 
 fn lift(error: ConnectorCodecError) -> Failure {
     match error.compile_control_error() {
-        Some(cause) => Failure::Control(cause),
+        Some(cause) => Failure::Control(cause.clone()),
         None => Failure::Provider(error),
     }
 }

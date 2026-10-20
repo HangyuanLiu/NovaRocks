@@ -198,9 +198,10 @@ impl DmlService {
 mod execution_error_tests {
     use super::*;
     use crate::dml::error::DmlExecutionError;
-    use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+    use crate::query_execution::contract::DistributedQueryError;
     use crate::query_execution::dml::delete::{DeleteOperation, DeletePrepared};
-    use novarocks_types::EngineErrorCode;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_plan_codec::PhysicalEncodeError;
 
     struct Prepared;
     impl DeletePrepared for Prepared {
@@ -210,7 +211,7 @@ mod execution_error_tests {
     }
 
     struct RefusingEngine {
-        code: Option<EngineErrorCode>,
+        source: PhysicalEncodeError,
     }
     impl DeleteEngine for RefusingEngine {
         fn prepare_delete(&self, _: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
@@ -221,12 +222,9 @@ mod execution_error_tests {
             &self,
             _: &dyn DeletePrepared,
         ) -> Result<DeleteWriteReport, DmlExecutionError> {
-            Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::Failed,
-                "unsupported diagnostic",
-            )
-            .with_engine_error_code(self.code)
-            .into())
+            Err(DmlExecutionError::from_distributed(
+                DistributedQueryError::from_encode(self.source.clone()),
+            ))
         }
 
         fn finalize_delete(&self, _: &dyn DeletePrepared) -> Result<(), String> {
@@ -236,8 +234,12 @@ mod execution_error_tests {
 
     #[test]
     fn delete_execution_port_preserves_typed_runtime_identity() {
-        for code in [None, Some(EngineErrorCode::UnsupportedCompiledShape)] {
-            let engine = RefusingEngine { code };
+        for source in [
+            PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+            PhysicalEncodeError::UnsupportedCapability("unsupported diagnostic".into()),
+        ] {
+            let expected = source.failure_fact();
+            let engine = RefusingEngine { source };
             let prepared = PreparedDelete {
                 operation: DeleteOperation {
                     publication_id: LakePublicationId::new_v7(),
@@ -259,8 +261,12 @@ mod execution_error_tests {
                 .run_coordinated_write(&write_transaction_spec(&prepared))
                 .err()
                 .expect("write must fail");
-            assert_eq!(error.engine_error_code(), code);
-            assert_eq!(error.to_string(), "Executor: unsupported diagnostic");
+            assert_eq!(error.execution_failure().unwrap().fact(), expected);
+            assert_eq!(error.engine_error_code(), None);
+            assert_eq!(
+                error.to_string(),
+                "Executor: native attempt initialization failed in its owning domain",
+            );
         }
     }
 }

@@ -60,7 +60,7 @@ pub(super) fn original(
     text: ArrayRef,
     pattern: ArrayRef,
     negated: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let left = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), text.data_type().clone());
     let right = arena.push_typed(
@@ -158,11 +158,11 @@ fn like_original_wrong_type_errors_even_empty_and_bare_null() {
         let null: ArrayRef = Arc::new(NullArray::new(len));
         for wrong in [wrong, null] {
             assert_eq!(
-                original(wrong.clone(), text.clone(), false).unwrap_err(),
+                (original(wrong.clone(), text.clone(), false).unwrap_err()).to_string(),
                 "like: first argument must be a string array"
             );
             assert_eq!(
-                original(text.clone(), wrong, false).unwrap_err(),
+                (original(text.clone(), wrong, false).unwrap_err()).to_string(),
                 "like: second argument must be a string array"
             );
         }
@@ -186,14 +186,27 @@ fn throwing(arena: &mut ExprArena, message: String) -> ExprId {
     )
 }
 #[test]
-fn like_original_evaluates_pattern_before_first_type_error_full_message() {
+fn like_pattern_assertion_precedes_input_type_admission_with_bounded_detail() {
     let c = chunk(vec![Arc::new(Int32Array::from(vec![1]))]);
     let mut arena = ExprArena::default();
     let left = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), DataType::Int32);
     let message = format!("LIKE pattern before downcast {}", "x".repeat(2048));
     let right = throwing(&mut arena, message.clone());
     let root = call(&mut arena, left, right, false);
-    assert_eq!(arena.eval(root, &c).unwrap_err(), message);
+    let failure = arena.eval(root, &c).unwrap_err();
+    use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureFact, FailureProjection};
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Data,
+            crate::runtime::fragment::ExecutionReason::AssertionFailed.reason()
+        )
+    );
+    assert_eq!(
+        failure.detail(),
+        BoundedDetail::truncating(&message).as_str()
+    );
+    assert!(failure.detail().len() <= 512);
 }
 #[test]
 fn like_original_source_first_error_never_evaluates_pattern() {
@@ -203,7 +216,20 @@ fn like_original_source_first_error_never_evaluates_pattern() {
     let left = throwing(&mut arena, message.clone());
     let right = throwing(&mut arena, "later pattern must not win".into());
     let root = call(&mut arena, left, right, true);
-    assert_eq!(arena.eval(root, &c).unwrap_err(), message);
+    let failure = arena.eval(root, &c).unwrap_err();
+    use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureFact, FailureProjection};
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Data,
+            crate::runtime::fragment::ExecutionReason::AssertionFailed.reason()
+        )
+    );
+    assert_eq!(
+        failure.detail(),
+        BoundedDetail::truncating(&message).as_str()
+    );
+    assert!(failure.detail().len() <= 512);
 }
 #[test]
 fn like_original_empty_invocation_still_evaluates_missing_pattern() {
@@ -214,7 +240,10 @@ fn like_original_empty_invocation_still_evaluates_missing_pattern() {
     let original_error = arena.eval(missing, &c).unwrap_err();
     for negated in [false, true] {
         let root = call(&mut arena, left, missing, negated);
-        assert_eq!(arena.eval(root, &c).unwrap_err(), original_error);
+        let observed = arena.eval(root, &c).unwrap_err();
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(observed.failure_fact(), original_error.failure_fact());
+        assert_eq!(observed.detail(), original_error.detail());
     }
 }
 
@@ -227,11 +256,11 @@ fn like_original_largeutf8_utf8view_are_data_errors_not_silent_coercion() {
             Arc::new(StringViewArray::from(vec!["a"; len])) as ArrayRef,
         ] {
             assert_eq!(
-                original(wider.clone(), text.clone(), false).unwrap_err(),
+                (original(wider.clone(), text.clone(), false).unwrap_err()).to_string(),
                 "like: first argument must be a string array"
             );
             assert_eq!(
-                original(text.clone(), wider, false).unwrap_err(),
+                (original(text.clone(), wider, false).unwrap_err()).to_string(),
                 "like: second argument must be a string array"
             );
         }

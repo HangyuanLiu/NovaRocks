@@ -54,7 +54,7 @@ impl PureCompileControl for Control {
             );
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((at, error)) if trace.len() == at => Err(error),
             _ => Ok(()),
         }
@@ -136,9 +136,9 @@ fn assert_original_refusals<T>(format: impl Fn(&Control) -> Result<T, SqlCompile
         CompileControlError::ResourceExhausted,
     ] {
         for at in 1..=trace.len() {
-            let refused = Control::new(Some((at, cause)));
+            let refused = Control::new(Some((at, cause.clone())));
             assert!(
-                matches!(format(&refused), Err(actual) if actual == SqlCompileError::from(cause))
+                matches!(format(&refused), Err(actual) if actual == SqlCompileError::from(cause.clone()))
             );
             assert_eq!(refused.trace(), trace[..at]);
         }

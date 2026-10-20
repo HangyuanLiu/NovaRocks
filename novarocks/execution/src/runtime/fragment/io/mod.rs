@@ -29,8 +29,10 @@ pub use exchange_receiver::{
     ExecutionRuntimeExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
 pub use result::{
-    FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,
-    ResultWriteAdmission, ResultWriteCredit, ResultWriteFailure, ResultWriteSpec,
-    RootInputAdmission, RootInputAuthority, RootInputPermit, RootProducerState, RootResultSession,
-    RootResultWriteSpec, RootResultWriter,
+    FragmentResultSession, FragmentResultWriter, ResultAbort, ResultInputMetadata,
+    ResultPresentation, ResultProjection, ResultWriteAdmission, ResultWriteCredit,
+    ResultWriteFailure, ResultWriteSpec, RootInputAdmission, RootInputAuthority, RootInputPermit,
+    RootInputReadinessNotifier, RootInputReservation, RootInputReservationAdmission,
+    RootProducerState, RootResultInput, RootResultSession, RootResultWriteSpec, RootResultWriter,
+    RootWorkExitProgress,
 };

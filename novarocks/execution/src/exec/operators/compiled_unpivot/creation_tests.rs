@@ -85,7 +85,7 @@ fn compiled_unpivot_output_and_slot_retain_actual_creator_after_operator_exit() 
     let program = unpivot_program();
     let program_weak = Arc::downgrade(&program);
     let tracker = MemTracker::new_root("compiled Unpivot last output owner");
-    let state = RuntimeState::new(None, None, None, None, None, None, None);
+    let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
     let error = state.error_state();
     let error_weak = Arc::downgrade(&error);
     let factory = runtime_factory(&tracker, &error);
@@ -97,15 +97,12 @@ fn compiled_unpivot_output_and_slot_retain_actual_creator_after_operator_exit() 
         tracker.clone(),
         &state,
     );
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&state, source)
+    crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state)
+        .accept_without_output(source)
         .unwrap();
-    let output = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&state)
+    let output = crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state)
+        .advance_to_boundary()
+        .map(|step| step.output)
         .unwrap()
         .unwrap();
     assert_eq!(output.len(), 2);
@@ -154,7 +151,7 @@ fn compiled_unpivot_output_and_slot_retain_actual_creator_after_operator_exit() 
 fn compiled_unpivot_candidate_refusal_preserves_typed_limit_and_original_input() {
     let program = unpivot_program();
     let tracker = MemTracker::new_root("compiled Unpivot candidate refusal");
-    let state = RuntimeState::new(None, None, None, None, None, None, None);
+    let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
     let error = state.error_state();
     let factory = runtime_factory(&tracker, &error);
     let source = input(&program, factory.as_ref(), error.clone());
@@ -166,18 +163,22 @@ fn compiled_unpivot_candidate_refusal_preserves_typed_limit_and_original_input()
         tracker.clone(),
         &state,
     );
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&state, source)
+    crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state)
+        .accept_without_output(source)
         .unwrap();
+    // Finish accepted-input preparation and install the original expansion
+    // cursor before refusing the candidate's first output construction.
+    let installed = operator.drive_for_test(&state).unwrap();
+    assert!(installed.output.is_none());
+    assert!(matches!(
+        installed.next,
+        crate::exec::pipeline::step::NextStep::Runnable
+    ));
     let before = tracker.current();
     tracker.install_limit_once(before + 1).unwrap();
-    let failure = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&state)
-        .unwrap_err();
+    // Observe rollback before the caller's distinct failure cleanup. The
+    // high-level TestDriver performs that cleanup as soon as drive fails.
+    let failure = operator.drive_for_test(&state).unwrap_err();
     assert!(
         matches!(
             failure.cause(),
@@ -191,9 +192,16 @@ fn compiled_unpivot_candidate_refusal_preserves_typed_limit_and_original_input()
         "refused new construction rolls back without resetting old holds"
     );
     assert!(
-        operator.as_processor_ref().unwrap().has_output(),
-        "the original expansion remains available"
+        operator
+            .drive_for_test(&state)
+            .unwrap_err()
+            .same_occurrence(&failure),
+        "a failed candidate cannot resume or replay its retained original input"
     );
+    operator.on_driver_failure();
+    let after_cleanup = tracker.current();
+    operator.on_driver_failure();
+    assert_eq!(tracker.current(), after_cleanup, "cleanup is idempotent");
     let ids = source_projection
         .record_batch()
         .column(0)
@@ -206,6 +214,10 @@ fn compiled_unpivot_candidate_refusal_preserves_typed_limit_and_original_input()
     drop(error);
     drop(state);
     drop(program);
+    assert!(
+        tracker.current() > 0,
+        "the caller's original projection remains paid"
+    );
     drop(source_projection);
     assert_eq!(tracker.current(), 0);
 }
@@ -214,7 +226,7 @@ fn compiled_unpivot_candidate_refusal_preserves_typed_limit_and_original_input()
 fn compiled_unpivot_cancel_preserves_original_caller_cause_before_candidate_creation() {
     let program = unpivot_program();
     let tracker = MemTracker::new_root("compiled Unpivot original cancellation cause");
-    let state = RuntimeState::new(None, None, None, None, None, None, None);
+    let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
     let error = state.error_state();
     let factory = runtime_factory(&tracker, &error);
     let source = input(&program, factory.as_ref(), error.clone());
@@ -225,25 +237,97 @@ fn compiled_unpivot_cancel_preserves_original_caller_cause_before_candidate_crea
         tracker.clone(),
         &state,
     );
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&state, source)
-        .unwrap();
+    use crate::exec::pipeline::{
+        input::RawInput,
+        step::InputResult,
+        step_context::{StepContext, TurnWork},
+    };
+    let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut context = StepContext::new(&error, &mut work);
+    let step = operator.as_mut();
+    assert!(matches!(
+        step.try_push(&mut context, RawInput::for_test(source)),
+        InputResult::Accepted(Ok(_))
+    ));
+    assert!(step.drive(&mut context).unwrap().output.is_none());
     let before = tracker.current();
-    let original = ExecutionFailure::from("original Unpivot caller shutdown");
+    let allocated_before = tracker.allocated();
+    let original = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
     error.set_error(original.clone());
-    let observed = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&state)
-        .unwrap_err();
-    assert_eq!(observed, original);
+    let observed = match step.drive(&mut context) {
+        Err(failure) => failure,
+        Ok(_) => panic!("stopped work must not create another Unpivot candidate"),
+    };
+    assert!(observed.same_occurrence(&original));
+    assert_eq!(observed.context(), original.context());
+    assert_eq!(error.error(), Some(original));
     assert_eq!(tracker.current(), before);
+    assert_eq!(tracker.allocated(), allocated_before);
     drop(operator);
     drop(factory);
     drop(error);
     drop(state);
     drop(program);
     assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn actual_literal_materializers_refuse_wide_offsets_before_any_expansion() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    let copies = i32::MAX as usize + 1;
+    let item = Arc::new(arrow::datatypes::Field::new("item", DataType::Int32, false));
+    let error = int32_list(&item, &[7], copies).unwrap_err();
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Representation);
+    let rep = fact.representation().unwrap();
+    assert_eq!(rep.boundary, RepresentationBoundary::SingleOutput);
+    assert_eq!(rep.required, Some(copies as u64));
+    assert_eq!(rep.extent_limit, Some(i32::MAX as u64));
+    assert_eq!(rep.layout.code.get(), 11);
+    let entries_field = Arc::new(arrow::datatypes::Field::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                arrow::datatypes::Field::new("key", DataType::Utf8, false),
+                arrow::datatypes::Field::new("value", DataType::Utf8, false),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+    let error = utf8_map(&entries_field, false, &[("k", "v")], copies).unwrap_err();
+    assert_eq!(
+        error
+            .failure_fact()
+            .representation()
+            .unwrap()
+            .layout
+            .code
+            .get(),
+        12
+    );
+    // The row count itself fits; repeated string bytes do not. No huge Vec is made.
+    let key = "k".repeat(1024);
+    let copies = i32::MAX as usize / key.len() + 1;
+    let error = utf8_map(&entries_field, false, &[(key.as_str(), "v")], copies).unwrap_err();
+    let rep = error.failure_fact().representation().unwrap();
+    assert_eq!(rep.layout.code.get(), 13);
+    assert_eq!(rep.required, Some((copies * key.len()) as u64));
+    assert_eq!(rep.boundary, RepresentationBoundary::SingleOutput);
+    let error = int32_list(&item, &[], usize::MAX).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+    // Legal small materializations still use the original Arrow body and values.
+    let actual = int32_list(&item, &[7, 9], 2).unwrap();
+    let actual = actual.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(actual.value_offsets(), &[0, 2, 4]);
+    assert_eq!(
+        actual
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[7, 9, 7, 9]
+    );
 }

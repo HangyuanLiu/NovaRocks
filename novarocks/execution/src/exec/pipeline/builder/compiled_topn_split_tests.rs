@@ -665,7 +665,7 @@ fn rows_of(chunk: &Chunk) -> Vec<Row> {
 }
 
 fn runtime_state() -> Arc<RuntimeState> {
-    Arc::new(RuntimeState::new(
+    Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,

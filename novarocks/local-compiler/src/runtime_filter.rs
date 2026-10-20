@@ -132,10 +132,16 @@ fn unsupported(node: NodeId, feature: &'static str) -> FragmentCompileError {
     }
 }
 
-fn static_filter(error: impl std::error::Error + Send + Sync + 'static) -> FragmentCompileError {
+fn static_filter(
+    error: impl std::error::Error
+    + novarocks_failure_contract::FailureProjection
+    + Send
+    + Sync
+    + 'static,
+) -> FragmentCompileError {
     FragmentCompileError::Owner {
         phase: "runtime filter",
-        error: Box::new(error),
+        error: novarocks_failure_contract::SharedFailureCause::new(error),
     }
 }
 

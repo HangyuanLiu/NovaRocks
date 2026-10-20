@@ -18,6 +18,7 @@
 //! P09 real FE semantic refusal after a bounded authenticated native reply fault.
 //! Requires the separately reviewed actor v2 and runner launch opt-in integration.
 
+use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use super::result_delivery::root_census;
 use super::result_delivery_root_protocol::parse_created_task_candidates;
 use super::result_delivery_support::await_idle;
@@ -88,7 +89,10 @@ impl Case {
         }
     }
 }
-struct NativeRootReplyRefusal(Case);
+struct NativeRootReplyRefusal {
+    case: Case,
+    intent: SqlIntentOwner,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Freeze {
@@ -118,7 +122,12 @@ struct Freeze {
 pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
     [Case::Profile, Case::Kind, Case::Prefix, Case::PrefixSuffix]
         .into_iter()
-        .map(|case| Box::new(NativeRootReplyRefusal(case)) as Box<dyn Scenario>)
+        .map(|case| {
+            Box::new(NativeRootReplyRefusal {
+                case,
+                intent: SqlIntentOwner::default(),
+            }) as Box<dyn Scenario>
+        })
         .collect()
 }
 #[derive(serde::Serialize)]
@@ -132,6 +141,8 @@ async fn negative_client(
     user: String,
     port: u16,
     ready: tokio::sync::oneshot::Sender<()>,
+    connected: tokio::sync::oneshot::Sender<u32>,
+    submit: tokio::sync::oneshot::Receiver<()>,
     deadline: Instant,
 ) -> NegativeClientAttempt {
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -150,16 +161,39 @@ async fn negative_client(
     )
     .await;
     match connect {
-        Ok(Ok(mut stream)) => NegativeClientAttempt {
-            connection_stage: "authenticated",
-            connection_wire: "handshake-bytes-unobserved",
-            connection_failure: Value::Null,
-            mysql: Some(
-                stream
-                    .observe_bounded_contract_error(SQL, ready, deadline)
-                    .await,
-            ),
-        },
+        Ok(Ok(mut stream)) => {
+            // Keep the actual connection idle until the original statement
+            // owner has bound this exact SQL and connection before submission.
+            let admission = async {
+                connected.send(stream.connection_id()?).map_err(|_| {
+                    anyhow::anyhow!("root reply connection owner closed before binding")
+                })?;
+                tokio::time::timeout_at(deadline.into(), submit)
+                    .await
+                    .context("root reply original submission deadline")?
+                    .context("root reply original submission owner closed")?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(cause) = admission {
+                return NegativeClientAttempt {
+                    connection_stage: "authenticated-before-submission",
+                    connection_wire: "handshake-bytes-unobserved",
+                    connection_failure: failure_summary("mysql-statement-binding", Some(&cause)),
+                    mysql: None,
+                };
+            }
+            NegativeClientAttempt {
+                connection_stage: "authenticated",
+                connection_wire: "handshake-bytes-unobserved",
+                connection_failure: Value::Null,
+                mysql: Some(
+                    stream
+                        .observe_bounded_contract_error(SQL, ready, deadline)
+                        .await,
+                ),
+            }
+        }
         Ok(Err(error)) => NegativeClientAttempt {
             connection_stage: "failed-before-observer",
             connection_wire: "unknown-partial-handshake",
@@ -189,7 +223,7 @@ impl Scenario for NativeRootReplyRefusal {
     }
 
     fn name(&self) -> &'static str {
-        match self.0 {
+        match self.case {
             Case::Profile => "result-delivery/native-root-reply-profile-refusal",
             Case::Kind => "result-delivery/native-root-reply-kind-refusal",
             Case::Prefix => "result-delivery/native-root-reply-prefix-only-refusal",
@@ -208,6 +242,29 @@ impl Scenario for NativeRootReplyRefusal {
         );
         Ok(())
     }
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![StatementSpec {
+                sql: SQL.into(),
+                faults: Vec::new(),
+                observations: (0..cluster_size)
+                    .map(|index| (index, "grpc-fragment", Some(1)))
+                    .collect(),
+            }],
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
         let mut config = ScenarioLaunchConfig::default();
         // Select the bounded RootReply actor explicitly for these scenarios.
@@ -226,14 +283,14 @@ impl Scenario for NativeRootReplyRefusal {
             context.handle().be_count() == 3,
             "native root reply refusal requires 1FE+3BE"
         );
-        let freeze: Freeze = serde_json::from_str(self.0.freeze())?;
+        let freeze: Freeze = serde_json::from_str(self.case.freeze())?;
         ensure!(
             freeze.schema_version == 1
                 && freeze.status == "draft-unexecuted"
                 && freeze.scenario == self.name()
                 && freeze.topology == "1FE+3BE"
                 && freeze.sql == SQL
-                && freeze.mutation == format!("{:?}", self.0.mutation())
+                && freeze.mutation == format!("{:?}", self.case.mutation())
                 && freeze.capture_millis == 5000
                 && freeze.maximum_target_attempts == 32
                 && freeze.forward_millis == 20000
@@ -246,7 +303,7 @@ impl Scenario for NativeRootReplyRefusal {
                     == "known-semantic-profile-purpose-schema-not-exact-protobuf-bytes",
             "unsupported frozen negative contract"
         );
-        validate_suffix_freeze(&freeze, self.0)?;
+        validate_suffix_freeze(&freeze, self.case)?;
         let control = context.handle().native_root_reply_fault(0)?;
         let epoch = Instant::now();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -254,7 +311,8 @@ impl Scenario for NativeRootReplyRefusal {
             .enable_all()
             .build()?;
         let mut job = None;
-        let mut evidence = json!({"schema_version":1,"scenario":self.name(),"freeze":serde_json::from_str::<Value>(self.0.freeze())?});
+        let mut observation = None;
+        let mut evidence = json!({"schema_version":1,"scenario":self.name(),"freeze":serde_json::from_str::<Value>(self.case.freeze())?});
         let outcome = (|| -> Result<()> {
             check_effective(context, &mut evidence)?;
             context.recheck_live_process_launch_identities()?;
@@ -286,6 +344,9 @@ impl Scenario for NativeRootReplyRefusal {
             let user = context.mysql_user().to_owned();
             let port = context.mysql_port();
             let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+            let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+            let (submit_tx, submit_rx) = tokio::sync::oneshot::channel();
+            let selected = self.intent.take(0)?;
             ensure!(
                 context.remaining("absolute capture and client join")? >= CLIENT,
                 "insufficient remaining scenario budget for bounded query join"
@@ -294,7 +355,24 @@ impl Scenario for NativeRootReplyRefusal {
             let client_deadline = client_started + CLIENT;
             let deadline = client_started + CAPTURE;
             control.begin_capture(deadline)?;
-            job = Some(runtime.spawn(negative_client(user, port, ready_tx, client_deadline)));
+            job = Some(runtime.spawn(negative_client(
+                user,
+                port,
+                ready_tx,
+                connected_tx,
+                submit_rx,
+                client_deadline,
+            )));
+            let connection_id = runtime.block_on(async {
+                tokio::time::timeout_at(deadline.into(), connected_rx)
+                    .await
+                    .context("root reply idle connection deadline")?
+                    .context("root reply client closed before publishing its actual connection")
+            })?;
+            observation = Some(selected.arm(context, connection_id, SQL)?);
+            submit_tx.send(()).map_err(|_| {
+                anyhow::anyhow!("root reply client closed before its bound SQL submission")
+            })?;
             let mut snapshots = Vec::with_capacity(51);
             let mut metadata_ready = false;
             loop {
@@ -369,7 +447,7 @@ impl Scenario for NativeRootReplyRefusal {
                                     "independent_markers":appended_markers(&before,&after)?,
                                     "root_meta_known_facts":{"profile":1,"kind":"ClientRows","schema":[{"name":"payload","mysql_type":253}]},
                                     "metadata_sha256":metadata_hash,"candidate_request_sha256":candidate.request_sha256});
-                                control.arm_exact(task, frontend, *be, self.0.mutation())?;
+                                control.arm_exact(task, frontend, *be, self.case.mutation())?;
                                 break;
                             }
                         }
@@ -387,8 +465,8 @@ impl Scenario for NativeRootReplyRefusal {
             let mysql = observed.mysql.as_ref().context(
                 "connection failed before MySQL observer; partial connection wire unknown",
             )?;
-            check_mysql(mysql, &freeze, &metadata_hash)?;
-            check_fault(&control.observation(), &freeze, self.0)?;
+            check_mysql(mysql, &freeze, &metadata_hash, self.case)?;
+            check_fault(&control.observation(), &freeze, self.case)?;
             evidence["fault_complete"] = serde_json::to_value(control.observation())?;
             control.disarm();
             await_idle(context, "root-reply", "after-refusal", epoch)?;
@@ -410,7 +488,7 @@ impl Scenario for NativeRootReplyRefusal {
             evidence["healthy_mysql"] = serde_json::to_value(health)?;
             await_idle(context, "root-reply", "after-health", epoch)?;
             zero_roots(context, "after-health", &mut evidence)?;
-            check_fault(&control.observation(), &freeze, self.0)?;
+            check_fault(&control.observation(), &freeze, self.case)?;
             context.recheck_live_process_launch_identities()?;
             Ok(())
         })();
@@ -442,15 +520,25 @@ impl Scenario for NativeRootReplyRefusal {
         } else {
             Ok(())
         };
+        let cleanup_observation = if let Some(observation) = observation.as_ref() {
+            let deadline = context.deadline();
+            context
+                .handle()
+                .drain_query_lifecycle_statement_binding(observation, deadline)
+        } else {
+            Ok(())
+        };
         evidence["failure_summaries"] = json!({
             "primary": failure_summary("scene-contract", outcome.as_ref().err()),
             "client_join": failure_summary("client-join", cleanup_join.as_ref().err()),
             "owner_cleanup": failure_summary("owner-cleanup", cleanup_owners.as_ref().err()),
+            "statement_observation": failure_summary("statement-observation", cleanup_observation.as_ref().err()),
         });
         evidence["actor_before_shutdown"] = serde_json::to_value(control.observation())?;
         if outcome.is_err()
             || cleanup_join.is_err()
             || cleanup_owners.is_err()
+            || cleanup_observation.is_err()
             || !control.observation().failures.is_empty()
         {
             context.retain_artifacts();
@@ -460,7 +548,8 @@ impl Scenario for NativeRootReplyRefusal {
         let joined = check_shutdown(&post);
         evidence["actor_after_shutdown"] = serde_json::to_value(post)?;
         evidence["outcome"] = json!({"contract_and_recovery_ok":outcome.is_ok(),"client_join_ok":cleanup_join.is_ok(),
-            "cluster_shutdown_ok":shutdown.is_ok(),"actor_join_ok":joined.is_ok(),"failure_owner_cleanup_ok":cleanup_owners.is_ok()});
+            "cluster_shutdown_ok":shutdown.is_ok(),"actor_join_ok":joined.is_ok(),"failure_owner_cleanup_ok":cleanup_owners.is_ok(),
+            "statement_observation_cleanup_ok":cleanup_observation.is_ok()});
         std::fs::write(
             context
                 .scenario_root()
@@ -470,6 +559,7 @@ impl Scenario for NativeRootReplyRefusal {
         outcome?;
         cleanup_owners?;
         cleanup_join?;
+        cleanup_observation?;
         shutdown?;
         joined?;
         context.action("verified one exact native RootReply semantic refusal, no target ACK, owner convergence and normal native recovery");
@@ -535,6 +625,7 @@ fn check_mysql(
     observed: &BoundedNegativeTextObservation,
     freeze: &Freeze,
     metadata: &str,
+    case: Case,
 ) -> Result<()> {
     let err = observed
         .terminal
@@ -554,7 +645,11 @@ fn check_mysql(
             && err.sequence == 4
             && err.code == freeze.mysql_error_code
             && err.sqlstate == freeze.mysql_sqlstate
-            && err.message.contains(&freeze.contract_reason)
+            && match case {
+                Case::Profile | Case::Kind =>
+                    err.message == "[query.execution.invariant] root response violates its contract",
+                Case::Prefix | Case::PrefixSuffix => err.message.contains(&freeze.contract_reason),
+            }
             && err.payload_hex.starts_with("ff5104234859303030"),
         "real FE did not report the exact semantic contract refusal with complete metadata and zero rows"
     );
@@ -667,21 +762,12 @@ fn check_shutdown(obs: &RootReplyFaultObservation) -> Result<()> {
     Ok(())
 }
 
-fn logs(context: &ScenarioContext) -> Result<Vec<String>> {
-    // CrossProcessServerHandle current log layout, with live launch identities
-    // checked before/after capture; no BE restart or log-history concatenation.
+fn logs(context: &mut ScenarioContext) -> Result<Vec<String>> {
+    // Read the original process stdout owner, not its diagnostic locator or
+    // human combined-stream rendering. Launch identities remain checked
+    // before/after capture; this scene never restarts a backend.
     (0..3)
-        .map(|i| {
-            let mut bytes = Vec::with_capacity(LOG_CAP + 1);
-            std::fs::File::open(context.runtime_dir().join(format!("be_{i}.log")))?
-                .take((LOG_CAP + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() <= LOG_CAP,
-                "BE task log exceeds 2 MiB observation cap"
-            );
-            Ok(String::from_utf8(bytes)?)
-        })
+        .map(|i| context.handle().be_stdout_contents(i, LOG_CAP))
         .collect()
 }
 fn appended_markers(before: &[String], after: &[String]) -> Result<Vec<Vec<String>>> {
@@ -1226,7 +1312,13 @@ mod root_reply_predicate_tests {
                 .await
                 .expect("joined scripted peer");
             assert!(
-                check_mysql(&result.observed, &freeze, &result.metadata_sha256).is_err(),
+                check_mysql(
+                    &result.observed,
+                    &freeze,
+                    &result.metadata_sha256,
+                    Case::Profile
+                )
+                .is_err(),
                 "accepted {mode:?}"
             );
             assert!(
@@ -1270,8 +1362,13 @@ mod root_reply_predicate_tests {
         let valid = script(Mode::Valid, Duration::ZERO)
             .await
             .expect("joined positive control");
-        check_mysql(&valid.observed, &freeze, &valid.metadata_sha256)
-            .expect("valid contract ERR oracle");
+        check_mysql(
+            &valid.observed,
+            &freeze,
+            &valid.metadata_sha256,
+            Case::Profile,
+        )
+        .expect("valid contract ERR oracle");
         assert!(valid.observed.pending_packet.is_none());
         assert_eq!(
             valid.observed.text.wire_bytes as usize,

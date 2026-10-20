@@ -133,12 +133,22 @@ fn test_row_rejects_decimal_precision_drift() {
     let err = eval_struct_function("row", &arena, expr, &[value], &chunk)
         .expect_err("row must reject actual-widen decimal child");
 
-    assert!(
-        err.contains("row field type mismatch at field[0]"),
-        "err={err}"
-    );
-    assert!(err.contains("Decimal128(10, 2)"), "err={err}");
-    assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+    use novarocks_execution::exec::chunk::type_compatibility::{
+        NestedStep, TypeMismatch, TypeMismatchKind,
+    };
+    let mut source: &(dyn std::error::Error + 'static) = &err;
+    let mismatch = loop {
+        if let Some(mismatch) = source.downcast_ref::<TypeMismatch>() {
+            break mismatch;
+        }
+        source = source
+            .source()
+            .expect("the original structured mismatch remains in the cause chain");
+    };
+    assert_eq!(mismatch.nested_path, [NestedStep::StructField(0)]);
+    assert_eq!(mismatch.kind, TypeMismatchKind::ScalarMismatch);
+    assert!(err.to_string().contains("Decimal128(10, 2)"), "err={err}");
+    assert!(err.to_string().contains("Decimal128(38, 2)"), "err={err}");
 }
 
 #[test]
@@ -228,7 +238,7 @@ fn test_named_struct_arg_validation() {
         &chunk,
     )
     .expect_err("must fail");
-    assert!(err.contains("even number"));
+    assert!(err.to_string().contains("even number"));
 }
 
 // ---------------------------------------------------------------------------

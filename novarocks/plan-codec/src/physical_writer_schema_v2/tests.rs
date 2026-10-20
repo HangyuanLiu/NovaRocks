@@ -35,7 +35,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -699,7 +699,7 @@ fn writer_all_small_callback_prefixes_and_wide_actual_name_copy_preserve_primary
                 }
                 for at in 0..trace.len() {
                     for cause in CAUSES {
-                        c.arm(Some((at, cause)));
+                        c.arm(Some((at, cause.clone())));
                         assert!(
                             matches!(invoke(),Err(Error::Control(actual))if actual==cause),
                             "route {route}, ordinary {ordinary}, at {at}"
@@ -726,7 +726,7 @@ fn writer_all_small_callback_prefixes_and_wide_actual_name_copy_preserve_primary
             let trace = c.trace();
             let at = trace.iter().position(|(_, u)| *u == 256).unwrap();
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(matches!(invoke(),Err(Error::Control(actual))if actual==cause));
                 assert_eq!(c.trace(), trace[..=at]);
             }
@@ -751,7 +751,7 @@ fn writer_all_small_callback_prefixes_and_wide_actual_name_copy_preserve_primary
             let trace = c.trace();
             let at = trace.iter().position(|(_, u)| *u == 256).unwrap();
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(matches!(invoke(),Err(Error::Control(actual))if actual==cause));
                 assert_eq!(c.trace(), trace[..=at]);
             }
@@ -1529,7 +1529,7 @@ fn writer_schema_parent_prefix_replacement_exact_replay_and_actual_callbacks() {
             assert_eq!(run(exact, &mut vec![]).unwrap(), f);
             for at in 0..trace.len() {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(
                         matches!(run(parent_limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause)
                     );

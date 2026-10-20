@@ -19,7 +19,7 @@
 use super::aggregate_map_core as core;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, ScalarWork};
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
@@ -50,7 +50,7 @@ impl MapState {
         &mut self,
         from: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), KernelFailure> {
         for (key, value) in &self.core.entries[from..] {
             for scalar in std::iter::once(key).chain(value.iter()) {
                 self.heap_bytes = self
@@ -139,11 +139,25 @@ impl FailureSink<'_, '_> {
     }
 }
 impl FailureSink<'_, '_> {
-    fn scalar(&mut self, error: ScalarStateError) -> EvaluationFailure {
-        match error {
-            ScalarStateError::Kernel(cause) => cause.into(),
-            ScalarStateError::OutputAllocation(_) => KernelFailure::ResourceExhausted.into(),
-            ScalarStateError::Legacy(message) => self.diagnostic(&message),
+    fn scalar(&mut self, origin: KernelFailure) -> EvaluationFailure {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        if origin.failure_fact().class() != FailureClass::Data {
+            return origin.into();
+        }
+        let phase = match &self.domain {
+            FailureDomain::Mutation { phase, .. } => *phase,
+            FailureDomain::Emission(context) => context.phase(),
+        };
+        match self.diagnostic(&origin) {
+            EvaluationFailure::InvocationData(data) => data.with_whole_value_source(origin).into(),
+            EvaluationFailure::Kernel(diagnostic) => KernelFailure::from_domain(
+                super::aggregate_map_source_failure::MapDiagnosticFailure {
+                    origin,
+                    diagnostic,
+                    phase,
+                },
+            )
+            .into(),
         }
     }
 }
@@ -455,7 +469,7 @@ impl PreparedAggregateKernel for MapKernel {
                 &mut |capacity| {
                     *key_bytes = key_bytes
                         .checked_add(capacity)
-                        .ok_or(ScalarStateError::Kernel(KernelFailure::ResourceExhausted))?;
+                        .ok_or(KernelFailure::ResourceExhausted)?;
                     Ok(())
                 },
             )
@@ -514,7 +528,7 @@ impl PreparedAggregateKernel for MapKernel {
                 &mut |capacity| {
                     *key_bytes = key_bytes
                         .checked_add(capacity)
-                        .ok_or(ScalarStateError::Kernel(KernelFailure::ResourceExhausted))?;
+                        .ok_or(KernelFailure::ResourceExhausted)?;
                     Ok(())
                 },
             )
@@ -590,7 +604,7 @@ impl MapKernel {
                 target,
                 states.map(|state| {
                     if state.failed {
-                        Err(ScalarStateError::Kernel(KernelFailure::InstanceFailed))
+                        Err(KernelFailure::InstanceFailed)
                     } else {
                         Ok(&state.core)
                     }

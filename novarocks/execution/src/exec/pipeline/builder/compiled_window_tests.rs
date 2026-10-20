@@ -21,6 +21,7 @@
 //! stable sort by the partition and order keys, explicit per-row frame
 //! membership, and each function's SQL definition.
 
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -569,29 +570,36 @@ fn drive(
         Arc::new(RuntimeErrorState::default()),
     ));
     operator.prepare().unwrap();
-    let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
     let mut output = Vec::new();
     let mut offset = 0;
     while offset < batch.num_rows() {
         let len = step.min(batch.num_rows() - offset);
         processor
-            .push_chunk(
-                &state,
+            .accept_without_output(
                 Chunk::try_new_with_chunk_schema(batch.slice(offset, len), Arc::clone(&schema))
                     .unwrap(),
             )
             .unwrap();
-        while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+        while let Some(chunk) = processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap()
+        {
             output.push(chunk.into_batch_projection());
         }
         offset += len;
     }
-    processor.set_finishing(&state).unwrap();
-    while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+    processor.signal_eos().unwrap();
+    while let Some(chunk) = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+    {
         output.push(chunk.into_batch_projection());
     }
-    assert!(processor.is_finished());
+    assert!(matches!(processor.next(), NextStep::Finished));
     output
 }
 

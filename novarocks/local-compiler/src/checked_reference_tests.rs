@@ -60,7 +60,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() < at, "no callback after the primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -429,14 +429,14 @@ fn checked_reference_loops_keep_each_original_control_prefix_and_ordinary_tail()
         CompileControlError::ResourceExhausted,
     ] {
         for at in 1..=lowering_trace.len() {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(lower(&package, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
             );
             assert_eq!(control.trace(), lowering_trace[..at]);
         }
         for at in 1..=preparing_trace.len() {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(prepare_calls(&package, &lowered, &functions, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
             );
@@ -460,7 +460,7 @@ fn checked_reference_loops_keep_each_original_control_prefix_and_ordinary_tail()
         CompileControlError::ResourceExhausted,
     ] {
         for at in 1..=ordinary_trace.len() {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(prepare_calls(&small_package, &wrong, &functions, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
             );

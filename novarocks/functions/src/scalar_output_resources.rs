@@ -21,8 +21,8 @@
 
 use crate::KernelFailure;
 use crate::aggregate_scalar::{
-    AggScalarValue as V, ScalarStateAllocator, ScalarStateError, ScalarWork,
-    TrackedAggScalarValue as T, tracked_scalar_heap_capacity,
+    AggScalarValue as V, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue as T,
+    tracked_scalar_heap_capacity,
 };
 use arrow_schema::DataType;
 
@@ -34,15 +34,13 @@ pub(crate) struct ScalarOutputResources {
     pub(crate) type_nodes: usize,
     pub(crate) type_metadata_bytes: usize,
 }
-fn add(a: usize, b: usize) -> Result<usize, ScalarStateError> {
-    a.checked_add(b)
-        .ok_or(KernelFailure::ResourceExhausted.into())
+fn add(a: usize, b: usize) -> Result<usize, KernelFailure> {
+    a.checked_add(b).ok_or(KernelFailure::ResourceExhausted)
 }
-fn mul(a: usize, b: usize) -> Result<usize, ScalarStateError> {
-    a.checked_mul(b)
-        .ok_or(KernelFailure::ResourceExhausted.into())
+fn mul(a: usize, b: usize) -> Result<usize, KernelFailure> {
+    a.checked_mul(b).ok_or(KernelFailure::ResourceExhausted)
 }
-fn type_nodes(ty: &DataType, work: &mut ScalarWork<'_, '_>) -> Result<usize, ScalarStateError> {
+fn type_nodes(ty: &DataType, work: &mut ScalarWork<'_, '_>) -> Result<usize, KernelFailure> {
     work.step()?;
     let mut count = 1;
     match ty {
@@ -58,10 +56,7 @@ fn type_nodes(ty: &DataType, work: &mut ScalarWork<'_, '_>) -> Result<usize, Sca
     }
     Ok(count)
 }
-fn owned_graph(
-    value: &V,
-    work: &mut ScalarWork<'_, '_>,
-) -> Result<(usize, usize), ScalarStateError> {
+fn owned_graph(value: &V, work: &mut ScalarWork<'_, '_>) -> Result<(usize, usize), KernelFailure> {
     work.step()?;
     let mut slots = 1;
     let mut heap = match value {
@@ -71,7 +66,7 @@ fn owned_graph(
         V::Map(items) => mul(items.capacity(), size_of::<(Option<V>, Option<V>)>())?,
         _ => 0,
     };
-    let mut child = |value: &Option<V>| -> Result<(), ScalarStateError> {
+    let mut child = |value: &Option<V>| -> Result<(), KernelFailure> {
         match value {
             None => {
                 slots = add(slots, 1)?;
@@ -104,10 +99,10 @@ fn owned_graph(
 fn tracked_slots<A: ScalarStateAllocator>(
     value: &T<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<usize, ScalarStateError> {
+) -> Result<usize, KernelFailure> {
     work.step()?;
     let mut slots = 1;
-    let mut child = |value: &Option<T<A>>| -> Result<(), ScalarStateError> {
+    let mut child = |value: &Option<T<A>>| -> Result<(), KernelFailure> {
         slots = add(
             slots,
             match value {
@@ -141,7 +136,7 @@ impl ScalarOutputResources {
         ty: &DataType,
         values: &[Option<V>],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, KernelFailure> {
         let mut slots = 0;
         let mut heap_bytes = 0;
         for value in values {
@@ -169,7 +164,7 @@ impl ScalarOutputResources {
         ty: &DataType,
         value: Option<&T<A>>,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, KernelFailure> {
         let (slots, heap_bytes) = match value {
             None => {
                 work.step()?;
@@ -194,7 +189,7 @@ impl ScalarOutputResources {
     /// Arrow builders, their growth peak, and the custody transition. The 1024
     /// element/byte initial capacities are the pinned original Arrow builders'
     /// real defaults; all variable byte payload comes from the actual graph.
-    pub(crate) fn operation_upper_bound(self) -> Result<usize, ScalarStateError> {
+    pub(crate) fn operation_upper_bound(self) -> Result<usize, KernelFailure> {
         if self.rows == 0 {
             // The original analytic empty branch constructs a zero-length null
             // carrier; none of the default scalar builders is invoked here.
@@ -227,7 +222,7 @@ impl ScalarOutputResources {
     pub(crate) fn owned_heap_bytes(
         values: &[Option<V>],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<usize, ScalarStateError> {
+    ) -> Result<usize, KernelFailure> {
         let mut bytes = 0;
         for value in values {
             work.step()?;

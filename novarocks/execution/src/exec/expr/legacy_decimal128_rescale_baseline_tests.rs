@@ -46,7 +46,7 @@ pub(super) fn actual(
     target: DataType,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ty = FunctionValueType::new(array.data_type().clone(), true);
     let data = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -87,7 +87,7 @@ fn overflow(array: ArrayRef, target: DataType, expected: &[Option<i128>]) {
             assert_eq!(out.data_type(), &target);
             assert_eq!(values(&out), expected);
         } else {
-            assert_eq!(out.unwrap_err(), OVERFLOW);
+            assert_eq!((out.unwrap_err()).to_string(), OVERFLOW);
         }
     }
 }
@@ -181,19 +181,22 @@ fn decimal128_rescale_original_identical_metadata_complete_legal_signed_scales()
     }
 }
 #[test]
-fn decimal128_rescale_original_scale_factor_data_error_and_null_empty_masking() {
+fn decimal128_large_downscale_has_an_exact_zero_without_an_oversized_factor() {
     let target = DataType::Decimal128(38, -39);
     for (policy, allow) in modes() {
-        assert_eq!(
-            actual(
-                input(38, 0, vec![None, Some(1)]),
-                target.clone(),
-                policy,
-                allow
-            )
-            .unwrap_err(),
-            "CAST failed: from Decimal128(38, 0) to Decimal128(38, -39): decimal scale overflow while casting DECIMAL"
-        );
+        let out = actual(
+            input(
+                38,
+                0,
+                vec![None, Some(i128::MIN), Some(-1), Some(1), Some(i128::MAX)],
+            ),
+            target.clone(),
+            policy,
+            allow,
+        )
+        .unwrap();
+        assert_eq!(out.data_type(), &target);
+        assert_eq!(values(&out), vec![None, Some(0), Some(0), Some(0), Some(0)]);
         for array in [input(38, 0, vec![None, None]), input(38, 0, vec![])] {
             let out = actual(array.clone(), target.clone(), policy, allow).unwrap();
             assert_eq!(out.data_type(), &target);
@@ -201,37 +204,25 @@ fn decimal128_rescale_original_scale_factor_data_error_and_null_empty_masking() 
         }
     }
 }
+
 #[test]
-fn decimal128_rescale_original_extreme_scale_subtraction_panic_and_hidden_null() {
-    // The profile uses the project's original i8 arithmetic setting. This
-    // independent arithmetic witness distinguishes checked and wrapping builds.
-    fn original_difference(left: i8, right: i8) -> i8 {
-        left - right
-    }
-    let arithmetic = std::panic::catch_unwind(|| {
-        original_difference(std::hint::black_box(38), std::hint::black_box(i8::MIN))
-    });
+fn decimal128_full_signed_scale_difference_is_checked_and_keeps_hidden_nulls() {
     let target = DataType::Decimal128(38, i8::MIN);
     for (policy, allow) in modes() {
-        let out = std::panic::catch_unwind(|| {
-            actual(
-                input(38, 38, vec![None, Some(1)]),
-                target.clone(),
-                policy,
-                allow,
-            )
-        });
-        if arithmetic.is_err() {
-            assert!(
-                out.is_err(),
-                "the original unchecked scale difference must preserve host panic"
-            );
-        } else {
-            assert_eq!(
-                out.unwrap().unwrap_err(),
-                "CAST failed: from Decimal128(38, 38) to Decimal128(38, -128): decimal scale overflow while casting DECIMAL"
-            );
-        }
+        // All physical i128 values divided by 10^166 round to zero.
+        let out = actual(
+            input(
+                38,
+                38,
+                vec![None, Some(i128::MIN), Some(1), Some(i128::MAX)],
+            ),
+            target.clone(),
+            policy,
+            allow,
+        )
+        .unwrap();
+        assert_eq!(out.data_type(), &target);
+        assert_eq!(values(&out), vec![None, Some(0), Some(0), Some(0)]);
         let hidden: ArrayRef = Arc::new(
             Decimal128Array::new(
                 vec![i128::MIN, i128::MAX].into(),

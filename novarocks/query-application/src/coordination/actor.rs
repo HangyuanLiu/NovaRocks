@@ -1111,6 +1111,7 @@ pub enum LogicalExecutionActorError {
     /// attempt decision authority remains with the caller.
     ExecutionConcluded(LogicalConclusion),
     ResultDeliveryFailed,
+    ResultProtocolViolation,
 }
 
 impl fmt::Display for LogicalExecutionActorError {
@@ -1149,6 +1150,7 @@ impl fmt::Display for LogicalExecutionActorError {
                 );
             }
             Self::ResultDeliveryFailed => "logical result delivery failed",
+            Self::ResultProtocolViolation => "logical result delivery protocol was violated",
             Self::Establish(_)
             | Self::StandDown(_)
             | Self::RecoveryRefused(_)
@@ -1158,6 +1160,67 @@ impl fmt::Display for LogicalExecutionActorError {
 }
 
 impl std::error::Error for LogicalExecutionActorError {}
+
+impl novarocks_execution_contract::failure::FailureProjection for LogicalExecutionActorError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+        };
+        let (class, code, observed_stop) = match self {
+            Self::MailboxClosed => (FailureClass::Control, 50, true),
+            Self::StaleAuthority => (FailureClass::Control, 51, true),
+            Self::WrongExecution => (FailureClass::Invariant, 52, false),
+            Self::WrongPhase => (FailureClass::Control, 53, true),
+            Self::AlreadyConcluded => (FailureClass::Control, 54, true),
+            Self::RecoveryRefused(_) => (FailureClass::Control, 55, false),
+            Self::ReplacementNotReady => (FailureClass::Control, 56, false),
+            Self::InvariantViolation => (FailureClass::Invariant, 57, false),
+            Self::RootAttemptTerminal => (FailureClass::Control, 58, true),
+            Self::ExecutionConcluded(_) => (FailureClass::Control, 59, true),
+            Self::ResultDeliveryFailed => (FailureClass::Unexpected, 60, false),
+            Self::ResultProtocolViolation => (FailureClass::Invariant, 99, false),
+            Self::Establish(error) => return FailureProjection::failure_fact(error),
+            Self::StandDown(error) => return FailureProjection::failure_fact(error),
+            Self::ReplacementQualificationFailed(error) => {
+                return FailureProjection::failure_fact(error);
+            }
+        };
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        if observed_stop {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(class, reason)
+        }
+    }
+}
+
+impl LogicalExecutionActorError {
+    /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
+    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        let message = match self {
+            Self::MailboxClosed => "logical execution actor mailbox is closed",
+            Self::StaleAuthority => "attempt authority is no longer current",
+            Self::WrongExecution => "attempt authority names a different logical execution",
+            Self::WrongPhase => "logical execution operation is not allowed in its current phase",
+            Self::AlreadyConcluded => "logical execution has already concluded",
+            Self::RecoveryRefused(_) => "logical execution recovery was refused by query policy",
+            Self::ReplacementNotReady => "attempt replacement qualification is not ready",
+            Self::InvariantViolation => "logical execution actor invariant was violated",
+            Self::RootAttemptTerminal => "root task already reached a non-success terminal state",
+            Self::ExecutionConcluded(_) => "logical execution already has a terminal conclusion",
+            Self::ResultDeliveryFailed => {
+                "logical result delivery failed without a more specific recorded cause"
+            }
+            Self::ResultProtocolViolation => {
+                "logical result sequence or delivery authority violated its protocol"
+            }
+            Self::Establish(error) => return error.safe_detail(),
+            Self::StandDown(error) => return error.safe_detail(),
+            Self::ReplacementQualificationFailed(error) => return error.safe_detail(),
+        };
+        novarocks_execution_contract::SafeDetail::truncating(message)
+    }
+}
 
 impl From<ActorStateError> for LogicalExecutionActorError {
     fn from(value: ActorStateError) -> Self {
@@ -1266,6 +1329,9 @@ struct ReplacementRuntime {
     conservative_expiry: Option<MonotonicInstant>,
     reservation_valid_for: Duration,
     stale_usage_accounted: bool,
+    /// Only the qualifier failure accepted by this replacement's own token
+    /// can decide a late activation. Later effect errors remain diagnostics.
+    accepted_failure: Option<ReplacementQualificationFailure>,
 }
 
 impl fmt::Debug for ReplacementRuntime {
@@ -1379,12 +1445,20 @@ enum InFlightResult {
     },
 }
 
+// An observed attempt failure is pending the logical recovery decision. It
+// belongs to that exact activation and cannot become a successor's cause.
+struct AttemptResultFailure {
+    activation: AttemptActivationIdentity,
+    error: QueryExecutionError,
+}
+
 struct ResultRuntime {
     carrier: crate::api::ResultRowCarrier,
     schema_receipt: Option<ResultDeliveryReceipt>,
     schema_writer_completed: bool,
     failure_sender: Option<watch::Sender<Option<QueryExecutionError>>>,
-    terminal_error: Option<QueryExecutionError>,
+    accepted_error: Option<QueryExecutionError>,
+    attempt_error: Option<AttemptResultFailure>,
     transport: QueryResultTransport,
     root_success: Option<RootSuccessGate>,
     attempt_decision_pending: Option<AttemptActivationIdentity>,
@@ -1399,6 +1473,16 @@ enum ResultReceiptOutcome {
 }
 
 impl ResultRuntime {
+    fn retire_attempt_failure(&mut self, activation: AttemptActivationIdentity) {
+        if self
+            .attempt_error
+            .as_ref()
+            .is_some_and(|failure| failure.activation == activation)
+        {
+            self.attempt_error.take();
+        }
+    }
+
     fn idle(&self) -> bool {
         self.finish_waiter.is_none() && self.pending.is_none() && self.in_flight.is_none()
     }
@@ -2123,7 +2207,8 @@ pub(crate) fn spawn_logical_execution_actor(
                     schema_receipt: Some(schema_receipt),
                     schema_writer_completed: false,
                     failure_sender: Some(failure_sender),
-                    terminal_error: None,
+                    accepted_error: None,
+                    attempt_error: None,
                     transport,
                     root_success: None,
                     attempt_decision_pending: None,
@@ -2311,6 +2396,7 @@ async fn run_actor(
             max_establish_authorizations_per_context,
             max_abort_authorizations_per_context,
             clock.as_ref(),
+            result_runtime.as_mut(),
         );
         release_concluded_actor_resources(state, &mut execution_stage, replacement.as_mut());
         let committed_end_awaiting_transport = state.conclusion()
@@ -2322,11 +2408,19 @@ async fn run_actor(
             settle_finish_establish_readiness(state, &mut attempts, result_runtime.as_mut());
         if state.conclusion().is_some() && !committed_end_awaiting_transport {
             fail_result_runtime(state, result_runtime.as_mut());
-        } else if drive_root_success(state, result_runtime.as_mut(), finish_establish_ready)
-            .is_err()
+        } else if let Err(error) =
+            drive_root_success(state, result_runtime.as_mut(), finish_establish_ready)
         {
-            conclude_failed(state, "the root attempt could not be driven to success");
-            fail_result_runtime(state, result_runtime.as_mut());
+            let runtime = result_runtime
+                .as_mut()
+                .expect("a failed root success drive has its result owner");
+            conclude_result_failure(
+                state,
+                runtime,
+                "the root attempt could not be driven to success",
+                result_actor_failure(error),
+            );
+            fail_result_runtime(state, Some(runtime));
         }
         if registry_close_requested
             && actor_cleanup_complete(state, &attempts, replacement.as_ref())
@@ -2528,7 +2622,7 @@ async fn run_actor(
                             replacement.effect_backpressured = false;
                         }
                         replacement_error.get_or_insert(failure);
-                        conclude_replacement_failed(state, replacement.as_mut());
+                        conclude_replacement_failed(state, replacement.as_mut(), failure);
                     }
                 }
             }
@@ -2541,9 +2635,9 @@ fn release_concluded_actor_resources(
     execution_stage: &mut Option<StagePermit>,
     replacement: Option<&mut ReplacementRuntime>,
 ) {
-    if state.conclusion().is_none() {
+    let Some(conclusion) = state.conclusion() else {
         return;
-    }
+    };
     execution_stage.take();
     let Some(replacement) = replacement else {
         return;
@@ -2554,9 +2648,10 @@ fn release_concluded_actor_resources(
     replacement.reservation.take();
     if let Some(pending) = replacement.activation.take() {
         pending.lifetime.settle();
-        let _ = pending
-            .reply
-            .send(Err(LogicalExecutionActorError::WrongPhase));
+        let _ = pending.reply.send(Err(replacement_terminal_disposition(
+            replacement,
+            conclusion,
+        )));
     }
 }
 
@@ -2587,7 +2682,11 @@ fn expire_replacement_reservation(
             ),
         ));
     }
-    conclude_replacement_failed(state, Some(replacement));
+    conclude_replacement_failed(
+        state,
+        Some(replacement),
+        ReplacementQualificationFailure::Expired,
+    );
 }
 
 enum AttemptLedgerEvent {
@@ -2895,16 +2994,24 @@ fn apply_replacement_receipt(
         replacement.effect_settled = true;
         replacement_error.get_or_insert(ReplacementQualificationFailure::EffectOwnerClosed);
         if state.conclusion().is_none() {
-            conclude_replacement_failed(state, Some(replacement));
+            conclude_replacement_failed(
+                state,
+                Some(replacement),
+                ReplacementQualificationFailure::EffectOwnerClosed,
+            );
         }
         return;
     };
     replacement.effect_settled = true;
     let (operation_id, identity, settlement) = receipt.into_parts();
     if identity != replacement.identity || operation_id != replacement.request.operation_id() {
-        replacement_error.get_or_insert(ReplacementQualificationFailure::OutcomeUnknown);
+        replacement_error.get_or_insert(ReplacementQualificationFailure::MismatchedReceipt);
         if state.conclusion().is_none() {
-            conclude_replacement_failed(state, Some(replacement));
+            conclude_replacement_failed(
+                state,
+                Some(replacement),
+                ReplacementQualificationFailure::MismatchedReceipt,
+            );
         }
         return;
     }
@@ -2913,7 +3020,11 @@ fn apply_replacement_receipt(
             let Some(dispatched_at) = replacement.effect_dispatched_at else {
                 replacement_error
                     .get_or_insert(ReplacementQualificationFailure::InvalidReservation);
-                conclude_replacement_failed(state, Some(replacement));
+                conclude_replacement_failed(
+                    state,
+                    Some(replacement),
+                    ReplacementQualificationFailure::InvalidReservation,
+                );
                 return;
             };
             let ticket_expiry =
@@ -2923,12 +3034,13 @@ fn apply_replacement_receipt(
                     .conservative_expiry
                     .map_or(ticket_expiry, |current| current.min(ticket_expiry)),
             );
-            if state.conclusion().is_some() {
+            if let Some(conclusion) = state.conclusion() {
                 if let Some(pending) = replacement.activation.take() {
                     pending.lifetime.settle();
-                    let _ = pending
-                        .reply
-                        .send(Err(LogicalExecutionActorError::WrongPhase));
+                    let _ = pending.reply.send(Err(replacement_terminal_disposition(
+                        replacement,
+                        conclusion,
+                    )));
                 }
                 return;
             }
@@ -2937,7 +3049,7 @@ fn apply_replacement_receipt(
         ReplacementQualificationSettlement::Failed(failure) => {
             replacement_error.get_or_insert(failure);
             if state.conclusion().is_none() {
-                conclude_replacement_failed(state, Some(replacement));
+                conclude_replacement_failed(state, Some(replacement), failure);
             }
         }
     }
@@ -2946,10 +3058,25 @@ fn apply_replacement_receipt(
 fn conclude_replacement_failed(
     state: &mut LogicalExecutionState,
     replacement: Option<&mut ReplacementRuntime>,
+    failure: ReplacementQualificationFailure,
 ) {
-    if let Some(replacement) = replacement {
-        let _ = state.conclude_replacement(&replacement.token, LogicalConclusion::Failed);
+    if let Some(replacement) = replacement
+        && state
+            .conclude_replacement(&replacement.token, LogicalConclusion::Failed)
+            .is_ok()
+    {
+        replacement.accepted_failure = Some(failure);
     }
+}
+
+fn replacement_terminal_disposition(
+    replacement: &ReplacementRuntime,
+    conclusion: LogicalConclusion,
+) -> LogicalExecutionActorError {
+    replacement.accepted_failure.map_or(
+        LogicalExecutionActorError::ExecutionConcluded(conclusion),
+        LogicalExecutionActorError::ReplacementQualificationFailed,
+    )
 }
 
 fn try_activate_qualified_replacement(
@@ -2961,6 +3088,7 @@ fn try_activate_qualified_replacement(
     max_establish_authorizations_per_context: NonZeroUsize,
     max_abort_authorizations_per_context: NonZeroUsize,
     clock: &dyn LogicalExecutionClock,
+    result_runtime: Option<&mut ResultRuntime>,
 ) {
     let Some(active) = replacement.as_mut() else {
         return;
@@ -2979,7 +3107,11 @@ fn try_activate_qualified_replacement(
                 ReplacementQualificationFailure::InvalidReservation,
             ),
         ));
-        conclude_replacement_failed(state, Some(active));
+        conclude_replacement_failed(
+            state,
+            Some(active),
+            ReplacementQualificationFailure::InvalidReservation,
+        );
         return;
     };
     if clock.now().has_reached(conservative_expiry) {
@@ -2989,7 +3121,11 @@ fn try_activate_qualified_replacement(
                 ReplacementQualificationFailure::Expired,
             ),
         ));
-        conclude_replacement_failed(state, Some(active));
+        conclude_replacement_failed(
+            state,
+            Some(active),
+            ReplacementQualificationFailure::Expired,
+        );
         return;
     }
     // The opaque reservation proves reachability, isolation, successor
@@ -3012,7 +3148,11 @@ fn try_activate_qualified_replacement(
                 ReplacementQualificationFailure::InvalidReservation,
             ),
         ));
-        conclude_replacement_failed(state, Some(active));
+        conclude_replacement_failed(
+            state,
+            Some(active),
+            ReplacementQualificationFailure::InvalidReservation,
+        );
         return;
     }
     for fact in [
@@ -3031,7 +3171,11 @@ fn try_activate_qualified_replacement(
                     ReplacementQualificationFailure::OutcomeUnknown,
                 ),
             ));
-            conclude_replacement_failed(state, Some(active));
+            conclude_replacement_failed(
+                state,
+                Some(active),
+                ReplacementQualificationFailure::OutcomeUnknown,
+            );
             return;
         }
     }
@@ -3042,7 +3186,7 @@ fn try_activate_qualified_replacement(
             let _ = pending_activation.reply.send(Err(
                 LogicalExecutionActorError::ReplacementQualificationFailed(error),
             ));
-            conclude_replacement_failed(state, Some(active));
+            conclude_replacement_failed(state, Some(active), error);
             return;
         }
     };
@@ -3053,7 +3197,11 @@ fn try_activate_qualified_replacement(
                 ReplacementQualificationFailure::InvalidReservation,
             ),
         ));
-        conclude_replacement_failed(state, Some(active));
+        conclude_replacement_failed(
+            state,
+            Some(active),
+            ReplacementQualificationFailure::InvalidReservation,
+        );
         return;
     };
     match state.activate_replacement(&active.token) {
@@ -3118,6 +3266,11 @@ fn try_activate_qualified_replacement(
             .and_then(|permit| permit);
             match result {
                 Ok(permit) => {
+                    if let Some(runtime) = result_runtime
+                        && let Some(failed) = attempts.get(&active.identity.failed())
+                    {
+                        runtime.retire_attempt_failure(failed.activation);
+                    }
                     if let Err(response) = pending_activation.reply.send(Ok(permit)) {
                         drop(response);
                     }
@@ -3144,7 +3297,11 @@ fn try_activate_qualified_replacement(
                     ReplacementQualificationFailure::InvalidReservation,
                 ),
             ));
-            conclude_replacement_failed(state, Some(active));
+            conclude_replacement_failed(
+                state,
+                Some(active),
+                ReplacementQualificationFailure::InvalidReservation,
+            );
         }
         Err(error) => {
             drop(activated);
@@ -3156,9 +3313,9 @@ fn try_activate_qualified_replacement(
 
 /// Conclude this execution as failed, naming the transition that failed.
 ///
-/// `reason` is what the client is told when nothing richer was recorded. A
-/// failure with no cause anywhere reads the same as every other failure, and
-/// this is the one place that always knows which step gave up.
+/// This records local transition context. A result failure also installs its
+/// producer-authored fact through `conclude_result_failure`; this text alone
+/// cannot classify a failure or claim that a logical conclusion was accepted.
 fn conclude_failed(state: &mut LogicalExecutionState, reason: impl Into<String>) {
     state.note_failure_reason(reason);
     if state.conclusion().is_some() {
@@ -3174,6 +3331,57 @@ fn conclude_failed(state: &mut LogicalExecutionState, reason: impl Into<String>)
     }
 }
 
+/// Preserve a result producer's cause only if this same serialized transition
+/// actually accepts the failure. Attempt observations and prior conclusions
+/// cannot be replaced by a later protocol rejection.
+fn conclude_result_failure(
+    state: &mut LogicalExecutionState,
+    runtime: &mut ResultRuntime,
+    context: &'static str,
+    error: QueryExecutionError,
+) {
+    if state.conclusion().is_some() {
+        return;
+    }
+    conclude_failed(state, context);
+    if state.conclusion() == Some(LogicalConclusion::Failed) {
+        runtime.accepted_error = Some(error);
+    }
+}
+
+fn result_protocol_failure(detail: &'static str) -> QueryExecutionError {
+    use novarocks_execution_contract::failure::FailureProjection;
+    QueryExecutionError::from_execution(crate::execution_error::ExecutionFailureInput::new(
+        LogicalExecutionActorError::ResultProtocolViolation.failure_fact(),
+        novarocks_execution_contract::SafeDetail::truncating(detail),
+        crate::execution_error::ExecutionFailureSite::Coordinator,
+    ))
+}
+
+fn result_actor_failure(error: LogicalExecutionActorError) -> QueryExecutionError {
+    use novarocks_execution_contract::failure::FailureProjection;
+    QueryExecutionError::from_execution(crate::execution_error::ExecutionFailureInput::new(
+        error.failure_fact(),
+        error.safe_detail(),
+        crate::execution_error::ExecutionFailureSite::Coordinator,
+    ))
+}
+
+/// A consumer's explicit failure is already authored. Losing the receipt
+/// owner only observes a stop; it cannot manufacture Query cancellation.
+fn result_receipt_failure(
+    disposition: Result<ResultDeliveryDisposition, ()>,
+) -> Option<QueryExecutionError> {
+    match disposition {
+        Ok(ResultDeliveryDisposition::Completed) => None,
+        Ok(ResultDeliveryDisposition::Failed(error)) => Some(error),
+        Ok(ResultDeliveryDisposition::Dropped) | Err(()) => Some(logical_owner_failure(
+            crate::execution_error::QueryFailureReason::LogicalOwnerStopped,
+            "result delivery receipt ended without a consumer completion",
+        )),
+    }
+}
+
 fn start_schema_delivery(
     state: &mut LogicalExecutionState,
     runtime: &mut ResultRuntime,
@@ -3183,7 +3391,7 @@ fn start_schema_delivery(
         return Ok(());
     }
     if runtime.in_flight.is_some() {
-        return Err(LogicalExecutionActorError::ResultDeliveryFailed);
+        return Err(LogicalExecutionActorError::ResultProtocolViolation);
     }
     let capability = state.attempt_capability(activation.execution())?;
     if identity_of(&capability) != activation {
@@ -3286,6 +3494,9 @@ fn settle_finish_establish_readiness(
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: Option<&mut ResultRuntime>,
 ) -> bool {
+    if state.conclusion().is_some() {
+        return true;
+    }
     let Some(runtime) = runtime else {
         return false;
     };
@@ -3301,13 +3512,18 @@ fn settle_finish_establish_readiness(
         Ok(()) => true,
         Err(EstablishIssueError::EstablishNotSettled) => false,
         Err(error) => {
-            runtime.terminal_error = Some(QueryExecutionError::new(
-                crate::api::QueryExecutionErrorKind::Failed,
-                format!(
-                    "logical execution cannot emit success EOF because Establish settlement failed: {error}"
-                ),
-            ));
+            tracing::debug!(error = %error, "Establish settlement failed before success EOF");
             conclude_failed(state, "Establish settlement failed before success EOF");
+            if state.conclusion() == Some(LogicalConclusion::Failed) {
+                use novarocks_execution_contract::failure::FailureProjection;
+                runtime.accepted_error = Some(QueryExecutionError::from_execution(
+                    crate::execution_error::ExecutionFailureInput::new(
+                        error.failure_fact(),
+                        error.safe_detail(),
+                        crate::execution_error::ExecutionFailureSite::Coordinator,
+                    ),
+                ));
+            }
             false
         }
     }
@@ -3342,19 +3558,19 @@ fn drive_root_success(
     };
     let expected = ResultPacketSequence::new(state.accepted_result_packets());
     if sequence != expected {
-        return Err(LogicalExecutionActorError::ResultDeliveryFailed);
+        return Err(LogicalExecutionActorError::ResultProtocolViolation);
     }
     if sequence.get() > 0
         && state.delivered_result_through() != Some(sequence.get().saturating_sub(1))
     {
-        return Err(LogicalExecutionActorError::ResultDeliveryFailed);
+        return Err(LogicalExecutionActorError::ResultProtocolViolation);
     }
     let finish = runtime
         .finish_waiter
         .as_ref()
         .ok_or(LogicalExecutionActorError::InvariantViolation)?;
     if finish.permit.identity() != gate.activation {
-        return Err(LogicalExecutionActorError::ResultDeliveryFailed);
+        return Err(LogicalExecutionActorError::ResultProtocolViolation);
     }
     let finish = runtime
         .finish_waiter
@@ -3381,8 +3597,13 @@ fn apply_result_capacity(
     };
     let slot = match reserved {
         Ok(slot) => slot,
-        Err(_) => {
-            conclude_failed(state, "no result delivery slot could be reserved");
+        Err(error) => {
+            conclude_result_failure(
+                state,
+                runtime,
+                "no result delivery slot could be reserved",
+                error,
+            );
             reject_pending_result(state, pending);
             return;
         }
@@ -3396,7 +3617,7 @@ fn apply_result_capacity(
                     drop(pending.delivery);
                     let _ = pending
                         .reply
-                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                        .send(Err(LogicalExecutionActorError::StaleAuthority));
                     return;
                 }
             };
@@ -3406,12 +3627,14 @@ fn apply_result_capacity(
                 ResultPacket::Data(()),
             ) {
                 Ok(permit) => permit,
-                Err(_) => {
+                Err(error) => {
                     drop(slot);
                     drop(pending.delivery);
-                    conclude_failed(
+                    conclude_result_failure(
                         state,
+                        runtime,
                         "a reserved result delivery slot could not be started",
+                        result_actor_failure(ActorStateError::Delivery(error.error()).into()),
                     );
                     reply_result_failure(state, pending.reply);
                     return;
@@ -3492,13 +3715,17 @@ fn apply_result_receipt(
     let Some(runtime) = runtime else {
         return;
     };
+    let was_unconcluded = state.conclusion().is_none();
     let disposition = match outcome {
         ResultReceiptOutcome::Schema(disposition) => {
             runtime.schema_receipt.take();
-            if matches!(disposition, Ok(ResultDeliveryDisposition::Completed)) {
-                runtime.schema_writer_completed = true;
-            } else {
+            if let Some(error) = result_receipt_failure(disposition) {
                 conclude_with(state, replacement, LogicalConclusion::Failed);
+                if was_unconcluded && state.conclusion() == Some(LogicalConclusion::Failed) {
+                    runtime.accepted_error = Some(error);
+                }
+            } else {
+                runtime.schema_writer_completed = true;
             }
             return;
         }
@@ -3507,40 +3734,65 @@ fn apply_result_receipt(
     let Some(in_flight) = runtime.in_flight.take() else {
         return;
     };
-    let completed = matches!(disposition, Ok(ResultDeliveryDisposition::Completed));
-    match in_flight {
+    let mut failure = result_receipt_failure(disposition);
+    let completed = failure.is_none();
+    // Settle the original state transition before installing a failure or
+    // replying. A prior cancellation/success still owns its exact conclusion.
+    let reply = match in_flight {
         InFlightResult::Schema { permit, .. } => {
             if completed {
-                if state.complete_schema_delivery(permit).is_err() {
+                if let Err(error) = state.complete_schema_delivery(permit) {
+                    failure = Some(result_actor_failure(error.into()));
                     conclude_failed(state, "schema delivery could not be completed");
                 }
             } else {
-                let _ = state.fail_schema_delivery(permit);
+                if let Err(error) = state.fail_schema_delivery(permit) {
+                    failure = Some(result_actor_failure(error.into()));
+                }
                 conclude_failed(state, "schema delivery was rejected by the consumer");
             }
+            None
         }
         InFlightResult::Batch { permit, reply, .. } => {
-            if completed {
+            let delivered = if completed {
                 match state.complete_result_delivery(permit) {
-                    Ok(_) => {
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(_) => {
+                    Ok(_) => true,
+                    Err(error) => {
+                        failure = Some(result_actor_failure(
+                            ActorStateError::Delivery(error.error()).into(),
+                        ));
                         conclude_failed(state, "result delivery could not be completed");
-                        reply_result_failure(state, reply);
+                        false
                     }
                 }
             } else {
-                let _ = state.fail_result_delivery(permit);
+                if let Err(error) = state.fail_result_delivery(permit) {
+                    failure = Some(result_actor_failure(
+                        ActorStateError::Delivery(error.error()).into(),
+                    ));
+                }
                 conclude_failed(state, "result delivery was rejected by the consumer");
-                reply_result_failure(state, reply);
-            }
+                false
+            };
+            Some((reply, delivered))
         }
         InFlightResult::End { .. } => {
-            // The actor authorized and committed logical success before this
-            // End token entered the consumer queue. Completion or failure here
-            // belongs to the transport/protocol owner and cannot revoke it.
-            let _ = completed;
+            // This EOF was authorized only after committed logical success.
+            // Its transport failure cannot install another logical cause.
+            None
+        }
+    };
+    if was_unconcluded
+        && state.conclusion() == Some(LogicalConclusion::Failed)
+        && let Some(error) = failure
+    {
+        runtime.accepted_error = Some(error);
+    }
+    if let Some((reply, delivered)) = reply {
+        if delivered {
+            let _ = reply.send(Ok(()));
+        } else {
+            reply_result_failure(state, reply);
         }
     }
 }
@@ -3561,35 +3813,52 @@ fn reject_pending_result(state: &mut LogicalExecutionState, pending: PendingResu
     }
 }
 
+fn logical_owner_failure(
+    reason: crate::execution_error::QueryFailureReason,
+    detail: &str,
+) -> QueryExecutionError {
+    use novarocks_execution_contract::failure::FailureProjection;
+    QueryExecutionError::from_execution(crate::execution_error::ExecutionFailureInput::new(
+        reason.failure_fact(),
+        novarocks_execution_contract::SafeDetail::truncating(detail),
+        crate::execution_error::ExecutionFailureSite::Coordinator,
+    ))
+}
+
 fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut ResultRuntime>) {
     let Some(runtime) = runtime else {
         return;
     };
     if let Some(sender) = runtime.failure_sender.take() {
-        if let Some(error) = runtime.terminal_error.take() {
+        if state.conclusion() == Some(LogicalConclusion::Succeeded) {
+            runtime.accepted_error.take();
+            runtime.attempt_error.take();
+            drop(sender);
+        } else if let Some(error) = runtime.accepted_error.take().or_else(|| {
+            (state.conclusion() == Some(LogicalConclusion::Failed))
+                .then(|| runtime.attempt_error.take().map(|failure| failure.error))
+                .flatten()
+        }) {
             sender.send_replace(Some(error));
         } else {
             match state.conclusion() {
                 Some(LogicalConclusion::Succeeded) => drop(sender),
                 Some(LogicalConclusion::Cancelled) => {
-                    sender.send_replace(Some(QueryExecutionError::new(
-                        crate::api::QueryExecutionErrorKind::Cancelled,
-                        "logical execution was cancelled before success EOF",
+                    sender.send_replace(Some(logical_owner_failure(
+                        crate::execution_error::QueryFailureReason::LogicalOwnerStopped,
+                        "the logical result owner stopped without an accepted cancellation",
                     )));
                 }
                 Some(LogicalConclusion::Failed) => {
-                    let detail = state.failure_reason().map_or_else(
-                        || "logical execution failed before success EOF".to_string(),
-                        |reason| format!("logical execution failed before success EOF: {reason}"),
-                    );
-                    sender.send_replace(Some(QueryExecutionError::new(
-                        crate::api::QueryExecutionErrorKind::Failed,
-                        detail,
+                    tracing::debug!(reason = ?state.failure_reason(), "logical execution failed without a selected domain cause");
+                    sender.send_replace(Some(logical_owner_failure(
+                        crate::execution_error::QueryFailureReason::LogicalFailureUnspecified,
+                        "logical execution failed before success EOF",
                     )));
                 }
                 Some(LogicalConclusion::BusinessDecisionRequired) => {
-                    sender.send_replace(Some(QueryExecutionError::new(
-                        crate::api::QueryExecutionErrorKind::Failed,
+                    sender.send_replace(Some(logical_owner_failure(
+                        crate::execution_error::QueryFailureReason::BusinessDecisionUnspecified,
                         "logical execution requires a business decision before success EOF",
                     )));
                 }
@@ -3626,11 +3895,21 @@ fn conclude_for_work_cancellation(
     mut runtime: Option<&mut ResultRuntime>,
     reason: &CancellationReason,
 ) {
-    if let Some(runtime) = runtime.as_deref_mut() {
+    let was_unconcluded = state.conclusion().is_none();
+    let conclusion = match reason {
+        CancellationReason::DeadlineExceeded
+        | CancellationReason::FrontendDrainDeadlineExceeded => LogicalConclusion::Failed,
+        _ => LogicalConclusion::Cancelled,
+    };
+    conclude_or_interrupt_success(state, replacement, None, conclusion);
+    if was_unconcluded
+        && state.conclusion() == Some(conclusion)
+        && let Some(runtime) = runtime.as_deref_mut()
+    {
         let (kind, message) = match reason {
             CancellationReason::DeadlineExceeded
             | CancellationReason::FrontendDrainDeadlineExceeded => (
-                crate::api::QueryExecutionErrorKind::DeadlineExceeded,
+                crate::execution_error::QueryFailureReason::DeadlineExceeded,
                 "logical execution deadline expired before success EOF",
             ),
             CancellationReason::Requested
@@ -3639,23 +3918,12 @@ fn conclude_for_work_cancellation(
             | CancellationReason::ClientDisconnected
             | CancellationReason::ServerShutdown
             | CancellationReason::OwnerDropped => (
-                crate::api::QueryExecutionErrorKind::Cancelled,
+                crate::execution_error::QueryFailureReason::Cancelled,
                 "logical execution was cancelled before success EOF",
             ),
         };
-        runtime.terminal_error = Some(QueryExecutionError::new(kind, message));
+        runtime.accepted_error = Some(logical_owner_failure(kind, message));
     }
-    let conclusion = match reason {
-        CancellationReason::DeadlineExceeded
-        | CancellationReason::FrontendDrainDeadlineExceeded => LogicalConclusion::Failed,
-        CancellationReason::Requested
-        | CancellationReason::ExplicitKill { .. }
-        | CancellationReason::ExplicitKillConnection { .. }
-        | CancellationReason::ClientDisconnected
-        | CancellationReason::ServerShutdown
-        | CancellationReason::OwnerDropped => LogicalConclusion::Cancelled,
-    };
-    conclude_or_interrupt_success(state, replacement, runtime, conclusion);
 }
 
 fn conclude_or_interrupt_success(
@@ -3709,16 +3977,17 @@ fn handle_command(
     match command {
         ActorCommand::TakeReplacementAdmissionEvidence { activation, reply } => {
             let result = (|| {
+                let current = state.attempt_capability(activation.execution())?;
+                if identity_of(&current) != activation {
+                    return Err(LogicalExecutionActorError::StaleAuthority);
+                }
+                validate_attempt_command(state, &current)?;
                 if !matches!(
                     state.phase(),
                     ExecutionPhase::Instantiating { execution, .. }
                         if execution == activation.execution()
                 ) {
                     return Err(LogicalExecutionActorError::WrongPhase);
-                }
-                let current = state.attempt_capability(activation.execution())?;
-                if identity_of(&current) != activation {
-                    return Err(LogicalExecutionActorError::StaleAuthority);
                 }
                 let attempt = attempts
                     .get_mut(&activation.execution())
@@ -3740,7 +4009,9 @@ fn handle_command(
         }
         ActorCommand::Activate { readiness, reply } => {
             let (capability, lifetime, mailbox_liveness) = readiness.into_parts();
-            match state.mark_running(&capability) {
+            match validate_attempt_command(state, &capability)
+                .and_then(|()| state.mark_running(&capability).map_err(Into::into))
+            {
                 Ok(()) => {
                     let running = RunningAttemptPermit::new(capability, lifetime, mailbox_liveness);
                     if let Err(response) = reply.send(Ok(running)) {
@@ -3748,24 +4019,37 @@ fn handle_command(
                     }
                 }
                 Err(error) => {
-                    lifetime.abandon();
-                    let _ = reply.send(Err(error.into()));
+                    settle_refused_attempt(&lifetime, error);
+                    let _ = reply.send(Err(error));
                 }
             }
         }
         ActorCommand::InitializationFailed { permit, reply } => {
-            settle_terminal(state, permit.into_parts(), LogicalConclusion::Failed, reply);
+            settle_terminal(
+                state,
+                permit.into_parts(),
+                LogicalConclusion::Failed,
+                || {},
+                reply,
+            );
         }
         ActorCommand::InitializationCancelled { permit, reply } => {
             settle_terminal(
                 state,
                 permit.into_parts(),
                 LogicalConclusion::Cancelled,
+                || {},
                 reply,
             );
         }
         ActorCommand::Completed { permit, reply } => {
             let execution = permit.identity().execution();
+            let parts = permit.into_parts();
+            if let Err(error) = validate_attempt_command(state, &parts.0) {
+                settle_refused_attempt(&parts.1, error);
+                let _ = reply.send(Err(error));
+                return;
+            }
             let Some(attempt) = attempts.get_mut(&execution) else {
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongExecution));
                 return;
@@ -3773,18 +4057,13 @@ fn handle_command(
             match attempt.ensure_success_ready() {
                 Ok(()) => {
                     attempt.establish.revoke_issue_authority();
-                    settle_terminal(
-                        state,
-                        permit.into_parts(),
-                        LogicalConclusion::Succeeded,
-                        reply,
-                    );
+                    settle_terminal(state, parts, LogicalConclusion::Succeeded, || {}, reply);
                 }
                 Err(error) => {
                     establish_error.get_or_insert(error);
                     attempt.establish_error.get_or_insert(error);
                     attempt.establish.revoke_issue_authority();
-                    settle_terminal_with_error(state, permit.into_parts(), error.into(), reply);
+                    settle_terminal_with_error(state, parts, error.into(), reply);
                 }
             }
         }
@@ -3793,13 +4072,21 @@ fn handle_command(
             error,
             reply,
         } => {
-            if let Some(attempt) = attempts.get_mut(&permit.identity().execution()) {
-                attempt.establish.revoke_issue_authority();
-            }
-            if let (Some(runtime), Some(error)) = (result_runtime.as_deref_mut(), error) {
-                runtime.terminal_error = Some(error);
-            }
-            settle_terminal(state, permit.into_parts(), LogicalConclusion::Failed, reply);
+            let execution = permit.identity().execution();
+            settle_terminal(
+                state,
+                permit.into_parts(),
+                LogicalConclusion::Failed,
+                || {
+                    if let Some(attempt) = attempts.get_mut(&execution) {
+                        attempt.establish.revoke_issue_authority();
+                    }
+                    if let (Some(runtime), Some(error)) = (result_runtime.as_deref_mut(), error) {
+                        runtime.accepted_error = Some(error);
+                    }
+                },
+                reply,
+            );
         }
         ActorCommand::DeliverRootSegment {
             activation,
@@ -3834,11 +4121,17 @@ fn handle_command(
                 .is_some_and(|gate| gate.activation == activation && gate.final_eos_ack.is_some())
             {
                 drop(segment);
-                conclude_failed(state, "a root segment arrived outside its delivery gate");
+                conclude_result_failure(
+                    state,
+                    runtime,
+                    "a root segment arrived outside its delivery gate",
+                    result_protocol_failure("a root segment arrived outside its delivery gate"),
+                );
                 reply_result_failure(state, reply);
                 return;
             }
-            if verify_running_activation(state, activation).is_err()
+            let activation_error = verify_running_activation(state, activation).err();
+            if activation_error.is_some()
                 || runtime.pending.is_some()
                 || matches!(
                     runtime.in_flight,
@@ -3846,12 +4139,19 @@ fn handle_command(
                 )
             {
                 drop(segment);
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                let error =
+                    activation_error.unwrap_or(LogicalExecutionActorError::ResultProtocolViolation);
+                let _ = reply.send(Err(error));
                 return;
             }
             if sequence.next().is_none() {
                 drop(segment);
-                conclude_failed(state, "a root segment sequence overflowed");
+                conclude_result_failure(
+                    state,
+                    runtime,
+                    "a root segment sequence overflowed",
+                    result_protocol_failure("a root segment sequence overflowed"),
+                );
                 reply_result_failure(state, reply);
                 return;
             }
@@ -3861,28 +4161,45 @@ fn handle_command(
             };
             if runtime.carrier != expected {
                 drop(segment);
-                conclude_failed(
+                conclude_result_failure(
                     state,
+                    runtime,
                     "a root segment does not match the row carrier this result declared",
+                    result_protocol_failure(
+                        "a root segment does not match the row carrier this result declared",
+                    ),
                 );
                 reply_result_failure(state, reply);
                 return;
             }
-            let Ok((delivery, receipt)) = RootSegmentDelivery::try_new(
+            let (delivery, receipt) = match RootSegmentDelivery::try_new(
                 activation.execution(),
                 sequence,
                 segment,
                 client_rows,
                 rows,
-            ) else {
-                conclude_failed(state, "a root segment could not be prepared for delivery");
-                reply_result_failure(state, reply);
-                return;
+            ) {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    conclude_result_failure(
+                        state,
+                        runtime,
+                        "a root segment could not be prepared for delivery",
+                        error,
+                    );
+                    reply_result_failure(state, reply);
+                    return;
+                }
             };
             let delivery = delivery.with_resident_window(resident_window);
-            if start_schema_delivery(state, runtime, activation).is_err() {
+            if let Err(error) = start_schema_delivery(state, runtime, activation) {
                 drop(delivery);
-                conclude_failed(state, "schema delivery could not be started");
+                conclude_result_failure(
+                    state,
+                    runtime,
+                    "schema delivery could not be started",
+                    result_actor_failure(error),
+                );
                 reply_result_failure(state, reply);
                 return;
             }
@@ -3921,9 +4238,13 @@ fn handle_command(
                     let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 }
                 Some(gate) if gate.activation == activation => {
-                    conclude_failed(
+                    conclude_result_failure(
                         state,
+                        runtime,
                         "the delivery gate was closed while its activation was still current",
+                        result_protocol_failure(
+                            "the delivery gate was closed while its activation was still current",
+                        ),
                     );
                     reply_result_failure(state, reply);
                 }
@@ -3960,7 +4281,7 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
                 return;
             }
-            runtime.terminal_error = Some(error);
+            runtime.attempt_error = Some(AttemptResultFailure { activation, error });
             let protocol_may_own_rows = matches!(
                 runtime.in_flight,
                 Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
@@ -4129,6 +4450,13 @@ fn handle_command(
         } => {
             let activation = permit.identity();
             let (capability, lifetime, mailbox_liveness) = permit.into_parts();
+            if let Err(error) = validate_attempt_command(state, &capability)
+                .and_then(|()| verify_running_activation(state, activation))
+            {
+                settle_refused_attempt(&lifetime, error);
+                let _ = reply.send(Err(error));
+                return;
+            }
             if let Some(runtime) = result_runtime.as_deref_mut()
                 && matches!(
                     runtime.pending.as_ref(),
@@ -4140,9 +4468,18 @@ fn handle_command(
             }
             if let Some(reason) = work_cancellation.reason() {
                 revoke_all_establish_authority(attempts);
-                conclude_for_work_cancellation(state, replacement.as_ref(), None, &reason);
-                lifetime.settle();
-                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                conclude_for_work_cancellation(
+                    state,
+                    replacement.as_ref(),
+                    result_runtime.as_deref_mut(),
+                    &reason,
+                );
+                let error = state.conclusion().map_or(
+                    LogicalExecutionActorError::WrongPhase,
+                    LogicalExecutionActorError::ExecutionConcluded,
+                );
+                settle_refused_attempt(&lifetime, error);
+                let _ = reply.send(Err(error));
                 return;
             }
             let preparation = validate_contexts(replacement_execution, &replacement_contexts)
@@ -4171,18 +4508,23 @@ fn handle_command(
                 match state.begin_replacement(&capability, replacement_execution, failure, false) {
                     Ok(token) => token,
                     Err(error) => {
-                        if let (Some(runtime), Some(terminal_error)) =
-                            (result_runtime, terminal_error)
+                        if state
+                            .conclude(&capability, LogicalConclusion::Failed)
+                            .is_ok()
                         {
-                            runtime.terminal_error = Some(terminal_error);
+                            if let (Some(runtime), Some(error)) = (result_runtime, terminal_error) {
+                                runtime.accepted_error = Some(error);
+                            }
                         }
-                        let _ = state.conclude(&capability, LogicalConclusion::Failed);
                         lifetime.settle();
                         let _ = reply.send(Err(error.into()));
                         return;
                     }
                 };
             if let Some(runtime) = result_runtime.as_deref_mut() {
+                if let Some(error) = terminal_error {
+                    runtime.attempt_error = Some(AttemptResultFailure { activation, error });
+                }
                 runtime.root_success = None;
                 runtime.attempt_decision_pending = None;
             }
@@ -4223,6 +4565,7 @@ fn handle_command(
                 conservative_expiry: Some(conservative_expiry),
                 reservation_valid_for,
                 stale_usage_accounted: true,
+                accepted_failure: None,
             });
             let qualification = ReplacementQualification {
                 identity,
@@ -4246,6 +4589,11 @@ fn handle_command(
             if identity != active.identity {
                 lifetime.abandon();
                 let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+                return;
+            }
+            if let Some(conclusion) = state.conclusion() {
+                lifetime.settle();
+                let _ = reply.send(Err(replacement_terminal_disposition(active, conclusion)));
                 return;
             }
             if let Some(error) = *replacement_error {
@@ -4320,10 +4668,21 @@ fn handle_command(
                 }
                 if matches!(state.phase(), ExecutionPhase::Running { execution, .. } if execution == activation.execution())
                 {
-                    conclude_failed(
-                        state,
-                        format!("settling this attempt's admission issue failed: {error}"),
-                    );
+                    if let Some(runtime) = result_runtime {
+                        conclude_result_failure(
+                            state,
+                            runtime,
+                            "settling this attempt's admission issue failed",
+                            result_actor_failure(error.into()),
+                        );
+                    } else {
+                        // Completion callers receive the same typed error in
+                        // the original reply below; there is no row channel.
+                        conclude_failed(
+                            state,
+                            format!("settling this attempt's admission issue failed: {error}"),
+                        );
+                    }
                 }
             }
             let _ = reply.send(result);
@@ -4715,7 +5074,7 @@ fn apply_root_status_observation(
             return;
         }
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
-            runtime.terminal_error = Some(error);
+            runtime.attempt_error = Some(AttemptResultFailure { activation, error });
         }
         if state.output_visible() {
             fail_result_observation(state, runtime);
@@ -4744,7 +5103,8 @@ fn apply_root_status_observation(
         StatusObservation::VersionConflict
         | StatusObservation::IdentityMismatch(_)
         | StatusObservation::TerminalOverwrite
-        | StatusObservation::InstallationRegression => {
+        | StatusObservation::InstallationRegression
+        | StatusObservation::ConclusionOverwrite => {
             fail_result_observation(state, runtime);
             reply_result_failure(state, reply);
             return;
@@ -4770,7 +5130,7 @@ fn apply_root_status_observation(
     if terminal_state {
         let cause_pending = matches!(&terminal_failure, RootTerminalFailure::Pending);
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
-            runtime.terminal_error = Some(error);
+            runtime.attempt_error = Some(AttemptResultFailure { activation, error });
         }
         if cause_pending {
             runtime.attempt_decision_pending = Some(activation);
@@ -4828,6 +5188,31 @@ fn fail_result_observation(state: &mut LogicalExecutionState, runtime: &mut Resu
     }
 }
 
+/// A terminal reply is a disposition of this exact actor-owned capability,
+/// never a conclusion inferred later by the supervisor from a snapshot.
+fn validate_attempt_command(
+    state: &LogicalExecutionState,
+    capability: &AttemptCapability,
+) -> Result<(), LogicalExecutionActorError> {
+    let activation = identity_of(capability);
+    let known = state.attempt_capability(activation.execution())?;
+    if identity_of(&known) != activation {
+        return Err(LogicalExecutionActorError::StaleAuthority);
+    }
+    match state.conclusion() {
+        Some(conclusion) => Err(LogicalExecutionActorError::ExecutionConcluded(conclusion)),
+        None => Ok(()),
+    }
+}
+
+fn settle_refused_attempt(lifetime: &PermitLifetime, error: LogicalExecutionActorError) {
+    if matches!(error, LogicalExecutionActorError::ExecutionConcluded(_)) {
+        lifetime.settle();
+    } else {
+        lifetime.abandon();
+    }
+}
+
 fn settle_terminal(
     state: &mut LogicalExecutionState,
     (capability, lifetime, _mailbox_liveness): (
@@ -4836,16 +5221,17 @@ fn settle_terminal(
         mpsc::Sender<ActorCommand>,
     ),
     conclusion: LogicalConclusion,
+    on_accepted: impl FnOnce(),
     reply: ActorReply<LogicalConclusion>,
 ) {
-    let result = state
-        .conclude(&capability, conclusion)
-        .map(|()| conclusion)
-        .map_err(LogicalExecutionActorError::from);
+    let result = validate_attempt_command(state, &capability)
+        .and_then(|()| state.conclude(&capability, conclusion).map_err(Into::into))
+        .map(|()| conclusion);
     if result.is_ok() {
+        on_accepted();
         lifetime.settle();
-    } else {
-        lifetime.abandon();
+    } else if let Err(error) = result {
+        settle_refused_attempt(&lifetime, error);
     }
     let _ = reply.send(result);
 }
@@ -4860,14 +5246,18 @@ fn settle_terminal_with_error(
     error: LogicalExecutionActorError,
     reply: ActorReply<LogicalConclusion>,
 ) {
-    match state.conclude(&capability, LogicalConclusion::Failed) {
+    match validate_attempt_command(state, &capability).and_then(|()| {
+        state
+            .conclude(&capability, LogicalConclusion::Failed)
+            .map_err(Into::into)
+    }) {
         Ok(()) => {
             lifetime.settle();
             let _ = reply.send(Err(error));
         }
         Err(state_error) => {
-            lifetime.abandon();
-            let _ = reply.send(Err(state_error.into()));
+            settle_refused_attempt(&lifetime, state_error);
+            let _ = reply.send(Err(state_error));
         }
     }
 }
@@ -5861,7 +6251,7 @@ mod tests {
             .try_acquire(&root.owner.scope(), ResultWindowClass::Client)
             .unwrap();
         let segment = RetainedRootReply::try_new(
-            RootResultReply {
+            novarocks_execution_contract::root_result::RootReadResponse::Reply(RootResultReply {
                 root_task: root_task(execution, 1),
                 profile: RootProfileId::V1,
                 kind: RootOutputKind::ClientRows,
@@ -5877,7 +6267,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-            },
+            }),
             window.retain_alias(),
             4096,
         )
@@ -7008,6 +7398,242 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_cancellation_returns_its_conclusion_to_late_initial_commands() {
+        for reason in [
+            CancellationReason::Requested,
+            CancellationReason::DeadlineExceeded,
+        ] {
+            for fail_initialization in [false, true] {
+                let (parent, work_owner, stage) = test_governed_child_work(None);
+                let config = LogicalExecutionActorConfig::single_attempt_completion(
+                    execution(88001),
+                    ExecutionEffect::None,
+                    NonZeroUsize::new(4).unwrap(),
+                    Vec::new(),
+                    NonZeroUsize::new(2).unwrap(),
+                    NonZeroUsize::new(2).unwrap(),
+                    work_owner,
+                    stage,
+                )
+                .unwrap();
+                let (owner, initial, _output) =
+                    spawn_logical_execution_actor(&Handle::current(), config)
+                        .unwrap()
+                        .into_parts();
+                let actor = owner.actor().clone();
+                let conclusion = if matches!(reason, CancellationReason::DeadlineExceeded) {
+                    LogicalConclusion::Failed
+                } else {
+                    LogicalConclusion::Cancelled
+                };
+                parent.cancel(reason.clone());
+                wait_for_conclusion(&actor, conclusion).await;
+                let result = if fail_initialization {
+                    actor.initialization_failed(initial).await.map(|_| ())
+                } else {
+                    actor.activate(initial.ready()).await.map(|_| ())
+                };
+                assert_eq!(
+                    result,
+                    Err(LogicalExecutionActorError::ExecutionConcluded(conclusion))
+                );
+                assert_eq!(actor.snapshot().await.unwrap().conclusion, Some(conclusion));
+                drop(actor);
+                owner
+                    .into_residual_stand_down_supervisor()
+                    .join()
+                    .await
+                    .unwrap();
+                parent.complete();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_cancellation_does_not_turn_late_failure_or_replacement_into_a_new_verdict() {
+        for reason in [
+            CancellationReason::Requested,
+            CancellationReason::DeadlineExceeded,
+        ] {
+            for command in 0..3 {
+                let (parent, work_owner, stage) = test_governed_child_work(None);
+                let port = Arc::new(DelayedQualificationPort::default());
+                let submissions = Arc::clone(&port.submissions);
+                let first = execution(88002);
+                let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+                    first,
+                    NonZeroUsize::new(4).unwrap(),
+                    Vec::new(),
+                    NonZeroUsize::new(2).unwrap(),
+                    NonZeroUsize::new(2).unwrap(),
+                    NonZeroU32::new(2).unwrap(),
+                    port,
+                    work_owner,
+                    stage,
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+                .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+                .with_result_row_carrier(result_carrier());
+                let (owner, initial, output) =
+                    spawn_logical_execution_actor(&Handle::current(), config)
+                        .unwrap()
+                        .into_parts();
+                let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+                    panic!("the recovery fixture owns a result stream");
+                };
+                stream.begin_schema().unwrap().complete();
+                let actor = owner.actor().clone();
+                let running = actor.activate(initial.ready()).await.unwrap();
+                let conclusion = if matches!(reason, CancellationReason::DeadlineExceeded) {
+                    LogicalConclusion::Failed
+                } else {
+                    LogicalConclusion::Cancelled
+                };
+                parent.cancel(reason.clone());
+                wait_for_conclusion(&actor, conclusion).await;
+                let result = match command {
+                    0 => actor
+                        .fail_attempt_with_error(
+                            running,
+                            result_protocol_failure("late producer failure must remain diagnostic"),
+                        )
+                        .await
+                        .map(|_| ()),
+                    1 => actor.complete_attempt(running).await.map(|_| ()),
+                    _ => actor
+                        .begin_replacement(
+                            running,
+                            AttemptFailureClass::RecoverableInfrastructure,
+                            replacement(first, 2),
+                            Vec::new(),
+                        )
+                        .await
+                        .map(|_| ()),
+                };
+                assert_eq!(
+                    result,
+                    Err(LogicalExecutionActorError::ExecutionConcluded(conclusion))
+                );
+                assert_eq!(actor.snapshot().await.unwrap().conclusion, Some(conclusion));
+                assert!(submissions.lock().unwrap().is_empty());
+                let error = match stream.next().await {
+                    Err(error) => error,
+                    Ok(_) => panic!("accepted cancellation must retain its public failure"),
+                };
+                assert_eq!(
+                    error.kind(),
+                    if matches!(reason, CancellationReason::DeadlineExceeded) {
+                        QueryExecutionErrorKind::DeadlineExceeded
+                    } else {
+                        QueryExecutionErrorKind::Cancelled
+                    }
+                );
+                drop(stream);
+                drop(actor);
+                owner
+                    .into_residual_stand_down_supervisor()
+                    .join()
+                    .await
+                    .unwrap();
+                parent.complete();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_cancellation_settles_held_and_pending_replacement_activation_with_its_conclusion()
+     {
+        for reason in [
+            CancellationReason::Requested,
+            CancellationReason::DeadlineExceeded,
+        ] {
+            for already_enqueued in [false, true] {
+                let (parent, work_owner, stage) = test_governed_child_work(None);
+                let port = Arc::new(DelayedQualificationPort::default());
+                let submissions = Arc::clone(&port.submissions);
+                let first = execution(88003);
+                let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+                    first,
+                    NonZeroUsize::new(4).unwrap(),
+                    Vec::new(),
+                    NonZeroUsize::new(2).unwrap(),
+                    NonZeroUsize::new(2).unwrap(),
+                    NonZeroU32::new(2).unwrap(),
+                    port,
+                    work_owner,
+                    stage,
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+                .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+                .with_result_row_carrier(result_carrier());
+                let (owner, initial, _output) =
+                    spawn_logical_execution_actor(&Handle::current(), config)
+                        .unwrap()
+                        .into_parts();
+                let actor = owner.actor().clone();
+                let running = actor.activate(initial.ready()).await.unwrap();
+                let qualification = actor
+                    .begin_replacement(
+                        running,
+                        AttemptFailureClass::RecoverableInfrastructure,
+                        replacement(first, 2),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap();
+                let mut submission = Some(submissions.lock().unwrap().pop().unwrap());
+                let conclusion = if matches!(reason, CancellationReason::DeadlineExceeded) {
+                    LogicalConclusion::Failed
+                } else {
+                    LogicalConclusion::Cancelled
+                };
+                let result = if already_enqueued {
+                    let mut activation = Box::pin(actor.activate_replacement(qualification));
+                    assert!(matches!(
+                        std::future::poll_fn(|cx| Poll::Ready(activation.as_mut().poll(cx))).await,
+                        Poll::Pending
+                    ));
+                    parent.cancel(reason.clone());
+                    activation.await
+                } else {
+                    parent.cancel(reason.clone());
+                    wait_for_conclusion(&actor, conclusion).await;
+                    submission
+                        .take()
+                        .unwrap()
+                        .refused(ReplacementQualificationFailure::Expired);
+                    loop {
+                        if actor.snapshot().await.unwrap().replacement_error.is_some() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    actor.activate_replacement(qualification).await
+                };
+                assert!(matches!(
+                    result,
+                    Err(LogicalExecutionActorError::ExecutionConcluded(actual)) if actual == conclusion
+                ));
+                assert_eq!(actor.snapshot().await.unwrap().conclusion, Some(conclusion));
+                // A pending activation still owns its dispatched effect; the
+                // held case already consumed the late refusal above.
+                if let Some(submission) = submission.take() {
+                    qualify(submission);
+                }
+                drop(actor);
+                owner
+                    .into_residual_stand_down_supervisor()
+                    .join()
+                    .await
+                    .unwrap();
+                parent.complete();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn inherited_work_cancellation_concludes_a_running_execution() {
         let runtime = Handle::current();
         let first = execution(880);
@@ -7327,6 +7953,74 @@ mod tests {
             .unwrap();
         supervisor.join().await.unwrap();
         parent.complete();
+    }
+
+    #[tokio::test]
+    async fn replacement_receipt_rejects_exact_header_mismatch_and_preserves_domain_refusal() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        for fault in 0..3 {
+            let first = execution(10_100 + fault);
+            let port = Arc::new(DelayedQualificationPort::default());
+            let submissions = Arc::clone(&port.submissions);
+            let config = recovery_config(first, port, 2);
+            let scope = config.work_owner.as_ref().unwrap().scope().clone();
+            let (owner, initial, output) =
+                spawn_logical_execution_actor(&Handle::current(), config)
+                    .unwrap()
+                    .into_parts();
+            let (actor, join) = owner.into_test_parts();
+            let running = actor.activate(initial.ready()).await.unwrap();
+            let qualification = actor
+                .begin_replacement(
+                    running,
+                    AttemptFailureClass::RecoverableInfrastructure,
+                    replacement(first, 2),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            let submission = submissions.lock().unwrap().pop().unwrap();
+            let identity = submission.request().identity();
+            let original_operation = submission.request().operation_id();
+            let original =
+                novarocks_workload_control::WorkError::CapacityWaitTimeout.failure_fact();
+            if fault == 0 {
+                submission.reject_with_header_for_test(TaskOperationId::new_v7(), identity);
+            } else if fault == 1 {
+                let foreign = ReplacementQualificationIdentity::new(
+                    identity.actor(),
+                    identity.failed(),
+                    identity.replacement(),
+                    identity.eligibility_generation().checked_add(1).unwrap(),
+                );
+                submission.reject_with_header_for_test(original_operation, foreign);
+            } else {
+                submission.refused(ReplacementQualificationFailure::DomainRefused(original));
+            }
+            let snapshot = wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+            let refusal = snapshot.replacement_error.unwrap();
+            if fault < 2 {
+                assert_eq!(refusal, ReplacementQualificationFailure::MismatchedReceipt);
+                assert_eq!(refusal.failure_fact().reason().code(), 100);
+                assert_eq!(refusal.failure_fact().class(), FailureClass::Invariant);
+            } else {
+                assert_eq!(
+                    refusal,
+                    ReplacementQualificationFailure::DomainRefused(original)
+                );
+                assert_eq!(refusal.failure_fact(), original);
+            }
+            drop(qualification);
+            drop(output);
+            drop(actor);
+            tokio::time::timeout(Duration::from_secs(1), join)
+                .await
+                .expect("the original actor joins after its effect verdict")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), scope.wait_released())
+                .await
+                .expect("the original work scope releases after the actual actor join");
+        }
     }
 
     #[tokio::test]
@@ -8331,6 +9025,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreign_failed_permit_cannot_install_a_canonical_cause_in_another_actor() {
+        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+        use novarocks_execution_contract::failure::FailureProjection;
+        let config_a = recovery_config(
+            execution(10_200),
+            Arc::new(DelayedQualificationPort::default()),
+            2,
+        );
+        let scope_a = config_a.work_owner.as_ref().unwrap().scope().clone();
+        let config_b = recovery_config(
+            execution(10_201),
+            Arc::new(DelayedQualificationPort::default()),
+            2,
+        );
+        let scope_b = config_b.work_owner.as_ref().unwrap().scope().clone();
+        let (owner_a, initial_a, output_a) =
+            spawn_logical_execution_actor(&Handle::current(), config_a)
+                .unwrap()
+                .into_parts();
+        let (owner_b, initial_b, output_b) =
+            spawn_logical_execution_actor(&Handle::current(), config_b)
+                .unwrap()
+                .into_parts();
+        let (actor_a, join_a) = owner_a.into_test_parts();
+        let (actor_b, join_b) = owner_b.into_test_parts();
+        let running_a = actor_a.activate(initial_a.ready()).await.unwrap();
+        let running_b = actor_b.activate(initial_b.ready()).await.unwrap();
+        let ExecutionOutput::Rows(mut stream_b) = output_b.into_output() else {
+            panic!("the receiving actor must own its original result stream");
+        };
+        stream_b.begin_schema().unwrap().complete();
+        let failure_b = stream_b.failure_view().unwrap();
+        let source = EstablishIssueError::AuthorizationBudgetExhausted;
+        let foreign_error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            source.failure_fact(),
+            source.safe_detail(),
+            ExecutionFailureSite::Coordinator,
+        ));
+
+        // This is a real move-only permit owned by a different governed actor.
+        let refusal = actor_b
+            .fail_attempt_with_error(running_a, foreign_error.clone())
+            .await;
+        let snapshot_after_refusal = actor_b.snapshot().await.unwrap();
+        let failure_after_refusal = failure_b.current();
+        let accepted = actor_b.fail_attempt(running_b).await;
+        let delivered = stream_b.next().await;
+        let published = failure_b.current();
+
+        // Join both original actor bodies and release their work before asserting the oracle.
+        drop(output_a);
+        drop(stream_b);
+        drop(actor_a);
+        drop(actor_b);
+        let (joined_a, joined_b) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), join_a),
+            tokio::time::timeout(Duration::from_secs(1), join_b),
+        );
+        joined_a
+            .expect("the foreign permit's original actor must actually join")
+            .unwrap();
+        joined_b
+            .expect("the receiving actor must actually join")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), scope_a.wait_released())
+            .await
+            .expect("the foreign actor original Work scope releases after join");
+        tokio::time::timeout(Duration::from_secs(1), scope_b.wait_released())
+            .await
+            .expect("the receiving actor original Work scope releases after join");
+
+        assert_eq!(refusal, Err(LogicalExecutionActorError::StaleAuthority));
+        assert_eq!(snapshot_after_refusal.conclusion, None);
+        assert_eq!(failure_after_refusal, None);
+        assert_eq!(accepted, Ok(LogicalConclusion::Failed));
+        let error = match delivered {
+            Err(error) => error,
+            Ok(_) => panic!("the receiving actor's own failure must terminate its stream"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            error.message(),
+            "logical execution failed before success EOF"
+        );
+        let input = error
+            .execution_failure()
+            .expect("the receiving actor owns its fallback reason");
+        assert_eq!(
+            input.fact(),
+            crate::execution_error::QueryFailureReason::LogicalFailureUnspecified.failure_fact()
+        );
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_ne!(error, foreign_error);
+        assert_eq!(published, Some(error));
+    }
+
+    #[tokio::test]
     async fn logical_failure_wakes_an_idle_result_stream_without_queue_capacity() {
         let runtime = Handle::current();
         let first = execution(110);
@@ -8495,7 +9286,7 @@ mod tests {
             .await
             .expect("the in-flight protocol writer must observe cancellation");
         assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
-        delivery.fail(error);
+        delivery.fail(actual_consumer_body_failure());
         assert_eq!(
             delivery_task.await.unwrap().unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Cancelled)
@@ -8508,8 +9299,71 @@ mod tests {
         drop(control);
         drop(stream);
         drop(actor);
-        drop(owner);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        assert_eq!(failure.current(), Some(error));
         parent.complete();
+    }
+
+    fn actual_consumer_body_failure() -> QueryExecutionError {
+        use novarocks_execution_contract::failure::FailureProjection;
+        let after = ClientRowStreamCursor::default()
+            .validate_body(result_profile(), &[2, 0, 0, 0, b'a'])
+            .unwrap()
+            .after();
+        let cause = after.validate_end().unwrap_err();
+        assert_eq!(
+            cause,
+            novarocks_result_contract::ClientBodyError::EndInsideRow
+        );
+        QueryExecutionError::from_execution(crate::execution_error::ExecutionFailureInput::new(
+            cause.failure_fact(),
+            novarocks_execution_contract::SafeDetail::truncating(cause.safe_detail()),
+            crate::execution_error::ExecutionFailureSite::Coordinator,
+        ))
+    }
+
+    #[tokio::test]
+    async fn schema_consumer_failure_keeps_its_original_domain_input() {
+        let first = execution(12_201);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
+        let scope = config.work_owner.as_ref().unwrap().scope().clone();
+        let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("result execution must expose its row stream");
+        };
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let original = actual_consumer_body_failure();
+        let failure = stream.failure_view().unwrap();
+        stream.begin_schema().unwrap().fail(original.clone());
+        let received = match tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+        {
+            Err(error) => error,
+            Ok(_) => panic!("schema failure must prevent every batch and success EOF"),
+        };
+        assert_eq!(received, original);
+        assert!(stream.next().await.unwrap().is_none());
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        drop((running, stream, actor));
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        assert_eq!(failure.current(), Some(original));
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_released())
+            .await
+            .expect("the original schema failure owner releases its work");
     }
 
     #[tokio::test]
@@ -8544,22 +9398,35 @@ mod tests {
         let ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue one batch");
         };
-        delivery.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            "protocol writer failed",
-        ));
+        let original = actual_consumer_body_failure();
+        let failure = stream.failure_view().unwrap();
+        delivery.fail(original.clone());
         assert_eq!(
             delivery_task.await.unwrap().unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        let received = match tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+        {
+            Err(error) => error,
+            Ok(_) => panic!("failed consumer receipt must prevent successful EOF"),
+        };
+        assert_eq!(received, original);
+        assert!(stream.next().await.unwrap().is_none());
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         drop(running);
         window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
-        drop(owner);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        assert_eq!(failure.current(), Some(original));
     }
 
     #[tokio::test]
@@ -8578,7 +9445,12 @@ mod tests {
         drop(stream);
         let actor = owner.actor().clone();
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
-        assert!(actor.activate(initial.ready()).await.is_err());
+        assert!(matches!(
+            actor.activate(initial.ready()).await,
+            Err(LogicalExecutionActorError::ExecutionConcluded(
+                LogicalConclusion::Failed
+            ))
+        ));
         drop(actor);
         drop(owner);
     }
@@ -8644,7 +9516,7 @@ mod tests {
             })
             .await
             .unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::WrongPhase
         );
         assert_eq!(foreign_capacity.snapshot().held_positions, [0; 4]);
         assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
@@ -8825,6 +9697,210 @@ mod tests {
         drop(stream);
         drop(actor);
         drop(owner);
+    }
+
+    #[tokio::test]
+    async fn result_constructor_failure_keeps_its_domain_fact_through_the_actor() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        let first = execution(12_200);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
+        let scope = config.work_owner.as_ref().unwrap().scope().clone();
+        let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
+        let (actor, join) = owner.into_test_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let observer = running.bind_root_result(root_task(first, 1)).await.unwrap();
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
+        // A real unfinished row leaves two payload bytes. The supplied segment
+        // then presents an out-of-profile prefix, so its original body domain
+        // rejects it before any delivery can own the window.
+        let before = ClientRowStreamCursor::default()
+            .validate_body(result_profile(), &[3, 0, 0, 0, b'x'])
+            .unwrap()
+            .after();
+        let delivery_result = running
+            .deliver_root_segment(
+                ResultPacketSequence::new(0),
+                segment,
+                Some((result_profile(), before)),
+                2,
+                crate::api::RootRelayResidentWindow::default(),
+            )
+            .await;
+        let observed = match stream.next().await {
+            Err(error) => Some(error),
+            Ok(delivery) => {
+                drop(delivery);
+                None
+            }
+        };
+        drop(observer);
+        drop(running);
+        drop(stream);
+        drop(actor);
+        tokio::time::timeout(Duration::from_secs(1), join)
+            .await
+            .expect("the original actor actually exits")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_released())
+            .await
+            .expect("the original actor work releases after exit");
+        let held = capacity.snapshot().held_positions;
+        window_owner.complete();
+        drop(control);
+        assert!(delivery_result.is_err());
+        assert_eq!(held, [0; 4]);
+        let error = observed.expect("the rejected body must terminate its original stream");
+        let input = error
+            .execution_failure()
+            .expect("body facts must remain typed");
+        assert_eq!(
+            input.fact(),
+            novarocks_result_contract::ClientBodyError::InvalidRowLength.failure_fact()
+        );
+        assert_eq!(
+            input.site(),
+            crate::execution_error::ExecutionFailureSite::Coordinator
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_attempt_failure_does_not_escape_its_activation() {
+        use crate::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        for outcome in 0..3 {
+            let first = execution(12_100 + outcome);
+            let second = replacement(first, 2);
+            let port = Arc::new(DelayedQualificationPort::default());
+            let submissions = Arc::clone(&port.submissions);
+            let config = recovery_config(first, port, 2)
+                .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+                .with_result_row_carrier(result_carrier());
+            let scope = config.work_owner.as_ref().unwrap().scope().clone();
+            let (owner, initial, output) =
+                spawn_logical_execution_actor(&Handle::current(), config)
+                    .unwrap()
+                    .into_parts();
+            let (actor, join) = owner.into_test_parts();
+            let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+                panic!("result execution must expose its row stream");
+            };
+            let failure_view = stream.failure_view().unwrap();
+            stream.begin_schema().unwrap().complete();
+            let running = actor.activate(initial.ready()).await.unwrap();
+            let original = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                QueryFailureReason::BackendLost.failure_fact(),
+                SafeDetail::truncating("the original attempt lost its exact backend"),
+                ExecutionFailureSite::Backend {
+                    process: BackendProcessId::new_v7(),
+                },
+            ));
+            running
+                .freeze_result_attempt_failure(original.clone())
+                .await
+                .unwrap();
+            let qualification = actor
+                .begin_replacement_with_error(
+                    running,
+                    AttemptFailureClass::RecoverableInfrastructure,
+                    original.clone(),
+                    second,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            let submission = submissions.lock().unwrap().pop().unwrap();
+            let mut observed_failure = None;
+            if outcome == 0 {
+                submission.rejected();
+                wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+                observed_failure = match stream.next().await {
+                    Err(error) => Some(error),
+                    Ok(delivery) => {
+                        drop(delivery);
+                        None
+                    }
+                };
+                drop(qualification);
+            } else {
+                let mut activation = Box::pin(actor.activate_replacement(qualification));
+                assert!(matches!(
+                    std::future::poll_fn(|cx| Poll::Ready(activation.as_mut().poll(cx))).await,
+                    Poll::Pending
+                ));
+                qualify(submission);
+                let successor = actor
+                    .activate(activation.await.unwrap().ready())
+                    .await
+                    .unwrap();
+                if outcome == 1 {
+                    actor.fail_attempt(successor).await.unwrap();
+                    observed_failure = match stream.next().await {
+                        Err(error) => Some(error),
+                        Ok(delivery) => {
+                            drop(delivery);
+                            None
+                        }
+                    };
+                } else {
+                    let root = root_task(second, 4);
+                    let observer = successor.bind_root_result(root).await.unwrap();
+                    observer
+                        .observe_local_root_end(root, result_end(0))
+                        .await
+                        .unwrap();
+                    observer
+                        .observe_status(root_status(root, 1, TaskState::Finished))
+                        .await
+                        .unwrap();
+                    let finish =
+                        tokio::spawn(async move { successor.finish_result_stream().await });
+                    let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+                        panic!("the successor must deliver its own success End");
+                    };
+                    assert_eq!(end.execution_id(), second);
+                    assert_eq!(finish.await.unwrap().unwrap(), LogicalConclusion::Succeeded);
+                    end.complete();
+                    drop(observer);
+                }
+            }
+            drop(stream);
+            drop(actor);
+            tokio::time::timeout(Duration::from_secs(1), join)
+                .await
+                .expect("the original actor actually exits")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), scope.wait_released())
+                .await
+                .expect("the original work scope releases after actor exit");
+            if outcome == 0 {
+                assert_eq!(observed_failure, Some(original));
+            } else if outcome == 1 {
+                let current = observed_failure.expect("the successor must publish its own failure");
+                assert_eq!(current.kind(), QueryExecutionErrorKind::Failed);
+                assert_eq!(
+                    current.message(),
+                    "logical execution failed before success EOF"
+                );
+                assert_ne!(current, original);
+                assert_ne!(current.execution_failure(), original.execution_failure());
+            } else {
+                assert_eq!(
+                    failure_view.current(),
+                    None,
+                    "a successful successor must never publish its predecessor's failure"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -9198,6 +10274,7 @@ mod tests {
         let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
+        let failure = stream.failure_view().unwrap();
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
@@ -9215,19 +10292,22 @@ mod tests {
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue success EOF");
         };
-        end.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            "protocol writer failed to encode EOF",
-        ));
+        end.fail(actual_consumer_body_failure());
 
         assert_eq!(
             finish_task.await.unwrap().unwrap(),
             LogicalConclusion::Succeeded
         );
         wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
+        drop(observer);
         drop(stream);
         drop(actor);
-        drop(owner);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        assert!(failure.current().is_none());
     }
 
     #[tokio::test]

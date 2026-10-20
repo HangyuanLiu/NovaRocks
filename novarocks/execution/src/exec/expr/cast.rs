@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::{Chunk, ChunkFieldSchema};
-use crate::exec::expr::decimal::pow10_i256;
 use crate::exec::expr::function::{parse_date_value, parse_datetime_value};
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
     Decimal256Array, Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array,
@@ -45,41 +45,355 @@ use novarocks_types::value::variant::{
     variant_to_datetime_micros, variant_to_f64, variant_to_i64, variant_to_string,
     variant_to_time_micros,
 };
-const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-fn pow10_i128(scale: u32) -> Option<i128> {
-    novarocks_functions::legacy_decimal::checked_pow10_i128(scale as usize)
+
+impl From<novarocks_types::arrow_cast::ScalarCastFailure> for ExecutionFailure {
+    fn from(cause: novarocks_types::arrow_cast::ScalarCastFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+impl From<novarocks_functions::decimal128_rescale::DecimalCastFailure> for ExecutionFailure {
+    fn from(cause: novarocks_functions::decimal128_rescale::DecimalCastFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+impl From<novarocks_functions::largeint::LargeIntCarrierFailure> for ExecutionFailure {
+    fn from(cause: novarocks_functions::largeint::LargeIntCarrierFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+/// The CAST expression owns source/target context; the value domain retains
+/// its original cause and decides the neutral fact. Labels are cold, bounded
+/// diagnostics and cannot add SQL position or change the failure category.
+#[derive(Debug)]
+struct CastEvaluationFailure {
+    source: ExecutionFailure,
+    from: novarocks_failure_contract::BoundedDetail,
+    to: novarocks_failure_contract::BoundedDetail,
+    composite: bool,
+}
+impl std::fmt::Display for CastEvaluationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.composite {
+            // Field/layout facts must remain visible before potentially wide
+            // type labels consume the bounded diagnostic budget.
+            write!(
+                f,
+                "{}; CAST failed: from {} to {}",
+                self.source.detail(),
+                self.from.as_str(),
+                self.to.as_str()
+            )
+        } else {
+            write!(
+                f,
+                "CAST failed: from {} to {}: {}",
+                self.from.as_str(),
+                self.to.as_str(),
+                self.source.detail()
+            )
+        }
+    }
+}
+impl std::error::Error for CastEvaluationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CastEvaluationFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.source)
+    }
+}
+fn cast_evaluation_failure(
+    source: ExecutionFailure,
+    from: &DataType,
+    to: &DataType,
+) -> ExecutionFailure {
+    let composite = [from, to].into_iter().any(|ty| {
+        matches!(
+            ty,
+            DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Struct(_)
+                | DataType::Map(_, _)
+        )
+    });
+    ExecutionFailure::from_domain(CastEvaluationFailure {
+        source,
+        composite,
+        from: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "{from:?}"
+        )),
+        to: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!("{to:?}")),
+    })
 }
 
-fn decimal128_to_i64_literal(value: i128, scale: i8) -> Option<i64> {
-    let integral = if scale >= 0 {
-        let divisor = pow10_i128(scale as u32)?;
-        value / divisor
-    } else {
-        let factor = pow10_i128((-scale) as u32)?;
-        value.checked_mul(factor)?
-    };
-    i64::try_from(integral).ok()
+#[derive(Debug)]
+struct CastNumericFailure(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for CastNumericFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for CastNumericFailure {}
+impl novarocks_failure_contract::FailureProjection for CastNumericFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+    }
+}
+fn cast_numeric_failure(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(CastNumericFailure(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+#[derive(Debug)]
+struct CastConstructionFailure(arrow::error::ArrowError);
+impl std::fmt::Display for CastConstructionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CAST carrier construction: {}", self.0)
+    }
+}
+impl std::error::Error for CastConstructionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CastConstructionFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match self.0 {
+            arrow::error::ArrowError::MemoryError(_) => (
+                FailureClass::Resource,
+                crate::runtime::fragment::ExecutionReason::ArrayCastAllocation,
+            ),
+            _ => (
+                FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::ArrayCastContract,
+            ),
+        };
+        FailureFact::new(class, reason.reason())
+    }
+}
+pub(super) fn cast_construct_failure(cause: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(CastConstructionFailure(cause))
+}
+#[derive(Debug)]
+struct CastJsonFailure {
+    source: serde_json::Error,
+    decode: bool,
+}
+impl std::fmt::Display for CastJsonFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CAST JSON conversion: {}", self.source)
+    }
+}
+impl std::error::Error for CastJsonFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CastJsonFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        if self.decode {
+            return novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact();
+        }
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::ArrayCastJsonEncode.reason(),
+        )
+    }
+}
+fn cast_json_encode_failure(source: serde_json::Error) -> ExecutionFailure {
+    ExecutionFailure::from_domain(CastJsonFailure {
+        source,
+        decode: false,
+    })
+}
+fn cast_json_decode_failure(source: serde_json::Error) -> ExecutionFailure {
+    ExecutionFailure::from_domain(CastJsonFailure {
+        source,
+        decode: true,
+    })
+}
+#[derive(Debug)]
+struct CastLargeIntWidth(std::array::TryFromSliceError);
+impl std::fmt::Display for CastLargeIntWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CAST LARGEINT value requires 16 bytes: {}", self.0)
+    }
+}
+impl std::error::Error for CastLargeIntWidth {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CastLargeIntWidth {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::ArrayCastLargeIntWidth.reason(),
+        )
+    }
+}
+fn cast_largeint_view<'a>(
+    array: &'a ArrayRef,
+    context: &str,
+) -> Result<&'a arrow::array::FixedSizeBinaryArray, ExecutionFailure> {
+    let array = array
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+        .ok_or_else(|| {
+            super::expression_contract(format_args!("{context}: expected LARGEINT carrier"))
+        })?;
+    if array.value_length() != 16 {
+        return Err(super::expression_contract(format_args!(
+            "{context}: expected 16 bytes, got {}",
+            array.value_length()
+        )));
+    }
+    Ok(array)
+}
+fn cast_largeint_value(
+    array: &arrow::array::FixedSizeBinaryArray,
+    row: usize,
+) -> Result<i128, ExecutionFailure> {
+    let bytes: [u8; 16] = array
+        .value(row)
+        .try_into()
+        .map_err(|cause| ExecutionFailure::from_domain(CastLargeIntWidth(cause)))?;
+    Ok(i128::from_be_bytes(bytes))
+}
+fn cast_pow10_i256(exp: usize) -> Result<i256, ExecutionFailure> {
+    let mut out = i256::ONE;
+    for _ in 0..exp {
+        out = out.checked_mul(i256::from_i128(10)).ok_or_else(|| {
+            super::expression_contract("decimal scale factor exceeds its frozen i256 carrier")
+        })?;
+    }
+    Ok(out)
 }
 
-fn decimal128_to_i128_literal(value: i128, scale: i8) -> Option<i128> {
-    if scale >= 0 {
-        let divisor = pow10_i128(scale as u32)?;
-        Some(value / divisor)
-    } else {
-        let factor = pow10_i128((-scale) as u32)?;
-        value.checked_mul(factor)
+impl From<novarocks_functions::list_cast_core::ListCastFailure> for ExecutionFailure {
+    fn from(cause: novarocks_functions::list_cast_core::ListCastFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+#[derive(Debug)]
+enum CastContainerExtent {
+    Offsets { required: u128, minimum_unit: bool },
+    Backing { required: u128 },
+}
+impl std::fmt::Display for CastContainerExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Offsets {
+                required,
+                minimum_unit,
+            } => write!(
+                f,
+                "CAST {} requires {required} child positions, i32 offset limit {}",
+                if *minimum_unit { "one row" } else { "output" },
+                i32::MAX
+            ),
+            Self::Backing { required } => write!(
+                f,
+                "CAST temporary backing requires {required} bytes, layout limit {}",
+                isize::MAX
+            ),
+        }
+    }
+}
+impl std::error::Error for CastContainerExtent {}
+impl novarocks_failure_contract::FailureProjection for CastContainerExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, ResourceDimension, ResourceFacts, ResourceScope, domain,
+        };
+        match self {
+            Self::Offsets {
+                required,
+                minimum_unit,
+            } => FailureFact::new(
+                FailureClass::Representation,
+                ExecutionReason::ArrayCastContainerOffset.reason(),
+            )
+            .with_representation(RepresentationFacts {
+                boundary: if *minimum_unit {
+                    RepresentationBoundary::MinimumUnit
+                } else {
+                    RepresentationBoundary::SingleOutput
+                },
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(32).unwrap(),
+                },
+                required: u64::try_from(*required).ok(),
+                extent_limit: Some(i32::MAX as u64),
+                representable_prefix: None,
+            }),
+            Self::Backing { required } => {
+                novarocks_functions::allocation_failure::rust_array_backing_failure_fact(
+                    ExecutionReason::ArrayCastContainerBacking.reason(),
+                    *required,
+                    RepresentationBoundary::SingleOutput,
+                )
+            }
+        }
+    }
+}
+// The caller sizes the actual demanded rows before cloning/flattening them.
+// These layout bounds report representation facts; they do not grant memory.
+fn preflight_cast_container(
+    rows: usize,
+    total: u128,
+    largest: usize,
+    item_width: usize,
+) -> Result<(), ExecutionFailure> {
+    if total > i32::MAX as u128 {
+        let minimum_unit = largest as u128 > i32::MAX as u128;
+        return Err(ExecutionFailure::from_domain(
+            CastContainerExtent::Offsets {
+                required: if minimum_unit { largest as u128 } else { total },
+                minimum_unit,
+            },
+        ));
+    }
+    for required in [
+        (rows as u128 + 1) * std::mem::size_of::<i32>() as u128,
+        total * item_width as u128,
+    ] {
+        if required > isize::MAX as u128 {
+            return Err(ExecutionFailure::from_domain(
+                CastContainerExtent::Backing { required },
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl From<novarocks_functions::date_float_cast::DateFloatFailure> for ExecutionFailure {
+    fn from(cause: novarocks_functions::date_float_cast::DateFloatFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+impl From<novarocks_functions::float_date_cast::FloatDateFailure> for ExecutionFailure {
+    fn from(cause: novarocks_functions::float_date_cast::FloatDateFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+impl From<novarocks_functions::temporal_carrier::TemporalCastFailure> for ExecutionFailure {
+    fn from(cause: novarocks_functions::temporal_carrier::TemporalCastFailure) -> Self {
+        Self::from_domain(cause)
     }
 }
 
-fn decimal256_to_i128_literal(value: i256, scale: i8) -> Option<i128> {
-    let integral = if scale >= 0 {
-        let divisor = pow10_i256(scale as usize).ok()?;
-        value.checked_div(divisor)?
-    } else {
-        let factor = pow10_i256((-scale) as usize).ok()?;
-        value.checked_mul(factor)?
-    };
-    integral.to_i128()
+const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
+fn pow10_i128(scale: u32) -> Option<i128> {
+    novarocks_functions::legacy_decimal::checked_pow10_i128(scale as usize)
 }
 
 fn format_decimal_with_scale(unscaled: i128, scale: i8) -> String {
@@ -90,314 +404,7 @@ fn format_decimal256_with_scale(unscaled: i256, scale: i8) -> String {
     novarocks_functions::builtin::string_extended::format_decimal256_with_scale(unscaled, scale)
 }
 
-fn numeric_largeint_literal_at(array: &ArrayRef, row: usize) -> Result<Option<i128>, String> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    match array.data_type() {
-        DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-            Ok(Some(if arr.value(row) { 1 } else { 0 }))
-        }
-        DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::UInt8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| "failed to downcast to UInt8Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::UInt16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| "failed to downcast to UInt16Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::UInt32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| "failed to downcast to UInt32Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::UInt64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| "failed to downcast to UInt64Array".to_string())?;
-            Ok(Some(arr.value(row) as i128))
-        }
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-            let value = arr.value(row) as f64;
-            if !value.is_finite() || value < i128::MIN as f64 || value > i128::MAX as f64 {
-                Ok(None)
-            } else {
-                Ok(Some(value.trunc() as i128))
-            }
-        }
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-            let value = arr.value(row);
-            if !value.is_finite() || value < i128::MIN as f64 || value > i128::MAX as f64 {
-                Ok(None)
-            } else {
-                Ok(Some(value.trunc() as i128))
-            }
-        }
-        DataType::Decimal128(_, scale) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-            Ok(decimal128_to_i128_literal(arr.value(row), *scale))
-        }
-        other => Err(format!(
-            "unsupported numeric LARGEINT source type: {:?}",
-            other
-        )),
-    }
-}
-
-fn cast_numeric_to_largeint_binary_array(array: &ArrayRef) -> Result<ArrayRef, String> {
-    let mut values = Vec::with_capacity(array.len());
-    for row in 0..array.len() {
-        values.push(numeric_largeint_literal_at(array, row)?);
-    }
-    largeint::array_from_i128(&values)
-}
-
-fn is_numeric_datetime_source(ty: &DataType) -> bool {
-    matches!(
-        ty,
-        DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::FixedSizeBinary(16)
-    )
-}
-
-fn numeric_datetime_literal_at(array: &ArrayRef, row: usize) -> Result<Option<i64>, String> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    match array.data_type() {
-        DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-            Ok(Some(if arr.value(row) { 1 } else { 0 }))
-        }
-        DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
-            Ok(Some(arr.value(row) as i64))
-        }
-        DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
-            Ok(Some(arr.value(row) as i64))
-        }
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
-            Ok(Some(arr.value(row) as i64))
-        }
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-            Ok(Some(arr.value(row)))
-        }
-        DataType::UInt8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| "failed to downcast to UInt8Array".to_string())?;
-            Ok(Some(arr.value(row) as i64))
-        }
-        DataType::UInt16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| "failed to downcast to UInt16Array".to_string())?;
-            Ok(Some(arr.value(row) as i64))
-        }
-        DataType::UInt32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| "failed to downcast to UInt32Array".to_string())?;
-            Ok(Some(arr.value(row) as i64))
-        }
-        DataType::UInt64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| "failed to downcast to UInt64Array".to_string())?;
-            let value = arr.value(row);
-            Ok((value <= i64::MAX as u64).then_some(value as i64))
-        }
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-            let value = arr.value(row) as f64;
-            if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
-                Ok(None)
-            } else {
-                Ok(Some(value.trunc() as i64))
-            }
-        }
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-            let value = arr.value(row);
-            if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
-                Ok(None)
-            } else {
-                Ok(Some(value.trunc() as i64))
-            }
-        }
-        DataType::Decimal128(_, scale) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-            Ok(decimal128_to_i64_literal(arr.value(row), *scale))
-        }
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let arr =
-                largeint::as_fixed_size_binary_array(array, "cast LARGEINT to DATETIME source")?;
-            let value = largeint::value_at(arr, row)?;
-            Ok(i64::try_from(value).ok())
-        }
-        other => Err(format!(
-            "unsupported numeric datetime source type: {:?}",
-            other
-        )),
-    }
-}
-
-fn cast_numeric_to_date32_array(array: &ArrayRef) -> Result<ArrayRef, String> {
-    let mut builder = Date32Builder::new();
-    for row in 0..array.len() {
-        let value = numeric_datetime_literal_at(array, row)?;
-        let days = value
-            .and_then(datetime_literal_to_naive_datetime)
-            .map(|dt| dt.date().num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET);
-        match days {
-            Some(v) => builder.append_value(v),
-            None => builder.append_null(),
-        }
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
-fn cast_numeric_to_timestamp_array(
-    array: &ArrayRef,
-    target_type: &DataType,
-) -> Result<ArrayRef, String> {
-    // For nanosecond targets, build directly from nanoseconds to avoid losing sub-microsecond
-    // precision when the numeric literal encodes fractional seconds.
-    if matches!(target_type, DataType::Timestamp(TimeUnit::Nanosecond, _)) {
-        let mut nanos = Vec::with_capacity(array.len());
-        for row in 0..array.len() {
-            let value = numeric_datetime_literal_at(array, row)?;
-            let nanos_value = value
-                .and_then(datetime_literal_to_naive_datetime)
-                .map(|dt| {
-                    dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
-                        "CAST failed: numeric datetime literal is out of nanosecond i64 range"
-                            .to_string()
-                    })
-                })
-                .transpose()?;
-            nanos.push(nanos_value);
-        }
-        return Ok(Arc::new(TimestampNanosecondArray::from(nanos)) as ArrayRef);
-    }
-
-    let mut micros = Vec::with_capacity(array.len());
-    for row in 0..array.len() {
-        let value = numeric_datetime_literal_at(array, row)?;
-        let micros_value = value
-            .and_then(datetime_literal_to_naive_datetime)
-            .map(|dt| dt.and_utc().timestamp_micros());
-        micros.push(micros_value);
-    }
-    let micro_array = Arc::new(TimestampMicrosecondArray::from(micros)) as ArrayRef;
-    if micro_array.data_type() == target_type {
-        return Ok(micro_array);
-    }
-    cast(micro_array.as_ref(), target_type).map_err(|e| {
-        format!(
-            "CAST failed: from {:?} to {:?}: {}",
-            micro_array.data_type(),
-            target_type,
-            e
-        )
-    })
-}
-
-fn cast_date32_to_float64(arr: &Date32Array) -> Result<ArrayRef, String> {
+fn cast_date32_to_float64(arr: &Date32Array) -> Result<ArrayRef, ExecutionFailure> {
     let mut builder = Float64Builder::new();
     for i in 0..arr.len() {
         if arr.is_null(i) {
@@ -411,7 +418,7 @@ fn cast_date32_to_float64(arr: &Date32Array) -> Result<ArrayRef, String> {
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn cast_date32_to_float32(arr: &Date32Array) -> Result<ArrayRef, String> {
+fn cast_date32_to_float32(arr: &Date32Array) -> Result<ArrayRef, ExecutionFailure> {
     let mut builder = Float32Builder::new();
     for i in 0..arr.len() {
         if arr.is_null(i) {
@@ -425,7 +432,7 @@ fn cast_date32_to_float32(arr: &Date32Array) -> Result<ArrayRef, String> {
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn cast_float64_to_date32(arr: &Float64Array) -> Result<ArrayRef, String> {
+fn cast_float64_to_date32(arr: &Float64Array) -> Result<ArrayRef, ExecutionFailure> {
     let mut builder = Date32Builder::new();
     for i in 0..arr.len() {
         if arr.is_null(i) {
@@ -439,7 +446,7 @@ fn cast_float64_to_date32(arr: &Float64Array) -> Result<ArrayRef, String> {
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn cast_float32_to_date32(arr: &Float32Array) -> Result<ArrayRef, String> {
+fn cast_float32_to_date32(arr: &Float32Array) -> Result<ArrayRef, ExecutionFailure> {
     let mut builder = Date32Builder::new();
     for i in 0..arr.len() {
         if arr.is_null(i) {
@@ -513,20 +520,20 @@ fn cast_float32_to_float64_preserve_non_finite(arr: &Float32Array) -> ArrayRef {
 fn sanitize_non_finite_cast_result(
     array: ArrayRef,
     target_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     match target_type {
         DataType::Float64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float64Array"))?;
             Ok(sanitize_non_finite_float64(arr))
         }
         DataType::Float32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float32Array"))?;
             Ok(sanitize_non_finite_float32(arr))
         }
         _ => Ok(array),
@@ -565,7 +572,7 @@ fn first_float_to_int_overflow_value(
     source: &ArrayRef,
     casted: &ArrayRef,
     target_type: &DataType,
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, ExecutionFailure> {
     if source.len() != casted.len() || !is_integral_target_type(target_type) {
         return Ok(None);
     }
@@ -575,7 +582,7 @@ fn first_float_to_int_overflow_value(
             let arr = source
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float32Array"))?;
             for i in 0..arr.len() {
                 if !arr.is_null(i) && casted.is_null(i) {
                     return Ok(Some(arr.value(i) as f64));
@@ -587,7 +594,7 @@ fn first_float_to_int_overflow_value(
             let arr = source
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float64Array"))?;
             for i in 0..arr.len() {
                 if !arr.is_null(i) && casted.is_null(i) {
                     return Ok(Some(arr.value(i)));
@@ -630,82 +637,6 @@ fn parse_datetime_string_to_seconds(raw: &str) -> Option<i64> {
     novarocks_functions::time_text_cast::parse_datetime_string_to_seconds(raw)
 }
 
-fn parse_string_to_naive_datetime(raw: &str) -> Option<NaiveDateTime> {
-    parse_datetime_value(raw)
-        .or_else(|| parse_date_value(raw).and_then(|d: NaiveDate| d.and_hms_opt(0, 0, 0)))
-}
-
-fn cast_utf8_to_date32_array(arr: &StringArray) -> ArrayRef {
-    let mut builder = Date32Builder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            builder.append_null();
-            continue;
-        }
-        let days = parse_string_to_naive_datetime(arr.value(row))
-            .map(|dt| dt.date().num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET);
-        match days {
-            Some(v) => builder.append_value(v),
-            None => builder.append_null(),
-        }
-    }
-    Arc::new(builder.finish()) as ArrayRef
-}
-
-fn cast_utf8_to_timestamp_array(
-    arr: &StringArray,
-    target_type: &DataType,
-) -> Result<ArrayRef, String> {
-    // For nanosecond targets, parse directly to nanoseconds to preserve sub-microsecond
-    // precision. Going through a microsecond intermediate would silently truncate
-    // the last 3 significant digits (e.g. '...05.000000001' → '...05.000000').
-    if matches!(target_type, DataType::Timestamp(TimeUnit::Nanosecond, _)) {
-        let nanos_vec: Vec<Option<i64>> =
-            (0..arr.len())
-                .map(|row| {
-                    if arr.is_null(row) {
-                        Ok(None)
-                    } else {
-                        let dt = parse_string_to_naive_datetime(arr.value(row));
-                        match dt {
-                        None => Ok(None),
-                        Some(dt) => dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
-                            format!(
-                                "CAST failed: timestamp value '{}' is out of nanosecond range",
-                                arr.value(row)
-                            )
-                        }).map(Some),
-                    }
-                    }
-                })
-                .collect::<Result<_, String>>()?;
-        return Ok(Arc::new(TimestampNanosecondArray::from(nanos_vec)) as ArrayRef);
-    }
-
-    let micros = (0..arr.len())
-        .map(|row| {
-            if arr.is_null(row) {
-                None
-            } else {
-                parse_string_to_naive_datetime(arr.value(row))
-                    .map(|dt| dt.and_utc().timestamp_micros())
-            }
-        })
-        .collect::<Vec<_>>();
-    let micro_array = Arc::new(TimestampMicrosecondArray::from(micros)) as ArrayRef;
-    if micro_array.data_type() == target_type {
-        return Ok(micro_array);
-    }
-    cast(micro_array.as_ref(), target_type).map_err(|e| {
-        format!(
-            "CAST failed: from {:?} to {:?}: {}",
-            arr.data_type(),
-            target_type,
-            e
-        )
-    })
-}
-
 fn parse_time_integer_to_seconds(value: i64) -> Option<i64> {
     if value < 0 {
         return None;
@@ -731,8 +662,8 @@ fn parse_time_float_to_seconds(value: f64) -> Option<i64> {
     parse_time_integer_to_seconds(value.trunc() as i64)
 }
 
-fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> Result<ArrayRef, String> {
-    novarocks_functions::time_text_cast::seconds_to_time64_micro_array(seconds)
+fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> Result<ArrayRef, ExecutionFailure> {
+    Ok(novarocks_functions::time_text_cast::seconds_to_time64_micro_array(seconds))
 }
 
 fn parse_varchar_to_boolean_starrocks(value: &str) -> Option<bool> {
@@ -777,30 +708,6 @@ fn format_float32_for_varchar(value: f32) -> String {
     novarocks_functions::builtin::string_extended::format_float32_for_varchar(value)
 }
 
-fn cast_float64_to_utf8_array(arr: &Float64Array) -> ArrayRef {
-    let mut builder = StringBuilder::new();
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            builder.append_null();
-            continue;
-        }
-        builder.append_value(format_float64_for_varchar(arr.value(i)));
-    }
-    Arc::new(builder.finish()) as ArrayRef
-}
-
-fn cast_float32_to_utf8_array(arr: &Float32Array) -> ArrayRef {
-    let mut builder = StringBuilder::new();
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            builder.append_null();
-            continue;
-        }
-        builder.append_value(format_float32_for_varchar(arr.value(i)));
-    }
-    Arc::new(builder.finish()) as ArrayRef
-}
-
 fn decimal_precision_limit(precision: u8) -> Option<i128> {
     if precision == 0 {
         return Some(1);
@@ -819,7 +726,7 @@ fn decimal256_precision_limit(precision: u8) -> Option<i256> {
     if precision == 0 {
         return Some(i256::ONE);
     }
-    pow10_i256(precision as usize).ok()
+    cast_pow10_i256(precision as usize).ok()
 }
 
 fn decimal256_value_within_precision(value: i256, precision: u8) -> bool {
@@ -832,80 +739,8 @@ fn decimal256_value_within_precision(value: i256, precision: u8) -> bool {
     value > neg_limit && value < limit
 }
 
-fn cast_float_to_decimal_with_rounding(
-    len: usize,
-    value_at: impl FnMut(usize) -> Option<f64>,
-    precision: u8,
-    scale: i8,
-) -> Result<ArrayRef, String> {
-    novarocks_functions::float_decimal128::evaluate_legacy(len, value_at, precision, scale)
-}
-
 pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str>) -> String {
     novarocks_functions::builtin::string_extended::format_timestamp_for_varchar(unit, value, tz)
-}
-
-fn cast_timestamp_to_utf8_array(
-    array: &ArrayRef,
-    unit: &TimeUnit,
-    tz: Option<&str>,
-) -> Result<ArrayRef, String> {
-    let mut builder = StringBuilder::new();
-    match unit {
-        TimeUnit::Second => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(format_timestamp_for_varchar(unit, arr.value(i), tz));
-                }
-            }
-        }
-        TimeUnit::Millisecond => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(format_timestamp_for_varchar(unit, arr.value(i), tz));
-                }
-            }
-        }
-        TimeUnit::Microsecond => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(format_timestamp_for_varchar(unit, arr.value(i), tz));
-                }
-            }
-        }
-        TimeUnit::Nanosecond => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(format_timestamp_for_varchar(unit, arr.value(i), tz));
-                }
-            }
-        }
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 fn field_has_json_semantics(field_schema: Option<&novarocks_type_contract::ValueTypeRef>) -> bool {
@@ -914,14 +749,13 @@ fn field_has_json_semantics(field_schema: Option<&novarocks_type_contract::Value
     })
 }
 
-fn format_json_value_for_cast(value: &JsonValue, out: &mut String) -> Result<(), String> {
+fn format_json_value_for_cast(value: &JsonValue, out: &mut String) -> Result<(), ExecutionFailure> {
     match value {
         JsonValue::Null => out.push_str("null"),
         JsonValue::Bool(v) => out.push_str(if *v { "true" } else { "false" }),
         JsonValue::Number(v) => out.push_str(&v.to_string()),
         JsonValue::String(v) => {
-            let escaped = serde_json::to_string(v)
-                .map_err(|e| format!("json stringify failed while cast: {e}"))?;
+            let escaped = serde_json::to_string(v).map_err(cast_json_encode_failure)?;
             out.push_str(&escaped);
         }
         JsonValue::Array(items) => {
@@ -942,13 +776,12 @@ fn format_json_value_for_cast(value: &JsonValue, out: &mut String) -> Result<(),
                 if idx > 0 {
                     out.push_str(", ");
                 }
-                let escaped_key = serde_json::to_string(key)
-                    .map_err(|e| format!("json stringify key failed while cast: {e}"))?;
+                let escaped_key = serde_json::to_string(key).map_err(cast_json_encode_failure)?;
                 out.push_str(&escaped_key);
                 out.push_str(": ");
-                let child = map
-                    .get(*key)
-                    .ok_or_else(|| "json object key missing while cast".to_string())?;
+                let child = map.get(*key).ok_or_else(|| {
+                    super::expression_contract("json object key missing while cast")
+                })?;
                 format_json_value_for_cast(child, out)?;
             }
             out.push('}');
@@ -957,13 +790,13 @@ fn format_json_value_for_cast(value: &JsonValue, out: &mut String) -> Result<(),
     Ok(())
 }
 
-fn json_value_to_normalized_text(value: &JsonValue) -> Result<String, String> {
+fn json_value_to_normalized_text(value: &JsonValue) -> Result<String, ExecutionFailure> {
     let mut out = String::new();
     format_json_value_for_cast(value, &mut out)?;
     Ok(out)
 }
 
-fn json_value_to_varchar(value: &JsonValue) -> Result<Option<String>, String> {
+fn json_value_to_varchar(value: &JsonValue) -> Result<Option<String>, ExecutionFailure> {
     match value {
         JsonValue::Null => Ok(None),
         JsonValue::String(v) => Ok(Some(v.clone())),
@@ -986,7 +819,7 @@ fn parse_utf8_json_rows(arr: &StringArray) -> Vec<Option<JsonValue>> {
 fn cast_optional_utf8_to_target(
     values: Vec<Option<String>>,
     target_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let source = Arc::new(StringArray::from(values)) as ArrayRef;
     if matches!(target_type, DataType::Utf8) {
         return Ok(source);
@@ -1020,7 +853,22 @@ fn cast_json_values_to_list(
     values: &[Option<JsonValue>],
     target_field: Arc<Field>,
     target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
+    let (total, largest) = values
+        .iter()
+        .filter_map(|value| match value {
+            Some(JsonValue::Array(items)) => Some(items.len()),
+            _ => None,
+        })
+        .fold((0_u128, 0_usize), |(total, largest), len| {
+            (total + len as u128, largest.max(len))
+        });
+    preflight_cast_container(
+        values.len(),
+        total,
+        largest,
+        std::mem::size_of::<Option<JsonValue>>(),
+    )?;
     let mut flat_values = Vec::<Option<JsonValue>>::new();
     let mut offsets = Vec::with_capacity(values.len() + 1);
     offsets.push(0_i32);
@@ -1030,12 +878,7 @@ fn cast_json_values_to_list(
     for value in values {
         match value {
             Some(JsonValue::Array(items)) => {
-                current = current
-                    .checked_add(items.len() as i64)
-                    .ok_or_else(|| "CAST list offset overflow".to_string())?;
-                if current > i32::MAX as i64 {
-                    return Err("CAST list offset overflow".to_string());
-                }
+                current += items.len() as i64;
                 for item in items {
                     flat_values.push(Some(item.clone()));
                 }
@@ -1054,12 +897,13 @@ fn cast_json_values_to_list(
         target_field.data_type(),
         target_field_schema.and_then(|schema| schema.child_type_at(0)),
     )?;
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         target_field,
         OffsetBuffer::new(offsets.into()),
         cast_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(cast_construct_failure)?;
     Ok(Arc::new(out) as ArrayRef)
 }
 
@@ -1067,7 +911,7 @@ fn cast_json_values_to_struct(
     values: &[Option<JsonValue>],
     target_fields: Fields,
     target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let field_count = target_fields.len();
     let mut field_values = vec![Vec::<Option<JsonValue>>::with_capacity(values.len()); field_count];
     let mut struct_nulls = NullBufferBuilder::new(values.len());
@@ -1103,7 +947,8 @@ fn cast_json_values_to_struct(
             target_field_schema.and_then(|schema| schema.child_type_at(idx)),
         )?);
     }
-    let out = StructArray::new(target_fields, casted_fields, struct_nulls.finish());
+    let out = StructArray::try_new(target_fields, casted_fields, struct_nulls.finish())
+        .map_err(cast_construct_failure)?;
     Ok(Arc::new(out) as ArrayRef)
 }
 
@@ -1112,16 +957,35 @@ fn cast_json_values_to_map(
     entries_field: Arc<Field>,
     ordered: bool,
     target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let DataType::Struct(entry_fields) = entries_field.data_type() else {
-        return Err("CAST MAP target entries field must be STRUCT".to_string());
+        return Err(super::expression_contract(
+            "CAST MAP target entries field must be STRUCT",
+        ));
     };
     if entry_fields.len() != 2 {
-        return Err("CAST MAP target entries struct must have 2 fields".to_string());
+        return Err(super::expression_contract(
+            "CAST MAP target entries struct must have 2 fields",
+        ));
     }
     let key_field = entry_fields[0].clone();
     let value_field = entry_fields[1].clone();
 
+    let (total, largest) = values
+        .iter()
+        .filter_map(|value| match value {
+            Some(JsonValue::Object(items)) => Some(items.len()),
+            _ => None,
+        })
+        .fold((0_u128, 0_usize), |(total, largest), len| {
+            (total + len as u128, largest.max(len))
+        });
+    preflight_cast_container(
+        values.len(),
+        total,
+        largest,
+        std::mem::size_of::<Option<JsonValue>>().max(std::mem::size_of::<Option<String>>()),
+    )?;
     let mut key_values = Vec::<Option<String>>::new();
     let mut value_values = Vec::<Option<JsonValue>>::new();
     let mut offsets = Vec::with_capacity(values.len() + 1);
@@ -1136,12 +1000,7 @@ fn cast_json_values_to_map(
                     key_values.push(Some(key.clone()));
                     value_values.push(Some(child.clone()));
                 }
-                current = current
-                    .checked_add(map.len() as i64)
-                    .ok_or_else(|| "CAST MAP offset overflow".to_string())?;
-                if current > i32::MAX as i64 {
-                    return Err("CAST MAP offset overflow".to_string());
-                }
+                current += map.len() as i64;
                 map_nulls.append_non_null();
                 offsets.push(current as i32);
             }
@@ -1158,14 +1017,17 @@ fn cast_json_values_to_map(
         value_field.data_type(),
         target_field_schema.and_then(|schema| schema.child_type_at(1)),
     )?;
-    let entries = StructArray::new(entry_fields.clone(), vec![casted_keys, casted_values], None);
-    let map = MapArray::new(
+    let entries =
+        StructArray::try_new(entry_fields.clone(), vec![casted_keys, casted_values], None)
+            .map_err(cast_construct_failure)?;
+    let map = MapArray::try_new(
         entries_field,
         OffsetBuffer::new(offsets.into()),
         entries,
         map_nulls.finish(),
         ordered,
-    );
+    )
+    .map_err(cast_construct_failure)?;
     Ok(Arc::new(map) as ArrayRef)
 }
 
@@ -1173,7 +1035,7 @@ fn cast_json_values_to_target(
     values: &[Option<JsonValue>],
     target_type: &DataType,
     target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     match target_type {
         DataType::Utf8 => {
             let json_semantic = field_has_json_semantics(target_field_schema);
@@ -1231,35 +1093,38 @@ fn cast_utf8_json_to_target(
     array: &ArrayRef,
     target_type: &DataType,
     target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let arr = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to StringArray"))?;
     let parsed = parse_utf8_json_rows(arr);
     cast_json_values_to_target(&parsed, target_type, target_field_schema)
 }
 
-fn cast_struct_to_struct(array: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef, String> {
+fn cast_struct_to_struct(
+    array: &ArrayRef,
+    target_fields: &Fields,
+) -> Result<ArrayRef, ExecutionFailure> {
     let source = array
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to StructArray"))?;
     let source_fields = match array.data_type() {
         DataType::Struct(fields) => fields,
         other => {
-            return Err(format!(
+            return Err(super::expression_contract(format_args!(
                 "CAST failed: source is not STRUCT, got {:?}",
                 other
-            ));
+            )));
         }
     };
     if source_fields.len() != target_fields.len() {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "CAST STRUCT field count mismatch: source={} target={}",
             source_fields.len(),
             target_fields.len()
-        ));
+        )));
     }
 
     // Build a name-to-index map for source fields to support by-name matching
@@ -1301,39 +1166,49 @@ fn cast_struct_to_struct(array: &ArrayRef, target_fields: &Fields) -> Result<Arr
         casted_columns.push(casted);
     }
 
-    let out = StructArray::new(
+    let out = StructArray::try_new(
         Fields::from(out_fields),
         casted_columns,
         source.nulls().cloned(),
-    );
+    )
+    .map_err(cast_construct_failure)?;
     Ok(Arc::new(out) as ArrayRef)
 }
 
-fn cast_map_to_utf8_array(array: &ArrayRef) -> Result<ArrayRef, String> {
+fn cast_map_to_utf8_array(array: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     let source = array
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to MapArray"))?;
     let (entries_field, ordered) = match source.data_type() {
         DataType::Map(entries_field, ordered) => (entries_field.clone(), *ordered),
         other => {
-            return Err(format!("CAST failed: source is not MAP, got {:?}", other));
+            return Err(super::expression_contract(format_args!(
+                "CAST failed: source is not MAP, got {:?}",
+                other
+            )));
         }
     };
     let DataType::Struct(entry_fields) = entries_field.data_type() else {
-        return Err("CAST MAP source entries field must be STRUCT".to_string());
+        return Err(super::expression_contract(
+            "CAST MAP source entries field must be STRUCT",
+        ));
     };
     if entry_fields.len() != 2 {
-        return Err("CAST MAP source entries struct must have 2 fields".to_string());
+        return Err(super::expression_contract(
+            "CAST MAP source entries struct must have 2 fields",
+        ));
     }
     let (sorted_offsets, sorted_indices) =
         crate::exec::expr::function::map::sorted_map_offsets_and_indices(source)?;
     let sorted_index_array = UInt32Array::from(sorted_indices);
-    let sorted_keys = take(source.keys().as_ref(), &sorted_index_array, None)
-        .map_err(|e| format!("CAST MAP failed to reorder keys: {e}"))?;
-    let sorted_values = take(source.values().as_ref(), &sorted_index_array, None)
-        .map_err(|e| format!("CAST MAP failed to reorder values: {e}"))?;
-    let entries = StructArray::new(entry_fields.clone(), vec![sorted_keys, sorted_values], None);
+    let sorted_keys =
+        take(source.keys().as_ref(), &sorted_index_array, None).map_err(cast_arrow_failure)?;
+    let sorted_values =
+        take(source.values().as_ref(), &sorted_index_array, None).map_err(cast_arrow_failure)?;
+    let entries =
+        StructArray::try_new(entry_fields.clone(), vec![sorted_keys, sorted_values], None)
+            .map_err(cast_construct_failure)?;
     let sorted_map = MapArray::try_new(
         entries_field,
         sorted_offsets,
@@ -1341,24 +1216,28 @@ fn cast_map_to_utf8_array(array: &ArrayRef) -> Result<ArrayRef, String> {
         source.nulls().cloned(),
         ordered,
     )
-    .map_err(|e| format!("CAST MAP failed to rebuild sorted map: {e}"))?;
-    cast(&sorted_map, &DataType::Utf8).map_err(|e| e.to_string())
+    .map_err(cast_construct_failure)?;
+    cast(&sorted_map, &DataType::Utf8).map_err(cast_arrow_failure)
 }
 
 fn cast_map_to_map(
     array: &ArrayRef,
     target_entries: &Arc<Field>,
     ordered: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let source = array
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to MapArray"))?;
     let DataType::Struct(target_entry_fields) = target_entries.data_type() else {
-        return Err("CAST MAP target entries type must be STRUCT".to_string());
+        return Err(super::expression_contract(
+            "CAST MAP target entries type must be STRUCT",
+        ));
     };
     if target_entry_fields.len() != 2 {
-        return Err("CAST MAP target entries struct must have 2 fields".to_string());
+        return Err(super::expression_contract(
+            "CAST MAP target entries struct must have 2 fields",
+        ));
     }
     let target_key_field = target_entry_fields[0].clone();
     let target_value_field = target_entry_fields[1].clone();
@@ -1402,23 +1281,25 @@ fn cast_map_to_map(
         out_entry_fields = Fields::from(adjusted);
     }
 
-    let out_entries = StructArray::new(
+    let out_entries = StructArray::try_new(
         out_entry_fields.clone(),
         vec![casted_keys, casted_values],
         None,
-    );
+    )
+    .map_err(cast_construct_failure)?;
     let out_entries_field = Arc::new(Field::new(
         target_entries.name(),
         DataType::Struct(out_entry_fields),
         target_entries.is_nullable(),
     ));
-    let out = MapArray::new(
+    let out = MapArray::try_new(
         out_entries_field,
         OffsetBuffer::new(source.value_offsets().to_vec().into()),
         out_entries,
         source.nulls().cloned(),
         ordered,
-    );
+    )
+    .map_err(cast_construct_failure)?;
     Ok(Arc::new(out) as ArrayRef)
 }
 
@@ -1426,11 +1307,11 @@ fn cast_list_to_map(
     array: &ArrayRef,
     target_entries: &Arc<Field>,
     ordered: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let source = array
         .as_any()
         .downcast_ref::<ListArray>()
-        .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to ListArray"))?;
     let values = if source.values().data_type() == target_entries.data_type() {
         source.values().clone()
     } else {
@@ -1439,22 +1320,83 @@ fn cast_list_to_map(
     let entries = values
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| "CAST LIST to MAP requires STRUCT list values".to_string())?
+        .ok_or_else(|| super::expression_contract("CAST LIST to MAP requires STRUCT list values"))?
         .clone();
-    let out = MapArray::new(
+    let out = MapArray::try_new(
         target_entries.clone(),
         OffsetBuffer::new(source.value_offsets().to_vec().into()),
         entries,
         source.nulls().cloned(),
         ordered,
-    );
+    )
+    .map_err(cast_construct_failure)?;
     Ok(Arc::new(out) as ArrayRef)
 }
 
+#[derive(Debug)]
+struct ArrayCastArrowFailure(arrow::error::ArrowError);
+impl std::fmt::Display for ArrayCastArrowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "array CAST: {}", self.0)
+    }
+}
+impl std::error::Error for ArrayCastArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ArrayCastArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use arrow::error::ArrowError;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        if matches!(self.0, ArrowError::ArithmeticOverflow(_)) {
+            return novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact();
+        }
+        let (class, reason) = match self.0 {
+            ArrowError::MemoryError(_) => {
+                (FailureClass::Resource, ExecutionReason::ArrayCastAllocation)
+            }
+            ArrowError::OffsetOverflowError(_) => (
+                FailureClass::Representation,
+                ExecutionReason::ArrayCastOffset,
+            ),
+            ArrowError::CastError(_) => (FailureClass::Data, ExecutionReason::ArrayCastData),
+            ArrowError::IoError(..) => (
+                FailureClass::Unexpected,
+                ExecutionReason::ArrayCastUnexpected,
+            ),
+            _ => (FailureClass::Invariant, ExecutionReason::ArrayCastContract),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        if matches!(self.0, ArrowError::OffsetOverflowError(_)) {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(31).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+pub(super) fn cast_arrow_failure(
+    source: arrow::error::ArrowError,
+) -> crate::runtime::fragment::ExecutionFailure {
+    crate::runtime::fragment::ExecutionFailure::from_domain(ArrayCastArrowFailure(source))
+}
 pub fn cast_with_special_rules(
     array: &ArrayRef,
     target_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     cast_with_special_rules_with_field_schema(array, target_type, None)
 }
 
@@ -1462,7 +1404,7 @@ fn cast_with_special_rules_with_field_schema(
     array: &ArrayRef,
     target_type: &DataType,
     target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if array.data_type() == target_type {
         return Ok(array.clone());
     }
@@ -1497,204 +1439,11 @@ fn cast_with_special_rules_with_field_schema(
             | DataType::Struct(_)
             | DataType::Map(_, _)
     ) {
-        return novarocks_types::arrow_cast::cast_scalar_with_special_rules(array, target_type);
+        return novarocks_types::arrow_cast::cast_scalar_with_special_rules(array, target_type)
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain);
     }
     match (array.data_type(), target_type) {
-        (DataType::Utf8, DataType::Date32) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            Ok(cast_utf8_to_date32_array(arr))
-        }
-        (DataType::Utf8, DataType::Timestamp(_, _)) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            cast_utf8_to_timestamp_array(arr, target_type)
-        }
-        (source, DataType::Date32) if is_numeric_datetime_source(source) => {
-            cast_numeric_to_date32_array(array)
-        }
-        (source, DataType::Timestamp(_, _)) if is_numeric_datetime_source(source) => {
-            cast_numeric_to_timestamp_array(array, target_type)
-        }
-        (source, DataType::FixedSizeBinary(width))
-            if *width == largeint::LARGEINT_BYTE_WIDTH && is_numeric_datetime_source(source) =>
-        {
-            cast_numeric_to_largeint_binary_array(array)
-        }
-        (DataType::Utf8, DataType::FixedSizeBinary(width))
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_utf8_to_largeint_binary(array)
-        }
-        (DataType::Utf8, DataType::Boolean) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            Ok(cast_utf8_to_boolean_array(arr))
-        }
-        (DataType::Float64, DataType::Decimal128(precision, scale)) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-            cast_float_to_decimal_with_rounding(
-                arr.len(),
-                |row| {
-                    if arr.is_null(row) {
-                        None
-                    } else {
-                        Some(arr.value(row))
-                    }
-                },
-                *precision,
-                *scale,
-            )
-        }
-        (DataType::Float32, DataType::Decimal128(precision, scale)) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-            cast_float_to_decimal_with_rounding(
-                arr.len(),
-                |row| {
-                    if arr.is_null(row) {
-                        None
-                    } else {
-                        Some(arr.value(row) as f64)
-                    }
-                },
-                *precision,
-                *scale,
-            )
-        }
-        (DataType::Float64, DataType::Utf8) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-            Ok(cast_float64_to_utf8_array(arr))
-        }
-        (DataType::Float32, DataType::Utf8) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-            Ok(cast_float32_to_utf8_array(arr))
-        }
-        (DataType::FixedSizeBinary(width), DataType::Decimal128(precision, scale))
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_decimal(array, *precision, *scale)
-        }
-        (DataType::FixedSizeBinary(width), DataType::Decimal256(precision, scale))
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_decimal256(array, *precision, *scale)
-        }
-        (DataType::Boolean, DataType::Decimal128(precision, scale)) => {
-            cast_boolean_to_decimal128_array(array, *precision, *scale)
-        }
-        (DataType::Boolean, DataType::Decimal256(precision, scale)) => {
-            cast_boolean_to_decimal256_array(array, *precision, *scale)
-        }
-        (DataType::Decimal128(_, source_scale), DataType::Utf8) => {
-            cast_decimal_to_utf8_array(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Utf8) => {
-            cast_decimal256_to_utf8_array(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Float32) => {
-            cast_decimal256_to_float32(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Float64) => {
-            cast_decimal256_to_float64(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Boolean) => {
-            cast_decimal256_to_boolean(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Int8) => {
-            cast_decimal256_to_int8(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Int16) => {
-            cast_decimal256_to_int16(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Int32) => {
-            cast_decimal256_to_int32(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Int64) => {
-            cast_decimal256_to_int64(array, *source_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::FixedSizeBinary(width))
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_decimal256_to_largeint_binary(array, *source_scale)
-        }
-        (DataType::FixedSizeBinary(width), DataType::Int8)
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_int8(array)
-        }
-        (DataType::FixedSizeBinary(width), DataType::Int16)
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_int16(array)
-        }
-        (DataType::FixedSizeBinary(width), DataType::Int32)
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_int32(array)
-        }
-        (DataType::FixedSizeBinary(width), DataType::Int64)
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_int64(array)
-        }
-        (DataType::Timestamp(unit, tz), DataType::Utf8) => {
-            cast_timestamp_to_utf8_array(array, unit, tz.as_deref())
-        }
-        (DataType::Utf8, DataType::Decimal128(_, _)) => {
-            cast_utf8_to_decimal_with_empty_as_null(array, target_type)
-        }
-        (
-            DataType::Decimal128(_, source_scale),
-            DataType::Decimal128(target_precision, target_scale),
-        ) => {
-            cast_decimal_to_decimal_relaxed(array, *source_scale, *target_precision, *target_scale)
-        }
-        (
-            DataType::Decimal256(source_precision, source_scale),
-            DataType::Decimal256(target_precision, target_scale),
-        ) => {
-            // Same-type cast: source and target have identical precision and scale.
-            // No scale adjustment or precision check needed; pass through unchanged.
-            // This matches StarRocks behavior where the write path handles overflow.
-            if source_precision == target_precision && source_scale == target_scale {
-                return Ok(Arc::clone(array));
-            }
-            cast_decimal256_to_decimal256_relaxed(
-                array,
-                *source_scale,
-                *target_precision,
-                *target_scale,
-            )
-        }
-        (DataType::FixedSizeBinary(width), DataType::Utf8)
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_utf8(array)
-        }
         (DataType::Map(_, _), DataType::Utf8) => cast_map_to_utf8_array(array),
-        (DataType::FixedSizeBinary(width), DataType::Boolean)
-            if *width == largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            cast_largeint_binary_to_boolean(array)
-        }
         (DataType::Utf8, DataType::List(target_field))
             if novarocks_type_contract::default_json_structure_carrier_cast_supported(
                 array.data_type(),
@@ -1708,7 +1457,7 @@ fn cast_with_special_rules_with_field_schema(
             )? {
                 Ok(out)
             } else {
-                cast(array.as_ref(), target_type).map_err(|e| e.to_string())
+                cast(array.as_ref(), target_type).map_err(cast_arrow_failure)
             }
         }
         (DataType::Utf8, DataType::Struct(_)) | (DataType::Utf8, DataType::Map(_, _))
@@ -1739,64 +1488,18 @@ fn cast_with_special_rules_with_field_schema(
         (DataType::Map(_, _), DataType::Map(target_entries, ordered)) => {
             cast_map_to_map(array, target_entries, *ordered)
         }
-        // Explicit timestamp→timestamp handling.
-        // Same-unit casts can differ only by timezone metadata. Retag the
-        // physical array so descriptor-bound scans expose the authoritative
-        // Iceberg timestamptz Arrow type without changing values.
-        (DataType::Timestamp(source_unit, _), DataType::Timestamp(target_unit, _))
-            if source_unit == target_unit =>
-        {
-            retag_timestamp_same_unit(array, target_type)
-        }
-        // Narrowing (nanosecond→microsecond or same-unit): defer to Arrow, which truncates
-        // toward zero — the correct behavior for narrowing casts.
-        // Widening (microsecond→nanosecond): validate that ×1000 does not overflow i64
-        // before delegating to Arrow, so callers get a deterministic error rather than
-        // silent NULL-ification or silent wraparound.
-        (
-            DataType::Timestamp(TimeUnit::Microsecond, _),
-            DataType::Timestamp(TimeUnit::Nanosecond, _),
-        ) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    continue;
-                }
-                arr.value(i).checked_mul(1_000).ok_or_else(|| {
-                    format!(
-                        "CAST timestamp microsecond->nanosecond overflow: value {} cannot be \
-                         represented as nanoseconds in i64",
-                        arr.value(i)
-                    )
-                })?;
-            }
-            cast(array.as_ref(), target_type).map_err(|e| e.to_string())
-        }
-        _ => cast(array.as_ref(), target_type).map_err(|e| e.to_string()),
+        _ => cast(array.as_ref(), target_type).map_err(cast_arrow_failure),
     }
-}
-
-fn retag_timestamp_same_unit(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(target_type.clone())
-        .build()
-        .map_err(|e| format!("retag timestamp timezone metadata failed: {e}"))?;
-    Ok(make_array(data))
 }
 
 fn cast_utf8_to_decimal_with_empty_as_null(
     child_array: &ArrayRef,
     target_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let arr = child_array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to StringArray"))?;
 
     let mut builder = StringBuilder::new();
     for i in 0..arr.len() {
@@ -1813,102 +1516,18 @@ fn cast_utf8_to_decimal_with_empty_as_null(
     }
 
     let normalized = Arc::new(builder.finish()) as ArrayRef;
-    cast(normalized.as_ref(), target_type).map_err(|e| e.to_string())
-}
-
-fn cast_decimal_to_utf8_array(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-
-    let mut builder = StringBuilder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            builder.append_null();
-            continue;
-        }
-        builder.append_value(format_decimal_with_scale(arr.value(row), scale));
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
-fn cast_decimal256_to_utf8_array(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-
-    let mut builder = StringBuilder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            builder.append_null();
-            continue;
-        }
-        builder.append_value(format_decimal256_with_scale(arr.value(row), scale));
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
-fn cast_boolean_to_decimal256_array(
-    child_array: &ArrayRef,
-    precision: u8,
-    scale: i8,
-) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-
-    let factor = if scale == 0 {
-        None
-    } else {
-        Some(
-            pow10_i256(scale.unsigned_abs() as usize)
-                .map_err(|e| format!("decimal scale overflow while casting BOOLEAN: {e}"))?,
-        )
-    };
-
-    let mut out = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.push(None);
-            continue;
-        }
-        let mut value = if arr.value(row) {
-            i256::from_i128(1)
-        } else {
-            i256::ZERO
-        };
-        if let Some(factor) = factor {
-            if scale > 0 {
-                value = value
-                    .checked_mul(factor)
-                    .ok_or_else(|| "decimal overflow while casting BOOLEAN".to_string())?;
-            } else {
-                value = value
-                    .checked_div(factor)
-                    .ok_or_else(|| "decimal overflow while casting BOOLEAN".to_string())?;
-            }
-        }
-        out.push(Some(value));
-    }
-
-    let array = Decimal256Array::from(out)
-        .with_precision_and_scale(precision, scale)
-        .map_err(|e| e.to_string())?;
-    Ok(Arc::new(array))
+    cast(normalized.as_ref(), target_type).map_err(cast_arrow_failure)
 }
 
 fn try_cast_utf8_json_array_to_list(
     child_array: &ArrayRef,
     target_field: Arc<Field>,
     target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
-) -> Result<Option<ArrayRef>, String> {
+) -> Result<Option<ArrayRef>, ExecutionFailure> {
     let arr = child_array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to StringArray"))?;
 
     let mut parsed_rows = Vec::<Option<Vec<Option<String>>>>::with_capacity(arr.len());
     for row in 0..arr.len() {
@@ -1944,6 +1563,18 @@ fn try_cast_utf8_json_array_to_list(
         }
     }
 
+    let (total, largest) = parsed_rows
+        .iter()
+        .filter_map(|row| row.as_ref().map(Vec::len))
+        .fold((0_u128, 0_usize), |(total, largest), len| {
+            (total + len as u128, largest.max(len))
+        });
+    preflight_cast_container(
+        arr.len(),
+        total,
+        largest,
+        std::mem::size_of::<Option<String>>(),
+    )?;
     let mut flat_values = Vec::<Option<String>>::new();
     let mut offsets = Vec::with_capacity(arr.len() + 1);
     offsets.push(0_i32);
@@ -1957,12 +1588,7 @@ fn try_cast_utf8_json_array_to_list(
                 offsets.push(current as i32);
             }
             Some(values) => {
-                current = current
-                    .checked_add(values.len() as i64)
-                    .ok_or_else(|| "CAST list offset overflow".to_string())?;
-                if current > i32::MAX as i64 {
-                    return Err("CAST list offset overflow".to_string());
-                }
+                current += values.len() as i64;
                 flat_values.extend(values);
                 null_builder.append_non_null();
                 offsets.push(current as i32);
@@ -1980,161 +1606,34 @@ fn try_cast_utf8_json_array_to_list(
             target_field_schema,
         )?
     };
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         target_field.clone(),
         OffsetBuffer::new(offsets.into()),
         cast_values,
         null_builder.finish(),
-    );
-    Ok(Some(Arc::new(out) as ArrayRef))
-}
-
-fn retag_decimal_array(
-    array: &Decimal128Array,
-    precision: u8,
-    scale: i8,
-) -> Result<ArrayRef, String> {
-    novarocks_functions::decimal128_rescale::retag_legacy(array, precision, scale)
-}
-
-fn retag_decimal256_array(
-    array: &Decimal256Array,
-    precision: u8,
-    scale: i8,
-) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal256(precision, scale))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(make_array(data))
-}
-
-fn cast_decimal_to_decimal_relaxed(
-    child_array: &ArrayRef,
-    source_scale: i8,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    novarocks_functions::decimal128_rescale::relaxed_legacy(
-        child_array,
-        source_scale,
-        target_precision,
-        target_scale,
     )
-}
-
-fn cast_decimal256_to_decimal256_relaxed(
-    child_array: &ArrayRef,
-    source_scale: i8,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-
-    let upscale = if source_scale < target_scale {
-        Some(
-            pow10_i256((target_scale - source_scale) as usize)
-                .map_err(|e| format!("decimal scale overflow while casting DECIMAL: {e}"))?,
-        )
-    } else {
-        None
-    };
-    let downscale = if source_scale > target_scale {
-        Some(
-            pow10_i256((source_scale - target_scale) as usize)
-                .map_err(|e| format!("decimal scale overflow while casting DECIMAL: {e}"))?,
-        )
-    } else {
-        None
-    };
-
-    let mut values = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            values.push(None);
-            continue;
-        }
-
-        let mut value = arr.value(row);
-        if let Some(factor) = upscale {
-            let Some(scaled) = value.checked_mul(factor) else {
-                values.push(None);
-                continue;
-            };
-            value = scaled;
-        } else if let Some(factor) = downscale {
-            let quotient = value / factor;
-            let remainder = value % factor;
-            let remainder_abs = if remainder < i256::ZERO {
-                let Some(abs) = remainder.checked_neg() else {
-                    values.push(None);
-                    continue;
-                };
-                abs
-            } else {
-                remainder
-            };
-            let doubled = match remainder_abs.checked_mul(i256::from_i128(2)) {
-                Some(v) => v,
-                None => {
-                    values.push(None);
-                    continue;
-                }
-            };
-            let needs_round = doubled >= factor;
-            value = if needs_round {
-                let carry = if value < i256::ZERO {
-                    i256::from_i128(-1)
-                } else {
-                    i256::from_i128(1)
-                };
-                let Some(rounded) = quotient.checked_add(carry) else {
-                    values.push(None);
-                    continue;
-                };
-                rounded
-            } else {
-                quotient
-            };
-        }
-        if !decimal256_value_within_precision(value, target_precision) {
-            values.push(None);
-            continue;
-        }
-        values.push(Some(value));
-    }
-
-    let wide = Decimal256Array::from(values);
-    retag_decimal256_array(&wide, target_precision, target_scale)
+    .map_err(cast_construct_failure)?;
+    Ok(Some(Arc::new(out) as ArrayRef))
 }
 
 fn cast_largeint_binary_to_decimal(
     child_array: &ArrayRef,
     precision: u8,
     scale: i8,
-) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to DECIMAL")?;
+) -> Result<ArrayRef, ExecutionFailure> {
+    let arr = cast_largeint_view(child_array, "cast LARGEINT to DECIMAL")?;
     let mut values = Vec::with_capacity(arr.len());
     let multiplier = if scale >= 0 {
-        Some(
-            10_i128
-                .checked_pow(scale as u32)
-                .ok_or_else(|| format!("decimal scale overflow: {scale}"))?,
-        )
+        Some(10_i128.checked_pow(scale as u32).ok_or_else(|| {
+            super::expression_contract(format_args!("decimal scale overflow: {scale}"))
+        })?)
     } else {
         None
     };
     let divisor = if scale < 0 {
-        Some(
-            10_i128
-                .checked_pow((-scale) as u32)
-                .ok_or_else(|| format!("decimal scale overflow: {scale}"))?,
-        )
+        Some(10_i128.checked_pow((-scale) as u32).ok_or_else(|| {
+            super::expression_contract(format_args!("decimal scale overflow: {scale}"))
+        })?)
     } else {
         None
     };
@@ -2144,7 +1643,7 @@ fn cast_largeint_binary_to_decimal(
             values.push(None);
             continue;
         }
-        let mut value = largeint::value_at(arr, row)?;
+        let mut value = cast_largeint_value(arr, row)?;
         if let Some(m) = multiplier {
             let Some(scaled) = value.checked_mul(m) else {
                 values.push(None);
@@ -2164,7 +1663,7 @@ fn cast_largeint_binary_to_decimal(
 
     let out = Decimal128Array::from(values)
         .with_precision_and_scale(precision, scale)
-        .map_err(|e| e.to_string())?;
+        .map_err(cast_construct_failure)?;
     Ok(Arc::new(out) as ArrayRef)
 }
 
@@ -2172,22 +1671,16 @@ fn cast_largeint_binary_to_decimal256(
     child_array: &ArrayRef,
     precision: u8,
     scale: i8,
-) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to DECIMAL256")?;
+) -> Result<ArrayRef, ExecutionFailure> {
+    let arr = cast_largeint_view(child_array, "cast LARGEINT to DECIMAL256")?;
     let mut values = Vec::with_capacity(arr.len());
     let multiplier = if scale >= 0 {
-        Some(
-            pow10_i256(scale as usize)
-                .map_err(|e| format!("decimal scale overflow while casting LARGEINT: {e}"))?,
-        )
+        Some(cast_pow10_i256(scale as usize)?)
     } else {
         None
     };
     let divisor = if scale < 0 {
-        Some(
-            pow10_i256((-scale) as usize)
-                .map_err(|e| format!("decimal scale overflow while casting LARGEINT: {e}"))?,
-        )
+        Some(cast_pow10_i256((-scale) as usize)?)
     } else {
         None
     };
@@ -2197,7 +1690,7 @@ fn cast_largeint_binary_to_decimal256(
             values.push(None);
             continue;
         }
-        let mut value = i256::from_i128(largeint::value_at(arr, row)?);
+        let mut value = i256::from_i128(cast_largeint_value(arr, row)?);
         if let Some(m) = multiplier {
             let Some(scaled) = value.checked_mul(m) else {
                 values.push(None);
@@ -2220,31 +1713,24 @@ fn cast_largeint_binary_to_decimal256(
 
     let out = Decimal256Array::from(values)
         .with_precision_and_scale(precision, scale)
-        .map_err(|e| e.to_string())?;
+        .map_err(cast_construct_failure)?;
     Ok(Arc::new(out) as ArrayRef)
-}
-
-fn decimal256_integral_values(arr: &Decimal256Array, source_scale: i8) -> Vec<Option<i128>> {
-    let mut values = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        values.push(decimal256_to_i128_literal(arr.value(row), source_scale));
-    }
-    values
 }
 
 fn decimal256_to_f64(value: i256, scale: i8) -> f64 {
     novarocks_functions::decimal_float_cast::decimal256_to_f64(value, scale)
 }
 
-fn cast_decimal256_to_float64(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {
+fn cast_decimal256_to_float64(
+    child_array: &ArrayRef,
+    scale: i8,
+) -> Result<ArrayRef, ExecutionFailure> {
     let arr = child_array
         .as_any()
         .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array for float64 cast".to_string())?;
+        .ok_or_else(|| {
+            super::expression_contract("failed to downcast to Decimal256Array for float64 cast")
+        })?;
     let mut values: Vec<Option<f64>> = Vec::with_capacity(arr.len());
     for row in 0..arr.len() {
         if arr.is_null(row) {
@@ -2256,11 +1742,16 @@ fn cast_decimal256_to_float64(child_array: &ArrayRef, scale: i8) -> Result<Array
     Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
 }
 
-fn cast_decimal256_to_float32(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {
+fn cast_decimal256_to_float32(
+    child_array: &ArrayRef,
+    scale: i8,
+) -> Result<ArrayRef, ExecutionFailure> {
     let arr = child_array
         .as_any()
         .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array for float32 cast".to_string())?;
+        .ok_or_else(|| {
+            super::expression_contract("failed to downcast to Decimal256Array for float32 cast")
+        })?;
     let mut values: Vec<Option<f32>> = Vec::with_capacity(arr.len());
     for row in 0..arr.len() {
         if arr.is_null(row) {
@@ -2276,275 +1767,30 @@ fn cast_decimal256_to_float32(child_array: &ArrayRef, scale: i8) -> Result<Array
     Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
 }
 
-fn cast_decimal256_to_boolean(
-    child_array: &ArrayRef,
-    _source_scale: i8,
-) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-    let mut out = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.push(None);
-            continue;
-        }
-        out.push(Some(arr.value(row) != i256::ZERO));
-    }
-    Ok(Arc::new(BooleanArray::from(out)) as ArrayRef)
-}
-
-fn cast_decimal256_to_int8(child_array: &ArrayRef, source_scale: i8) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-    let out = decimal256_integral_values(arr, source_scale)
-        .into_iter()
-        .map(|v| v.and_then(|n| i8::try_from(n).ok()))
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Int8Array::from(out)) as ArrayRef)
-}
-
-fn cast_decimal256_to_int16(child_array: &ArrayRef, source_scale: i8) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-    let out = decimal256_integral_values(arr, source_scale)
-        .into_iter()
-        .map(|v| v.and_then(|n| i16::try_from(n).ok()))
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Int16Array::from(out)) as ArrayRef)
-}
-
-fn cast_decimal256_to_int32(child_array: &ArrayRef, source_scale: i8) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-    let out = decimal256_integral_values(arr, source_scale)
-        .into_iter()
-        .map(|v| v.and_then(|n| i32::try_from(n).ok()))
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
-}
-
-fn cast_decimal256_to_int64(child_array: &ArrayRef, source_scale: i8) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-    let out = decimal256_integral_values(arr, source_scale)
-        .into_iter()
-        .map(|v| v.and_then(|n| i64::try_from(n).ok()))
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
-}
-
-fn cast_decimal256_to_largeint_binary(
-    child_array: &ArrayRef,
-    source_scale: i8,
-) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-    let values = decimal256_integral_values(arr, source_scale);
-    largeint::array_from_i128(&values)
-}
-
-fn cast_boolean_to_decimal128_array(
-    child_array: &ArrayRef,
-    precision: u8,
-    scale: i8,
-) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-    let factor = if scale == 0 {
-        None
-    } else {
-        Some(
-            pow10_i128(scale.unsigned_abs() as u32)
-                .ok_or_else(|| format!("decimal scale overflow while casting BOOLEAN: {scale}"))?,
-        )
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.push(None);
-            continue;
-        }
-        let mut value = if arr.value(row) { 1_i128 } else { 0_i128 };
-        if let Some(factor) = factor {
-            if scale > 0 {
-                let Some(scaled) = value.checked_mul(factor) else {
-                    out.push(None);
-                    continue;
-                };
-                value = scaled;
-            } else {
-                value /= factor;
-            }
-        }
-        if !decimal_value_within_precision(value, precision) {
-            out.push(None);
-            continue;
-        }
-        out.push(Some(value));
-    }
-    let array = Decimal128Array::from(out)
-        .with_precision_and_scale(precision, scale)
-        .map_err(|e| e.to_string())?;
-    Ok(Arc::new(array))
-}
-
-fn cast_largeint_binary_to_float64(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to DOUBLE")?;
+fn cast_largeint_binary_to_float64(child_array: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
+    let arr = cast_largeint_view(child_array, "cast LARGEINT to DOUBLE")?;
     let mut out = Float64Builder::new();
     for row in 0..arr.len() {
         if arr.is_null(row) {
             out.append_null();
             continue;
         }
-        out.append_value(largeint::value_at(arr, row)? as f64);
+        out.append_value(cast_largeint_value(arr, row)? as f64);
     }
     Ok(Arc::new(out.finish()) as ArrayRef)
 }
 
-fn cast_largeint_binary_to_int8(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to TINYINT")?;
-    let mut out = Int8Builder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.append_null();
-            continue;
-        }
-        let value = largeint::value_at(arr, row)?;
-        if value < i8::MIN as i128 || value > i8::MAX as i128 {
-            out.append_null();
-            continue;
-        }
-        out.append_value(value as i8);
-    }
-    Ok(Arc::new(out.finish()) as ArrayRef)
-}
-
-fn cast_largeint_binary_to_int16(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to SMALLINT")?;
-    let mut out = Int16Builder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.append_null();
-            continue;
-        }
-        let value = largeint::value_at(arr, row)?;
-        if value < i16::MIN as i128 || value > i16::MAX as i128 {
-            out.append_null();
-            continue;
-        }
-        out.append_value(value as i16);
-    }
-    Ok(Arc::new(out.finish()) as ArrayRef)
-}
-
-fn cast_largeint_binary_to_int32(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to INT")?;
-    let mut out = Int32Builder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.append_null();
-            continue;
-        }
-        let value = largeint::value_at(arr, row)?;
-        if value < i32::MIN as i128 || value > i32::MAX as i128 {
-            out.append_null();
-            continue;
-        }
-        out.append_value(value as i32);
-    }
-    Ok(Arc::new(out.finish()) as ArrayRef)
-}
-
-fn cast_largeint_binary_to_int64(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to BIGINT")?;
-    let mut out = Int64Builder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.append_null();
-            continue;
-        }
-        let value = largeint::value_at(arr, row)?;
-        if value < i64::MIN as i128 || value > i64::MAX as i128 {
-            out.append_null();
-            continue;
-        }
-        out.append_value(value as i64);
-    }
-    Ok(Arc::new(out.finish()) as ArrayRef)
-}
-
-fn cast_largeint_binary_to_float32(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to FLOAT")?;
+fn cast_largeint_binary_to_float32(child_array: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
+    let arr = cast_largeint_view(child_array, "cast LARGEINT to FLOAT")?;
     let mut out = Float32Builder::new();
     for row in 0..arr.len() {
         if arr.is_null(row) {
             out.append_null();
             continue;
         }
-        out.append_value(largeint::value_at(arr, row)? as f32);
+        out.append_value(cast_largeint_value(arr, row)? as f32);
     }
     Ok(Arc::new(out.finish()) as ArrayRef)
-}
-
-fn cast_largeint_binary_to_boolean(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to BOOLEAN")?;
-    let mut out = BooleanBuilder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            out.append_null();
-            continue;
-        }
-        out.append_value(largeint::value_at(arr, row)? != 0);
-    }
-    Ok(Arc::new(out.finish()) as ArrayRef)
-}
-
-fn parse_utf8_to_largeint(value: &str) -> Option<i128> {
-    novarocks_functions::largeint_text::parse_utf8(value)
-}
-
-fn cast_utf8_to_largeint_binary(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-    let mut values = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        values.push(parse_utf8_to_largeint(arr.value(row)));
-    }
-    largeint::array_from_i128(&values)
-}
-
-fn cast_largeint_binary_to_utf8(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to VARCHAR")?;
-    let mut builder = StringBuilder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            builder.append_null();
-            continue;
-        }
-        let value = largeint::value_at(arr, row)?;
-        builder.append_value(value.to_string());
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 fn is_decimal_type(data_type: &DataType) -> bool {
@@ -2554,26 +1800,33 @@ fn is_decimal_type(data_type: &DataType) -> bool {
     )
 }
 
-fn checked_numeric_cast_has_overflow(source: &ArrayRef, casted: &ArrayRef) -> Result<bool, String> {
+fn checked_numeric_cast_has_overflow(
+    source: &ArrayRef,
+    casted: &ArrayRef,
+) -> Result<bool, ExecutionFailure> {
     novarocks_functions::decimal128_rescale::checked_numeric_cast_has_overflow_legacy(
         source, casted,
     )
+    .map_err(Into::into)
 }
 
 /// Enforce a declared decimal target even on same-scale/retag conversion paths.
 /// Limits are frozen metadata and computed once, before iterating values.
-fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, String> {
+fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     match array.data_type() {
         DataType::Decimal128(..) => {
             novarocks_functions::decimal128_rescale::enforce_precision_legacy(array)
+                .map_err(Into::into)
         }
         DataType::Decimal256(precision, scale) => {
             let (precision, scale) = (*precision, *scale);
-            let limit = pow10_i256(usize::from(precision))?;
+            let limit = cast_pow10_i256(usize::from(precision))?;
             let source = array
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| "checked CAST Decimal256 downcast failed".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("checked CAST Decimal256 downcast failed")
+                })?;
             let fits = |value: i256| value > -limit && value < limit;
             if (0..source.len()).all(|row| source.is_null(row) || fits(source.value(row))) {
                 return Ok(array);
@@ -2590,7 +1843,7 @@ fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, Strin
             Ok(Arc::new(
                 Decimal256Array::from(values)
                     .with_precision_and_scale(precision, scale)
-                    .map_err(|error| error.to_string())?,
+                    .map_err(cast_construct_failure)?,
             ))
         }
         _ => Ok(array),
@@ -2607,47 +1860,49 @@ pub fn eval<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     child: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let target_type = arena
         .data_type(cast_expr)
-        .ok_or_else(|| "CAST missing target data type".to_string())?
+        .ok_or_else(|| super::expression_contract("CAST missing target data type"))?
         .clone();
     let target_field_schema = arena
         .field_schema(cast_expr)
         .map(ChunkFieldSchema::value_type);
     let source_type = arena
         .data_type(child)
-        .ok_or_else(|| "CAST missing source data type".to_string())?;
+        .ok_or_else(|| super::expression_contract("CAST missing source data type"))?;
     if !decimal_error_policy_cast_supported(source_type, &target_type, decimal_overflow_policy) {
-        return Err(
-            ("ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST".to_string()).into(),
-        );
+        return Err(super::expression_contract(
+            "ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST",
+        ));
     }
 
     let child_array = arena.eval(child, chunk)?;
     if let (DataType::Decimal128(..), DataType::Decimal128(precision, scale)) =
         (child_array.data_type(), &target_type)
     {
-        return Ok((novarocks_functions::decimal128_rescale::evaluate_legacy(
+        return novarocks_functions::decimal128_rescale::evaluate_legacy(
             &child_array,
             *precision,
             *scale,
             decimal_overflow_policy,
             arena.allow_throw_exception(),
-        ))?);
+        )
+        .map_err(Into::into);
     }
     if matches!(
         child_array.data_type(),
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
     ) && let DataType::Decimal128(precision, scale) = target_type
     {
-        return Ok((novarocks_functions::integral_decimal128::evaluate_legacy(
+        return novarocks_functions::integral_decimal128::evaluate_legacy(
             &child_array,
             precision,
             scale,
             decimal_overflow_policy,
             arena.allow_throw_exception(),
-        ))?);
+        )
+        .map_err(Into::into);
     }
     if is_checked_decimal_numeric_cast(child_array.data_type(), &target_type) {
         let casted = if child_array.data_type() == &target_type {
@@ -2658,7 +1913,9 @@ pub fn eval<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 &target_type,
                 target_field_schema,
             )
-            .map_err(|error| format_cast_error(child_array.data_type(), &target_type, &error))?
+            .map_err(|source| {
+                cast_evaluation_failure(source, child_array.data_type(), &target_type)
+            })?
         };
         let casted = enforce_declared_decimal_precision(casted)?;
         let overflow = checked_numeric_cast_has_overflow(&child_array, &casted)?;
@@ -2670,14 +1927,11 @@ pub fn eval<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                     && is_decimal_type(child_array.data_type())
                     && is_decimal_type(&target_type)))
         {
-            return Err(
-                ("Expr evaluate meet error: The numeric type cast involving decimal overflows"
-                    .to_string())
-                .into(),
-            );
+            return Err(cast_numeric_failure(
+                "Expr evaluate meet error: The numeric type cast involving decimal overflows",
+            ));
         }
-        return Ok((sanitize_non_finite_cast_result(casted, &target_type)
-            .map_err(|error| format_cast_error(child_array.data_type(), &target_type, &error)))?);
+        return sanitize_non_finite_cast_result(casted, &target_type);
     }
     if child_array.data_type() == &target_type {
         return Ok(child_array);
@@ -2687,23 +1941,9 @@ pub fn eval<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let variant_arr = child_array
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
-            .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
-        let casted = cast_variant_array(variant_arr, &target_type).map_err(|e| {
-            format!(
-                "CAST failed: from {:?} to {:?}: {e}",
-                child_array.data_type(),
-                target_type
-            )
-        });
-        return Ok((casted.and_then(|array| {
-            sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            })
-        }))?);
+            .ok_or_else(|| super::expression_contract("failed to downcast to LargeBinaryArray"))?;
+        let casted = cast_variant_array(variant_arr, &target_type);
+        return casted.and_then(|array| sanitize_non_finite_cast_result(array, &target_type));
     }
 
     match (child_array.data_type(), &target_type) {
@@ -2711,217 +1951,95 @@ pub fn eval<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to StringArray"))?;
             return Ok(cast_utf8_to_boolean_array(arr));
         }
         (DataType::Date32, DataType::Float64) => {
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-            let casted = cast_date32_to_float64(arr).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
+                .ok_or_else(|| super::expression_contract("failed to downcast to Date32Array"))?;
+            let casted = cast_date32_to_float64(arr).map_err(|source| {
+                cast_evaluation_failure(source, child_array.data_type(), &target_type)
             });
-            return Ok((casted.and_then(|array| {
-                sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                })
-            }))?);
+            return casted.and_then(|array| sanitize_non_finite_cast_result(array, &target_type));
         }
         (DataType::Date32, DataType::Float32) => {
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-            let casted = cast_date32_to_float32(arr).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
+                .ok_or_else(|| super::expression_contract("failed to downcast to Date32Array"))?;
+            let casted = cast_date32_to_float32(arr).map_err(|source| {
+                cast_evaluation_failure(source, child_array.data_type(), &target_type)
             });
-            return Ok((casted.and_then(|array| {
-                sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                })
-            }))?);
+            return casted.and_then(|array| sanitize_non_finite_cast_result(array, &target_type));
         }
         (DataType::Float64, DataType::Float32) => {
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float64Array"))?;
             return Ok(cast_float64_to_float32_preserve_non_finite(arr));
         }
         (DataType::Float32, DataType::Float64) => {
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float32Array"))?;
             return Ok(cast_float32_to_float64_preserve_non_finite(arr));
         }
         (DataType::Float64, DataType::Date32) => {
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-            let casted = cast_float64_to_date32(arr).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float64Array"))?;
+            let casted = cast_float64_to_date32(arr).map_err(|source| {
+                cast_evaluation_failure(source, child_array.data_type(), &target_type)
             });
-            return Ok((casted.and_then(|array| {
-                sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                })
-            }))?);
+            return casted.and_then(|array| sanitize_non_finite_cast_result(array, &target_type));
         }
         (DataType::Float32, DataType::Date32) => {
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-            let casted = cast_float32_to_date32(arr).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float32Array"))?;
+            let casted = cast_float32_to_date32(arr).map_err(|source| {
+                cast_evaluation_failure(source, child_array.data_type(), &target_type)
             });
-            return Ok((casted.and_then(|array| {
-                sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                })
-            }))?);
+            return casted.and_then(|array| sanitize_non_finite_cast_result(array, &target_type));
         }
         (DataType::FixedSizeBinary(width), DataType::Decimal128(precision, scale))
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
         {
-            let casted = cast_largeint_binary_to_decimal(&child_array, *precision, *scale)
-                .map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                })?;
-            return Ok(
-                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                }))?,
-            );
+            let casted = cast_largeint_binary_to_decimal(&child_array, *precision, *scale)?;
+            return sanitize_non_finite_cast_result(casted, &target_type);
         }
         (DataType::FixedSizeBinary(width), DataType::Decimal256(precision, scale))
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
         {
-            let casted = cast_largeint_binary_to_decimal256(&child_array, *precision, *scale)
-                .map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                })?;
-            return Ok(
-                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                }))?,
-            );
+            let casted = cast_largeint_binary_to_decimal256(&child_array, *precision, *scale)?;
+            return sanitize_non_finite_cast_result(casted, &target_type);
         }
         (DataType::FixedSizeBinary(width), DataType::Float64)
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
         {
-            let casted = cast_largeint_binary_to_float64(&child_array).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            })?;
-            return Ok(
-                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                }))?,
-            );
+            let casted = cast_largeint_binary_to_float64(&child_array)?;
+            return sanitize_non_finite_cast_result(casted, &target_type);
         }
         (DataType::FixedSizeBinary(width), DataType::Float32)
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
         {
-            let casted = cast_largeint_binary_to_float32(&child_array).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            })?;
-            return Ok(
-                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                }))?,
-            );
+            let casted = cast_largeint_binary_to_float32(&child_array)?;
+            return sanitize_non_finite_cast_result(casted, &target_type);
         }
         // Decimal256 → Float32/Float64: use our custom conversion that preserves +/-inf,
         // and return early to skip the sanitize_non_finite_cast_result step below which
         // would convert infinity to null.
         (DataType::Decimal256(_, source_scale), DataType::Float32) => {
-            return Ok(
-                (cast_decimal256_to_float32(&child_array, *source_scale).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                }))?,
-            );
+            return cast_decimal256_to_float32(&child_array, *source_scale);
         }
         (DataType::Decimal256(_, source_scale), DataType::Float64) => {
-            return Ok(
-                (cast_decimal256_to_float64(&child_array, *source_scale).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                }))?,
-            );
+            return cast_decimal256_to_float64(&child_array, *source_scale);
         }
         _ => {}
     }
@@ -2929,63 +2047,33 @@ pub fn eval<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     if matches!(child_array.data_type(), DataType::Utf8)
         && matches!(target_type, DataType::Decimal128(_, _))
     {
-        let casted =
-            cast_utf8_to_decimal_with_empty_as_null(&child_array, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            })?;
-        return Ok(
-            (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            }))?,
-        );
+        let casted = cast_utf8_to_decimal_with_empty_as_null(&child_array, &target_type)?;
+        return sanitize_non_finite_cast_result(casted, &target_type);
     }
 
     let casted =
         cast_with_special_rules_with_field_schema(&child_array, &target_type, target_field_schema)
-            .map_err(|e| format_cast_error(child_array.data_type(), &target_type, &e))?;
+            .map_err(|source| {
+                cast_evaluation_failure(source, child_array.data_type(), &target_type)
+            })?;
     if arena.allow_throw_exception() {
         if let Some(value) = first_float_to_int_overflow_value(&child_array, &casted, &target_type)?
         {
-            return Err((format!(
+            return Err(cast_numeric_failure(format_args!(
                 "Expr evaluate meet error: CAST failed: from {:?} to {:?}: {} conflict with range of {}",
                 child_array.data_type(),
                 target_type,
                 value,
                 integral_target_name(&target_type)
-            )).into());
+            )));
         }
         if has_decimal_to_decimal_overflow(&child_array, &casted) {
-            return Err(
-                ("Expr evaluate meet error: The type cast from decimal to decimal overflows"
-                    .to_string())
-                .into(),
-            );
+            return Err(cast_numeric_failure(
+                "Expr evaluate meet error: The type cast from decimal to decimal overflows",
+            ));
         }
     }
-    Ok(
-        (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-            format!(
-                "CAST failed: from {:?} to {:?}: {e}",
-                child_array.data_type(),
-                target_type
-            )
-        }))?,
-    )
-}
-
-fn format_cast_error(source_type: &DataType, target_type: &DataType, err: &str) -> String {
-    if err.starts_with("CAST STRUCT field count mismatch") {
-        return format!("{err}; CAST failed: from {source_type:?} to {target_type:?}");
-    }
-    format!("CAST failed: from {source_type:?} to {target_type:?}: {err}")
+    sanitize_non_finite_cast_result(casted, &target_type)
 }
 
 fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -2994,17 +2082,16 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     child: ExprId,
     chunk: &Chunk,
     source_is_datetime: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let target_type = arena
         .data_type(cast_expr)
-        .ok_or_else(|| "CAST missing target data type".to_string())?
+        .ok_or_else(|| super::expression_contract("CAST missing target data type"))?
         .clone();
     if !matches!(target_type, DataType::Time64(TimeUnit::Microsecond)) {
-        return Err((format!(
+        return Err(super::expression_contract(format_args!(
             "CAST failed: TIME target must be Time64(Microsecond), got {:?}",
             target_type
-        ))
-        .into());
+        )));
     }
 
     let child_array = arena.eval(child, chunk)?;
@@ -3018,14 +2105,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         if child_array.data_type() == &target_type {
             return Ok(child_array);
         }
-        return Ok((cast(&child_array, &target_type).map_err(|e| {
-            format!(
-                "CAST failed: from {:?} to {:?}: {}",
-                child_array.data_type(),
-                target_type,
-                e
-            )
-        }))?);
+        return cast(&child_array, &target_type).map_err(cast_arrow_failure);
     }
 
     if matches!(
@@ -3037,20 +2117,22 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         } else {
             novarocks_functions::time_text_cast::TimeTextParseMode::Duration
         };
-        return Ok((novarocks_functions::time_text_cast::evaluate_arrays(
+        return novarocks_functions::time_text_cast::evaluate_arrays(
             &child_array,
             &target_type,
             mode,
-        ))?);
+        )
+        .map_err(Into::into);
     }
     if matches!(
         child_array.data_type(),
         DataType::Date32 | DataType::Timestamp(_, _)
     ) {
-        return Ok((novarocks_functions::time_calendar_cast::evaluate_arrays(
+        return novarocks_functions::time_calendar_cast::evaluate_arrays(
             &child_array,
             &target_type,
-        ))?);
+        )
+        .map_err(Into::into);
     }
     let mut seconds = Vec::with_capacity(child_array.len());
     match child_array.data_type() {
@@ -3058,7 +2140,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to BooleanArray"))?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3075,7 +2157,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Int8Array"))?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3088,7 +2170,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Int16Array"))?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3101,7 +2183,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Int32Array"))?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3114,7 +2196,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Int64Array"))?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3127,7 +2209,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float32Array"))?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3140,7 +2222,7 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                .ok_or_else(|| super::expression_contract("failed to downcast to Float64Array"))?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3153,7 +2235,9 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let arr = child_array
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast to Decimal128Array")
+                })?;
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     seconds.push(None);
@@ -3168,22 +2252,8 @@ fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             }
         }
         _ => {
-            let casted = cast(child_array.as_ref(), &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            })?;
-            return Ok(
-                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                    format!(
-                        "CAST failed: from {:?} to {:?}: {e}",
-                        child_array.data_type(),
-                        target_type
-                    )
-                }))?,
-            );
+            let casted = cast(child_array.as_ref(), &target_type).map_err(cast_arrow_failure)?;
+            return sanitize_non_finite_cast_result(casted, &target_type);
         }
     }
 
@@ -3195,8 +2265,8 @@ pub fn eval_time<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     cast_expr: ExprId,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_time_internal(arena, cast_expr, child, chunk, false))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_time_internal(arena, cast_expr, child, chunk, false)
 }
 
 pub fn eval_time_from_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -3204,14 +2274,14 @@ pub fn eval_time_from_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Size
     cast_expr: ExprId,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_time_internal(arena, cast_expr, child, chunk, true))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_time_internal(arena, cast_expr, child, chunk, true)
 }
 
 fn cast_variant_array(
     variant_arr: &LargeBinaryArray,
     target_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let tz = Local::now().offset().fix();
     match target_type {
         DataType::Boolean => {
@@ -3446,12 +2516,14 @@ fn cast_variant_array(
                 }
                 let json_text = value.to_json_local()?;
                 let json = serde_json::from_str::<JsonValue>(&json_text)
-                    .map_err(|e| format!("CAST VARIANT complex JSON parse failed: {e}"))?;
+                    .map_err(cast_json_decode_failure)?;
                 values.push(Some(json));
             }
             cast_json_values_to_target(&values, target_type, None)
         }
-        _ => Err("CAST from VARIANT is not supported".to_string()),
+        _ => Err(super::expression_contract(
+            "CAST from VARIANT is not supported",
+        )),
     }
 }
 
@@ -3464,6 +2536,33 @@ fn parse_variant(variant_arr: &LargeBinaryArray, row: usize) -> Option<VariantVa
 
 #[cfg(test)]
 mod tests {
+    use novarocks_failure_contract::FailureProjection;
+    // Exercise layout limits without constructing multi-gigabyte input values.
+    #[test]
+    fn container_extent_uses_exact_unit_or_output_facts_before_backing() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+        preflight_cast_container(2, i32::MAX as u128, i32::MAX as usize, 1).unwrap();
+        let batch = preflight_cast_container(2, i32::MAX as u128 + 1, 1, 1).unwrap_err();
+        assert_eq!(batch.failure_fact().class(), FailureClass::Representation);
+        let facts = batch.failure_fact().representation().unwrap();
+        assert_eq!(facts.boundary, RepresentationBoundary::SingleOutput);
+        assert_eq!(facts.required, Some(i32::MAX as u64 + 1));
+        let single = preflight_cast_container(1, i32::MAX as u128 + 1, i32::MAX as usize + 1, 1)
+            .unwrap_err();
+        assert_eq!(
+            single.failure_fact().representation().unwrap().boundary,
+            RepresentationBoundary::MinimumUnit
+        );
+        let backing = preflight_cast_container(usize::MAX, 0, 0, 1).unwrap_err();
+        assert_eq!(backing.failure_fact().class(), FailureClass::Representation);
+        assert!(backing.failure_fact().resource().is_none());
+        let extent = backing.failure_fact().representation().unwrap();
+        assert_eq!(extent.required, None);
+        assert_eq!(extent.layout.code.get(), 80);
+        assert_eq!(extent.extent_limit, Some(isize::MAX as u64));
+        assert_eq!(extent.boundary, RepresentationBoundary::SingleOutput);
+    }
+
     use super::*;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
@@ -4104,7 +3203,8 @@ mod tests {
     #[test]
     fn test_cast_float32_to_utf8_uses_compact_representation() {
         let arr = Float32Array::from(vec![Some(0.369_004_f32), Some(1.5_f32), Some(-0.0)]);
-        let out = cast_float32_to_utf8_array(&arr);
+        let input = Arc::new(arr) as ArrayRef;
+        let out = cast_with_special_rules(&input, &DataType::Utf8).unwrap();
         let out = out.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(out.value(0), "0.369004");
         assert_eq!(out.value(1), "1.5");
@@ -4139,7 +3239,11 @@ mod tests {
             DataType::Int32,
         );
         let err = arena_strict.eval(cast_strict, &chunk).unwrap_err();
-        assert!(err.contains("conflict with range of INT"));
+        assert_eq!(
+            err.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+        assert!(err.detail().contains("conflict with range of INT"));
     }
 
     #[test]
@@ -4292,7 +3396,7 @@ mod tests {
             .expect_err("field count mismatch");
 
         assert!(
-            err.starts_with("CAST STRUCT field count mismatch"),
+            err.detail().starts_with("CAST STRUCT field count mismatch"),
             "got: {err}"
         );
     }
@@ -4526,6 +3630,7 @@ mod overflow_policy_prepared_tests {
                 arena
                     .eval(throwing, &chunk)
                     .unwrap_err()
+                    .detail()
                     .contains("numeric type cast involving decimal overflows")
             );
             assert_eq!(arena.eval(nullable, &chunk).unwrap().null_count(), 2);
@@ -4618,7 +3723,7 @@ mod overflow_policy_prepared_tests {
         )));
         let (arena, chunk, nullable, throwing) = prepare(source.clone(), target);
         assert_eq!(
-            arena.eval(throwing, &chunk).unwrap_err(),
+            arena.eval(throwing, &chunk).unwrap_err().detail(),
             "ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST"
         );
         let result = arena.eval(nullable, &chunk).unwrap();
@@ -4830,3 +3935,62 @@ mod cast_bool_oracle_tests;
 #[cfg(test)]
 #[path = "cast_unsigned_oracle_tests.rs"]
 mod cast_unsigned_oracle_tests;
+
+#[cfg(test)]
+mod cast_context_properties {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+
+    // An actual value-domain refusal must survive CAST context and driver
+    // location unchanged. Differential CAST suites cover the public routes.
+    #[test]
+    fn specific_structure_failure_precedes_wide_context_labels() {
+        let fields = Fields::from(vec![
+            Field::new("field_".repeat(100), DataType::Int32, true),
+            Field::new("other", DataType::Int32, true),
+        ]);
+        let input: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(arrow::array::Int32Array::from(vec![8])) as ArrayRef,
+            ],
+            None,
+        ));
+        let target = DataType::Struct(Fields::from(vec![Field::new("one", DataType::Int32, true)]));
+        let original = cast_with_special_rules(&input, &target).unwrap_err();
+        let failure = cast_evaluation_failure(original.clone(), input.data_type(), &target);
+        assert_eq!(failure.failure_fact(), original.failure_fact());
+        assert!(
+            failure
+                .detail()
+                .starts_with("CAST STRUCT field count mismatch: source=2 target=1")
+        );
+        assert!(failure.detail().len() <= 512);
+    }
+
+    #[test]
+    fn original_value_cause_survives_cast_context() {
+        let original = cast_date32_to_float64(&Date32Array::from(vec![i32::MIN])).unwrap_err();
+        let expected = original.failure_fact();
+        let failure =
+            cast_evaluation_failure(original.clone(), &DataType::Date32, &DataType::Float64)
+                .at_operator(3, crate::runtime::fragment::PipelineOperation::Pull);
+        assert_eq!(failure.failure_fact(), expected);
+        assert_eq!(
+            failure.detail(),
+            "CAST failed: from Date32 to Float64: invalid Date32 value -2147483648"
+        );
+        let mut current: &(dyn Error + 'static) = &failure;
+        loop {
+            if let Some(context) = current.downcast_ref::<CastEvaluationFailure>() {
+                assert!(context.source.same_occurrence(&original));
+                break;
+            }
+            current = current
+                .source()
+                .expect("original CAST context must remain in source chain");
+        }
+    }
+}

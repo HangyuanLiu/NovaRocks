@@ -67,7 +67,7 @@ fn original_aes_invocation_failure_precedes_and_or_later_child() {
             };
             let root = arena.push_typed(node, DataType::Boolean);
             assert_eq!(
-                arena.eval(root, &chunk).unwrap_err(),
+                (arena.eval(root, &chunk).unwrap_err()).to_string(),
                 original_error(encrypt)
             );
         }
@@ -90,7 +90,7 @@ fn original_and_false_or_true_still_eagerly_invokes_whole_right_batch() {
             };
             let root = arena.push_typed(node, DataType::Boolean);
             assert_eq!(
-                arena.eval(root, &chunk).unwrap_err(),
+                (arena.eval(root, &chunk).unwrap_err()).to_string(),
                 original_error(encrypt)
             );
         }
@@ -113,7 +113,7 @@ fn original_if_mixed_then_failure_stops_before_invalid_else_child() {
             DataType::Boolean,
         );
         assert_eq!(
-            arena.eval(root, &chunk).unwrap_err(),
+            (arena.eval(root, &chunk).unwrap_err()).to_string(),
             original_error(encrypt)
         );
     }
@@ -147,7 +147,7 @@ fn original_aes_wrong_arity_parent_stops_before_every_argument_and_later_operand
         let first = boolean_aes(&mut arena, &[ExprId(usize::MAX); 3], encrypt);
         let root = arena.push_typed(ExprNode::And(first, ExprId(usize::MAX)), DataType::Boolean);
         assert_eq!(
-            arena.eval(root, &chunk).unwrap_err(),
+            (arena.eval(root, &chunk).unwrap_err()).to_string(),
             format!(
                 "{} expects 2, 4, or 5 arguments",
                 if encrypt {

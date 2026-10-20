@@ -47,7 +47,11 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &'static str, columns: Vec<ArrayRef>, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &'static str,
+    columns: Vec<ArrayRef>,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -196,7 +200,8 @@ fn legacy_calendar_add_baseline_factor_overflow_precedes_null_date_mask() {
 }
 
 #[test]
-fn legacy_calendar_add_baseline_literal_broadcast_and_requested_seconds_carrier() {
+fn legacy_calendar_add_baseline_literal_broadcast_uses_frozen_microseconds_and_rejects_seconds_declaration()
+ {
     let mut arena = ExprArena::default();
     let date = arena.push_typed(
         ExprNode::Literal(LiteralValue::Utf8("1970-01-01 00:00:10".into())),
@@ -209,18 +214,29 @@ fn legacy_calendar_add_baseline_literal_broadcast_and_requested_seconds_carrier(
             kind: FunctionKind::Date("days_add"),
             args: args.clone(),
         },
-        DataType::Timestamp(TimeUnit::Second, None),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let source = chunk(vec![ints(vec![Some(1), Some(-1), None])]);
     let output = eval_date_function("days_add", &arena, call, &args, &source).unwrap();
-    // Preserve the historical numeric-seconds result in its microsecond Arrow carrier.
+    // Epoch units match the frozen normalized Arrow carrier.
     assert_eq!(
         output.data_type(),
         &DataType::Timestamp(TimeUnit::Microsecond, None)
     );
     assert_eq!(
         output.to_data(),
-        TimestampMicrosecondArray::from(vec![Some(86410), Some(-86390), None]).to_data()
+        TimestampMicrosecondArray::from(vec![Some(86_410_000_000), Some(-86_390_000_000), None])
+            .to_data()
+    );
+    let incompatible = arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Date("days_add"),
+            args: args.clone(),
+        },
+        DataType::Timestamp(TimeUnit::Second, None),
+    );
+    assert_frozen_calendar_contract(
+        eval_date_function("days_add", &arena, incompatible, &args, &source).unwrap_err(),
     );
 }
 
@@ -345,7 +361,7 @@ fn legacy_calendar_add_baseline_timestampdiff_units_calendar_fields_and_null_mas
 #[test]
 fn legacy_calendar_add_baseline_original_unit_and_input_error_text() {
     assert_eq!(
-        eval(
+        (eval(
             "timestampdiff",
             vec![
                 text(vec![Some(" quarter ")]),
@@ -354,11 +370,12 @@ fn legacy_calendar_add_baseline_original_unit_and_input_error_text() {
             ],
             DataType::Int64
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "unit of timestampdiff must be one of year/month/week/day/hour/minute/second/millisecond"
     );
     assert_eq!(
-        eval(
+        (eval(
             "timestampdiff",
             vec![
                 Arc::new(BooleanArray::from(vec![None])),
@@ -367,20 +384,22 @@ fn legacy_calendar_add_baseline_original_unit_and_input_error_text() {
             ],
             DataType::Int64
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "timestampdiff expects unit string"
     );
     assert_eq!(
-        eval(
+        (eval(
             "days_add",
             vec![dates(vec![None]), Arc::new(BooleanArray::from(vec![None]))],
             DataType::Date32
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "date_add expects int"
     );
     assert_eq!(
-        eval(
+        (eval(
             "days_add",
             vec![
                 Arc::new(BooleanArray::from(vec![None])),
@@ -388,7 +407,21 @@ fn legacy_calendar_add_baseline_original_unit_and_input_error_text() {
             ],
             DataType::Date32
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "unsupported datetime input type: Boolean"
+    );
+}
+
+fn assert_frozen_calendar_contract(failure: crate::runtime::fragment::ExecutionFailure) {
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(274).unwrap())
+        )
     );
 }

@@ -34,6 +34,71 @@ use crate::test_controls::{NativeFaultClaim, NativeTestControls};
 
 type NodeRange = (i32, u64, u64);
 
+#[derive(Debug)]
+pub(super) enum ReplayReservationFailure {
+    InstalledTaskRequired(TaskIdentity),
+    ControlsRequired,
+    AlreadyHeld(TaskIdentity),
+    LiveControlRequired(TaskIdentity),
+    RepeatedRange { node: i32, first: u64, last: u64 },
+    NonemptyTerminalAssignmentRequired,
+    Queue(novarocks_execution::connector::scan_queue::TestConsumptionGateFailure),
+}
+impl std::fmt::Display for ReplayReservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InstalledTaskRequired(identity) => write!(
+                f,
+                "controlled replay gate requires actual installed Task {identity}"
+            ),
+            Self::ControlsRequired => {
+                f.write_str("controlled replay gate has no installed Native controls")
+            }
+            Self::AlreadyHeld(identity) => {
+                write!(f, "Task {identity} already has an active exact replay gate")
+            }
+            Self::LiveControlRequired(identity) => write!(
+                f,
+                "replay gate has no live control for actual Task {identity}"
+            ),
+            Self::RepeatedRange { node, first, last } => write!(
+                f,
+                "replay gate repeats terminal input range {first}..={last} for node {node}"
+            ),
+            Self::NonemptyTerminalAssignmentRequired => {
+                f.write_str("replay gate requires an actual nonempty terminal split assignment")
+            }
+            Self::Queue(source) => source.fmt(f),
+        }
+    }
+}
+impl std::error::Error for ReplayReservationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Queue(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for ReplayReservationFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let code = match self {
+            Self::InstalledTaskRequired(_) => 9630,
+            Self::ControlsRequired => 9631,
+            Self::AlreadyHeld(_) => 9632,
+            Self::LiveControlRequired(_) => 9633,
+            Self::RepeatedRange { .. } => 9634,
+            Self::NonemptyTerminalAssignmentRequired => 9635,
+            Self::Queue(source) => return source.failure_fact(),
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Reserved,
@@ -64,12 +129,14 @@ impl TaskUpdateReplayGate {
         queues: &TaskAttemptSplitQueues<S>,
         control: ControlCancellation,
         task_stop: ConnectorStopView,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Arc<Self>, ReplayReservationFailure> {
         if control.process() != ProcessBinding::Backend(request.identity().backend_process_id())
             || !control.is_active()
             || task_stop.is_stopped()
         {
-            return Err("replay gate has no live control for the actual task process".into());
+            return Err(ReplayReservationFailure::LiveControlRequired(
+                request.identity(),
+            ));
         }
         let mut duplicates = BTreeMap::new();
         let mut inputs: Vec<Arc<TestSplitConsumptionGate>> = Vec::new();
@@ -89,7 +156,11 @@ impl TaskUpdateReplayGate {
                 for gate in &inputs {
                     gate.release();
                 }
-                return Err("replay gate repeats a terminal input range".into());
+                return Err(ReplayReservationFailure::RepeatedRange {
+                    node,
+                    first: first.get(),
+                    last: last.get(),
+                });
             }
             match queues.queue(node).reserve_test_consumption_gate() {
                 Ok(gate) => inputs.push(gate),
@@ -97,12 +168,12 @@ impl TaskUpdateReplayGate {
                     for gate in &inputs {
                         gate.release();
                     }
-                    return Err(error);
+                    return Err(ReplayReservationFailure::Queue(error));
                 }
             }
         }
         if inputs.is_empty() {
-            return Err("replay gate requires an actual nonempty terminal split assignment".into());
+            return Err(ReplayReservationFailure::NonemptyTerminalAssignmentRequired);
         }
         Ok(Arc::new(Self {
             identity: request.identity(),

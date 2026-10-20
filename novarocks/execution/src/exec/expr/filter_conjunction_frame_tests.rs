@@ -461,7 +461,7 @@ impl PureCompileControl for CompileStop {
     fn checkpoint(&self, phase: CompilePhase, n: u32) -> Result<(), CompileControlError> {
         let mut trace = self.trace.lock().unwrap();
         if trace.len() == self.at {
-            return Err(self.cause);
+            return Err(self.cause.clone());
         }
         trace.push((phase, n));
         Ok(())
@@ -506,7 +506,7 @@ fn filter_conjunction_actual_local_compile_three_causes_sampled_prefix() {
         ] {
             let stop = CompileStop {
                 at: index,
-                cause,
+                cause: cause.clone(),
                 trace: Mutex::new(Vec::new()),
             };
             let result = compile_fragment(

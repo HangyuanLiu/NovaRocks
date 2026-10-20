@@ -14,9 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use super::super::aggregate_mann_whitney_core::{MannWhitneyInput, MannWhitneyState};
 use super::super::aggregate_mann_whitney_resources::MannSourceParams;
 use super::*;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::opaque_memory::OpaqueAllocationHost;
 use crate::source_custody_resources_tests::{measured, measured_live_bytes, without_recording};
 use crate::*;
@@ -508,15 +510,18 @@ fn mann_whitney_selected_empty_update_validates_original_setup() {
     let channels = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
     let input = selected(&malformed, &channels, Selection::all(0));
     let result = malformed.prepare_update_evaluation(input, &[], Some(host.clone()), &control);
-    let Err(EvaluationFailure::InvocationData(data)) = result else {
-        panic!("original empty setup Data expected");
+    let Err(EvaluationFailure::Kernel(cause)) = result else {
+        panic!("physical input contract failure expected");
     };
     assert_eq!(
-        data.message(),
-        "update aggregate state: mann_whitney_u_test expects string alternative"
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+        novarocks_failure_contract::FailureClass::Invariant
     );
-    assert!(data.input_rows().is_empty());
-    drop(data);
+    assert_eq!(
+        cause.to_string(),
+        "mann_whitney_u_test expects string alternative"
+    );
+    drop(cause);
     assert!(host.ledger.lock().unwrap().live.is_empty());
     assert_eq!(host.ledger.lock().unwrap().opaque, 0);
 }
@@ -861,7 +866,7 @@ fn mann_whitney_selected_all_real_host_frontiers_keep_seven_causes_and_cleanup()
                 view.update_row(&mut original, [row; 4], &mut ScalarWork::new(None))
                     .unwrap();
             }
-            let bytes = original.serialize();
+            let bytes = original.serialize().unwrap();
             drop(original);
             binary = Some(Arc::new(BinaryArray::from(vec![Some(bytes.as_slice())])) as ArrayRef);
             state = Some(

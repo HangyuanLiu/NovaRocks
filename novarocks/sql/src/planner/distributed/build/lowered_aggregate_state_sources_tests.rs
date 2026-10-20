@@ -701,7 +701,7 @@ fn state_sources_foreign_same_signature_and_every_actual_visit_merge_control_pre
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke_foreign(&control), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
@@ -737,7 +737,7 @@ fn state_sources_foreign_same_signature_and_every_actual_visit_merge_control_pre
             ] {
                 let control = Control {
                     trace: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(invoke(&control).unwrap_err(), cause);
                 assert_eq!(*control.trace.lock().unwrap(), expected[..=at]);
@@ -826,7 +826,7 @@ fn state_sources_wide_320_ordered_project_links_visit_one_emission_and_sample_ac
             ] {
                 let control = Control {
                     trace: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(invoke(&control).unwrap_err(), cause);
                 assert_eq!(*control.trace.lock().unwrap(), expected[..=at]);

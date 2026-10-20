@@ -27,8 +27,33 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::fragment::error::{
+    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+#[path = "table_function_failure.rs"]
+mod failure;
+use failure::TableFunctionFailure;
+fn binding_failure(kind: FragmentBindingErrorKind, detail: impl Into<String>) -> ExecutionFailure {
+    FragmentBindingError::new(FragmentBindingTarget::Program, kind, detail).into()
+}
+fn layout_failure(_: std::alloc::LayoutError) -> ConstructionFailure {
+    ConstructionFailure::Resource(
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+    )
+}
+fn output_rows(counts: &[usize]) -> ExecutionResult<usize> {
+    let required = counts
+        .iter()
+        .try_fold(0_u128, |sum, count| sum.checked_add(*count as u128));
+    required
+        .filter(|rows| *rows <= u128::from(u32::MAX))
+        .and_then(|rows| usize::try_from(rows).ok())
+        .ok_or_else(|| TableFunctionFailure::OutputRowExtent { required }.into())
+}
+
 use novarocks_local_program::StaticLayout;
 use std::alloc::Layout;
 
@@ -47,8 +72,14 @@ use arrow_data::transform::MutableArrayData;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::table_function::TableFunctionOutputSlot;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::SlotId;
 #[cfg(test)]
@@ -104,12 +135,12 @@ enum TableFunctionConstructionStep<'a> {
     EmptyOuter(SlotId),
 }
 #[cfg(test)]
-struct TableFunctionConstruction<'a, E> {
-    observe: Option<&'a mut dyn FnMut(TableFunctionConstructionStep<'_>) -> Result<(), E>>,
+struct TableFunctionConstruction<'a> {
+    observe: Option<&'a mut dyn FnMut(TableFunctionConstructionStep<'_>) -> ExecutionResult<()>>,
 }
 #[cfg(test)]
-impl<E> TableFunctionConstruction<'_, E> {
-    fn step(&mut self, step: TableFunctionConstructionStep<'_>) -> Result<(), E> {
+impl TableFunctionConstruction<'_> {
+    fn step(&mut self, step: TableFunctionConstructionStep<'_>) -> ExecutionResult<()> {
         match self.observe.as_mut() {
             Some(observe) => observe(step),
             None => Ok(()),
@@ -185,9 +216,12 @@ impl TableFunctionFixtureFactory {
         input: StaticLayout,
         output: StaticLayout,
         output_slot_sources: Vec<TableFunctionOutputSlot>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if !input.is_typed() || !output.is_typed() {
-            return Err("native table function requires complete input/output declarations".into());
+            return Err(binding_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                "native table function requires complete input/output declarations",
+            ));
         }
         let name = if node_id >= 0 {
             format!("TableFunction (id={node_id})")
@@ -217,7 +251,7 @@ impl OperatorFactory for TableFunctionFixtureFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(TableFunctionFixtureOperator {
+        Box::new(Transform::hydrating(TableFunctionFixtureKernel {
             name: self.name.clone(),
             function_name: self.function_name.clone(),
             param_slots: self.param_slots.clone(),
@@ -237,14 +271,13 @@ impl OperatorFactory for TableFunctionFixtureFactory {
             output_chunk: None,
             output_offset: 0,
             emit_empty_once: false,
-            finishing: false,
-            finished: false,
-        })
+            batch_rows: None,
+        }))
     }
 }
 
 #[cfg(test)]
-struct TableFunctionFixtureOperator {
+struct TableFunctionFixtureKernel {
     name: String,
     function_name: String,
     param_slots: Vec<SlotId>,
@@ -261,12 +294,11 @@ struct TableFunctionFixtureOperator {
     output_chunk: Option<Chunk>,
     output_offset: usize,
     emit_empty_once: bool,
-    finishing: bool,
-    finished: bool,
+    batch_rows: Option<std::num::NonZeroUsize>,
 }
 
 #[cfg(test)]
-impl Operator for TableFunctionFixtureOperator {
+impl OperatorLifecycle for TableFunctionFixtureKernel {
     fn creates_typed_storage(&self) -> bool {
         matches!(self.schema_source, TableFunctionSchemaSource::Typed { .. })
     }
@@ -291,44 +323,48 @@ impl Operator for TableFunctionFixtureOperator {
         &self.name
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.batch_rows = Some(std::num::NonZeroUsize::new(state.chunk_size()).ok_or_else(
+            || {
+                novarocks_functions::KernelFailure::InvalidProgram(
+                    novarocks_functions::KernelDiagnostic::new("table function batch size is zero"),
+                )
+            },
+        )?);
+        Ok(())
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.output_chunk = None;
+        self.emit_empty_once = false;
+        Ok(())
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
+    }
+    fn cancel(&mut self) {
+        self.output_chunk = None;
+        self.emit_empty_once = false;
     }
 }
 
 #[cfg(test)]
-impl ProcessorOperator for TableFunctionFixtureOperator {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.output_chunk.is_none() && !self.emit_empty_once
-    }
-
-    fn has_output(&self) -> bool {
-        if self.finished {
-            return false;
-        }
-        if self.emit_empty_once {
-            return true;
-        }
-        self.output_chunk
-            .as_ref()
-            .map(|c| self.output_offset < c.len())
-            .unwrap_or(false)
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if !self.need_input() {
-            return Err("table function received input while not ready"
-                .to_string()
-                .into());
-        }
+impl InputEncodingPolicy for TableFunctionFixtureKernel {}
+#[cfg(test)]
+impl TransformKernel for TableFunctionFixtureKernel {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        self.batch_rows.ok_or_else(|| {
+            novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "table function batch size was not bound",
+                ),
+            )
+        })?;
         self.validate_config()?;
         if chunk.is_empty() {
             if self.creates_typed_storage() {
@@ -346,7 +382,7 @@ impl ProcessorOperator for TableFunctionFixtureOperator {
             self.emit_empty_once = true;
             self.output_chunk = None;
             self.output_offset = 0;
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::Runnable, rows));
         }
 
         let output = if matches!(self.schema_source, TableFunctionSchemaSource::Typed { .. }) {
@@ -358,37 +394,42 @@ impl ProcessorOperator for TableFunctionFixtureOperator {
             self.emit_empty_once = true;
             self.output_chunk = None;
             self.output_offset = 0;
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::Runnable, rows));
         }
         self.output_chunk = Some(output);
         self.output_offset = 0;
-        Ok(())
+        Ok(StepResult::new(None, NextStep::Runnable, rows))
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if !self.has_output() {
-            return Ok(None);
-        }
+    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         if self.emit_empty_once {
             self.emit_empty_once = false;
-            if self.finishing && self.output_chunk.is_none() {
-                self.finished = true;
-            }
-            return Ok(Some(if self.creates_typed_storage() {
+            let output = if self.creates_typed_storage() {
                 self.empty_output_chunk_typed()?
             } else {
                 self.empty_output_chunk()?
-            }));
+            };
+            return Ok(StepResult::new(Some(output), NextStep::NeedInput, 0));
         }
 
         let Some(output) = self.output_chunk.as_ref() else {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         };
         let total = output.len();
         if self.output_offset >= total {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
-        let take_len = state.chunk_size().min(total - self.output_offset);
+        let take_len = self
+            .batch_rows
+            .ok_or_else(|| {
+                novarocks_functions::KernelFailure::InvalidProgram(
+                    novarocks_functions::KernelDiagnostic::new(
+                        "table function batch size was not bound",
+                    ),
+                )
+            })?
+            .get()
+            .min(total - self.output_offset);
         let slice = if matches!(self.schema_source, TableFunctionSchemaSource::Typed { .. }) {
             let owner = self
                 .construction
@@ -405,81 +446,85 @@ impl ProcessorOperator for TableFunctionFixtureOperator {
             output.slice(self.output_offset, take_len)
         };
         self.output_offset += take_len;
-        if self.output_offset >= total {
+        let next = if self.output_offset == total {
             self.output_chunk = None;
             self.output_offset = 0;
-            if self.finishing {
-                self.finished = true;
-            }
-        }
-        Ok(Some(slice))
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        if self.output_chunk.is_none() && !self.emit_empty_once {
-            self.finished = true;
-        }
-        Ok(())
+            NextStep::NeedInput
+        } else {
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(Some(slice), next, 0))
     }
 }
 
 #[cfg(test)]
-impl TableFunctionFixtureOperator {
-    fn schema(&self) -> Result<&ChunkSchemaRef, String> {
-        self.output_chunk_schema
-            .as_ref()
-            .ok_or_else(|| "table function schema was not prepared".into())
+impl TableFunctionFixtureKernel {
+    fn schema(&self) -> ExecutionResult<&ChunkSchemaRef> {
+        self.output_chunk_schema.as_ref().ok_or_else(|| {
+            binding_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                "table function schema was not prepared",
+            )
+        })
     }
-    fn build_output_chunk(&self, chunk: &Chunk) -> Result<Chunk, String> {
-        let generated = self.build_output_columns::<String>(
+    fn build_output_chunk(&self, chunk: &Chunk) -> ExecutionResult<Chunk> {
+        let generated = self.build_output_columns(
             chunk,
             &mut |count| Ok(Vec::with_capacity(count)),
             &mut TableFunctionConstruction { observe: None },
         )?;
         Chunk::try_new_with_columns(self.schema()?.clone(), generated.columns)
-            .map_err(|cause| format!("table function build batch failed: {cause}"))
+            .map_err(ExecutionFailure::from)
     }
-    fn empty_output_chunk(&self) -> Result<Chunk, String> {
-        let generated = self.empty_output_columns::<String>(
+    fn empty_output_chunk(&self) -> ExecutionResult<Chunk> {
+        let generated = self.empty_output_columns(
             &mut |count| Ok(Vec::with_capacity(count)),
             &mut TableFunctionConstruction { observe: None },
         )?;
         Chunk::try_new_with_columns(self.schema()?.clone(), generated.columns)
-            .map_err(|cause| format!("table function build empty batch failed: {cause}"))
+            .map_err(ExecutionFailure::from)
     }
 
-    fn validate_config(&self) -> Result<(), String> {
+    fn validate_config(&self) -> ExecutionResult<()> {
         if self.param_slots.len() != self.param_types.len() {
-            return Err(format!(
-                "table function param slot mismatch: slots={} types={}",
-                self.param_slots.len(),
-                self.param_types.len()
+            return Err(binding_failure(
+                FragmentBindingErrorKind::SchemaMismatch,
+                format!(
+                    "table function param slot mismatch: slots={} types={}",
+                    self.param_slots.len(),
+                    self.param_types.len()
+                ),
             ));
         }
         if self.fn_result_slots.len() != self.ret_types.len() {
-            return Err(format!(
-                "table function result slot mismatch: slots={} types={}",
-                self.fn_result_slots.len(),
-                self.ret_types.len()
+            return Err(binding_failure(
+                FragmentBindingErrorKind::SchemaMismatch,
+                format!(
+                    "table function result slot mismatch: slots={} types={}",
+                    self.fn_result_slots.len(),
+                    self.ret_types.len()
+                ),
             ));
         }
         if self.output_slot_sources.len() != self.schema()?.slot_ids().len() {
-            return Err(format!(
-                "table function output mapping mismatch: slots={} sources={}",
-                self.schema()?.slot_ids().len(),
-                self.output_slot_sources.len()
+            return Err(binding_failure(
+                FragmentBindingErrorKind::SchemaMismatch,
+                format!(
+                    "table function output mapping mismatch: slots={} sources={}",
+                    self.schema()?.slot_ids().len(),
+                    self.output_slot_sources.len()
+                ),
             ));
         }
         Ok(())
     }
 
-    fn build_output_columns<E: From<String>>(
+    fn build_output_columns(
         &self,
         chunk: &Chunk,
-        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<GeneratedColumns, E> {
+        vector: &mut impl FnMut(usize) -> ExecutionResult<Vec<ArrayRef>>,
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<GeneratedColumns> {
         // The original case-insensitive dispatch borrows the frozen label;
         // no temporary lowercase String is needed by the actual operator.
         if self.function_name.eq_ignore_ascii_case("unnest") {
@@ -491,35 +536,39 @@ impl TableFunctionFixtureOperator {
         } else if self.function_name.eq_ignore_ascii_case("generate_series") {
             self.build_output_columns_generate_series(chunk, vector, construction)
         } else {
-            Err(format!("unsupported table function: {}", self.function_name).into())
+            Err(binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("unsupported table function: {}", self.function_name),
+            ))
         }
     }
 
-    fn build_output_columns_unnest<E: From<String>>(
+    fn build_output_columns_unnest(
         &self,
         chunk: &Chunk,
-        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<GeneratedColumns, E> {
+        vector: &mut impl FnMut(usize) -> ExecutionResult<Vec<ArrayRef>>,
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<GeneratedColumns> {
         construction.step(TableFunctionConstructionStep::Scratch(
-            Layout::array::<ArrayRef>(self.param_slots.len())
-                .map_err(|_| "table function source reference extent overflow".to_string())?,
+            Layout::array::<ArrayRef>(self.param_slots.len()).map_err(layout_failure)?,
         ))?;
         let mut list_cols = Vec::with_capacity(self.param_slots.len());
         for (idx, slot) in self.param_slots.iter().enumerate() {
             let col = chunk.column_by_slot_id(*slot)?;
             if col.as_any().downcast_ref::<ListArray>().is_none() {
-                return Err(format!(
-                    "table function unnest param {idx} expects ListArray, got {:?}",
-                    col.data_type()
+                return Err(binding_failure(
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "table function unnest param {idx} expects ListArray, got {:?}",
+                        col.data_type()
+                    ),
                 )
                 .into());
             }
             list_cols.push(col);
         }
         construction.step(TableFunctionConstructionStep::Scratch(
-            Layout::array::<&ListArray>(list_cols.len())
-                .map_err(|_| "table function source reference extent overflow".to_string())?,
+            Layout::array::<&ListArray>(list_cols.len()).map_err(layout_failure)?,
         ))?;
         let list_args: Vec<&ListArray> = list_cols
             .iter()
@@ -535,10 +584,7 @@ impl TableFunctionFixtureOperator {
         } else {
             self.row_counts_multi(&list_args)?
         };
-        let total_output_rows: usize = row_counts.iter().sum();
-        if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string().into());
-        }
+        let total_output_rows = output_rows(&row_counts)?;
         if total_output_rows == 0 {
             return self.empty_output_columns(vector, construction);
         }
@@ -549,9 +595,7 @@ impl TableFunctionFixtureOperator {
         let result_columns = if self.fn_result_required {
             if list_args.len() == 1 {
                 construction.step(TableFunctionConstructionStep::Scratch(
-                    Layout::array::<ArrayRef>(1).map_err(|_| {
-                        "table function result reference extent overflow".to_string()
-                    })?,
+                    Layout::array::<ArrayRef>(1).map_err(layout_failure)?,
                 ))?;
                 vec![self.build_result_column_single(
                     list_args[0],
@@ -580,16 +624,19 @@ impl TableFunctionFixtureOperator {
         )
     }
 
-    fn build_output_columns_unnest_bitmap<E: From<String>>(
+    fn build_output_columns_unnest_bitmap(
         &self,
         chunk: &Chunk,
-        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<GeneratedColumns, E> {
+        vector: &mut impl FnMut(usize) -> ExecutionResult<Vec<ArrayRef>>,
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<GeneratedColumns> {
         if self.param_slots.len() != 1 {
-            return Err(format!(
-                "table function unnest_bitmap expects 1 arg, got {}",
-                self.param_slots.len()
+            return Err(binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "table function unnest_bitmap expects 1 arg, got {}",
+                    self.param_slots.len()
+                ),
             )
             .into());
         }
@@ -598,9 +645,12 @@ impl TableFunctionFixtureOperator {
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
-                format!(
-                    "table function unnest_bitmap param expects BinaryArray, got {:?}",
-                    bitmap_col.data_type()
+                binding_failure(
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "table function unnest_bitmap param expects BinaryArray, got {:?}",
+                        bitmap_col.data_type()
+                    ),
                 )
             })?;
 
@@ -618,12 +668,11 @@ impl TableFunctionFixtureOperator {
                 continue;
             }
             let decoded = bitmap::decode_bitmap(bitmap_arr.value(row))
-                .map_err(|e| format!("table function unnest_bitmap decode failed: {e}"))?;
+                .map_err(ExecutionFailure::from_domain)?;
             let mut values = Vec::with_capacity(decoded.len());
             for value in decoded {
-                let value = i64::try_from(value).map_err(|_| {
-                    format!("table function unnest_bitmap value out of BIGINT range: {value}")
-                })?;
+                let value = i64::try_from(value)
+                    .map_err(|_| TableFunctionFailure::BitmapValueRange { value })?;
                 values.push(value);
             }
             if values.is_empty() {
@@ -638,10 +687,7 @@ impl TableFunctionFixtureOperator {
             row_values.push(Some(values));
         }
 
-        let total_output_rows: usize = row_counts.iter().sum();
-        if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string().into());
-        }
+        let total_output_rows = output_rows(&row_counts)?;
         if total_output_rows == 0 {
             return self.empty_output_columns(vector, construction);
         }
@@ -650,15 +696,17 @@ impl TableFunctionFixtureOperator {
         let outer_columns = self.build_outer_columns(chunk, &row_indices, construction)?;
         let result_columns = if self.fn_result_required {
             if !matches!(self.ret_types.first(), Some(DataType::Int64)) {
-                return Err(format!(
-                    "table function unnest_bitmap return type expects BIGINT, got {:?}",
-                    self.ret_types.first()
+                return Err(binding_failure(
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "table function unnest_bitmap return type expects BIGINT, got {:?}",
+                        self.ret_types.first()
+                    ),
                 )
                 .into());
             }
             construction.step(TableFunctionConstructionStep::Scratch(
-                Layout::array::<ArrayRef>(1)
-                    .map_err(|_| "table function result reference extent overflow".to_string())?,
+                Layout::array::<ArrayRef>(1).map_err(layout_failure)?,
             ))?;
             construction.step(TableFunctionConstructionStep::Flat {
                 result: 0,
@@ -695,16 +743,19 @@ impl TableFunctionFixtureOperator {
         )
     }
 
-    fn build_output_columns_subdivide_bitmap<E: From<String>>(
+    fn build_output_columns_subdivide_bitmap(
         &self,
         chunk: &Chunk,
-        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<GeneratedColumns, E> {
+        vector: &mut impl FnMut(usize) -> ExecutionResult<Vec<ArrayRef>>,
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<GeneratedColumns> {
         if self.param_slots.len() != 2 {
-            return Err(format!(
-                "table function subdivide_bitmap expects 2 args, got {}",
-                self.param_slots.len()
+            return Err(binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "table function subdivide_bitmap expects 2 args, got {}",
+                    self.param_slots.len()
+                ),
             )
             .into());
         }
@@ -714,9 +765,12 @@ impl TableFunctionFixtureOperator {
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
-                format!(
-                    "table function subdivide_bitmap param 0 expects BinaryArray, got {:?}",
-                    bitmap_col.data_type()
+                binding_failure(
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "table function subdivide_bitmap param 0 expects BinaryArray, got {:?}",
+                        bitmap_col.data_type()
+                    ),
                 )
             })?;
 
@@ -745,7 +799,7 @@ impl TableFunctionFixtureOperator {
                 continue;
             }
             let bitmap_values = bitmap::decode_bitmap(bitmap_arr.value(row))
-                .map_err(|e| format!("table function subdivide_bitmap decode failed: {e}"))?
+                .map_err(ExecutionFailure::from_domain)?
                 .into_iter()
                 .collect::<Vec<_>>();
             let batch_size = match usize::try_from(batch_size) {
@@ -757,10 +811,7 @@ impl TableFunctionFixtureOperator {
             row_values.push(Some(splits));
         }
 
-        let total_output_rows: usize = row_counts.iter().sum();
-        if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string().into());
-        }
+        let total_output_rows = output_rows(&row_counts)?;
         if total_output_rows == 0 {
             return self.empty_output_columns(vector, construction);
         }
@@ -769,15 +820,17 @@ impl TableFunctionFixtureOperator {
         let outer_columns = self.build_outer_columns(chunk, &row_indices, construction)?;
         let result_columns = if self.fn_result_required {
             if !matches!(self.ret_types.first(), Some(DataType::Binary)) {
-                return Err(format!(
-                    "table function subdivide_bitmap return type expects Binary, got {:?}",
-                    self.ret_types.first()
+                return Err(binding_failure(
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "table function subdivide_bitmap return type expects Binary, got {:?}",
+                        self.ret_types.first()
+                    ),
                 )
                 .into());
             }
             construction.step(TableFunctionConstructionStep::Scratch(
-                Layout::array::<ArrayRef>(1)
-                    .map_err(|_| "table function result reference extent overflow".to_string())?,
+                Layout::array::<ArrayRef>(1).map_err(layout_failure)?,
             ))?;
             construction.step(TableFunctionConstructionStep::Flat {
                 result: 0,
@@ -814,16 +867,19 @@ impl TableFunctionFixtureOperator {
         )
     }
 
-    fn build_output_columns_generate_series<E: From<String>>(
+    fn build_output_columns_generate_series(
         &self,
         chunk: &Chunk,
-        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<GeneratedColumns, E> {
+        vector: &mut impl FnMut(usize) -> ExecutionResult<Vec<ArrayRef>>,
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<GeneratedColumns> {
         if !(self.param_slots.len() == 2 || self.param_slots.len() == 3) {
-            return Err(format!(
-                "table function generate_series expects 2 or 3 args, got {}",
-                self.param_slots.len()
+            return Err(binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "table function generate_series expects 2 or 3 args, got {}",
+                    self.param_slots.len()
+                ),
             )
             .into());
         }
@@ -849,8 +905,8 @@ impl TableFunctionFixtureOperator {
             },
         )
         .map_err(|failure| match failure {
-            novarocks_functions::generate_series_core::SeriesFailure::Data(message) => {
-                E::from(message)
+            novarocks_functions::generate_series_core::SeriesFailure::Cause(cause) => {
+                ExecutionFailure::from(cause)
             }
             novarocks_functions::generate_series_core::SeriesFailure::Control(cause) => cause,
         })?;
@@ -861,8 +917,7 @@ impl TableFunctionFixtureOperator {
         let outer_columns = self.build_outer_columns(chunk, &row_indices, construction)?;
         let result_columns = if self.fn_result_required {
             construction.step(TableFunctionConstructionStep::Scratch(
-                Layout::array::<ArrayRef>(1)
-                    .map_err(|_| "table function result reference extent overflow".to_string())?,
+                Layout::array::<ArrayRef>(1).map_err(layout_failure)?,
             ))?;
             if self.ret_types.first().is_some() {
                 construction.step(TableFunctionConstructionStep::Flat {
@@ -877,7 +932,7 @@ impl TableFunctionFixtureOperator {
                     novarocks_functions::generate_series_core::SeriesObservation::OpaqueBoundary => 0,
                 })),
             ).map_err(|failure| match failure {
-                novarocks_functions::generate_series_core::SeriesFailure::Data(message) => E::from(message),
+                novarocks_functions::generate_series_core::SeriesFailure::Cause(cause) => ExecutionFailure::from(cause),
                 novarocks_functions::generate_series_core::SeriesFailure::Control(cause) => cause,
             })?]
         } else {
@@ -892,27 +947,33 @@ impl TableFunctionFixtureOperator {
         )
     }
 
-    fn assemble_output_columns<E: From<String>>(
+    fn assemble_output_columns(
         &self,
         outer_columns: HashMap<SlotId, ArrayRef>,
         result_columns: Vec<ArrayRef>,
         rows: usize,
-        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
-        _construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<GeneratedColumns, E> {
+        vector: &mut impl FnMut(usize) -> ExecutionResult<Vec<ArrayRef>>,
+        _construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<GeneratedColumns> {
         let mut output_columns = vector(self.schema()?.slot_ids().len())?;
         for source in &self.output_slot_sources {
             match source {
                 TableFunctionOutputSlot::Outer { slot } => {
-                    let col = outer_columns
-                        .get(slot)
-                        .ok_or_else(|| format!("table function missing outer slot {}", slot))?;
+                    let col = outer_columns.get(slot).ok_or_else(|| {
+                        binding_failure(
+                            FragmentBindingErrorKind::MissingAssignment,
+                            format!("table function missing outer slot {}", slot),
+                        )
+                    })?;
                     output_columns.push(col.clone());
                 }
                 TableFunctionOutputSlot::Result { index } => {
-                    let col = result_columns
-                        .get(*index)
-                        .ok_or_else(|| format!("table function missing result column {}", index))?;
+                    let col = result_columns.get(*index).ok_or_else(|| {
+                        binding_failure(
+                            FragmentBindingErrorKind::MissingAssignment,
+                            format!("table function missing result column {}", index),
+                        )
+                    })?;
                     output_columns.push(col.clone());
                 }
             }
@@ -924,11 +985,11 @@ impl TableFunctionFixtureOperator {
         })
     }
 
-    fn empty_output_columns<E: From<String>>(
+    fn empty_output_columns(
         &self,
-        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<GeneratedColumns, E> {
+        vector: &mut impl FnMut(usize) -> ExecutionResult<Vec<ArrayRef>>,
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<GeneratedColumns> {
         let schema = self.schema()?;
         let mut columns = vector(schema.slots().len())?;
         for (ordinal, slot) in schema.slots().iter().enumerate() {
@@ -944,15 +1005,18 @@ impl TableFunctionFixtureOperator {
         row: usize,
         arg_idx: usize,
         diagnostic: novarocks_functions::generate_series_core::IntegerDiagnosticContext,
-    ) -> Result<Option<i128>, String> {
+    ) -> Result<Option<i128>, novarocks_functions::generate_series_core::SeriesError> {
         novarocks_functions::generate_series_core::integer_argument(array, row, arg_idx, diagnostic)
     }
 
-    fn generate_series_result_column(&self, values: Vec<Option<i128>>) -> Result<ArrayRef, String> {
+    fn generate_series_result_column(
+        &self,
+        values: Vec<Option<i128>>,
+    ) -> Result<ArrayRef, novarocks_functions::generate_series_core::SeriesError> {
         novarocks_functions::generate_series_core::result_column(values, &self.ret_types)
     }
 
-    fn row_counts_single(&self, list: &ListArray) -> Result<Vec<usize>, String> {
+    fn row_counts_single(&self, list: &ListArray) -> ExecutionResult<Vec<usize>> {
         let num_rows = list.len();
         let offsets = list.value_offsets();
         let mut counts = Vec::with_capacity(num_rows);
@@ -964,7 +1028,7 @@ impl TableFunctionFixtureOperator {
             let start = offsets[row];
             let end = offsets[row + 1];
             if end < start {
-                return Err("table function unnest list offsets are invalid".to_string());
+                return Err(TableFunctionFailure::InvalidOffsets { row, start, end }.into());
             }
             let len = (end - start) as usize;
             if len == 0 && self.is_left_join {
@@ -976,17 +1040,19 @@ impl TableFunctionFixtureOperator {
         Ok(counts)
     }
 
-    fn row_counts_multi(&self, lists: &[&ListArray]) -> Result<Vec<usize>, String> {
+    fn row_counts_multi(&self, lists: &[&ListArray]) -> ExecutionResult<Vec<usize>> {
         if lists.is_empty() {
-            return Err("table function unnest requires at least one list param".to_string());
+            return Err(TableFunctionFailure::MissingList.into());
         }
         let num_rows = lists[0].len();
         for (idx, list) in lists.iter().enumerate() {
             if list.len() != num_rows {
-                return Err(format!(
-                    "table function unnest param {idx} length mismatch: expected {num_rows}, got {}",
-                    list.len()
-                ));
+                return Err(TableFunctionFailure::InputLength {
+                    argument: idx,
+                    expected: num_rows,
+                    actual: list.len(),
+                }
+                .into());
             }
         }
         let mut counts = Vec::with_capacity(num_rows);
@@ -1000,7 +1066,7 @@ impl TableFunctionFixtureOperator {
                 let start = offsets[row];
                 let end = offsets[row + 1];
                 if end < start {
-                    return Err("table function unnest list offsets are invalid".to_string());
+                    return Err(TableFunctionFailure::InvalidOffsets { row, start, end }.into());
                 }
                 let len = (end - start) as usize;
                 if len > max_len {
@@ -1016,12 +1082,12 @@ impl TableFunctionFixtureOperator {
         Ok(counts)
     }
 
-    fn build_outer_columns<E: From<String>>(
+    fn build_outer_columns(
         &self,
         chunk: &Chunk,
         row_indices: &[u32],
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<HashMap<SlotId, ArrayRef>, E> {
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<HashMap<SlotId, ArrayRef>> {
         construction.step(TableFunctionConstructionStep::OuterMap(
             self.outer_slots.len(),
         ))?;
@@ -1040,7 +1106,8 @@ impl TableFunctionFixtureOperator {
                         source: col.as_ref(),
                         indices: idx,
                     })?;
-                    let output = take(col.as_ref(), idx, None).map_err(|e| e.to_string())?;
+                    let output =
+                        take(col.as_ref(), idx, None).map_err(TableFunctionFailure::Arrow)?;
                     construction.step(TableFunctionConstructionStep::EndOperation)?;
                     output
                 }
@@ -1054,18 +1121,20 @@ impl TableFunctionFixtureOperator {
         Ok(out)
     }
 
-    fn build_result_column_single<E: From<String>>(
+    fn build_result_column_single(
         &self,
         list: &ListArray,
         row_counts: &[usize],
         total_output_rows: usize,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<ArrayRef, E> {
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<ArrayRef> {
         let values = list.values();
-        let expected = self
-            .ret_types
-            .first()
-            .ok_or_else(|| "table function missing return type".to_string())?;
+        let expected = self.ret_types.first().ok_or_else(|| {
+            binding_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                "table function missing return type",
+            )
+        })?;
         if matches!(expected, DataType::Null) {
             construction.step(TableFunctionConstructionStep::Null {
                 result: 0,
@@ -1074,10 +1143,13 @@ impl TableFunctionFixtureOperator {
             return Ok(Arc::new(NullArray::new(total_output_rows)) as ArrayRef);
         }
         if values.data_type() != expected {
-            return Err(format!(
-                "table function unnest result type mismatch: expected {:?}, got {:?}",
-                expected,
-                values.data_type()
+            return Err(binding_failure(
+                FragmentBindingErrorKind::SchemaMismatch,
+                format!(
+                    "table function unnest result type mismatch: expected {:?}, got {:?}",
+                    expected,
+                    values.data_type()
+                ),
             )
             .into());
         }
@@ -1087,9 +1159,7 @@ impl TableFunctionFixtureOperator {
             rows: total_output_rows,
         })?;
         construction.step(TableFunctionConstructionStep::Scratch(
-            Layout::array::<&arrow_data::ArrayData>(1).map_err(|_| {
-                "table function source packet reference extent overflow".to_string()
-            })?,
+            Layout::array::<&arrow_data::ArrayData>(1).map_err(layout_failure)?,
         ))?;
         let data_storage = [values.to_data()];
         let data_refs: Vec<&arrow_data::ArrayData> = data_storage.iter().collect();
@@ -1107,9 +1177,7 @@ impl TableFunctionFixtureOperator {
             let start = offsets[row];
             let end = offsets[row + 1];
             if end < start {
-                return Err("table function unnest list offsets are invalid"
-                    .to_string()
-                    .into());
+                return Err(TableFunctionFailure::InvalidOffsets { row, start, end }.into());
             }
             let len = (end - start) as usize;
             if len == 0 && self.is_left_join {
@@ -1128,24 +1196,25 @@ impl TableFunctionFixtureOperator {
         Ok(output)
     }
 
-    fn build_result_columns_multi<E: From<String>>(
+    fn build_result_columns_multi(
         &self,
         lists: &[&ListArray],
         row_counts: &[usize],
         total_output_rows: usize,
-        construction: &mut TableFunctionConstruction<'_, E>,
-    ) -> Result<Vec<ArrayRef>, E> {
+        construction: &mut TableFunctionConstruction<'_>,
+    ) -> ExecutionResult<Vec<ArrayRef>> {
         construction.step(TableFunctionConstructionStep::Scratch(
-            Layout::array::<ArrayRef>(lists.len())
-                .map_err(|_| "table function result reference extent overflow".to_string())?,
+            Layout::array::<ArrayRef>(lists.len()).map_err(layout_failure)?,
         ))?;
         let mut out = Vec::with_capacity(lists.len());
         for (col_idx, list) in lists.iter().enumerate() {
             let values = list.values();
-            let expected = self
-                .ret_types
-                .get(col_idx)
-                .ok_or_else(|| "table function missing return type".to_string())?;
+            let expected = self.ret_types.get(col_idx).ok_or_else(|| {
+                binding_failure(
+                    FragmentBindingErrorKind::MissingAssignment,
+                    "table function missing return type",
+                )
+            })?;
             if matches!(expected, DataType::Null) {
                 construction.step(TableFunctionConstructionStep::Null {
                     result: col_idx,
@@ -1155,10 +1224,13 @@ impl TableFunctionFixtureOperator {
                 continue;
             }
             if values.data_type() != expected {
-                return Err(format!(
-                    "table function unnest result type mismatch: expected {:?}, got {:?}",
-                    expected,
-                    values.data_type()
+                return Err(binding_failure(
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "table function unnest result type mismatch: expected {:?}, got {:?}",
+                        expected,
+                        values.data_type()
+                    ),
                 )
                 .into());
             }
@@ -1168,9 +1240,7 @@ impl TableFunctionFixtureOperator {
                 rows: total_output_rows,
             })?;
             construction.step(TableFunctionConstructionStep::Scratch(
-                Layout::array::<&arrow_data::ArrayData>(1).map_err(|_| {
-                    "table function source packet reference extent overflow".to_string()
-                })?,
+                Layout::array::<&arrow_data::ArrayData>(1).map_err(layout_failure)?,
             ))?;
             let data_storage = [values.to_data()];
             let data_refs: Vec<&arrow_data::ArrayData> = data_storage.iter().collect();
@@ -1188,9 +1258,7 @@ impl TableFunctionFixtureOperator {
                 let start = offsets[row];
                 let end = offsets[row + 1];
                 if end < start {
-                    return Err("table function unnest list offsets are invalid"
-                        .to_string()
-                        .into());
+                    return Err(TableFunctionFailure::InvalidOffsets { row, start, end }.into());
                 }
                 let len = (end - start) as usize;
                 if len == 0 && self.is_left_join && *count == 1 {
@@ -1212,12 +1280,15 @@ impl TableFunctionFixtureOperator {
 }
 
 #[cfg(test)]
-fn build_row_indices(counts: &[usize]) -> Result<Vec<u32>, String> {
-    let total: usize = counts.iter().sum();
+fn build_row_indices(counts: &[usize]) -> ExecutionResult<Vec<u32>> {
+    let total = output_rows(counts)?;
     let mut indices = Vec::with_capacity(total);
     for (row, count) in counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
         let row_u32 =
-            u32::try_from(row).map_err(|_| "table function row index overflow".to_string())?;
+            u32::try_from(row).map_err(|_| TableFunctionFailure::InputRowExtent { row })?;
         for _ in 0..*count {
             indices.push(row_u32);
         }
@@ -1226,9 +1297,9 @@ fn build_row_indices(counts: &[usize]) -> Result<Vec<u32>, String> {
 }
 
 #[cfg(test)]
-fn encode_bitmap_chunk(values: &[u64]) -> Result<Vec<u8>, String> {
+fn encode_bitmap_chunk(values: &[u64]) -> ExecutionResult<Vec<u8>> {
     let set: std::collections::BTreeSet<u64> = values.iter().copied().collect();
-    bitmap::encode_internal_bitmap(&set)
+    bitmap::encode_internal_bitmap(&set).map_err(ExecutionFailure::from_domain)
 }
 
 #[cfg(test)]
@@ -1251,18 +1322,26 @@ fn split_bitmap_values(values: &[u64], batch_size: usize) -> Vec<Vec<u64>> {
 }
 
 #[cfg(test)]
-fn generate_series_count(start: i128, end: i128, step: i128) -> Result<usize, String> {
+fn generate_series_count(
+    start: i128,
+    end: i128,
+    step: i128,
+) -> Result<usize, novarocks_functions::generate_series_core::SeriesError> {
     novarocks_functions::generate_series_core::count(start, end, step)
 }
 
 #[cfg(test)]
-fn checked_add_table_function_rows(total: &mut usize, rows: usize) -> Result<(), String> {
+fn checked_add_table_function_rows(
+    total: &mut usize,
+    rows: usize,
+) -> Result<(), novarocks_functions::generate_series_core::SeriesError> {
     novarocks_functions::generate_series_core::checked_add_output_rows(total, rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_failure_contract::FailureProjection;
 
     #[test]
     fn generate_series_count_handles_descending_steps() {
@@ -1276,7 +1355,10 @@ mod tests {
         checked_add_table_function_rows(&mut total, MAX_TABLE_FUNCTION_OUTPUT_ROWS)
             .expect("max rows accepted");
         let err = checked_add_table_function_rows(&mut total, 1).expect_err("too many rows");
-        assert!(err.contains("output too large"));
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Representation
+        );
     }
 }
 

@@ -21,18 +21,18 @@
 //! - Used by drivers to orchestrate cooperative operator execution steps.
 //!
 //! Key exported interfaces:
-//! - Types: `BlockedReason`, `FinishWatch`, `Operator`, `ProcessorOperator`.
+//! - Types: `BlockedReason`, `FinishWatch`, `OperatorLifecycle`, `Operator`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::io::{FragmentEventSink, RootInputPermit};
+use crate::runtime::fragment::io::FragmentEventSink;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
@@ -111,9 +111,93 @@ impl std::fmt::Debug for FinishWatch {
     }
 }
 
+/// Physical exit is independent of data EOS and the accepted Task conclusion.
+/// Neither an error nor a stop request certifies that an owner has exited.
+#[derive(Debug)]
+pub enum ExitProgress {
+    Pending(FinishWatch),
+    Exited,
+    Unresolved(FinishWatch),
+}
+
+/// The author identifies which obligation failed. A caller never infers this
+/// role from the error class, component, message, or accepted Task conclusion.
+#[derive(Debug)]
+pub enum ExitFailure {
+    Required(ExecutionFailure),
+    Cleanup(ExecutionFailure),
+}
+
+/// The worker consumes each failure once and may read physical progress again.
+/// Authors that already reported an event through the bound runtime port leave
+/// `failure` empty; repeated observations cannot submit the same event again.
+#[derive(Debug)]
+pub struct ExitObservation {
+    pub progress: ExitProgress,
+    pub failure: Option<ExitFailure>,
+    /// A newly observed physical-exit fault, consumed once by the same worker.
+    /// This is health evidence and grants no Task conclusion authority.
+    pub unresolved_exit: Option<ExecutionFailure>,
+}
+impl ExitObservation {
+    pub fn pending(watch: FinishWatch) -> Self {
+        Self {
+            progress: ExitProgress::Pending(watch),
+            failure: None,
+            unresolved_exit: None,
+        }
+    }
+    pub fn exited() -> Self {
+        Self {
+            progress: ExitProgress::Exited,
+            failure: None,
+            unresolved_exit: None,
+        }
+    }
+    pub fn unresolved(watch: FinishWatch) -> Self {
+        Self {
+            progress: ExitProgress::Unresolved(watch),
+            failure: None,
+            unresolved_exit: None,
+        }
+    }
+    pub fn with_failure(mut self, failure: ExitFailure) -> Self {
+        self.failure = Some(failure);
+        self
+    }
+    pub fn with_unresolved_exit(mut self, failure: ExecutionFailure) -> Self {
+        self.unresolved_exit = Some(failure);
+        self
+    }
+    pub(crate) fn report_to(
+        mut self,
+        control: &crate::runtime::runtime_state::RuntimeErrorState,
+    ) -> ExitProgress {
+        if let Some(failure) = self.unresolved_exit.take() {
+            control.report_unresolved_exit(&failure);
+        }
+        match self.failure.take() {
+            Some(ExitFailure::Required(failure)) => control.set_error(failure),
+            Some(ExitFailure::Cleanup(failure)) => control.report_cleanup(&failure),
+            None => {}
+        }
+        self.progress
+    }
+}
+
 /// Base operator contract implemented by source/processor/sink operator implementations.
-pub trait Operator: Send {
+pub trait OperatorLifecycle: Send {
     fn name(&self) -> &str;
+
+    /// Install the owned provider handle before activation. Only the driver
+    /// replenishes the shared allowance; synchronous work borrows StepContext.
+    fn bind_poll_budget(
+        &mut self,
+        _budget: novarocks_spi::connector::read_stack::ConnectorPollBudget,
+    ) {
+    }
+
+    fn on_downstream_backpressure(&mut self, _paused: bool) {}
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         let _ = tracker;
@@ -163,6 +247,29 @@ pub trait Operator: Send {
 
     fn set_fragment_event_sink(&mut self, _sink: Arc<dyn FragmentEventSink>) {}
 
+    /// End production and start outstanding owner exits exactly once. Errors
+    /// from this cleanup request are diagnostics, never required-output events.
+    /// It may initiate asynchronous closure but cannot certify actual exit.
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        Ok(())
+    }
+
+    fn observe_exit(&mut self) -> ExitObservation {
+        match self.pending_finish() {
+            Some(watch) => ExitObservation::pending(watch),
+            None => ExitObservation::exited(),
+        }
+    }
+
+    /// Composite owners expose each real exit separately. An error from one
+    /// child must not hide a sibling which still owns asynchronous work.
+    fn visit_exits(&mut self, visit: &mut dyn FnMut(ExitObservation)) {
+        visit(self.observe_exit());
+    }
+
+    /// Release resources after production has ended. Required output and
+    /// external commit belong to the normal step/finish continuation. An error
+    /// here is a cleanup diagnostic; physical exit is observed independently.
     fn close(&mut self) -> ExecutionResult<()> {
         Ok(())
     }
@@ -179,10 +286,6 @@ pub trait Operator: Send {
         self.cancel();
     }
 
-    fn is_finished(&self) -> bool {
-        false
-    }
-
     /// Asynchronous work this operator still owns after its driver reached a
     /// terminal state, as the way to learn that the work may have ended.
     ///
@@ -191,263 +294,13 @@ pub trait Operator: Send {
     fn pending_finish(&self) -> Option<FinishWatch> {
         None
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        None
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        None
-    }
 }
 
-/// What an operator's unfinished `set_finishing` is waiting for.
-///
-/// The driver asks this one question for two different decisions, and the two
-/// need different answers, which is why this is not a boolean:
-///
-/// * whether the operator may be latched as finished with `set_finishing` —
-///   only [`Self::Complete`] may;
-/// * whether giving it another turn right now would accomplish anything —
-///   only [`Self::OwedOutput`] would.
-///
-/// Collapsing the two deadlocks the driver in one direction or spins it in the
-/// other. Reporting owed output as "cannot progress" parks a driver forever
-/// with the payload still in hand — measured on a real 1FE+3BE cluster as a
-/// distributed `SELECT` whose one row-carrying producer never sent its end of
-/// stream. Reporting a wait for an external event as "can progress" turns the
-/// park into a hot spin over an obstacle the operator cannot clear.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub enum FinishingWait {
-    /// Finishing is done for this operator; the driver may latch it.
-    #[default]
-    Complete,
-    /// Output the operator still owes and can push on its next turn: a payload
-    /// it has buffered, or an end-of-stream marker it has not sent. The driver
-    /// must give it that turn.
-    OwedOutput,
-    /// An event only something else can produce — an exchange sink's outbound
-    /// edge has not been granted send permission, for one. Another turn now
-    /// would do nothing, so the driver parks on the operator's sink observable
-    /// and asks again when it fires.
-    ExternalEvent,
-}
-
-impl FinishingWait {
-    /// Whether finishing is still unfinished, whatever it is waiting for.
-    pub const fn is_pending(self) -> bool {
-        !matches!(self, Self::Complete)
-    }
-
-    /// Whether another turn right now would move this operator forward.
-    pub const fn can_progress(self) -> bool {
-        matches!(self, Self::OwedOutput)
-    }
-}
-
-/// Extended operator contract for processor stages with push/pull semantics.
-pub enum RootPreparedPull {
-    Chunk(Chunk),
-    /// A bounded CPU quantum completed. Workspace and its original grant
-    /// remain on the same driver edge while the driver yields Ready for its
-    /// next turn. No external readiness event is required to resume.
-    Yielded,
-    /// No root-covered workspace remains after this pull.
-    Empty,
-}
-
-pub trait ProcessorOperator: Operator {
-    fn need_input(&self) -> bool;
-
-    /// Admission before the upstream owner can materialize its next output.
-    /// Ordinary operators use readiness; bounded root sinks retain one exact
-    /// input/hydration overlap position through the final edge and producer.
-    fn prepare_upstream_pull(&self) -> ExecutionResult<bool> {
-        Ok(self.need_input())
-    }
-
-    /// An empty or failed pull must return an unused root position. A
-    /// successful pull keeps it while the chunk is retained on this edge.
-    fn finish_upstream_pull(&self, _produced_chunk: bool) {}
-
-    /// Move the original terminal admission onto its exact driver edge.
-    /// No upstream allocation may run while a sink's permit lock is held.
-    fn take_prepared_root_input(&mut self) -> Option<RootInputPermit> {
-        None
-    }
-
-    /// Borrow the unique original grant while producing the final batch.
-    /// Only a root-owned materializer constructs its output under this grant
-    /// and can yield without returning the coverage. An ordinary upstream
-    /// operator's output belongs to that operator's own admitted memory owner;
-    /// the root permit is never extended to cover it. The root boundary
-    /// instead reserves one input allowance before this pull and checks the
-    /// actual backing against it after the pull, refusing the input explicitly
-    /// when it does not fit.
-    fn pull_chunk_with_root_input(
-        &mut self,
-        state: &RuntimeState,
-        _input: &RootInputPermit,
-    ) -> ExecutionResult<RootPreparedPull> {
-        self.pull_chunk(state).map(|chunk| match chunk {
-            Some(chunk) => RootPreparedPull::Chunk(chunk),
-            None => RootPreparedPull::Empty,
-        })
-    }
-
-    /// Synchronously destroy only root-covered unpublished workspace before
-    /// its driver edge can return the permit. This API starts no async work.
-    fn release_root_pull_workspace(&mut self) {}
-
-    fn can_accept_root_input(
-        &self,
-        chunk: &Chunk,
-        _input: &RootInputPermit,
-    ) -> ExecutionResult<bool> {
-        self.can_accept_input(chunk)
-    }
-
-    fn push_chunk_with_root_input(
-        &mut self,
-        _state: &RuntimeState,
-        chunk: Chunk,
-        input: RootInputPermit,
-    ) -> ExecutionResult<()> {
-        drop(chunk);
-        drop(input);
-        Err("processor cannot consume an original root input grant"
-            .to_string()
-            .into())
-    }
-
-    /// A host-owned asynchronous terminal processor can fail while its source is
-    /// parked. The driver observes that failure before deciding completion;
-    /// the processor also supplies its stable early-finish wake observable.
-    fn execution_error(&self) -> Option<crate::runtime::fragment::ExecutionFailure> {
-        None
-    }
-
-    /// Non-blocking admission for the exact chunk currently retained on the
-    /// upstream edge.
-    ///
-    /// Most operators use their ordinary `need_input` decision. A bounded
-    /// terminal sink may reserve byte credit here before the driver transfers
-    /// ownership to `push_chunk`.
-    fn can_accept_input(&self, _chunk: &Chunk) -> ExecutionResult<bool> {
-        Ok(self.need_input())
-    }
-
-    /// Transfers the exact original Chunk to a precovered host input owner.
-    /// Such a processor owns finite carrier validation, hydration and memory
-    /// accounting itself; the driver must not inspect or copy its schema,
-    /// expand dictionaries, or create another accounting charge on this edge.
-    fn takes_original_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool;
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()>;
-
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>>;
-
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()>;
-
-    /// What `set_finishing` could not complete, and whether another turn
-    /// would complete it.
-    ///
-    /// Default [`FinishingWait::Complete`]: for almost every operator,
-    /// finishing completes in the one call the driver makes. An operator that
-    /// can be legitimately unable to finish yet reports which of the two
-    /// reasons it is, because the driver acts on them differently — see
-    /// [`FinishingWait`].
-    fn finishing_wait(&self) -> FinishingWait {
-        FinishingWait::Complete
-    }
-
-    /// Whether this operator can consume the given column in its current
-    /// physical encoding WITHOUT hydration. Default: false - the driver
-    /// hydrates every encoded column before `push_chunk`. C1-C4 override
-    /// this per slot to keep specific dictionary columns encoded on their
-    /// fast path.
-    fn accepts_encoded_column(&self, _slot_id: SlotId, _data_type: &DataType) -> bool {
-        false
-    }
-
-    /// Actual installed consumer capability for this structural occurrence.
-    /// The existing root capability covers only the empty path. A consumer
-    /// that handles nested encodings overrides this method explicitly.
-    fn accepts_encoded_path(&self, value: EncodedValueOccurrence<'_>) -> bool {
-        value.path.is_empty() && self.accepts_encoded_column(value.slot, value.carrier)
-    }
-
-    /// Actual preparation-created input construction owner, independent of
-    /// encoded-kernel capability. Typed construction refuses a missing owner.
-    fn input_construction_factory(&self) -> Option<&dyn InputConstructionFactory> {
-        None
-    }
-
-    /// Dependency that must be ready before the operator can make progress.
-    /// This is used for build-side readiness (join, runtime filters, etc.).
-    fn precondition_dependency(&self) -> Option<DependencyHandle> {
-        None
-    }
-
-    /// Observable for source-side readiness (has_output becomes true).
-    ///
-    /// The observable identity is part of the operator's scheduling contract:
-    /// while the operator is not finished, every `Some` returned for this
-    /// readiness direction must be the same `Arc` identity. Composite operators
-    /// must therefore expose an operator-owned observable and forward every
-    /// underlying readiness transition to it. A callback used for forwarding
-    /// must retain the composite observable weakly so an underlying observable
-    /// cannot extend the composite operator's lifetime.
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        None
-    }
-
-    /// A new scheduling turn of this operator's driver begins. Work bounded
-    /// per turn, such as a stream's CPU budget, is reset here, once per turn
-    /// however often the operator is polled within it.
-    fn begin_turn(&mut self) {}
-
-    /// Called on a pipeline source when its latest output stays on its
-    /// output edge because the downstream cannot accept it (`paused`), and
-    /// again when the downstream took it. The driver stops pulling the
-    /// source meanwhile.
-    fn on_downstream_backpressure(&mut self, _paused: bool) {}
-
-    /// Arm or return the deadline for the current confirmed source-idle block.
-    /// Called only by the driver worker after `has_output` returned false.
-    fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
-        None
-    }
-
-    /// Observable for sink-side readiness (need_input becomes true).
-    ///
-    /// The same lifetime-stable identity and weak-forwarding requirements as
-    /// [`ProcessorOperator::source_observable`] apply to this direction.
-    fn sink_observable(&self) -> Option<Arc<Observable>> {
-        None
-    }
-
-    /// Deadline at which a confirmed sink-side block must be rechecked even
-    /// without a notification, e.g. a bounded wait for runtime filters.
-    /// Called only by the driver worker after `need_input` returned false.
-    fn sink_block_deadline(&self) -> Option<DriverBlockDeadline> {
-        None
-    }
-
-    /// Observable notified when this operator becomes finished without a turn
-    /// of its own driver, e.g. a sink whose consumers all left.
-    ///
-    /// The driver watches the terminal operator's observable while it is
-    /// parked for any other reason, so an early finish ends the pipeline
-    /// instead of waiting for its source to produce again.
-    fn early_finish_observable(&self) -> Option<Arc<Observable>> {
-        None
-    }
-}
+/// A factory returns one object with complete lifecycle and step contracts.
+/// Kernels become operators through a production shape; stateful credit and
+/// asynchronous owners implement their own step contract directly.
+pub trait Operator: OperatorLifecycle + super::shape::StepOperator {}
+impl<T: OperatorLifecycle + super::shape::StepOperator + ?Sized> Operator for T {}
 
 /// Forwards readiness transitions without retaining the target observable.
 ///
@@ -465,25 +318,28 @@ pub(crate) fn forward_observable(source: &Arc<Observable>, target: &Arc<Observab
     }));
 }
 
-/// Hydrate a chunk for delivery to `downstream`, keeping only the columns the
-/// operator declares it can consume encoded. Default operators accept nothing
-/// encoded, so this hydrates everything (C0 behavior).
-pub(crate) fn hydrate_for_downstream(
-    chunk: &Chunk,
-    downstream: &dyn ProcessorOperator,
-) -> ExecutionResult<Chunk> {
-    hydrate_for_downstream_with_factory(chunk, downstream, downstream.input_construction_factory())
+/// The installed consumer's encoding contract. Preparation borrows this
+/// declaration from the same receiver that will execute the prepared input.
+pub trait InputEncodingPolicy: Send {
+    fn retains_encoded_column(&self, _slot_id: SlotId, _data_type: &DataType) -> bool {
+        false
+    }
+    fn retains_encoded_path(&self, value: EncodedValueOccurrence<'_>) -> bool {
+        value.path.is_empty() && self.retains_encoded_column(value.slot, value.carrier)
+    }
 }
 
+/// Prepare an input using the receiving owner's encoding declaration and
+/// private construction capability.
 pub(crate) fn hydrate_for_downstream_with_factory(
     chunk: &Chunk,
-    downstream: &dyn ProcessorOperator,
+    downstream: &(impl InputEncodingPolicy + ?Sized),
     factory: Option<&dyn InputConstructionFactory>,
 ) -> ExecutionResult<Chunk> {
     if chunk.chunk_schema().is_typed() {
         let mut accepts =
             |slot, occurrence, path: &[crate::exec::chunk::ArrayPathStep], carrier: &DataType| {
-                downstream.accepts_encoded_path(EncodedValueOccurrence {
+                downstream.retains_encoded_path(EncodedValueOccurrence {
                     slot,
                     occurrence,
                     path,
@@ -513,7 +369,7 @@ pub(crate) fn hydrate_for_downstream_with_factory(
     }
     // Explicit expansion adapter for producers not yet emitting typed Chunks.
     crate::exec::chunk::hydrate_dictionary_columns_except(chunk, |slot_id, dt| {
-        downstream.accepts_encoded_column(slot_id, dt)
+        downstream.retains_encoded_column(slot_id, dt)
     })
     .map_err(Into::into)
 }
@@ -537,7 +393,7 @@ impl DictionaryCarrierStats {
 
 pub(crate) fn dictionary_carrier_stats(
     chunk: &Chunk,
-    downstream: &dyn ProcessorOperator,
+    downstream: &(impl InputEncodingPolicy + ?Sized),
 ) -> DictionaryCarrierStats {
     let rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
     let mut stats = DictionaryCarrierStats::default();
@@ -551,7 +407,7 @@ pub(crate) fn dictionary_carrier_stats(
         stats.input_columns = stats.input_columns.saturating_add(1);
         stats.input_rows = stats.input_rows.saturating_add(rows);
 
-        if downstream.accepts_encoded_path(EncodedValueOccurrence {
+        if downstream.retains_encoded_path(EncodedValueOccurrence {
             slot: slot.slot_id(),
             occurrence,
             path: &[],
@@ -639,7 +495,7 @@ mod typed_input_construction_tests {
     }
     impl InputConstructionFactory for Factory {
         fn observe_input_work(&self, _: usize) -> Result<(), ConstructionFailure> {
-            match self.control_error {
+            match self.control_error.clone() {
                 Some(error) => Err(error.into()),
                 None => Ok(()),
             }
@@ -689,43 +545,19 @@ mod typed_input_construction_tests {
         factory: Option<Factory>,
         nested: bool,
     }
-    impl Operator for Consumer {
-        fn name(&self) -> &str {
-            "typed-consumer"
-        }
-    }
-    impl ProcessorOperator for Consumer {
-        fn need_input(&self) -> bool {
-            true
-        }
-        fn has_output(&self) -> bool {
-            false
-        }
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-        fn accepts_encoded_column(&self, slot: SlotId, _: &DataType) -> bool {
+
+    impl InputEncodingPolicy for Consumer {
+        fn retains_encoded_column(&self, slot: SlotId, _: &DataType) -> bool {
             slot == SlotId::new(1)
         }
-        fn accepts_encoded_path(&self, value: EncodedValueOccurrence<'_>) -> bool {
+        fn retains_encoded_path(&self, value: EncodedValueOccurrence<'_>) -> bool {
             if value.path.is_empty() {
-                self.accepts_encoded_column(value.slot, value.carrier)
+                self.retains_encoded_column(value.slot, value.carrier)
             } else {
                 self.nested
                     && value.occurrence == 0
                     && value.path == [ArrayPathStep::StructField(0)]
             }
-        }
-        fn input_construction_factory(&self) -> Option<&dyn InputConstructionFactory> {
-            self.factory
-                .as_ref()
-                .map(|factory| factory as &dyn InputConstructionFactory)
         }
     }
     fn source() -> Chunk {
@@ -775,7 +607,10 @@ mod typed_input_construction_tests {
             pure.clone(),
         )
         .unwrap();
-        Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             Arc::new(ChunkSchema::try_new_typed(vec![slot], pure.clone()).unwrap()),
             vec![array],
             2,
@@ -806,7 +641,7 @@ mod typed_input_construction_tests {
             nested: false,
         };
         assert!(
-            matches!(hydrate_for_downstream(&source, &op), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)))
+            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory)), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)))
         );
     }
     #[test]
@@ -814,7 +649,14 @@ mod typed_input_construction_tests {
         let source = source();
         let drops = Arc::new(AtomicUsize::new(0));
         let op = consumer(&drops, false, false);
-        let result = hydrate_for_downstream(&source, &op).unwrap();
+        let result = hydrate_for_downstream_with_factory(
+            &source,
+            &op,
+            op.factory
+                .as_ref()
+                .map(|factory| factory as &dyn InputConstructionFactory),
+        )
+        .unwrap();
         let array = result.columns()[0]
             .as_any()
             .downcast_ref::<StructArray>()
@@ -859,7 +701,14 @@ mod typed_input_construction_tests {
         let source = source();
         let drops = Arc::new(AtomicUsize::new(0));
         let op = consumer(&drops, true, false);
-        let result = hydrate_for_downstream(&source, &op).unwrap();
+        let result = hydrate_for_downstream_with_factory(
+            &source,
+            &op,
+            op.factory
+                .as_ref()
+                .map(|factory| factory as &dyn InputConstructionFactory),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&source.columns()[0], &result.columns()[0]));
         assert_eq!(
             op.factory.as_ref().unwrap().begins.load(Ordering::SeqCst),
@@ -886,7 +735,7 @@ mod typed_input_construction_tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let op = consumer(&drops, false, true);
         assert!(
-            matches!(hydrate_for_downstream(&source, &op), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::ResourceExhausted)))
+            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory)), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::ResourceExhausted)))
         );
         assert_eq!(
             op.factory.as_ref().unwrap().requests.load(Ordering::SeqCst),
@@ -899,8 +748,22 @@ mod typed_input_construction_tests {
         let source = source();
         let drops = Arc::new(AtomicUsize::new(0));
         let op = consumer(&drops, false, false);
-        let first = hydrate_for_downstream(&source, &op).unwrap();
-        let second = hydrate_for_downstream(&source, &op).unwrap();
+        let first = hydrate_for_downstream_with_factory(
+            &source,
+            &op,
+            op.factory
+                .as_ref()
+                .map(|factory| factory as &dyn InputConstructionFactory),
+        )
+        .unwrap();
+        let second = hydrate_for_downstream_with_factory(
+            &source,
+            &op,
+            op.factory
+                .as_ref()
+                .map(|factory| factory as &dyn InputConstructionFactory),
+        )
+        .unwrap();
         assert_eq!(
             op.factory.as_ref().unwrap().begins.load(Ordering::SeqCst),
             2
@@ -932,9 +795,9 @@ mod typed_input_construction_tests {
         ] {
             let drops = Arc::new(AtomicUsize::new(0));
             let mut op = consumer(&drops, false, false);
-            op.factory.as_mut().unwrap().control_error = Some(cause);
+            op.factory.as_mut().unwrap().control_error = Some(cause.clone());
             assert!(
-                matches!(hydrate_for_downstream(&source, &op), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Control(actual)) if *actual == cause))
+                matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory)), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Control(actual)) if *actual == cause))
             );
             assert_eq!(
                 op.factory.as_ref().unwrap().begins.load(Ordering::SeqCst),
@@ -947,16 +810,15 @@ mod typed_input_construction_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::fragment::ExecutionResult;
+    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
     use std::sync::Arc;
 
     use super::{
-        Chunk, Operator, ProcessorOperator, dictionary_carrier_stats, forward_observable,
-        hydrate_for_downstream,
+        Chunk, InputEncodingPolicy, dictionary_carrier_stats, forward_observable,
+        hydrate_for_downstream_with_factory,
     };
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::pipeline::schedule::observer::Observable;
-    use crate::runtime::runtime_state::RuntimeState;
     use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type};
     use arrow::record_batch::RecordBatch;
@@ -964,64 +826,12 @@ mod tests {
 
     struct StubOp;
 
-    impl Operator for StubOp {
-        fn name(&self) -> &str {
-            "stub"
-        }
-    }
-
-    impl ProcessorOperator for StubOp {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-    }
+    impl InputEncodingPolicy for StubOp {}
 
     struct KeepSlot1Op;
 
-    impl Operator for KeepSlot1Op {
-        fn name(&self) -> &str {
-            "keep-slot-1"
-        }
-    }
-
-    impl ProcessorOperator for KeepSlot1Op {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+    impl InputEncodingPolicy for KeepSlot1Op {
+        fn retains_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
             slot_id == SlotId::new(1)
                 && matches!(
                     data_type,
@@ -1085,8 +895,8 @@ mod tests {
         let dictionary_type =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
 
-        assert!(!op.accepts_encoded_column(slot_id, &dictionary_type));
-        assert!(!op.accepts_encoded_column(slot_id, &DataType::Utf8));
+        assert!(!op.retains_encoded_column(slot_id, &dictionary_type));
+        assert!(!op.retains_encoded_column(slot_id, &DataType::Utf8));
     }
 
     #[test]
@@ -1094,7 +904,8 @@ mod tests {
         let chunk = two_dictionary_column_chunk();
         let op = StubOp;
 
-        let hydrated = hydrate_for_downstream(&chunk, &op).expect("hydrate for downstream");
+        let hydrated =
+            hydrate_for_downstream_with_factory(&chunk, &op, None).expect("hydrate for downstream");
 
         assert_eq!(hydrated.columns()[0].data_type(), &DataType::Utf8);
         assert_eq!(hydrated.columns()[1].data_type(), &DataType::Utf8);
@@ -1123,7 +934,8 @@ mod tests {
         let chunk = two_dictionary_column_chunk();
         let op = KeepSlot1Op;
 
-        let hydrated = hydrate_for_downstream(&chunk, &op).expect("hydrate for downstream");
+        let hydrated =
+            hydrate_for_downstream_with_factory(&chunk, &op, None).expect("hydrate for downstream");
 
         assert!(matches!(
             hydrated.columns()[0].data_type(),
@@ -1157,13 +969,13 @@ mod tests {
         use crate::exec::chunk::ArrayPathStep;
         let operator = KeepSlot1Op;
         let carrier = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
-        assert!(operator.accepts_encoded_path(EncodedValueOccurrence {
+        assert!(operator.retains_encoded_path(EncodedValueOccurrence {
             slot: SlotId::new(1),
             occurrence: 0,
             path: &[],
             carrier: &carrier,
         }));
-        assert!(!operator.accepts_encoded_path(EncodedValueOccurrence {
+        assert!(!operator.retains_encoded_path(EncodedValueOccurrence {
             slot: SlotId::new(1),
             occurrence: 0,
             path: &[ArrayPathStep::StructField(0)],

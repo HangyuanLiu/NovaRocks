@@ -36,17 +36,18 @@ pub fn eval_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    Ok((novarocks_functions::legacy_arithmetic::eval_add_arrays(
+    novarocks_functions::legacy_arithmetic::eval_add_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    ))?)
+    )
+    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
 }
 
 pub fn eval_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -56,17 +57,18 @@ pub fn eval_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    Ok((novarocks_functions::legacy_arithmetic::eval_sub_arrays(
+    novarocks_functions::legacy_arithmetic::eval_sub_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    ))?)
+    )
+    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
 }
 
 pub fn eval_mul<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -76,17 +78,18 @@ pub fn eval_mul<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    Ok((novarocks_functions::legacy_arithmetic::eval_mul_arrays(
+    novarocks_functions::legacy_arithmetic::eval_mul_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    ))?)
+    )
+    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
 }
 
 pub fn eval_div<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -96,17 +99,18 @@ pub fn eval_div<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).unwrap_or(&DataType::Null);
-    Ok((novarocks_functions::legacy_arithmetic::eval_div_arrays(
+    novarocks_functions::legacy_arithmetic::eval_div_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    ))?)
+    )
+    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
 }
 
 pub fn eval_mod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -116,17 +120,18 @@ pub fn eval_mod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    Ok((novarocks_functions::legacy_arithmetic::eval_mod_arrays(
+    novarocks_functions::legacy_arithmetic::eval_mod_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    ))?)
+    )
+    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
 }
 #[cfg(test)]
 mod tests {
@@ -325,6 +330,7 @@ mod tests {
             prepared
                 .eval(unsupported, &chunk)
                 .unwrap_err()
+                .to_string()
                 .contains("frozen add/subtract rule")
         );
     }
@@ -364,6 +370,7 @@ mod tests {
                 DecimalOverflowPolicy::OutputNull,
             )
             .unwrap_err()
+            .to_string()
             .contains("frozen add/subtract rule")
         );
     }
@@ -790,9 +797,9 @@ mod overflow_policy_prepared_tests {
                 result.is_null(2),
                 "numeric overflow is NULL under OutputNull"
             );
-            assert_eq!(
+            assert_original_arithmetic_failure(
                 arena.eval(throwing, &batch).unwrap_err(),
-                decimal_overflow_error(operation)
+                decimal_overflow_error(operation),
             );
             let again = arena.eval(nullable, &batch).unwrap();
             let again = again.as_any().downcast_ref::<Decimal256Array>().unwrap();
@@ -829,9 +836,9 @@ mod overflow_policy_prepared_tests {
             DataType::Decimal256(76, 0),
         );
         assert_eq!(arena.eval(nullable, &batch).unwrap().null_count(), 2);
-        assert_eq!(
+        assert_original_arithmetic_failure(
             arena.eval(throwing, &batch).unwrap_err(),
-            decimal_overflow_error(DecimalOp::Mul)
+            decimal_overflow_error(DecimalOp::Mul),
         );
 
         // Maximum finite input divided/modulo zero is NULL, never overflow;
@@ -916,9 +923,9 @@ mod overflow_policy_prepared_tests {
             assert_eq!(result.value(0), first);
             assert!(result.is_null(1));
             assert!(result.is_null(2));
-            assert_eq!(
+            assert_original_arithmetic_failure(
                 arena.eval(throwing, &batch).unwrap_err(),
-                decimal_overflow_error(operation)
+                decimal_overflow_error(operation),
             );
             // A failed sibling publishes no partial result and cannot mutate the NULL policy.
             assert_eq!(arena.eval(nullable, &batch).unwrap().null_count(), 2);
@@ -982,6 +989,7 @@ mod overflow_policy_prepared_tests {
             arena
                 .eval(multiply, &overflow)
                 .unwrap_err()
+                .to_string()
                 .contains("'mul'")
         );
     }
@@ -1239,7 +1247,10 @@ mod legacy_signed_prepared_oracle_tests {
                         panic!("required signed fault disappeared");
                     };
                     assert_eq!(error.selected_ordinal(), 1);
-                    assert!(legacy_error.contains(error.message()), "{legacy_error}");
+                    assert!(
+                        legacy_error.to_string().contains(error.message()),
+                        "{legacy_error}"
+                    );
                     let masked_left = signed_array(&DataType::Int64, &[None]);
                     let masked_right = signed_array(&DataType::Int64, &[Some(rhs)]);
                     let (arena, id, chunk, recipe) =
@@ -1281,3 +1292,13 @@ mod arithmetic_decimal_oracle_tests;
 #[cfg(test)]
 #[path = "arithmetic_largeint_oracle_tests.rs"]
 mod arithmetic_largeint_oracle_tests;
+
+#[cfg(test)]
+fn assert_original_arithmetic_failure(
+    actual: crate::runtime::fragment::ExecutionFailure,
+    expected: novarocks_functions::legacy_arithmetic::ArithmeticFailure,
+) {
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(actual.failure_fact(), expected.failure_fact());
+    assert_eq!(actual.to_string(), expected.to_string());
+}

@@ -37,20 +37,28 @@ impl AggregateFunction for CountIfAgg {
         _func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let data_type = input_type.ok_or_else(|| "count_if input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let data_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "count_if input type missing",
+            )
+        })?;
         if input_is_intermediate {
             if !is_supported_merge_input_type(data_type) {
-                return Err(format!(
-                    "count_if expects integer intermediate input, got {:?}",
-                    data_type
-                ));
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "count_if expects integer intermediate input, got {:?}",
+                        data_type
+                    )),
+                );
             }
         } else if !matches!(data_type, DataType::Boolean) {
-            return Err(format!(
-                "count_if expects boolean input, got {:?}",
-                data_type
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "count_if expects boolean input, got {:?}",
+                    data_type
+                )),
+            );
         }
         Ok(AggSpec {
             kind: AggKind::CountIf,
@@ -72,14 +80,15 @@ impl AggregateFunction for CountIfAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "count_if input missing".to_string())?;
-        let arr = arr
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("count_if input missing")
+        })?;
+        let arr = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "failed to downcast to BooleanArray",
+            )
+        })?;
         Ok(AggInputView::Bool(arr))
     }
 
@@ -87,10 +96,10 @@ impl AggregateFunction for CountIfAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "count_if merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("count_if merge input missing")
+        })?;
         Ok(AggInputView::Int(IntArrayView::new(arr)?))
     }
 
@@ -114,9 +123,11 @@ impl AggregateFunction for CountIfAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(input, AggInputView::Bool(_)) {
-            return Err("count_if batch input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "count_if batch input type mismatch",
+            ));
         }
         super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
@@ -127,9 +138,11 @@ impl AggregateFunction for CountIfAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(input, AggInputView::Int(_)) {
-            return Err("count_if merge input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "count_if merge input type mismatch",
+            ));
         }
         super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
@@ -140,7 +153,7 @@ impl AggregateFunction for CountIfAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
 }

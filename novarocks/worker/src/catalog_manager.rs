@@ -101,44 +101,39 @@ impl ConnectorExecutionRoleBindingFactorySet {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogManagerError {
     InvalidConfiguration(&'static str),
-    ConflictingProperties {
-        handle: CatalogHandle,
-    },
-    MaterializationFailed {
-        class: ConnectorMaterializationErrorClass,
-        disposition: ConnectorMaterializationRetryDisposition,
-        detail: Arc<str>,
-    },
+    ConflictingProperties { handle: CatalogHandle },
+    MaterializationFailed(Arc<ConnectorMaterializationError>),
+    NotReadyAfterInstall,
 }
 
 impl CatalogManagerError {
     pub fn materialization_failed(message: impl Into<Arc<str>>) -> Self {
-        Self::MaterializationFailed {
-            class: ConnectorMaterializationErrorClass::Internal,
-            disposition: ConnectorMaterializationRetryDisposition::Transient,
-            detail: message.into(),
-        }
+        Self::from_materialization(ConnectorMaterializationError::new(
+            ConnectorMaterializationErrorClass::Internal,
+            ConnectorMaterializationRetryDisposition::Transient,
+            message.into().as_ref(),
+        ))
     }
 
     pub fn from_materialization(error: ConnectorMaterializationError) -> Self {
-        Self::MaterializationFailed {
-            class: error.class(),
-            disposition: error.disposition(),
-            detail: Arc::from(error.detail()),
+        Self::MaterializationFailed(Arc::new(error))
+    }
+
+    pub fn class(&self) -> Option<ConnectorMaterializationErrorClass> {
+        match self {
+            Self::MaterializationFailed(source) => Some(source.class()),
+            Self::InvalidConfiguration(_)
+            | Self::ConflictingProperties { .. }
+            | Self::NotReadyAfterInstall => None,
         }
     }
 
-    pub const fn class(&self) -> Option<ConnectorMaterializationErrorClass> {
+    pub fn disposition(&self) -> Option<ConnectorMaterializationRetryDisposition> {
         match self {
-            Self::MaterializationFailed { class, .. } => Some(*class),
-            Self::InvalidConfiguration(_) | Self::ConflictingProperties { .. } => None,
-        }
-    }
-
-    pub const fn disposition(&self) -> Option<ConnectorMaterializationRetryDisposition> {
-        match self {
-            Self::MaterializationFailed { disposition, .. } => Some(*disposition),
-            Self::InvalidConfiguration(_) | Self::ConflictingProperties { .. } => None,
+            Self::MaterializationFailed(source) => Some(source.disposition()),
+            Self::InvalidConfiguration(_)
+            | Self::ConflictingProperties { .. }
+            | Self::NotReadyAfterInstall => None,
         }
     }
 }
@@ -152,17 +147,37 @@ impl fmt::Display for CatalogManagerError {
                 "catalog handle {} has conflicting materialization properties",
                 handle.catalog_name().as_str()
             ),
-            Self::MaterializationFailed { class, detail, .. } => {
-                write!(
-                    formatter,
-                    "catalog materialization failed ({class:?}): {detail}"
-                )
+            Self::MaterializationFailed(source) => {
+                write!(formatter, "catalog materialization failed: {source}")
+            }
+            Self::NotReadyAfterInstall => {
+                formatter.write_str("catalog install did not complete Ready")
             }
         }
     }
 }
 
-impl std::error::Error for CatalogManagerError {}
+impl std::error::Error for CatalogManagerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MaterializationFailed(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for CatalogManagerError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        let reason = match self {
+            Self::MaterializationFailed(source) => return source.failure_fact(),
+            Self::InvalidConfiguration(_) => R::CatalogConfiguration,
+            Self::ConflictingProperties { .. } => R::CatalogPropertiesConflict,
+            Self::NotReadyAfterInstall => R::CatalogNotReadyAfterInstall,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
 
 /// Result of reconciling backend retention against a frontend reachability
 /// snapshot.  A rejection is atomic: no catalog was evicted.
@@ -648,9 +663,7 @@ impl<T> CatalogManager<T> {
     ) -> Result<(), CatalogManagerError> {
         let cell_state = cell.state.lock().unwrap_or_else(|error| error.into_inner());
         if !matches!(&*cell_state, CatalogCellState::Ready { .. }) {
-            return Err(CatalogManagerError::materialization_failed(
-                "catalog install did not complete Ready",
-            ));
+            return Err(CatalogManagerError::NotReadyAfterInstall);
         }
         drop(cell_state);
         self.state
@@ -726,11 +739,7 @@ fn all_query_handles(
 }
 
 fn cancelled_catalog_install_error() -> CatalogManagerError {
-    CatalogManagerError::from_materialization(ConnectorMaterializationError::new(
-        ConnectorMaterializationErrorClass::Cancelled,
-        ConnectorMaterializationRetryDisposition::Transient,
-        "catalog installation was cancelled before Ready",
-    ))
+    CatalogManagerError::from_materialization(ConnectorMaterializationError::cancelled())
 }
 
 fn trim_failed_entries<T>(
@@ -916,6 +925,66 @@ mod tests {
             ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None)
                 .map_err(Into::into)
         }
+    }
+
+    #[test]
+    fn materialization_source_survives_catalog_manager_and_host_projection() {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureEvidence, FailureProjection,
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        use std::error::Error;
+        let connector = ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "a provider-owned rejection",
+        );
+        let fact = connector.failure_fact();
+        let error = CatalogManagerError::from_materialization(ConnectorMaterializationError::from(
+            connector,
+        ));
+        assert_eq!(error.failure_fact(), fact);
+        let materialization = error
+            .source()
+            .unwrap()
+            .downcast_ref::<ConnectorMaterializationError>()
+            .unwrap();
+        assert_eq!(
+            materialization
+                .source()
+                .unwrap()
+                .downcast_ref::<ConnectorError>()
+                .unwrap()
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        let host = crate::HostRejection::from_domain(
+            novarocks_execution_contract::task_execution::status::TaskFailureCategory::ResourceExhausted,
+            error,
+        );
+        assert_eq!(host.failure_fact(), fact);
+        assert_eq!(host.failure_fact().class(), FailureClass::Resource);
+        assert!(!host.detail().as_str().contains("provider-owned"));
+        let failure = host.into_failure();
+        let catalog = failure
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<CatalogManagerError>()
+            .unwrap();
+        assert_eq!(catalog.failure_fact(), fact);
+        assert_eq!(
+            super::cancelled_catalog_install_error()
+                .failure_fact()
+                .evidence(),
+            FailureEvidence::StopObservation
+        );
+        assert_eq!(
+            CatalogManagerError::NotReadyAfterInstall
+                .failure_fact()
+                .class(),
+            FailureClass::Invariant
+        );
     }
 
     #[test]

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use std::sync::Arc;
 
@@ -24,17 +25,17 @@ fn eval_starts_ends_with_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     args: &[ExprId],
     chunk: &Chunk,
     starts: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "starts_with expects string".to_string())?;
+        .ok_or_else(|| expression_contract("starts_with expects string"))?;
     let p_arr = pat_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "starts_with expects string".to_string())?;
+        .ok_or_else(|| expression_contract("starts_with expects string"))?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
@@ -58,8 +59,8 @@ pub fn eval_starts_with<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_starts_ends_with_impl(arena, args, chunk, true))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_starts_ends_with_impl(arena, args, chunk, true)
 }
 
 pub fn eval_ends_with<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -67,6 +68,6 @@ pub fn eval_ends_with<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_starts_ends_with_impl(arena, args, chunk, false))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_starts_ends_with_impl(arena, args, chunk, false)
 }

@@ -37,7 +37,10 @@ fn list(
         valid.map(NullBuffer::from),
     ))
 }
-fn raw(columns: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    columns: Vec<ArrayRef>,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slots = (0..columns.len())
         .map(|i| SlotId::new(i as u32 + 1))
         .collect::<Vec<_>>();

@@ -41,16 +41,11 @@ use arrow_cast::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::ValueLogicalType;
-use std::{alloc::Layout, cell::RefCell, sync::Arc};
+use std::{alloc::Layout, sync::Arc};
 
-type ErrorBoundary<'a> = Option<&'a dyn Fn(&str) -> Result<(), KernelFailure>>;
-fn data_error(message: String, boundary: ErrorBoundary<'_>) -> KernelFailure {
-    if let Some(boundary) = boundary {
-        if let Err(error) = boundary(&message) {
-            return error;
-        }
-    }
-    internal(&message)
+use crate::control_values::{AssemblyFailure, ConditionalTextExtent};
+fn data_error(message: impl std::fmt::Display) -> KernelFailure {
+    AssemblyFailure::contract(message).into_kernel()
 }
 fn reserve<T>(rows: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, KernelFailure> {
     Layout::array::<T>(rows).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -122,7 +117,7 @@ pub(super) fn evaluate<'a>(
         let [left, right] = input.arguments() else {
             return Err(invalid("nullif requires two evaluated arguments"));
         };
-        let output = evaluate_values(*left, *right, input.selection(), &mut work, None)?;
+        let output = evaluate_values(*left, *right, input.selection(), &mut work)?;
         SelectedValues::try_new_observed(
             input.selection(),
             input.contract().result_type().data_type(),
@@ -139,32 +134,23 @@ pub(super) fn evaluate<'a>(
 pub fn evaluate_legacy(
     left: ArrayRef,
     right: ArrayRef,
-    output_type: Option<&DataType>,
-) -> Result<ArrayRef, String> {
-    let raw = RefCell::new(None);
-    let boundary = |message: &str| {
-        *raw.borrow_mut() = Some(message.to_string());
-        Err(KernelFailure::InstanceFailed)
-    };
+    output_type: &DataType,
+) -> Result<ArrayRef, KernelFailure> {
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
     let result = (|| {
-        let target = match output_type {
-            Some(t) if !matches!(t, DataType::Null) => t.clone(),
-            _ if matches!(left.data_type(), DataType::Null) => right.data_type().clone(),
-            _ => left.data_type().clone(),
-        };
+        let target = output_type.clone();
         let left = if left.data_type() != &target {
             work.flush()?;
-            let value = cast(left.as_ref(), &target).map_err(|error| {
-                data_error(
-                    format!(
-                        "nullif failed to cast left {:?} -> {:?}: {}",
+            let value = cast(left.as_ref(), &target).map_err(|source| {
+                AssemblyFailure::arrow(
+                    format_args!(
+                        "nullif failed to cast left {:?} -> {:?}",
                         left.data_type(),
-                        target,
-                        error
+                        target
                     ),
-                    Some(&boundary),
+                    source,
                 )
+                .into_kernel()
             })?;
             work.flush()?;
             value
@@ -173,37 +159,32 @@ pub fn evaluate_legacy(
         };
         let right = if right.data_type() != &target {
             work.flush()?;
-            let value = cast(right.as_ref(), &target).map_err(|error| {
-                data_error(
-                    format!(
-                        "nullif failed to cast right {:?} -> {:?}: {}",
+            let value = cast(right.as_ref(), &target).map_err(|source| {
+                AssemblyFailure::arrow(
+                    format_args!(
+                        "nullif failed to cast right {:?} -> {:?}",
                         right.data_type(),
-                        target,
-                        error
+                        target
                     ),
-                    Some(&boundary),
+                    source,
                 )
+                .into_kernel()
             })?;
             work.flush()?;
             value
         } else {
             right
         };
-        let rows = left.len();
         evaluate_values(
             EvaluatedArgument::Column(&left),
             EvaluatedArgument::Column(&right),
-            Selection::all(rows),
+            Selection::all(left.len()),
             &mut work,
-            Some(&boundary),
         )
     })();
-    let result = work.finish_result(result);
-    if let Some(message) = raw.into_inner() {
-        return Err(message);
-    }
-    result.map_err(|error| error.to_string())
+    work.finish_result(result)
 }
+
 struct LegacyControl;
 impl KernelEvaluationControl for LegacyControl {
     fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
@@ -219,40 +200,44 @@ fn evaluate_values(
     right: EvaluatedArgument<'_>,
     selection: Selection<'_>,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     match left.array().data_type() {
-        DataType::Int8 => primitive::<Int8Type>(left, right, selection, work, boundary),
-        DataType::Int16 => primitive::<Int16Type>(left, right, selection, work, boundary),
-        DataType::Int32 => primitive::<Int32Type>(left, right, selection, work, boundary),
-        DataType::Int64 => primitive::<Int64Type>(left, right, selection, work, boundary),
-        DataType::Float32 => primitive::<Float32Type>(left, right, selection, work, boundary),
-        DataType::Float64 => primitive::<Float64Type>(left, right, selection, work, boundary),
-        DataType::Date32 => primitive::<Date32Type>(left, right, selection, work, boundary),
-        DataType::Boolean => boolean(left, right, selection, work, boundary),
-        DataType::Utf8 => string(left, right, selection, work, boundary),
-        DataType::Decimal128(p, s) => decimal(left, right, *p, *s, selection, work, boundary),
+        DataType::Null => {
+            work.flush()?;
+            Ok(arrow_array::new_null_array(
+                &DataType::Null,
+                selection.len(),
+            ))
+        }
+        DataType::Int8 => primitive::<Int8Type>(left, right, selection, work),
+        DataType::Int16 => primitive::<Int16Type>(left, right, selection, work),
+        DataType::Int32 => primitive::<Int32Type>(left, right, selection, work),
+        DataType::Int64 => primitive::<Int64Type>(left, right, selection, work),
+        DataType::Float32 => primitive::<Float32Type>(left, right, selection, work),
+        DataType::Float64 => primitive::<Float64Type>(left, right, selection, work),
+        DataType::Date32 => primitive::<Date32Type>(left, right, selection, work),
+        DataType::Boolean => boolean(left, right, selection, work),
+        DataType::Utf8 => string(left, right, selection, work),
+        DataType::Decimal128(p, s) => decimal(left, right, *p, *s, selection, work),
         DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => {
-                primitive::<TimestampSecondType>(left, right, selection, work, boundary)
-            }
+            TimeUnit::Second => primitive::<TimestampSecondType>(left, right, selection, work),
             TimeUnit::Millisecond => {
-                primitive::<TimestampMillisecondType>(left, right, selection, work, boundary)
+                primitive::<TimestampMillisecondType>(left, right, selection, work)
             }
             TimeUnit::Microsecond => {
-                primitive::<TimestampMicrosecondType>(left, right, selection, work, boundary)
+                primitive::<TimestampMicrosecondType>(left, right, selection, work)
             }
             TimeUnit::Nanosecond => {
-                primitive::<TimestampNanosecondType>(left, right, selection, work, boundary)
+                primitive::<TimestampNanosecondType>(left, right, selection, work)
             }
         },
         DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
-            generic_legacy(left.array(), right.array(), work, boundary)
+            generic_legacy(left.array(), right.array(), work)
         }
-        other => Err(data_error(
-            format!("nullif unsupported type: {:?}", other),
-            boundary,
-        )),
+        other => Err(data_error(format_args!(
+            "nullif unsupported type: {:?}",
+            other
+        ))),
     }
 }
 fn primitive<T: ArrowPrimitiveType>(
@@ -260,18 +245,17 @@ fn primitive<T: ArrowPrimitiveType>(
     right: EvaluatedArgument<'_>,
     selection: Selection<'_>,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let l = left
         .array()
         .as_any()
         .downcast_ref::<PrimitiveArray<T>>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     let r = right
         .array()
         .as_any()
         .downcast_ref::<PrimitiveArray<T>>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     crate::selected_copy::guarded_interleave_extent(left.array().data_type(), selection.len())
         .map_err(|_| KernelFailure::ResourceExhausted)?;
     let mut values = reserve::<Option<T::Native>>(selection.len(), work)?;
@@ -294,8 +278,11 @@ fn primitive<T: ArrowPrimitiveType>(
         });
     }
     work.flush()?;
-    // Keep the original PrimitiveArray constructor, including timezone loss.
-    let output = Arc::new(PrimitiveArray::<T>::from_iter(values)) as ArrayRef;
+    // The concrete primitive family was checked above. Preserve its declared
+    // timestamp timezone rather than dropping metadata during reconstruction.
+    let output = Arc::new(
+        PrimitiveArray::<T>::from_iter(values).with_data_type(left.array().data_type().clone()),
+    ) as ArrayRef;
     work.flush()?;
     Ok(output)
 }
@@ -304,27 +291,23 @@ fn boolean(
     right: EvaluatedArgument<'_>,
     selection: Selection<'_>,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let l = left
         .array()
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     let r = right
         .array()
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     if matches!(
         (left, right),
         (EvaluatedArgument::Column(_), EvaluatedArgument::Column(_))
     ) && l.len() != r.len()
     {
-        return Err(data_error(
-            "nullif boolean length mismatch".to_string(),
-            boundary,
-        ));
+        return Err(data_error("nullif boolean length mismatch"));
     }
     crate::selected_copy::guarded_interleave_extent(&DataType::Boolean, selection.len())
         .map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -359,22 +342,22 @@ fn string(
     right: EvaluatedArgument<'_>,
     selection: Selection<'_>,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let l = left
         .array()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     let r = right
         .array()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     crate::selected_copy::guarded_interleave_extent(&DataType::Utf8, selection.len())
         .map_err(|_| KernelFailure::ResourceExhausted)?;
     let mut out = reserve::<Option<String>>(selection.len(), work)?;
     let mut bytes = 0usize;
+    let mut output_extent = ConditionalTextExtent::default();
     for (ordinal, row) in selection.iter().enumerate() {
         work.step()?;
         let li = left.value_row(ordinal, row);
@@ -399,10 +382,10 @@ fn string(
             out.push(None);
             continue;
         }
+        output_extent.append(text.len())?;
         bytes = bytes
             .checked_add(text.len())
             .ok_or(KernelFailure::ResourceExhausted)?;
-        i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
         Layout::array::<u8>(text.len()).map_err(|_| KernelFailure::ResourceExhausted)?;
         work.flush()?;
         let owned = text.to_string();
@@ -424,18 +407,17 @@ fn decimal(
     scale: i8,
     selection: Selection<'_>,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let l = left
         .array()
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     let r = right
         .array()
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| data_error("nullif downcast failed".to_string(), boundary))?;
+        .ok_or_else(|| data_error("nullif downcast failed"))?;
     crate::selected_copy::guarded_interleave_extent(left.array().data_type(), selection.len())
         .map_err(|_| KernelFailure::ResourceExhausted)?;
     let mut values = reserve::<Option<i128>>(selection.len(), work)?;
@@ -460,7 +442,7 @@ fn decimal(
     work.flush()?;
     let output = Decimal128Array::from(values)
         .with_precision_and_scale(precision, scale)
-        .map_err(|error| data_error(error.to_string(), boundary))?;
+        .map_err(|source| AssemblyFailure::arrow("", source).into_kernel())?;
     work.flush()?;
     Ok(Arc::new(output))
 }
@@ -470,15 +452,14 @@ fn generic_legacy(
     left: &ArrayRef,
     right: &ArrayRef,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let len = left.len();
     let fmt_opts = FormatOptions::default().with_null("\\N");
     work.flush()?;
     let left_fmt = ArrayFormatter::try_new(left.as_ref(), &fmt_opts)
-        .map_err(|e| data_error(format!("nullif: {e}"), boundary))?;
+        .map_err(|source| AssemblyFailure::arrow("nullif", source).into_kernel())?;
     let right_fmt = ArrayFormatter::try_new(right.as_ref(), &fmt_opts)
-        .map_err(|e| data_error(format!("nullif: {e}"), boundary))?;
+        .map_err(|source| AssemblyFailure::arrow("nullif", source).into_kernel())?;
     work.flush()?;
     let mut valid = reserve::<bool>(len, work)?;
     work.flush()?;
@@ -509,7 +490,7 @@ fn generic_legacy(
         .into_builder()
         .null_bit_buffer(Some(null_buffer.inner().inner().clone()))
         .build()
-        .map_err(|e| data_error(format!("nullif: {e}"), boundary))?;
+        .map_err(|source| AssemblyFailure::arrow("nullif", source).into_kernel())?;
     let output = make_array(new_data);
     work.flush()?;
     Ok(output)

@@ -43,8 +43,10 @@ impl TakeRootScratchFacts {
     pub fn try_new(indices: usize) -> Result<Self, CopyError> {
         buffer_extent(indices, std::mem::size_of::<Range<usize>>())?;
         buffer_extent(1, std::mem::size_of::<Block>())?;
-        let ranges = Layout::array::<Range<usize>>(indices).map_err(|_| CopyError::Extent)?;
-        let blocks = Layout::array::<Block>(1).map_err(|_| CopyError::Extent)?;
+        let ranges = Layout::array::<Range<usize>>(indices)
+            .map_err(|source| CopyError::layout::<Range<usize>>(indices, source))?;
+        let blocks =
+            Layout::array::<Block>(1).map_err(|source| CopyError::layout::<Block>(1, source))?;
         let bytes = add(
             mul(indices, std::mem::size_of::<Range<usize>>())?,
             blocks.size(),

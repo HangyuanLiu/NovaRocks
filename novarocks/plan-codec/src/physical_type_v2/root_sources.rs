@@ -443,7 +443,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let at = trace.len();
             trace.push(units);
-            if let Some((refusal, cause)) = self.refusal
+            if let Some((refusal, cause)) = self.refusal.clone()
                 && refusal == at
             {
                 return Err(cause);
@@ -942,7 +942,7 @@ mod tests {
             assert!(!trace.is_empty());
             for at in 0..trace.len() {
                 for cause in CAUSES {
-                    let control = Control::refusing(at, cause);
+                    let control = Control::refusing(at, cause.clone());
                     assert_control(invoke(&package, &control).unwrap_err(), cause);
                     assert_eq!(control.trace(), trace[..=at]);
                 }
@@ -971,7 +971,7 @@ mod tests {
         assert!(trace.contains(&256));
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert_control(invoke(&package, &control).unwrap_err(), cause);
                 assert_eq!(control.trace(), trace[..=at]);
             }

@@ -37,8 +37,89 @@ impl KernelDiagnostic {
     }
 }
 
+/// Opaque original cause for the outer channel. Only explicitly marked
+/// producer errors enter it; RowDataError has no implicit conversion here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelSourceFailure(novarocks_failure_contract::SharedFailureCause);
+impl KernelSourceFailure {
+    pub fn detail(&self) -> &str {
+        self.0.detail()
+    }
+}
+impl fmt::Display for KernelSourceFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for KernelSourceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for KernelSourceFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.0.failure_fact()
+    }
+}
+
+/// Known byte-limit refusal projected by its producing domain. This compact
+/// value has no diagnostic allocation, tracker reference or grant authority.
+/// It is suitable for allocation callbacks before error reporting can allocate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelCapacityRefusal {
+    reason: novarocks_failure_contract::FailureReason,
+    requested: u64,
+    limit: u64,
+    committed: u64,
+}
+impl KernelCapacityRefusal {
+    pub fn new(
+        reason: novarocks_failure_contract::FailureReason,
+        requested: u64,
+        limit: u64,
+        committed: u64,
+    ) -> Self {
+        Self {
+            reason,
+            requested,
+            limit,
+            committed,
+        }
+    }
+}
+impl fmt::Display for KernelCapacityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "byte capacity refused (reason={}, requested={}, limit={}, committed={})",
+            self.reason, self.requested, self.limit, self.committed
+        )
+    }
+}
+impl std::error::Error for KernelCapacityRefusal {}
+impl novarocks_failure_contract::FailureProjection for KernelCapacityRefusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts,
+        };
+        FailureFact::new(FailureClass::Resource, self.reason).with_resource(ResourceFacts {
+            request_scope: None,
+            constraint_scope: None,
+            dimension: ResourceDimension::Bytes,
+            requested: Some(self.requested),
+            required_growth: None,
+            limit: Some(self.limit),
+            live: None,
+            committed: Some(self.committed),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelFailure {
+    Capacity(KernelCapacityRefusal),
+    Source(KernelSourceFailure),
+    CompileControl(CompileControlError),
     Cancelled,
     DeadlineExceeded,
     ResourceExhausted,
@@ -50,6 +131,9 @@ pub enum KernelFailure {
 impl fmt::Display for KernelFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Source(source) => source.fmt(f),
+            Self::CompileControl(source) => source.fmt(f),
+            Self::Capacity(source) => source.fmt(f),
             Self::InstanceFailed => f.write_str("kernel instance has already failed"),
             Self::Cancelled => f.write_str("kernel evaluation was cancelled"),
             Self::DeadlineExceeded => f.write_str("kernel evaluation deadline was exceeded"),
@@ -64,7 +148,56 @@ impl fmt::Display for KernelFailure {
         }
     }
 }
-impl std::error::Error for KernelFailure {}
+impl KernelFailure {
+    // Only RowDataError's checked admission calls this. A non-Data source is
+    // unmaskable; avoid reprojecting or replacing its actual occurrence.
+    pub(crate) fn rejected_row_source(
+        source: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        debug_assert_ne!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&source).class(),
+            novarocks_failure_contract::FailureClass::Data
+        );
+        Self::Source(KernelSourceFailure(source))
+    }
+    pub(crate) fn is_interruption(&self) -> bool {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        matches!(self, Self::CompileControl(_) | Self::Capacity(_))
+            || matches!(
+                self.failure_fact().class(),
+                FailureClass::Control | FailureClass::Resource
+            )
+    }
+    /// These are already unmaskable originating failures. An optional completion
+    /// observation must neither replace them nor start another fallible tail.
+    /// RowDataError remains in its own journal; Task acceptance is separate.
+    pub(crate) fn is_atomic_failure(&self) -> bool {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        matches!(self, Self::CompileControl(_) | Self::Capacity(_))
+            || matches!(
+                self.failure_fact().class(),
+                FailureClass::Control
+                    | FailureClass::Resource
+                    | FailureClass::Data
+                    | FailureClass::Representation
+            )
+    }
+    pub fn from_domain<E: novarocks_failure_contract::OuterFailureProjection>(source: E) -> Self {
+        Self::Source(KernelSourceFailure(
+            novarocks_failure_contract::SharedFailureCause::new(source),
+        ))
+    }
+}
+impl std::error::Error for KernelFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::CompileControl(source) => Some(source),
+            Self::Capacity(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub const MAX_UNOBSERVED_KERNEL_WORK: u32 = 256;
 
@@ -130,19 +263,12 @@ pub(crate) fn internal(message: &str) -> KernelFailure {
 }
 
 pub(crate) fn compile_failure(error: CompileControlError) -> KernelFailure {
-    match error {
-        CompileControlError::Cancelled => KernelFailure::Cancelled,
-        CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
-        CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
-    }
+    KernelFailure::CompileControl(error)
 }
 pub(crate) fn type_failure(error: novarocks_type_contract::ValueTypeError) -> KernelFailure {
-    match error {
-        novarocks_type_contract::ValueTypeError::TooDeep
-        | novarocks_type_contract::ValueTypeError::TooManyNodes => KernelFailure::ResourceExhausted,
-        _ => invalid("binding has invalid exact logical type"),
-    }
+    KernelFailure::from_domain(error)
 }
+
 impl From<novarocks_type_contract::ValueTypeError> for KernelFailure {
     fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
         type_failure(error)
@@ -150,12 +276,88 @@ impl From<novarocks_type_contract::ValueTypeError> for KernelFailure {
 }
 impl From<novarocks_type_contract::CarrierParameterError> for KernelFailure {
     fn from(error: novarocks_type_contract::CarrierParameterError) -> Self {
-        invalid(&error.to_string())
+        Self::from_domain(error)
     }
 }
 
 impl From<crate::EvaluationContractError> for KernelFailure {
-    fn from(_: crate::EvaluationContractError) -> Self {
-        invalid("evaluated argument violates its exact selected carrier")
+    fn from(error: crate::EvaluationContractError) -> Self {
+        Self::from_domain(error)
+    }
+}
+
+/// Existing protocol tests check the input/output channel independently of the
+/// outer carrier. A typed source must be the actual evaluation-contract owner;
+/// neither row Data nor Resource/Control failures satisfy these assertions.
+#[cfg(test)]
+pub(crate) mod test_contract {
+    use super::*;
+    use crate::EvaluationContractError;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    fn evaluation(error: &KernelFailure) -> Option<&EvaluationContractError> {
+        let KernelFailure::Source(source) = error else {
+            return None;
+        };
+        assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+        source.0.downcast_ref()
+    }
+    pub fn input(error: &KernelFailure) -> bool {
+        matches!(error, KernelFailure::InvalidProgram(_))
+            || matches!(
+                evaluation(error),
+                Some(
+                    EvaluationContractError::ArgumentLength
+                        | EvaluationContractError::ArgumentType
+                        | EvaluationContractError::ArgumentSelection
+                        | EvaluationContractError::ArgumentRowErrors
+                )
+            )
+    }
+    pub fn output(error: &KernelFailure) -> bool {
+        matches!(error, KernelFailure::Internal(_))
+            || matches!(
+                evaluation(error),
+                Some(
+                    EvaluationContractError::ArgumentLength
+                        | EvaluationContractError::ArgumentType
+                        | EvaluationContractError::ArgumentSelection
+                        | EvaluationContractError::ArgumentRowErrors
+                        | EvaluationContractError::ResultLength
+                        | EvaluationContractError::ResultType
+                        | EvaluationContractError::InvalidRowErrors
+                )
+            )
+    }
+    pub fn exact(error: &KernelFailure, expected: EvaluationContractError) {
+        assert_eq!(evaluation(error), Some(&expected));
+        assert_eq!(error.failure_fact(), expected.failure_fact());
+    }
+}
+
+#[cfg(test)]
+mod compile_source_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    #[test]
+    fn compile_interruption_keeps_its_author_and_is_unmaskable_even_when_invariant() {
+        let raw = LayoutResourceError::SourceModel;
+        let expected = raw.failure_fact();
+        let control = CompileControlError::from_domain(raw);
+        let kernel = compile_failure(control.clone());
+        assert_eq!(kernel.failure_fact(), expected);
+        assert_eq!(kernel.failure_fact().class(), FailureClass::Invariant);
+        assert!(kernel.is_interruption());
+        assert!(kernel.is_atomic_failure());
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&kernel);
+        let mut original = None;
+        while let Some(error) = cause {
+            if let Some(found) = error.downcast_ref::<CompileControlError>() {
+                original = Some(found);
+                break;
+            }
+            cause = error.source();
+        }
+        assert_eq!(original, Some(&control));
     }
 }

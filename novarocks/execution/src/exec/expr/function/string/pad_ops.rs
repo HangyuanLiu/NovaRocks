@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, StringArray};
 use novarocks_functions::string_repeat_pad_core::{OriginalPadProjection, pad_into};
 use std::sync::Arc;
@@ -25,19 +26,19 @@ fn eval_pad_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     left: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let str_arr = arena.eval(args[0], chunk)?;
     let len_arr = arena.eval(args[1], chunk)?;
     let pad_arr = arena.eval(args[2], chunk)?;
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "pad expects string".to_string())?;
+        .ok_or_else(|| expression_contract("pad expects string"))?;
     let len_arr = super::common::downcast_int_arg_array(&len_arr, "pad")?;
     let p_arr = pad_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "pad expects string".to_string())?;
+        .ok_or_else(|| expression_contract("pad expects string"))?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
@@ -66,8 +67,8 @@ pub fn eval_lpad<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_pad_impl(arena, args, chunk, true))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_pad_impl(arena, args, chunk, true)
 }
 
 pub fn eval_rpad<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -75,6 +76,6 @@ pub fn eval_rpad<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_pad_impl(arena, args, chunk, false))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_pad_impl(arena, args, chunk, false)
 }

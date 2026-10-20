@@ -74,8 +74,8 @@ const EMPTY_ORDERED_COMPACT_V3: [u8; 8] = [1, 3, 3, 0, 0, 0x1e, 0, 0];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IcebergThetaError {
-    UnsupportedInputType(DataType),
-    ArrayTypeMismatch(DataType),
+    UnsupportedInputType(novarocks_failure_contract::BoundedDetail),
+    ArrayTypeMismatch(novarocks_failure_contract::BoundedDetail),
     MissingInput,
     InvalidBindOptions(&'static str),
     InvalidResolvedSignature,
@@ -93,13 +93,13 @@ impl fmt::Display for IcebergThetaError {
             Self::UnsupportedInputType(data_type) => {
                 write!(
                     formatter,
-                    "Iceberg Theta does not support input type {data_type:?}"
+                    "Iceberg Theta does not support input type {data_type}"
                 )
             }
             Self::ArrayTypeMismatch(data_type) => {
                 write!(
                     formatter,
-                    "Iceberg Theta input array does not match {data_type:?}"
+                    "Iceberg Theta input array does not match {data_type}"
                 )
             }
             Self::MissingInput => formatter.write_str("Iceberg Theta requires one input array"),
@@ -129,6 +129,37 @@ impl fmt::Display for IcebergThetaError {
 }
 
 impl std::error::Error for IcebergThetaError {}
+
+pub(crate) fn theta_type_description(
+    value: &DataType,
+) -> novarocks_failure_contract::BoundedDetail {
+    novarocks_failure_contract::BoundedDetail::truncating_display(format_args!("{value:?}"))
+}
+impl novarocks_failure_contract::FailureProjection for IcebergThetaError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        // These are the provider's existing outer operational/refusal channels.
+        // No per-row data is promoted through this internal statistics aggregate.
+        let (class, code) = match self {
+            Self::UnsupportedInputType(_) => (FailureClass::Invariant, 200),
+            Self::ArrayTypeMismatch(_) => (FailureClass::Invariant, 201),
+            Self::MissingInput => (FailureClass::Invariant, 202),
+            Self::InvalidBindOptions(_) => (FailureClass::Invariant, 203),
+            Self::InvalidResolvedSignature => (FailureClass::Invariant, 204),
+            Self::InvalidCompact(_) => (FailureClass::Unexpected, 205),
+            Self::CompactTooLarge { .. } => (FailureClass::Unexpected, 206),
+            Self::MixedUpdateAndMerge => (FailureClass::Unexpected, 207),
+            Self::Sketch(_) => (FailureClass::Unexpected, 208),
+            Self::OutputResourceExhausted => (FailureClass::Resource, 209),
+            Self::InvalidOutputExtent => (FailureClass::Invariant, 210),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for IcebergThetaError {}
 
 pub struct IcebergThetaAggregateFamily {
     overloads: Box<[AggregateOverloadDeclaration]>,
@@ -468,9 +499,9 @@ impl TypedAggregateKernel for IcebergThetaKernel {
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
-                IcebergThetaError::ArrayTypeMismatch(
-                    input.values().expect("checked above").data_type().clone(),
-                )
+                IcebergThetaError::ArrayTypeMismatch(theta_type_description(
+                    input.values().expect("checked above").data_type(),
+                ))
             })
     }
 
@@ -1585,3 +1616,27 @@ mod tests {
 #[cfg(test)]
 #[path = "theta_created_tests.rs"]
 mod created_tests;
+
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn actual_type_author_refusal_drops_source_metadata_before_cause() {
+        let field = Arc::new(arrow_schema::Field::new("value", DataType::Utf8, true));
+        let weak = Arc::downgrade(&field);
+        let data_type = DataType::Struct(vec![field.clone()].into());
+        let error = CanonicalKind::from_data_type(&data_type).unwrap_err();
+        drop(data_type);
+        drop(field);
+        assert!(weak.upgrade().is_none());
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Invariant);
+        assert_eq!(
+            fact.reason().domain(),
+            novarocks_failure_contract::domain::CONNECTOR.get()
+        );
+        assert_eq!(fact.reason().code(), 200);
+        assert!(error.to_string().contains("input type Struct"));
+    }
+}

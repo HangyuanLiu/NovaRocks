@@ -325,7 +325,7 @@ fn aggregate_known_root_and_dictionary_requests_precede_pending_late_causes() {
         let value = headers.functions().type_table().value_type(8).unwrap();
         assert_eq!(value.data_type(), &DataType::Utf8);
         for cause in CAUSES {
-            control.arm(Some((1, cause)));
+            control.arm(Some((1, cause.clone())));
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             for _ in 0..255 {
                 work.step().unwrap();
@@ -549,7 +549,7 @@ fn aggregate_wide_real_signature_copies_preserve_order_and_sampled_prefixes() {
         for cause in CAUSES {
             let c = Control::default();
             assert!(
-                matches!(wide(&c,Some((at,cause))),Err(Error::Control(actual)) if actual == cause)
+                matches!(wide(&c,Some((at,cause.clone()))),Err(Error::Control(actual)) if actual == cause)
             );
             assert_eq!(c.trace(), trace[..=at]);
         }
@@ -738,7 +738,7 @@ fn aggregate_actual_captured_signature_prefixes_admit_before_completed_lookup() 
         let baseline = c.trace();
         for at in 0..baseline.len() {
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 let mut work = match CompileCheckpoints::try_new(&c, CompilePhase::Decode) {
                     Ok(w) => w,
                     Err(actual) => {

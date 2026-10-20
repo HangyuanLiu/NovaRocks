@@ -65,7 +65,12 @@ pub fn prepare_project_metadata_for_test<'a>(
         CompiledSchemaSite::Project(node) => Some(node),
         CompiledSchemaSite::FinalResult => None,
         CompiledSchemaSite::AnalyticOutput(_) => {
-            return Err("Project fixture requires a Project or FinalResult site".into());
+            return Err(novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "Project fixture requires a Project or FinalResult site",
+                ),
+            )
+            .into());
         }
     };
     let factory = novarocks_execution::exec::operators::prepare_project_factory_for_test(

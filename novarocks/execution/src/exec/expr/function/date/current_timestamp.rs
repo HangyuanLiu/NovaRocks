@@ -16,7 +16,7 @@
 // under the License.
 use super::common::{datetime_from_local_now, datetime_from_utc_now, to_timestamp_value};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use std::sync::Arc;
@@ -27,18 +27,19 @@ fn eval_current_timestamp_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     expr: ExprId,
     chunk: &Chunk,
     utc: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(
+        arena.arena(),
+        expr,
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+    )?;
     let dt = if utc {
         datetime_from_utc_now()
     } else {
         datetime_from_local_now()
     };
-    let ts = to_timestamp_value(
-        dt,
-        arena
-            .data_type(expr)
-            .unwrap_or(&DataType::Timestamp(TimeUnit::Microsecond, None)),
-    )?;
+    let ts = to_timestamp_value(dt, TimeUnit::Microsecond)
+        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
     let values = vec![Some(ts); chunk.len()];
     Ok(Arc::new(TimestampMicrosecondArray::from(values)) as ArrayRef)
 }
@@ -48,8 +49,8 @@ pub fn eval_current_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_current_timestamp_inner(arena, expr, chunk, false)
 }
 
 pub fn eval_localtime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -57,8 +58,8 @@ pub fn eval_localtime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_current_timestamp_inner(arena, expr, chunk, false)
 }
 
 pub fn eval_localtimestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -66,8 +67,8 @@ pub fn eval_localtimestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_current_timestamp_inner(arena, expr, chunk, false)
 }
 
 pub fn eval_now<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -75,8 +76,8 @@ pub fn eval_now<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_current_timestamp_inner(arena, expr, chunk, false)
 }
 
 pub fn eval_utc_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -84,6 +85,6 @@ pub fn eval_utc_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_current_timestamp_inner(arena, expr, chunk, true))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_current_timestamp_inner(arena, expr, chunk, true)
 }

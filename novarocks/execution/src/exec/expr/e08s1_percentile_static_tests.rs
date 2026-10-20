@@ -121,7 +121,7 @@ impl PureCompileControl for Refuse {
             0,
             "no callback after first refusal"
         );
-        Err(self.cause)
+        Err(self.cause.clone())
     }
 }
 #[test]
@@ -142,7 +142,7 @@ fn e08s1_percentile_static_preserves_three_compile_causes_before_profile_work() 
         CompileControlError::ResourceExhausted,
     ] {
         let c = Refuse {
-            cause,
+            cause: cause.clone(),
             calls: AtomicUsize::new(0),
         };
         assert!(

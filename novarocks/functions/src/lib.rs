@@ -30,6 +30,8 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
 use sha2::{Digest, Sha256};
 
+mod failure_projection;
+
 mod aggregate_call;
 mod aggregate_erasure;
 pub mod aggregate_format;
@@ -43,6 +45,7 @@ pub mod aggregate_scalar_debug;
 pub mod aggregate_scalar_fingerprint;
 mod aggregate_state_column;
 pub mod aggregate_types;
+pub mod allocation_failure;
 pub mod approx_percentile_aggregate_core;
 pub mod approx_percentile_core;
 mod arithmetic;
@@ -493,7 +496,7 @@ impl From<novarocks_type_contract::CompileControlError> for FunctionResolutionEr
 impl FunctionResolutionError {
     pub fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         match self {
-            Self::Control(error) => Some(*error),
+            Self::Control(error) => Some(error.clone()),
             _ => None,
         }
     }
@@ -685,7 +688,7 @@ pub trait TypedAggregateKernel: Send + Sync + 'static {
     type PreparedMergeBatch<'batch>
     where
         Self: 'batch;
-    type Error: fmt::Display + Send + Sync + 'static;
+    type Error: novarocks_failure_contract::OuterFailureProjection;
 
     /// Declares the complete retained-memory contract for one state.
     ///
@@ -772,7 +775,7 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
     }
 
     type Kernel: TypedAggregateKernel;
-    type PrepareError: fmt::Display + Send + Sync + 'static;
+    type PrepareError: novarocks_failure_contract::OuterFailureProjection;
 
     /// Declare the complete value domains admitted by this family before any
     /// carrier-only kernel signature is materialized.
@@ -2526,7 +2529,7 @@ mod tests {
         type State = Vec<i64>;
         type PreparedUpdateBatch<'batch> = &'batch arrow_array::Int64Array;
         type PreparedMergeBatch<'batch> = &'batch arrow_array::Int64Array;
-        type Error = String;
+        type Error = KernelFailure;
 
         fn memory_policy(&self) -> AggregateStateMemoryPolicy {
             AggregateStateMemoryPolicy::BoundedRetained {
@@ -2545,7 +2548,11 @@ mod tests {
             input
                 .values()
                 .and_then(|values| values.as_any().downcast_ref())
-                .ok_or_else(|| "expected Int64 aggregate input".into())
+                .ok_or_else(|| {
+                    KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                        "expected Int64 aggregate input",
+                    ))
+                })
         }
 
         fn update_row<'batch>(
@@ -2603,7 +2610,7 @@ mod tests {
 
     impl TypedAggregateFamily for SumFamily {
         type Kernel = SumKernel;
-        type PrepareError = String;
+        type PrepareError = KernelFailure;
 
         fn overloads(&self) -> &[AggregateOverloadDeclaration] {
             &self.overloads
@@ -2861,3 +2868,7 @@ pub use array_backing_geometry::source_metadata_bytes_observed;
     all(not(novarocks_dev_controls), debug_assertions)
 ))]
 compile_error!("novarocks_dev_controls must match debug_assertions");
+
+pub use evaluation::DataFailureReason;
+
+pub mod array_generate;

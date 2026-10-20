@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use std::sync::Arc;
 
@@ -24,7 +26,12 @@ pub fn eval_ilike<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "ilike requires exactly two prepared arguments",
+        ));
+    }
     let _ = expr;
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
@@ -32,12 +39,17 @@ pub fn eval_ilike<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let left = left
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "ilike expects VARCHAR as first argument".to_string())?;
+        .ok_or_else(|| expression_contract("ilike expects VARCHAR as first argument"))?;
     let right = right
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "ilike expects VARCHAR as second argument".to_string())?;
+        .ok_or_else(|| expression_contract("ilike expects VARCHAR as second argument"))?;
 
+    if left.len() != chunk.len() || right.len() != chunk.len() {
+        return Err(expression_contract(
+            "ilike prepared argument lengths differ from their batch",
+        ));
+    }
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         if left.is_null(row) || right.is_null(row) {

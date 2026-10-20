@@ -38,7 +38,9 @@ use novarocks_type_contract::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeTypeConstructionError {
     Control(CompileControlError),
-    Capacity(String),
+    Capacity(novarocks_execution::runtime::mem_tracker::MemTrackerLimitExceeded),
+    Counter(NativeTypeCounterFailure),
+    Allocation(novarocks_execution_contract::failure::SharedFailureCause),
     Resource(LayoutResourceError),
     Funding(Box<crate::backend_task_execution::TypeMaterializationRefusal>),
 }
@@ -57,6 +59,8 @@ impl fmt::Display for NativeTypeConstructionError {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::Capacity(error) => write!(f, "native type construction capacity: {error}"),
+            Self::Counter(error) => error.fmt(f),
+            Self::Allocation(error) => error.fmt(f),
             Self::Resource(error) => write!(f, "native type construction layout: {error:?}"),
             Self::Funding(error) => error.fmt(f),
         }
@@ -66,7 +70,77 @@ impl std::error::Error for NativeTypeConstructionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Funding(cause) => Some(cause.as_ref()),
-            _ => None,
+            Self::Capacity(source) => Some(source),
+            Self::Control(source) => Some(source),
+            Self::Resource(source) => Some(source),
+            Self::Counter(source) => Some(source),
+            Self::Allocation(source) => Some(source),
+        }
+    }
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for NativeTypeConstructionError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        match self {
+            Self::Control(cause) => cause.failure_fact(),
+            Self::Capacity(cause) => cause.failure_fact(),
+            Self::Counter(cause) => cause.failure_fact(),
+            Self::Allocation(cause) => cause.failure_fact(),
+            Self::Resource(cause) => cause.failure_fact(),
+            Self::Funding(cause) => cause.failure_fact(),
+        }
+    }
+}
+
+/// Attribution counter width is opaque accounting, not an Arrow format or
+/// permission to split a value. The original SDK conversion remains available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeTypeCounterFailure {
+    Width {
+        requested: usize,
+        source: std::num::TryFromIntError,
+    },
+    Total {
+        committed: i64,
+        requested: i64,
+    },
+}
+impl std::fmt::Display for NativeTypeCounterFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Width { requested, .. } => write!(
+                f,
+                "native type construction request exceeds its signed attribution counter: {requested}"
+            ),
+            Self::Total {
+                committed,
+                requested,
+            } => write!(
+                f,
+                "native type construction retained counter overflowed: {committed} + {requested}"
+            ),
+        }
+    }
+}
+impl std::error::Error for NativeTypeCounterFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Width { source, .. } => Some(source),
+            Self::Total { .. } => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for NativeTypeCounterFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        match self {
+            Self::Width { requested, .. } => novarocks_execution::runtime::mem_tracker::MemoryAccountingFailure::BytesOutOfRange { requested: *requested }.failure_fact(),
+            Self::Total { committed, requested } => FailureFact::new(FailureClass::Resource, FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(4).unwrap()))
+                .with_resource(ResourceFacts {
+                    dimension: ResourceDimension::Bytes, request_scope: Some(ResourceScope::Request), constraint_scope: None,
+                    requested: u64::try_from(*requested).ok(), required_growth: None, limit: Some(i64::MAX as u64), live: None,
+                    committed: u64::try_from(*committed).ok(),
+                }),
         }
     }
 }
@@ -124,11 +198,14 @@ impl TypeReservation {
             observe(layout).map_err(Failure::Observer)?;
         }
         let bytes = i64::try_from(layout.size())
-            .map_err(|_| {
-                NativeTypeConstructionError::Control(CompileControlError::ResourceExhausted)
+            .map_err(|source| {
+                NativeTypeConstructionError::Counter(NativeTypeCounterFailure::Width {
+                    requested: layout.size(),
+                    source,
+                })
             })
             .map_err(Failure::Creator)?;
-        if let Err(error) = tracker.consume_and_check_limit(bytes) {
+        if let Err(error) = tracker.consume_and_check_limit_typed(bytes) {
             tracker.release(bytes);
             return Err(Failure::Creator(NativeTypeConstructionError::Capacity(
                 error,
@@ -148,19 +225,23 @@ impl TypeReservation {
         if requested_bytes == 0 {
             return Ok(());
         }
-        let bytes = i64::try_from(requested_bytes).map_err(|_| {
-            NativeTypeConstructionError::Control(CompileControlError::ResourceExhausted)
+        let bytes = i64::try_from(requested_bytes).map_err(|source| {
+            NativeTypeConstructionError::Counter(NativeTypeCounterFailure::Width {
+                requested: requested_bytes,
+                source,
+            })
         })?;
         let mut requested = self
             .requested
             .lock()
             .expect("type construction request lock");
-        let total = requested
-            .checked_add(bytes)
-            .ok_or(NativeTypeConstructionError::Control(
-                CompileControlError::ResourceExhausted,
-            ))?;
-        if let Err(error) = self.tracker.consume_and_check_limit(bytes) {
+        let total = requested.checked_add(bytes).ok_or_else(|| {
+            NativeTypeConstructionError::Counter(NativeTypeCounterFailure::Total {
+                committed: *requested,
+                requested: bytes,
+            })
+        })?;
+        if let Err(error) = self.tracker.consume_and_check_limit_typed(bytes) {
             // The tracker records a failed prospective request until balanced.
             self.tracker.release(bytes);
             return Err(NativeTypeConstructionError::Capacity(error));
@@ -179,7 +260,7 @@ pub(crate) struct NativeTypeConstruction<'control> {
 enum ConstructionControl<'control> {
     Task {
         stop: ConnectorStopView,
-        preparation_stop: novarocks_worker::TaskPreparationStopView,
+        preparation_stop: novarocks_worker::TaskPreparationView,
     },
     Borrowed(&'control dyn PureCompileControl),
 }
@@ -205,7 +286,7 @@ impl<'control> NativeTypeConstruction<'control> {
     pub(crate) fn try_new(
         tracker: Arc<MemTracker>,
         stop: ConnectorStopView,
-        preparation_stop: novarocks_worker::TaskPreparationStopView,
+        preparation_stop: novarocks_worker::TaskPreparationView,
     ) -> Result<Self, NativeTypeConstructionError> {
         Self::try_from_control(
             tracker,
@@ -460,17 +541,13 @@ impl novarocks_type_contract::ValueSchemaCreationFactory<NativeTypeConstructionE
 }
 
 fn check_preparation_stop(
-    stop: &novarocks_worker::TaskPreparationStopView,
+    stop: &novarocks_worker::TaskPreparationView,
 ) -> Result<(), CompileControlError> {
-    match stop.stop_cause() {
-        None => Ok(()),
-        Some(novarocks_worker::TaskPreparationStopCause::Cancelled) => {
-            Err(CompileControlError::Cancelled)
-        }
-        Some(novarocks_worker::TaskPreparationStopCause::LeaseExpired) => {
-            Err(CompileControlError::DeadlineExceeded)
-        }
-    }
+    stop.borrow_control().checkpoint().map_err(|error| {
+        CompileControlError::Source(
+            novarocks_execution::runtime::fragment::SharedDomainFailure::new(error),
+        )
+    })
 }
 impl PureCompileControl for NativeTypeConstruction<'_> {
     fn checkpoint(&self, phase: CompilePhase, node: u32) -> Result<(), CompileControlError> {
@@ -488,12 +565,8 @@ mod tests {
     fn independent_type_keeps_actual_creation_requests_until_its_last_reference() {
         let tracker = MemTracker::new_root("native type creation test");
         let stop = ConnectorStopOwner::new();
-        let creator = NativeTypeConstruction::try_new(
-            tracker.clone(),
-            stop.view(),
-            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
-        )
-        .unwrap();
+        let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+        let creator = NativeTypeConstruction::try_with_control(tracker.clone(), &control).unwrap();
         creator
             .request_layout(ValueTypeRef::storage_allocation_layout().unwrap())
             .unwrap();
@@ -514,12 +587,8 @@ mod tests {
     fn original_stop_and_failed_capacity_preserve_prior_successful_requests() {
         let tracker = MemTracker::new_root("native type refusal test");
         let stop = ConnectorStopOwner::new();
-        let creator = NativeTypeConstruction::try_new(
-            tracker.clone(),
-            stop.view(),
-            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
-        )
-        .unwrap();
+        let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+        let creator = NativeTypeConstruction::try_with_control(tracker.clone(), &control).unwrap();
         let held = tracker.current();
         tracker.install_limit_once(held + 8).unwrap();
         assert!(matches!(
@@ -576,12 +645,8 @@ mod tests {
     fn scoped_scratch_exits_without_retaining_its_parent_or_requests() {
         let tracker = MemTracker::new_root("native scratch scope");
         let stop = ConnectorStopOwner::new();
-        let creator = NativeTypeConstruction::try_new(
-            tracker.clone(),
-            stop.view(),
-            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
-        )
-        .unwrap();
+        let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+        let creator = NativeTypeConstruction::try_with_control(tracker.clone(), &control).unwrap();
         let parent = tracker.current();
         let scope = creator.begin_scope().unwrap();
         assert_eq!(tracker.current(), parent + reservation_bytes());
@@ -646,7 +711,7 @@ mod tests {
             panic!("actual tracker cause was replaced");
         };
         assert_eq!(
-            original,
+            original.detail(),
             format!(
                 "ResourceExhausted: memory limit exceeded for tracker native scope first refusal: current {} bytes, limit {limit} bytes",
                 prior + reservation_bytes(),

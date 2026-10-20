@@ -134,7 +134,7 @@ fn split_selected_compact_and_scalar_origins_use_demanded_addresses_only() {
         .unwrap();
     let left = Arc::new(StringArray::from(vec![Some("é中"), None])) as ArrayRef;
     let right = Arc::new(StringArray::from(vec![Some("中"), Some("中")])) as ArrayRef;
-    let expected = evaluate_legacy(&left, &right).unwrap();
+    let expected = evaluate_required(&left, &right).unwrap();
     assert_eq!(out.values().to_data(), expected.to_data());
     assert!(out.errors().is_empty());
     let source = Arc::new(StringArray::from(vec![
@@ -169,16 +169,66 @@ fn split_shared_raw_exact_admission_and_batch_length_errors_remain_full() {
     let left = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
     let right = Arc::new(StringArray::from(vec![","])) as ArrayRef;
     assert_eq!(
-        evaluate_legacy(&left, &right).unwrap_err(),
+        evaluate_required(&left, &right).unwrap_err().to_string(),
         "split: argument length mismatch"
     );
     let invalid = Arc::new(Int64Array::from(vec![None; 2])) as ArrayRef;
     assert_eq!(
-        evaluate_legacy(&invalid, &right).unwrap_err(),
+        evaluate_required(&invalid, &right).unwrap_err().to_string(),
         "split: first argument must be a string array"
     );
     assert_eq!(
-        evaluate_legacy(&left, &(Arc::new(NullArray::new(2)) as ArrayRef)).unwrap_err(),
+        evaluate_required(&left, &(Arc::new(NullArray::new(2)) as ArrayRef))
+            .unwrap_err()
+            .to_string(),
         "split: second argument must be a string array"
     );
+}
+
+#[test]
+fn split_failure_is_nominal_and_extent_refusal_does_not_append_a_partial_piece() {
+    use arrow_array::builder::ArrayBuilder;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    use std::error::Error;
+    let input: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let weak = Arc::downgrade(&input);
+    let delimiter: ArrayRef = Arc::new(StringArray::from(vec![","]));
+    let failure = evaluate_required(&input, &delimiter).unwrap_err();
+    drop(input);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 368);
+    assert!(
+        failure
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .is::<SplitContract>()
+    );
+    for (mut row, mut children, mut bytes, boundary, layout) in [
+        (
+            i32::MAX as usize,
+            0,
+            0,
+            RepresentationBoundary::MinimumUnit,
+            63,
+        ),
+        (0, i32::MAX, 0, RepresentationBoundary::SingleOutput, 63),
+        (0, 0, i32::MAX, RepresentationBoundary::SingleOutput, 60),
+    ] {
+        let before = (row, children, bytes);
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        let failure =
+            append_piece(&mut builder, "x", &mut row, &mut children, &mut bytes).unwrap_err();
+        assert_eq!((row, children, bytes), before);
+        assert_eq!(builder.values().len(), 0);
+        let fact = failure.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert!(fact.resource().is_none());
+        let extent = fact.representation().unwrap();
+        assert_eq!(extent.boundary, boundary);
+        assert_eq!(extent.layout.code.get(), layout);
+        assert_eq!(extent.representable_prefix, None);
+    }
 }

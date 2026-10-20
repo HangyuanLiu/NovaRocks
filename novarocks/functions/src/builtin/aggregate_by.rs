@@ -18,7 +18,7 @@
 //! Exact MAX_BY/MIN_BY over the original tracked scalar and recursive codec.
 use super::aggregate_by_core::{ByDirection, ByEncodeBuffer, ByState};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, ScalarWork};
 use crate::kernel_control::{KernelControlObservation, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
@@ -33,22 +33,18 @@ pub(super) struct ByKernel {
 }
 pub(super) struct HostByBuffer(pub(super) HostVec<u8, HostAggregateAllocator>);
 impl ByEncodeBuffer for HostByBuffer {
-    fn push(&mut self, byte: u8) -> Result<(), ScalarStateError> {
+    fn push(&mut self, byte: u8) -> Result<(), KernelFailure> {
         self.0
             .try_reserve(1)
-            .map_err(|_| ScalarStateError::Kernel(self.0.allocator().take_failure()))?;
+            .map_err(|_| self.0.allocator().take_failure())?;
         self.0.push(byte);
         Ok(())
     }
-    fn append(
-        &mut self,
-        bytes: &[u8],
-        work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    fn append(&mut self, bytes: &[u8], work: &mut ScalarWork<'_, '_>) -> Result<(), KernelFailure> {
         work.flush()?;
         self.0
             .try_reserve(bytes.len())
-            .map_err(|_| ScalarStateError::Kernel(self.0.allocator().take_failure()))?;
+            .map_err(|_| self.0.allocator().take_failure())?;
         work.flush()?;
         for byte in bytes {
             work.step()?;
@@ -70,13 +66,12 @@ fn observed<T>(
 }
 impl ByKernel {
     /// The one original emitter before either caller projects its error.
-    /// LegacyData remains full text here; the old aggregate entry still uses
-    /// exactly its original KernelFailure boundary below.
+    /// The whole-value source stays typed until either host adds its context.
     pub(super) fn build_final_scalar<'s, I>(
         &self,
         states: I,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<ArrayRef, ScalarStateError>
+    ) -> Result<ArrayRef, KernelFailure>
     where
         I: ExactSizeIterator<Item = &'s ByState<HostAggregateAllocator>>,
     {
@@ -84,7 +79,7 @@ impl ByKernel {
         let mut values = Vec::new();
         values
             .try_reserve_exact(expected)
-            .map_err(|_| ScalarStateError::Kernel(KernelFailure::ResourceExhausted))?;
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
         for state in states {
             if values.len() == expected {
                 return Err(internal("max_by/min_by state iterator exceeded its extent").into());
@@ -107,7 +102,7 @@ impl ByKernel {
         input: &SelectedAggregateUpdateInput<'a, 'a>,
         ordinal: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), KernelFailure> {
         let row = input
             .selection()
             .row(ordinal)
@@ -219,7 +214,6 @@ impl PreparedAggregateKernel for ByKernel {
         }
         let result = observed(control, |work| {
             self.update_row_scalar(state, input, ordinal, &mut ScalarWork::new(Some(work)))
-                .map_err(ScalarStateError::into_kernel_failure)
         });
         if result.is_err() {
             state.latch_failure();
@@ -273,13 +267,11 @@ impl PreparedAggregateKernel for ByKernel {
             if array.is_null(address) {
                 return Ok(());
             }
-            state
-                .merge_bytes(
-                    self.direction,
-                    array.value(address),
-                    &mut ScalarWork::new(Some(work)),
-                )
-                .map_err(ScalarStateError::into_kernel_failure)
+            state.merge_bytes(
+                self.direction,
+                array.value(address),
+                &mut ScalarWork::new(Some(work)),
+            )
         });
         if result.is_err() {
             state.latch_failure();
@@ -297,7 +289,7 @@ impl PreparedAggregateKernel for ByKernel {
         observed(control, |work| {
             let expected = states.len();
             let mut count = 0;
-            let mut builder = BinaryBuilder::new();
+            let mut builder = crate::aggregate_scalar::BinaryResultBuilder::new();
             let mut work = ScalarWork::new(Some(work));
             for state in states {
                 if count == expected {
@@ -307,19 +299,14 @@ impl PreparedAggregateKernel for ByKernel {
                 if state.failed {
                     return Err(KernelFailure::InstanceFailed);
                 }
-                work.step().map_err(ScalarStateError::into_kernel_failure)?;
+                work.step()?;
                 let mut bytes = HostByBuffer(HostVec::new_in(state.allocator.clone()));
-                if state
-                    .serialize(&mut bytes, &mut work)
-                    .map_err(ScalarStateError::into_kernel_failure)?
-                {
-                    work.flush()
-                        .map_err(ScalarStateError::into_kernel_failure)?;
-                    builder.append_value(&bytes.0);
-                    work.flush()
-                        .map_err(ScalarStateError::into_kernel_failure)?;
+                if state.serialize(&mut bytes, &mut work)? {
+                    work.flush()?;
+                    builder.append_value(&bytes.0)?;
+                    work.flush()?;
                 } else {
-                    builder.append_null();
+                    builder.append_null()?;
                 }
             }
             if count != expected {
@@ -327,7 +314,7 @@ impl PreparedAggregateKernel for ByKernel {
                     "max_by/min_by state iterator shortened its extent",
                 ));
             }
-            Ok(Arc::new(builder.finish()) as ArrayRef)
+            Ok(Arc::new(builder.finish()?) as ArrayRef)
         })
     }
     fn build_final<'s, I>(
@@ -340,7 +327,6 @@ impl PreparedAggregateKernel for ByKernel {
     {
         observed(control, |work| {
             self.build_final_scalar(states, &mut ScalarWork::new(Some(work)))
-                .map_err(ScalarStateError::into_kernel_failure)
         })
     }
 }

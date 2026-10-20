@@ -19,7 +19,7 @@
 use super::aggregate_by::HostByBuffer;
 use super::aggregate_n_core::NState;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, ScalarWork};
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
@@ -145,16 +145,14 @@ impl PreparedAggregateKernel for NKernel {
             if value_row >= values.array().len() || key_row >= keys.array().len() {
                 return Err(internal("min_n/max_n selected address is out of bounds"));
             }
-            state
-                .update_from_arrays(
-                    values.array(),
-                    value_row,
-                    keys.array(),
-                    key_row,
-                    self.keep_smallest,
-                    &mut ScalarWork::new(Some(work)),
-                )
-                .map_err(ScalarStateError::into_kernel_failure)
+            state.update_from_arrays(
+                values.array(),
+                value_row,
+                keys.array(),
+                key_row,
+                self.keep_smallest,
+                &mut ScalarWork::new(Some(work)),
+            )
         });
         if result.is_err() {
             state.latch_failure();
@@ -208,14 +206,12 @@ impl PreparedAggregateKernel for NKernel {
             if array.is_null(address) {
                 return Ok(());
             }
-            state
-                .merge_from_array(
-                    argument.array(),
-                    address,
-                    self.keep_smallest,
-                    &mut ScalarWork::new(Some(work)),
-                )
-                .map_err(ScalarStateError::into_kernel_failure)
+            state.merge_from_array(
+                argument.array(),
+                address,
+                self.keep_smallest,
+                &mut ScalarWork::new(Some(work)),
+            )
         });
         if result.is_err() {
             state.latch_failure();
@@ -255,7 +251,7 @@ impl NKernel {
         observed(control, |work| {
             let expected = states.len();
             let mut count = 0;
-            let mut builder = BinaryBuilder::new();
+            let mut builder = crate::aggregate_scalar::BinaryResultBuilder::new();
             let mut work = ScalarWork::new(Some(work));
             for state in states {
                 let state = state?;
@@ -266,21 +262,17 @@ impl NKernel {
                 if state.failed {
                     return Err(KernelFailure::InstanceFailed);
                 }
-                work.step().map_err(ScalarStateError::into_kernel_failure)?;
+                work.step()?;
                 let mut bytes = HostByBuffer(HostVec::new_in(state.allocator.clone()));
-                state
-                    .serialize(&mut bytes, &mut work)
-                    .map_err(ScalarStateError::into_kernel_failure)?;
-                work.flush()
-                    .map_err(ScalarStateError::into_kernel_failure)?;
-                builder.append_value(&bytes.0);
-                work.flush()
-                    .map_err(ScalarStateError::into_kernel_failure)?;
+                state.serialize(&mut bytes, &mut work)?;
+                work.flush()?;
+                builder.append_value(&bytes.0)?;
+                work.flush()?;
             }
             if count != expected {
                 return Err(internal("min_n/max_n state iterator shortened its extent"));
             }
-            Ok(Arc::new(builder.finish()) as ArrayRef)
+            Ok(Arc::new(builder.finish()?) as ArrayRef)
         })
     }
     pub(super) fn build_final_checked<'s, I>(
@@ -306,19 +298,13 @@ impl NKernel {
                 if state.failed {
                     return Err(KernelFailure::InstanceFailed);
                 }
-                work.step().map_err(ScalarStateError::into_kernel_failure)?;
-                values.push(
-                    state
-                        .output(&mut work)
-                        .map(Some)
-                        .map_err(ScalarStateError::into_kernel_failure)?,
-                );
+                work.step()?;
+                values.push(state.output(&mut work).map(Some)?);
             }
             if values.len() != expected {
                 return Err(internal("min_n/max_n state iterator shortened its extent"));
             }
             scalar::build_scalar_array(self.output_type(), values, &mut work)
-                .map_err(ScalarStateError::into_kernel_failure)
         })
     }
 }

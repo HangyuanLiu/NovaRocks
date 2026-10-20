@@ -61,10 +61,10 @@ fn timestampdiff_value(
     work.step()?;
     Ok(Ok(value))
 }
-pub(super) fn evaluate_timestampdiff<'a>(
-    input: CalendarInput<'_, 'a>,
+pub(super) fn evaluate_timestampdiff<'a, E>(
+    input: CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
+) -> Result<SelectedValues<'a>, super::calendar_extended_shared::CalendarFailure<E>> {
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
     let result = (|| {
@@ -77,9 +77,7 @@ pub(super) fn evaluate_timestampdiff<'a>(
             [unit_arg, start_arg, end_arg],
         ) = (input.types, input.arguments())
         else {
-            return Err(invalid(
-                "timestampdiff requires its exact three value arguments",
-            ));
+            return Err(invalid("timestampdiff requires its exact three value arguments").into());
         };
         let target = input.target;
         if target.logical_type() != ValueLogicalType::Physical
@@ -90,9 +88,7 @@ pub(super) fn evaluate_timestampdiff<'a>(
             || unit_arg.array().data_type() != &DataType::Utf8
             || (!input.legacy && start_type.data_type() != end_type.data_type())
         {
-            return Err(invalid(
-                "timestampdiff differs from its exact declared profile",
-            ));
+            return Err(invalid("timestampdiff differs from its exact declared profile").into());
         }
         let units = unit_arg
             .array()
@@ -126,11 +122,11 @@ pub(super) fn evaluate_timestampdiff<'a>(
                 rows[index] = arguments[index].value_row(ordinal, batch_row);
                 work.step()?;
                 if rows[index] >= arguments[index].array().len() {
-                    return Err(internal("timestampdiff selected row is out of bounds"));
+                    return Err(internal("timestampdiff selected row is out of bounds").into());
                 }
                 let is_null = arguments[index].array().is_null(rows[index]);
                 if is_null && !types[index].nullable() {
-                    return Err(internal("timestampdiff non-null source contains SQL NULL"));
+                    return Err(internal("timestampdiff non-null source contains SQL NULL").into());
                 }
                 null |= is_null;
                 work.step()?;
@@ -168,8 +164,9 @@ pub(super) fn evaluate_timestampdiff<'a>(
             errors.into_boxed_slice(),
             || work.step(),
         )
+        .map_err(super::calendar_extended_shared::CalendarFailure::Outer)
     })();
-    work.finish_result(result)
+    super::calendar_extended_shared::finish_calendar_result(work, result)
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let ordinal = trace.len();
         trace.push((phase, units));
-        if let Some((target, cause)) = self.fail
+        if let Some((target, cause)) = self.fail.clone()
             && ordinal == target
         {
             return Err(cause);
@@ -270,7 +270,7 @@ fn every_actual_decode_callback_preserves_control_identity_without_late_footer()
         for at in 0..trace.len() {
             for cause in causes() {
                 let control = Control {
-                    fail: Some((at, cause)),
+                    fail: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 assert!(

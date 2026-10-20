@@ -36,7 +36,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at + 1
         {
             Err(cause)
@@ -255,6 +255,10 @@ fn all_eight_float_signed_profiles_keep_native_boundaries_and_two_independent_po
                                     )
                                 };
                                 assert_eq!(error.selected_ordinal(), ordinal);
+                                assert_eq!(
+                                    error.reason(),
+                                    crate::DataFailureReason::NumericOutOfRange
+                                );
                                 assert!(error.message().contains("conflict with range of"));
                             }
                             _ => assert_eq!(actual, CastRowResult::Null),
@@ -433,8 +437,9 @@ fn constant_original_ordinal_sparse_compact_slice_and_broadcast_keep_error_addre
         for (ordinal, row) in selection.iter().enumerate() {
             let expected = match ordinal {
                 0 => CastRowResult::Signed(-7),
-                1 => CastRowResult::RowError(RowDataError::new(
+                1 => CastRowResult::RowError(RowDataError::with_reason(
                     1,
+                    crate::DataFailureReason::NumericOutOfRange,
                     &format!(
                         "Expr evaluate meet error: CAST failed: from {source:?} to Int8: inf conflict with range of TINYINT"
                     ),
@@ -611,7 +616,7 @@ fn float_compile_original_three_causes_keep_all_refusal_prefixes_and_metadata_qu
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = CompileControl {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 let error = PreparedCastRecipe::try_new(

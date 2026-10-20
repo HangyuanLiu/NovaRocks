@@ -27,8 +27,12 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+#[path = "analytic_failure.rs"]
+mod analytic_failure;
 #[path = "analytic_input_stages.rs"]
 mod analytic_input_stages;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use analytic_failure::{arrow as analytic_arrow, contract as analytic_contract};
 
 #[cfg(test)]
 #[path = "analytic_frozen_parameter_tests.rs"]
@@ -103,7 +107,7 @@ fn prepare_window_aggregates(
     arena: &ExprArena,
     functions: &[WindowFunctionSpec],
     function_set: &SealedExecutionFunctionSet,
-) -> Result<Vec<Option<PreparedWindowAggregate>>, String> {
+) -> crate::runtime::fragment::ExecutionResult<Vec<Option<PreparedWindowAggregate>>> {
     functions
         .iter()
         .enumerate()
@@ -112,47 +116,47 @@ fn prepare_window_aggregates(
             let binding = match (window_only, function.aggregate_binding.as_ref()) {
                 (true, None) => return Ok(None),
                 (true, Some(_)) => {
-                    return Err(format!(
+                    return Err(crate::exec::fragment::error::node_construction_failure(format_args!(
                         "window-only function #{} must not carry an aggregate binding",
                         index
-                    ));
+                    )));
                 }
                 (false, None) => {
-                    return Err(format!(
+                    return Err(crate::exec::fragment::error::node_construction_failure(format_args!(
                         "aggregate window function #{} requires an exact aggregate binding",
                         index
-                    ));
+                    )));
                 }
                 (false, Some(binding)) => binding,
             };
             if function.return_type != binding.resolved.output_type {
-                return Err(format!(
+                return Err(crate::exec::fragment::error::node_construction_failure(format_args!(
                     "aggregate window function #{} output type drift: function={:?} binding={:?}",
                     index, function.return_type, binding.resolved.output_type
-                ));
+                )));
             }
 
             let Some(expected_name) = custom_window_aggregate_name(&function.kind) else {
                 return Ok(None);
             };
             if binding.function_name != expected_name {
-                return Err(format!(
+                return Err(crate::exec::fragment::error::node_construction_failure(format_args!(
                     "aggregate window function #{} identity drift: kind expects `{expected_name}`, binding names `{}`",
                     index, binding.function_name
-                ));
+                )));
             }
             let [physical_input] = function.args.as_slice() else {
-                return Err(format!(
+                return Err(crate::exec::fragment::error::node_construction_failure(format_args!(
                     "custom aggregate window function #{} requires one packed physical input, got {}",
                     index,
                     function.args.len()
-                ));
+                )));
             };
             let evaluated_input_type = arena.data_type(*physical_input).cloned().ok_or_else(|| {
-                format!(
+                crate::exec::fragment::error::node_construction_failure(format_args!(
                     "custom aggregate window function #{} physical input type missing",
                     index
-                )
+                ))
             })?;
             let aggregate = AggFunction {
                 name: binding.function_name.clone(),
@@ -222,7 +226,7 @@ impl AnalyticSharedState {
         output_chunk_schema: ChunkSchemaRef,
         function_set: Arc<SealedExecutionFunctionSet>,
         node_id: i32,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Self::new_with_buffer_limit(
             arena,
             partition_exprs,
@@ -249,13 +253,13 @@ impl AnalyticSharedState {
         function_set: Arc<SealedExecutionFunctionSet>,
         node_id: i32,
         buffer_limit: usize,
-    ) -> Result<Self, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
         let prepared_window_aggregates =
             prepare_window_aggregates(&arena, &functions, &function_set)?;
         let label = if node_id >= 0 {
             format!("analytic_queue_{node_id}")
         } else {
-            "analytic_queue".to_string()
+            "analytic_queue".to_owned()
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(AnalyticState {
@@ -282,8 +286,19 @@ impl AnalyticSharedState {
         })
     }
 
-    pub(crate) fn push_input(&self, state: &RuntimeState, mut chunk: Chunk) -> Result<(), String> {
-        if let Some(tracker) = self.queue_mem_tracker(state).as_ref() {
+    pub(crate) fn input_memory(&self, state: &RuntimeState) -> AnalyticInputMemory {
+        AnalyticInputMemory {
+            queue: self.queue_mem_tracker(state),
+            aggregate: self.aggregate_mem_tracker(state),
+        }
+    }
+
+    pub(crate) fn push_input(
+        &self,
+        memory: &AnalyticInputMemory,
+        mut chunk: Chunk,
+    ) -> ExecutionResult<()> {
+        if let Some(tracker) = memory.queue.as_ref() {
             chunk.try_transfer_to(tracker)?;
         }
         let mut guard = self.inner.lock().expect("analytic state lock");
@@ -295,49 +310,38 @@ impl AnalyticSharedState {
 
     pub(crate) fn finish_created(
         &self,
-        state: &RuntimeState,
+        memory: &AnalyticInputMemory,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-    ) -> crate::runtime::fragment::ExecutionResult<()> {
-        self.finish_with(state, |chunk, exprs| {
+        ctx: &crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<()> {
+        self.finish_with(memory, |chunk, exprs| {
             if exprs.is_empty() {
                 return Ok(Vec::new());
             }
             let owner = factory.begin_input_construction(chunk)?;
-            let control =
-                super::compiled_expression::RuntimeKernelControl::new(state.error_state());
-            let evaluation = crate::exec::expr::ExprEvaluationContext::new(
-                &self.arena,
-                owner.as_ref(),
-                &control,
-            );
+            let evaluation =
+                crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), ctx);
             exprs.iter().map(|id| evaluation.eval(*id, chunk)).collect()
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn finish(&self, state: &RuntimeState) -> Result<(), String> {
-        self.finish_with(state, |chunk, exprs| {
-            self.eval_exprs(chunk, exprs).map_err(Into::into)
-        })
-        .map_err(|error| error.to_string())
+    pub(crate) fn finish(&self, memory: &AnalyticInputMemory) -> ExecutionResult<()> {
+        self.finish_with(memory, |chunk, exprs| self.eval_exprs(chunk, exprs))
     }
 
-    fn finish_with<F>(
-        &self,
-        state: &RuntimeState,
-        evaluate: F,
-    ) -> crate::runtime::fragment::ExecutionResult<()>
+    fn finish_with<F>(&self, memory: &AnalyticInputMemory, evaluate: F) -> ExecutionResult<()>
     where
-        F: FnMut(&Chunk, &[ExprId]) -> crate::runtime::fragment::ExecutionResult<Vec<ArrayRef>>,
+        F: FnMut(&Chunk, &[ExprId]) -> ExecutionResult<Vec<ArrayRef>>,
     {
         let notify = self.observable.defer_notify();
-        let aggregate_tracker = self.aggregate_mem_tracker(state);
+        let aggregate_tracker = memory.aggregate.clone();
         let mut guard = self.inner.lock().expect("analytic state lock");
         guard.sink_finishing = true;
         if !guard.computed {
             let outputs = self.compute_outputs_with(&guard.input, aggregate_tracker, evaluate)?;
             let mut outputs = outputs;
-            if let Some(tracker) = self.queue_mem_tracker(state).as_ref() {
+            if let Some(tracker) = memory.queue.as_ref() {
                 for chunk in outputs.iter_mut() {
                     chunk.try_transfer_to(tracker)?;
                 }
@@ -369,7 +373,8 @@ impl AnalyticSharedState {
         Arc::clone(&self.observable)
     }
 
-    pub(crate) fn pop_output(&self) -> Option<Chunk> {
+    pub(crate) fn next_output(&self) -> crate::exec::pipeline::shape::SourceRead {
+        use crate::exec::pipeline::shape::SourceRead;
         let mut guard = self.inner.lock().expect("analytic state lock");
         if guard.output.is_empty() && !guard.pending.is_empty() {
             while guard.output.len() < self.buffer_limit {
@@ -379,7 +384,19 @@ impl AnalyticSharedState {
                 guard.output.push_back(chunk);
             }
         }
-        guard.output.pop_front()
+        match guard.output.pop_front() {
+            Some(chunk) => SourceRead::Chunk(chunk),
+            None if guard.sink_complete && guard.pending.is_empty() => SourceRead::Finished,
+            None => SourceRead::Pending,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pop_output(&self) -> Option<Chunk> {
+        match self.next_output() {
+            crate::exec::pipeline::shape::SourceRead::Chunk(chunk) => Some(chunk),
+            _ => None,
+        }
     }
 
     pub(crate) fn is_done(&self) -> bool {
@@ -392,11 +409,10 @@ impl AnalyticSharedState {
         &self,
         input: &[Chunk],
         aggregate_tracker: Option<Arc<MemTracker>>,
-    ) -> Result<VecDeque<Chunk>, String> {
+    ) -> ExecutionResult<VecDeque<Chunk>> {
         self.compute_outputs_with(input, aggregate_tracker, |chunk, exprs| {
-            self.eval_exprs(chunk, exprs).map_err(Into::into)
+            self.eval_exprs(chunk, exprs)
         })
-        .map_err(|error| error.to_string())
     }
 
     fn compute_outputs_with<F>(
@@ -404,9 +420,9 @@ impl AnalyticSharedState {
         input: &[Chunk],
         aggregate_tracker: Option<Arc<MemTracker>>,
         mut evaluate: F,
-    ) -> crate::runtime::fragment::ExecutionResult<VecDeque<Chunk>>
+    ) -> ExecutionResult<VecDeque<Chunk>>
     where
-        F: FnMut(&Chunk, &[ExprId]) -> crate::runtime::fragment::ExecutionResult<Vec<ArrayRef>>,
+        F: FnMut(&Chunk, &[ExprId]) -> ExecutionResult<Vec<ArrayRef>>,
     {
         if input.is_empty() {
             return Ok(VecDeque::new());
@@ -457,9 +473,7 @@ impl AnalyticSharedState {
                 total_rows,
                 aggregate_tracker.clone(),
             )
-            .map_err(|e| {
-                novarocks_functions::window_format::window_failure_message(func_idx, &e)
-            })?;
+            .map_err(|source| analytic_failure::call(func_idx, source))?;
             func_outputs.push(out);
         }
 
@@ -474,7 +488,10 @@ impl AnalyticSharedState {
                 }
                 AnalyticOutputColumn::Window(window_idx) => {
                     let arr = func_outputs.get(window_idx).ok_or_else(|| {
-                        format!("window output index out of range: {}", window_idx)
+                        analytic_contract(format_args!(
+                            "window output index out of range: {}",
+                            window_idx
+                        ))
                     })?;
                     columns.push(Arc::clone(arr));
                 }
@@ -490,7 +507,7 @@ impl AnalyticSharedState {
     }
 
     #[cfg(test)]
-    fn eval_exprs(&self, chunk: &Chunk, exprs: &[ExprId]) -> Result<Vec<ArrayRef>, String> {
+    fn eval_exprs(&self, chunk: &Chunk, exprs: &[ExprId]) -> ExecutionResult<Vec<ArrayRef>> {
         let mut out = Vec::with_capacity(exprs.len());
         for id in exprs {
             out.push(self.arena.eval(*id, chunk)?);
@@ -514,6 +531,11 @@ impl AnalyticSharedState {
             .get_or_init(|| MemTracker::new_child(format!("{}_aggregate", self.label), &root));
         Some(Arc::clone(tracker))
     }
+}
+
+pub(crate) struct AnalyticInputMemory {
+    queue: Option<Arc<MemTracker>>,
+    aggregate: Option<Arc<MemTracker>>,
 }
 
 /// Borrowed result of the ONE original analytic output-layout validator.
@@ -572,10 +594,10 @@ impl std::fmt::Display for AnalyticOutputValidationFailure<'_> {
 }
 /// ONE original analytic input gathering. The nonempty source proof belongs
 /// to each caller; this helper changes neither Arrow order nor original Data.
-pub(crate) fn concat_original_analytic_input(input: &[Chunk]) -> Result<Chunk, String> {
-    analytic_input_stages::legacy(analytic_input_stages::gather(
+pub(crate) fn concat_original_analytic_input(input: &[Chunk]) -> ExecutionResult<Chunk> {
+    analytic_input_stages::unscoped(analytic_input_stages::gather(
         input,
-        &mut analytic_input_stages::LegacyWork,
+        &mut analytic_input_stages::UnscopedWork,
     ))
 }
 
@@ -583,9 +605,9 @@ fn validate_analytic_output_columns(
     columns: &[ArrayRef],
     output_chunk_schema: &crate::exec::chunk::ChunkSchemaRef,
     total_rows: usize,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     validate_analytic_output_columns_typed(columns, output_chunk_schema, total_rows)
-        .map_err(|error| error.to_string())
+        .map_err(analytic_contract)
 }
 pub(crate) fn validate_analytic_output_columns_typed<'a>(
     columns: &'a [ArrayRef],
@@ -622,7 +644,7 @@ pub(crate) fn validate_analytic_output_columns_typed<'a>(
 pub(crate) fn compute_partitions(
     keys: &[ArrayRef],
     rows: usize,
-) -> Result<Vec<(usize, usize)>, String> {
+) -> ExecutionResult<Vec<(usize, usize)>> {
     if rows == 0 {
         return Ok(Vec::new());
     }
@@ -652,7 +674,7 @@ impl PartitionWindowContext {
         partitions: &[(usize, usize)],
         order_keys: &[ArrayRef],
         window: Option<&WindowFrame>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let mut peer_groups_by_partition = Vec::with_capacity(partitions.len());
         let mut frames_by_partition = Vec::with_capacity(partitions.len());
         for (part_start, part_end) in partitions {
@@ -673,18 +695,28 @@ impl PartitionWindowContext {
         &self.partitions
     }
 
-    fn peer_groups(&self, part_idx: usize) -> Result<&[(usize, usize)], String> {
+    fn peer_groups(&self, part_idx: usize) -> ExecutionResult<&[(usize, usize)]> {
         self.peer_groups_by_partition
             .get(part_idx)
             .map(Vec::as_slice)
-            .ok_or_else(|| format!("window partition index out of range: {}", part_idx))
+            .ok_or_else(|| {
+                analytic_contract(format_args!(
+                    "window partition index out of range: {}",
+                    part_idx
+                ))
+            })
     }
 
-    fn frames(&self, part_idx: usize) -> Result<&[(usize, usize)], String> {
+    fn frames(&self, part_idx: usize) -> ExecutionResult<&[(usize, usize)]> {
         self.frames_by_partition
             .get(part_idx)
             .map(Vec::as_slice)
-            .ok_or_else(|| format!("window partition index out of range: {}", part_idx))
+            .ok_or_else(|| {
+                analytic_contract(format_args!(
+                    "window partition index out of range: {}",
+                    part_idx
+                ))
+            })
     }
 }
 
@@ -692,12 +724,12 @@ pub(crate) fn split_analytic_output_chunks(
     output_chunk_schema: ChunkSchemaRef,
     columns: &[ArrayRef],
     input: &[Chunk],
-) -> Result<VecDeque<Chunk>, String> {
-    analytic_input_stages::legacy(analytic_input_stages::split(
+) -> ExecutionResult<VecDeque<Chunk>> {
+    analytic_input_stages::unscoped(analytic_input_stages::split(
         output_chunk_schema,
         columns,
         input,
-        &mut analytic_input_stages::LegacyWork,
+        &mut analytic_input_stages::UnscopedWork,
     ))
 }
 
@@ -705,7 +737,7 @@ fn should_reorder_window_input(
     functions: &[WindowFunctionSpec],
     order_keys: &[ArrayRef],
     window: Option<&WindowFrame>,
-) -> Result<bool, String> {
+) -> ExecutionResult<bool> {
     Ok(
         novarocks_functions::window_input_order::should_regroup_partition_only(
             !order_keys.is_empty(),
@@ -737,11 +769,11 @@ fn should_reorder_window_input(
 pub(crate) fn reorder_chunk_by_partition_keys(
     chunk: &Chunk,
     keys: &[ArrayRef],
-) -> Result<Chunk, String> {
-    analytic_input_stages::legacy(analytic_input_stages::regroup(
+) -> ExecutionResult<Chunk> {
+    analytic_input_stages::unscoped(analytic_input_stages::regroup(
         chunk,
         keys,
-        &mut analytic_input_stages::LegacyWork,
+        &mut analytic_input_stages::UnscopedWork,
     ))
 }
 
@@ -749,15 +781,15 @@ fn compare_rows_on_partition_keys(
     keys: &[ArrayRef],
     left: usize,
     right: usize,
-) -> Result<Ordering, String> {
-    analytic_input_stages::legacy_compare(keys, left, right)
+) -> ExecutionResult<Ordering> {
+    analytic_input_stages::unscoped_compare(keys, left, right)
 }
 
 fn compute_peer_groups(
     order_keys: &[ArrayRef],
     part_start: usize,
     part_end: usize,
-) -> Result<Vec<(usize, usize)>, String> {
+) -> ExecutionResult<Vec<(usize, usize)>> {
     if part_start >= part_end {
         return Ok(Vec::new());
     }
@@ -780,7 +812,7 @@ pub(crate) fn row_equal_on_keys(
     keys: &[ArrayRef],
     left: usize,
     right: usize,
-) -> Result<bool, String> {
+) -> ExecutionResult<bool> {
     for a in keys {
         if !value_equal_or_both_null(a.as_ref(), left, right)? {
             return Ok(false);
@@ -789,7 +821,7 @@ pub(crate) fn row_equal_on_keys(
     Ok(true)
 }
 
-fn value_equal_or_both_null(array: &dyn Array, left: usize, right: usize) -> Result<bool, String> {
+fn value_equal_or_both_null(array: &dyn Array, left: usize, right: usize) -> ExecutionResult<bool> {
     if array.is_null(left) && array.is_null(right) {
         return Ok(true);
     }
@@ -801,70 +833,70 @@ fn value_equal_or_both_null(array: &dyn Array, left: usize, right: usize) -> Res
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| "failed to downcast BooleanArray".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast BooleanArray"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Int8 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
-                .ok_or_else(|| "failed to downcast Int8Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int8Array"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Int16 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
-                .ok_or_else(|| "failed to downcast Int16Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int16Array"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Int32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "failed to downcast Int32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int32Array"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Int64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "failed to downcast Int64Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int64Array"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::UInt32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::UInt32Array>()
-                .ok_or_else(|| "failed to downcast UInt32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast UInt32Array"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Float32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
-                .ok_or_else(|| "failed to downcast Float32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Float32Array"))?;
             Ok(a.value(left).to_bits() == a.value(right).to_bits())
         }
         DataType::Float64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast Float64Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Float64Array"))?;
             Ok(a.value(left).to_bits() == a.value(right).to_bits())
         }
         DataType::Utf8 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| "failed to downcast StringArray".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast StringArray"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Date32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Date32Array>()
-                .ok_or_else(|| "failed to downcast Date32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Date32Array"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Timestamp(unit, _) => match unit {
@@ -872,28 +904,34 @@ fn value_equal_or_both_null(array: &dyn Array, left: usize, right: usize) -> Res
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampSecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampSecondArray".to_string())?;
+                    .ok_or_else(|| analytic_contract("failed to downcast TimestampSecondArray"))?;
                 Ok(a.value(left) == a.value(right))
             }
             arrow::datatypes::TimeUnit::Millisecond => {
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampMillisecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        analytic_contract("failed to downcast TimestampMillisecondArray")
+                    })?;
                 Ok(a.value(left) == a.value(right))
             }
             arrow::datatypes::TimeUnit::Microsecond => {
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampMicrosecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        analytic_contract("failed to downcast TimestampMicrosecondArray")
+                    })?;
                 Ok(a.value(left) == a.value(right))
             }
             arrow::datatypes::TimeUnit::Nanosecond => {
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampNanosecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        analytic_contract("failed to downcast TimestampNanosecondArray")
+                    })?;
                 Ok(a.value(left) == a.value(right))
             }
         },
@@ -901,17 +939,20 @@ fn value_equal_or_both_null(array: &dyn Array, left: usize, right: usize) -> Res
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
-                .ok_or_else(|| "failed to downcast Decimal128Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Decimal128Array"))?;
             Ok(a.value(left) == a.value(right))
         }
         DataType::Decimal256(_, _) => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal256Array>()
-                .ok_or_else(|| "failed to downcast Decimal256Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Decimal256Array"))?;
             Ok(a.value(left) == a.value(right))
         }
-        other => Err(format!("unsupported key type for equality: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported key type for equality: {:?}",
+            other
+        ))),
     }
 }
 
@@ -923,7 +964,7 @@ fn compute_window_function(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
     aggregate_tracker: Option<Arc<MemTracker>>,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     match &func.kind {
         WindowFunctionKind::RowNumber => compute_row_number(window_ctx.partitions(), total_rows),
         WindowFunctionKind::Rank => compute_rank(window_ctx, total_rows),
@@ -1045,7 +1086,7 @@ fn compute_window_function(
 fn compute_row_number(
     partitions: &[(usize, usize)],
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut b = Int64Builder::with_capacity(total_rows);
     for (start, end) in partitions {
         for i in *start..*end {
@@ -1058,7 +1099,7 @@ fn compute_row_number(
 fn compute_rank(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut b = Int64Builder::with_capacity(total_rows);
     for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
         let peer_groups = window_ctx.peer_groups(part_idx)?;
@@ -1077,7 +1118,7 @@ fn compute_rank(
 fn compute_dense_rank(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut b = Int64Builder::with_capacity(total_rows);
     for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
         let peer_groups = window_ctx.peer_groups(part_idx)?;
@@ -1095,7 +1136,7 @@ fn compute_dense_rank(
 fn compute_cume_dist(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut b = Float64Builder::with_capacity(total_rows);
     for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
         let peer_groups = window_ctx.peer_groups(part_idx)?;
@@ -1115,7 +1156,7 @@ fn compute_cume_dist(
 fn compute_percent_rank(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut b = Float64Builder::with_capacity(total_rows);
     for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
         let peer_groups = window_ctx.peer_groups(part_idx)?;
@@ -1148,14 +1189,16 @@ fn compute_ntile(
     _args: &[ArrayRef],
     partitions: &[(usize, usize)],
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let buckets = if func.args.is_empty() {
-        return Err("ntile missing buckets argument".to_string());
+        return Err(analytic_contract("ntile missing buckets argument"));
     } else {
         parse_int64_literal(arena, func.args[0])?
     };
     if buckets <= 0 {
-        return Err("ntile buckets must be positive".to_string());
+        return Err(analytic_failure::parameter(
+            "ntile buckets must be positive",
+        ));
     }
 
     let mut b = Int64Builder::with_capacity(total_rows);
@@ -1187,21 +1230,21 @@ fn compute_window_custom_aggregate(
     return_type: &DataType,
     total_rows: usize,
     aggregate_tracker: Option<Arc<MemTracker>>,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let [input_array] = args else {
-        return Err(format!(
+        return Err(analytic_contract(format_args!(
             "window aggregate `{func_name}` expected one prepared physical input, got {}",
             args.len()
-        ));
+        )));
     };
     let prepared = prepared.ok_or_else(|| {
-        format!("window aggregate `{func_name}` was not prepared during pipeline construction")
+        analytic_contract(format_args!(
+            "window aggregate `{func_name}` was not prepared during pipeline construction"
+        ))
     })?;
-    let kernel = prepared
-        .kernels
-        .entries
-        .first()
-        .ok_or_else(|| format!("missing aggregate kernel for {}", func_name))?;
+    let kernel = prepared.kernels.entries.first().ok_or_else(|| {
+        analytic_contract(format_args!("missing aggregate kernel for {}", func_name))
+    })?;
 
     let mut output_values = Vec::with_capacity(total_rows);
     // Repeating one state pointer does not need a frame-sized heap allocation.
@@ -1227,8 +1270,7 @@ fn compute_window_custom_aggregate(
                     while batch_start < frame_end {
                         let batch_len = (frame_end - batch_start).min(UPDATE_ROWS);
                         let frame_input = input_array.slice(batch_start, batch_len);
-                        let input = AggregateInputBatch::try_new(Some(&frame_input), batch_len)
-                            .map_err(|error| error.to_string())?;
+                        let input = AggregateInputBatch::try_new(Some(&frame_input), batch_len)?;
                         retained_memory.update_batch(kernel, &state_ptrs[..batch_len], input)?;
                         batch_start += batch_len;
                     }
@@ -1239,13 +1281,7 @@ fn compute_window_custom_aggregate(
 
             let mut out = result?;
             if out.data_type() != return_type {
-                let from_type = out.data_type().clone();
-                out = cast(out.as_ref(), return_type).map_err(|e| {
-                    format!(
-                        "cast {} window aggregate output from {:?} to {:?}: {}",
-                        func_name, from_type, return_type, e
-                    )
-                })?;
+                out = cast(out.as_ref(), return_type).map_err(analytic_failure::cast)?;
             }
             output_values.push(agg_scalar_from_array(&out, 0)?);
         }
@@ -1263,10 +1299,10 @@ fn compute_first_last_value(
     ignore_nulls: bool,
     is_first: bool,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "first_value/last_value missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("first_value/last_value missing value argument"))?;
 
     let mut indices = UInt32Builder::with_capacity(total_rows);
 
@@ -1315,7 +1351,7 @@ fn compute_first_last_value(
                     .and_then(|v| (v >= frame_start).then_some(v))
             };
             if let Some(i) = idx {
-                indices.append_value(i as u32);
+                indices.append_value(analytic_failure::row_index(i)?);
             } else {
                 indices.append_null();
             }
@@ -1323,7 +1359,7 @@ fn compute_first_last_value(
     }
 
     let idx_arr = Arc::new(indices.finish()) as ArrayRef;
-    let out = take(value.as_ref(), idx_arr.as_ref(), None).map_err(|e| e.to_string())?;
+    let out = take(value.as_ref(), idx_arr.as_ref(), None).map_err(analytic_arrow)?;
     Ok(out)
 }
 
@@ -1333,10 +1369,10 @@ fn compute_first_value_rewrite(
     ignore_nulls: bool,
     pad_rows: i64,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "first_value_rewrite missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("first_value_rewrite missing value argument"))?;
 
     let pad_rows = if pad_rows < 0 { 0 } else { pad_rows as usize };
 
@@ -1391,7 +1427,7 @@ fn compute_first_value_rewrite(
                     .and_then(|v| (v >= frame_start).then_some(v))
             };
             if let Some(i) = idx {
-                indices.append_value(i as u32);
+                indices.append_value(analytic_failure::row_index(i)?);
             } else {
                 indices.append_null();
             }
@@ -1399,7 +1435,7 @@ fn compute_first_value_rewrite(
     }
 
     let idx_arr = Arc::new(indices.finish()) as ArrayRef;
-    let out = take(value.as_ref(), idx_arr.as_ref(), None).map_err(|e| e.to_string())?;
+    let out = take(value.as_ref(), idx_arr.as_ref(), None).map_err(analytic_arrow)?;
     Ok(out)
 }
 
@@ -1411,10 +1447,10 @@ fn compute_lead_lag(
     ignore_nulls: bool,
     is_lag: bool,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "lead/lag missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("lead/lag missing value argument"))?;
 
     let offset = if func.args.len() >= 2 {
         parse_int64_literal(arena, func.args[1])?
@@ -1422,7 +1458,9 @@ fn compute_lead_lag(
         1
     };
     if offset < 0 {
-        return Err("lead/lag offset must be non-negative".to_string());
+        return Err(analytic_failure::parameter(
+            "lead/lag offset must be non-negative",
+        ));
     }
     let offset = offset as i64;
 
@@ -1438,14 +1476,7 @@ fn compute_lead_lag(
         } else if matches!(def.data_type(), DataType::Null) {
             Some(new_null_array(value.data_type(), def.len()))
         } else {
-            let from_type = def.data_type().clone();
-            let to_type = value.data_type().clone();
-            Some(cast(def.as_ref(), value.data_type()).map_err(|e| {
-                format!(
-                    "cast lead/lag default value from {:?} to {:?}: {}",
-                    from_type, to_type, e
-                )
-            })?)
+            Some(cast(def.as_ref(), value.data_type()).map_err(analytic_failure::cast)?)
         }
     } else {
         None
@@ -1500,7 +1531,7 @@ fn compute_lead_lag(
             }
 
             if let Some(i) = found {
-                indices.append_value(i as u32);
+                indices.append_value(analytic_failure::row_index(i)?);
                 use_default.append_value(false);
             } else if default_array.is_some() {
                 indices.append_null();
@@ -1513,11 +1544,11 @@ fn compute_lead_lag(
     }
 
     let idx_arr = Arc::new(indices.finish()) as ArrayRef;
-    let taken = take(value.as_ref(), idx_arr.as_ref(), None).map_err(|e| e.to_string())?;
+    let taken = take(value.as_ref(), idx_arr.as_ref(), None).map_err(analytic_arrow)?;
 
     if let Some(def) = default_array.as_ref() {
         let mask = use_default.finish();
-        let out = zip(&mask, def, &taken).map_err(|e| e.to_string())?;
+        let out = zip(&mask, def, &taken).map_err(analytic_arrow)?;
         return Ok(out);
     }
 
@@ -1530,13 +1561,13 @@ fn compute_session_number(
     args: &[ArrayRef],
     partitions: &[(usize, usize)],
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     if func.args.len() != 2 {
-        return Err("session_number expects 2 arguments".to_string());
+        return Err(analytic_contract("session_number expects 2 arguments"));
     }
     let delta_node = arena
         .node(func.args[1])
-        .ok_or_else(|| "invalid ExprId".to_string())?;
+        .ok_or_else(|| analytic_contract("invalid ExprId"))?;
     let delta = match nullable_int64_parameter(delta_node)? {
         Some(delta) => delta,
         None => return Ok(new_null_array(&DataType::Int64, total_rows)),
@@ -1544,7 +1575,7 @@ fn compute_session_number(
 
     let value = args
         .first()
-        .ok_or_else(|| "session_number missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("session_number missing value argument"))?;
 
     let mut b = Int64Builder::with_capacity(total_rows);
 
@@ -1573,7 +1604,7 @@ fn compute_count(
     args: &[ArrayRef],
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     use novarocks_functions::builtin::aggregate_count_core as core;
     let value = args.first().cloned();
     let mut b = Int64Builder::with_capacity(total_rows);
@@ -1596,7 +1627,7 @@ fn compute_count(
             &mut |_| Ok::<_, std::convert::Infallible>(()),
         );
         result.map_err(|error| match error {
-            core::CountVisitError::Invalid(message) => message.to_owned(),
+            core::CountVisitError::Invalid(message) => analytic_contract(message),
             core::CountVisitError::Control(never) => match never {},
         })?;
     }
@@ -1608,10 +1639,10 @@ fn compute_sum(
     window_ctx: &PartitionWindowContext,
     return_type: &DataType,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "sum missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("sum missing value argument"))?;
 
     match return_type {
         DataType::Int64 => {
@@ -1640,7 +1671,7 @@ fn compute_sum(
                     } else {
                         let sum = prefix_sum[e] - prefix_sum[s];
                         let sum_i64: i64 =
-                            sum.try_into().map_err(|_| "sum overflow".to_string())?;
+                            i64::try_from(sum).map_err(analytic_failure::sum_narrow)?;
                         b.append_value(sum_i64);
                     }
                     let _ = row;
@@ -1714,9 +1745,9 @@ fn compute_sum(
                     let mut sum = prefix_sum[e] - prefix_sum[s];
                     if let Some(factor) = factor {
                         if scale_diff > 0 {
-                            sum = sum
-                                .checked_mul(factor)
-                                .ok_or_else(|| "decimal overflow".to_string())?;
+                            sum = sum.checked_mul(factor).ok_or_else(|| {
+                                analytic_failure::numeric_overflow("decimal product")
+                            })?;
                         } else {
                             sum /= factor;
                         }
@@ -1727,7 +1758,7 @@ fn compute_sum(
 
             let array = arrow::array::Decimal128Array::from(out)
                 .with_precision_and_scale(*out_precision, *out_scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(analytic_arrow)?;
             Ok(Arc::new(array))
         }
         DataType::Decimal256(out_precision, out_scale) => {
@@ -1838,10 +1869,13 @@ fn compute_sum(
 
             let array = Decimal256Array::from(out)
                 .with_precision_and_scale(*out_precision, *out_scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(analytic_arrow)?;
             Ok(Arc::new(array))
         }
-        other => Err(format!("unsupported sum return type: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported sum return type: {:?}",
+            other
+        ))),
     }
 }
 
@@ -1850,10 +1884,10 @@ fn compute_avg(
     window_ctx: &PartitionWindowContext,
     return_type: &DataType,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "avg missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("avg missing value argument"))?;
 
     match return_type {
         DataType::Float64 => {
@@ -1919,21 +1953,21 @@ fn compute_avg(
                     let mut sum = prefix_sum[e] - prefix_sum[s];
                     if let Some(factor) = factor {
                         if scale_diff > 0 {
-                            sum = sum
-                                .checked_mul(factor)
-                                .ok_or_else(|| "decimal overflow".to_string())?;
+                            sum = sum.checked_mul(factor).ok_or_else(|| {
+                                analytic_failure::numeric_overflow("decimal product")
+                            })?;
                         } else {
                             sum /= factor;
                         }
                     }
-                    let avg = div_round_i128(sum, cnt as i128);
+                    let avg = div_round_i128(sum, cnt as i128)?;
                     out.push(Some(avg));
                 }
             }
 
             let array = arrow::array::Decimal128Array::from(out)
                 .with_precision_and_scale(*out_precision, *out_scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(analytic_arrow)?;
             Ok(Arc::new(array))
         }
         DataType::Decimal256(out_precision, out_scale) => {
@@ -2047,10 +2081,13 @@ fn compute_avg(
 
             let array = Decimal256Array::from(out)
                 .with_precision_and_scale(*out_precision, *out_scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(analytic_arrow)?;
             Ok(Arc::new(array))
         }
-        other => Err(format!("unsupported avg return type: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported avg return type: {:?}",
+            other
+        ))),
     }
 }
 
@@ -2058,10 +2095,10 @@ fn compute_variance_samp(
     args: &[ArrayRef],
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "variance_samp missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("variance_samp missing value argument"))?;
 
     let mut b = Float64Builder::with_capacity(total_rows);
     for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
@@ -2093,12 +2130,12 @@ fn compute_stddev_samp(
     args: &[ArrayRef],
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let variance = compute_variance_samp(args, window_ctx, total_rows)?;
     let variance = variance
         .as_any()
         .downcast_ref::<arrow::array::Float64Array>()
-        .ok_or_else(|| "stddev_samp internal type mismatch".to_string())?;
+        .ok_or_else(|| analytic_contract("stddev_samp internal type mismatch"))?;
     let mut out = Float64Builder::with_capacity(total_rows);
     for row in 0..total_rows {
         if variance.is_null(row) {
@@ -2114,14 +2151,14 @@ fn compute_bool_or(
     args: &[ArrayRef],
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "bool_or missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("bool_or missing value argument"))?;
     let value = value
         .as_any()
         .downcast_ref::<arrow::array::BooleanArray>()
-        .ok_or_else(|| "bool_or expects boolean input".to_string())?;
+        .ok_or_else(|| analytic_contract("bool_or expects boolean input"))?;
 
     let mut b = BooleanBuilder::with_capacity(total_rows);
     for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
@@ -2144,13 +2181,13 @@ fn compute_covar_corr(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
     kind: &str,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let x = args
         .first()
-        .ok_or_else(|| format!("{} missing first argument", kind))?;
+        .ok_or_else(|| analytic_contract(format_args!("{} missing first argument", kind)))?;
     let y = args
         .get(1)
-        .ok_or_else(|| format!("{} missing second argument", kind))?;
+        .ok_or_else(|| analytic_contract(format_args!("{} missing second argument", kind)))?;
 
     let mut b = Float64Builder::with_capacity(total_rows);
     for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
@@ -2201,10 +2238,10 @@ fn compute_covar_corr(
                     }
                 }
                 other => {
-                    return Err(format!(
+                    return Err(analytic_contract(format_args!(
                         "unsupported covariance/correlation kind: {}",
                         other
-                    ));
+                    )));
                 }
             };
             if let Some(v) = out {
@@ -2225,27 +2262,27 @@ fn compute_window_array_agg(
     is_distinct: bool,
     is_asc_order: &[bool],
     nulls_first: &[bool],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     if is_asc_order.len() != nulls_first.len() {
-        return Err(format!(
+        return Err(analytic_contract(format_args!(
             "array_agg window metadata length mismatch: is_asc_order={} nulls_first={}",
             is_asc_order.len(),
             nulls_first.len()
-        ));
+        )));
     }
     let input = args
         .first()
-        .ok_or_else(|| "array_agg window function missing input argument".to_string())?;
+        .ok_or_else(|| analytic_contract("array_agg window function missing input argument"))?;
     let DataType::List(item_field) = return_type else {
-        return Err(format!(
+        return Err(analytic_contract(format_args!(
             "array_agg window return type must be LIST, got {:?}",
             return_type
-        ));
+        )));
     };
 
     let mut offsets: Vec<i32> = Vec::with_capacity(total_rows + 1);
     offsets.push(0);
-    let mut current_total: i64 = 0;
+    let mut current_total: i32 = 0;
     let mut flat_values: Vec<Option<AggScalarValue>> = Vec::new();
 
     for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
@@ -2266,57 +2303,58 @@ fn compute_window_array_agg(
             };
             for (value, _order_values) in rows {
                 if let Some(seen) = seen.as_mut() {
-                    let encoded = encode_window_approx_top_k_optional_scalar(&value);
+                    let encoded = encode_window_approx_top_k_optional_scalar(&value)?;
                     if !seen.insert(encoded) {
                         continue;
                     }
                 }
+                current_total = novarocks_functions::aggregate_scalar::checked_list_output_offset(
+                    current_total,
+                    1,
+                )?;
                 flat_values.push(value);
-                current_total += 1;
-                if current_total > i32::MAX as i64 {
-                    return Err("array_agg window output offset overflow".to_string());
-                }
             }
-            offsets.push(current_total as i32);
+            offsets.push(current_total);
         }
     }
 
     if offsets.len() != total_rows + 1 {
-        return Err(format!(
+        return Err(analytic_contract(format_args!(
             "array_agg window output size mismatch: offsets={} rows={}",
             offsets.len(),
             total_rows
-        ));
+        )));
     }
 
     let value_array = build_agg_scalar_array(item_field.data_type(), flat_values)?;
-    let list_array = ListArray::new(
+    let list_array = ListArray::try_new(
         item_field.clone(),
         OffsetBuffer::new(offsets.into()),
         value_array,
         None,
-    );
+    )
+    .map_err(analytic_arrow)?;
     Ok(Arc::new(list_array))
 }
 
 fn split_window_array_agg_row(
     row_value: Option<AggScalarValue>,
     order_key_count: usize,
-) -> Result<(Option<AggScalarValue>, Vec<Option<AggScalarValue>>), String> {
+) -> ExecutionResult<(Option<AggScalarValue>, Vec<Option<AggScalarValue>>)> {
     match row_value {
         None => Ok((None, vec![None; order_key_count])),
         Some(AggScalarValue::Struct(fields)) => {
             if fields.is_empty() {
-                return Err(
-                    "array_agg packed input struct must contain at least one field".to_string(),
-                );
+                return Err(analytic_contract(
+                    "array_agg packed input struct must contain at least one field",
+                ));
             }
             if fields.len() < (1 + order_key_count) {
-                return Err(format!(
+                return Err(analytic_contract(format_args!(
                     "array_agg packed input field count mismatch: fields={} order_keys={}",
                     fields.len(),
                     order_key_count
-                ));
+                )));
             }
             let value = fields.first().cloned().unwrap_or(None);
             let order_values = fields
@@ -2328,9 +2366,9 @@ fn split_window_array_agg_row(
         }
         Some(value) => {
             if order_key_count > 0 {
-                return Err(
-                    "array_agg ORDER BY requires packed struct input with order keys".to_string(),
-                );
+                return Err(analytic_contract(
+                    "array_agg ORDER BY requires packed struct input with order keys",
+                ));
             }
             Ok((Some(value), Vec::new()))
         }
@@ -2341,11 +2379,11 @@ fn sort_window_array_agg_rows(
     rows: &mut [(Option<AggScalarValue>, Vec<Option<AggScalarValue>>)],
     is_asc_order: &[bool],
     nulls_first: &[bool],
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     if is_asc_order.is_empty() {
         return Ok(());
     }
-    let mut error: Option<String> = None;
+    let mut error: Option<ExecutionFailure> = None;
     rows.sort_by(|(_left_value, left_keys), (_right_value, right_keys)| {
         if error.is_some() {
             return Ordering::Equal;
@@ -2380,7 +2418,7 @@ fn compare_window_array_agg_optional_values(
     right: &Option<AggScalarValue>,
     asc: bool,
     nulls_first: bool,
-) -> Result<Ordering, String> {
+) -> ExecutionResult<Ordering> {
     let ord = match (left, right) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => {
@@ -2416,32 +2454,34 @@ fn compute_window_approx_top_k(
     args: &[ArrayRef],
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
-        .ok_or_else(|| "approx_top_k window function missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("approx_top_k window function missing value argument"))?;
     let k_array = args.get(1);
     let counter_num_array = args.get(2);
 
     let DataType::List(list_field) = &func.return_type else {
-        return Err(format!(
+        return Err(analytic_contract(format_args!(
             "approx_top_k window return type must be LIST<STRUCT>, got {:?}",
             func.return_type
-        ));
+        )));
     };
     let DataType::Struct(struct_fields) = list_field.data_type() else {
-        return Err(format!(
+        return Err(analytic_contract(format_args!(
             "approx_top_k window list element type must be STRUCT, got {:?}",
             list_field.data_type()
-        ));
+        )));
     };
     if struct_fields.len() < 2 {
-        return Err("approx_top_k window output struct must have at least 2 fields".to_string());
+        return Err(analytic_contract(
+            "approx_top_k window output struct must have at least 2 fields",
+        ));
     }
 
     let mut offsets: Vec<i32> = Vec::with_capacity(total_rows + 1);
     offsets.push(0);
-    let mut current_total: i64 = 0;
+    let mut current_total: i32 = 0;
     let mut items: Vec<Option<AggScalarValue>> = Vec::new();
     let mut counts: Vec<Option<AggScalarValue>> = Vec::new();
     let mut extras: Vec<Vec<Option<AggScalarValue>>> =
@@ -2474,7 +2514,7 @@ fn compute_window_approx_top_k(
             let mut freqs: HashMap<Vec<u8>, (Option<AggScalarValue>, i64)> = HashMap::new();
             for idx in frame_start..frame_end {
                 let scalar = agg_scalar_from_array(value, idx)?;
-                let key = encode_window_approx_top_k_optional_scalar(&scalar);
+                let key = encode_window_approx_top_k_optional_scalar(&scalar)?;
                 let entry = freqs.entry(key).or_insert((scalar, 0));
                 entry.1 += 1;
             }
@@ -2492,11 +2532,11 @@ fn compute_window_approx_top_k(
                 top_entries.truncate(k);
             }
 
-            current_total += top_entries.len() as i64;
-            if current_total > i32::MAX as i64 {
-                return Err("approx_top_k window output offset overflow".to_string());
-            }
-            offsets.push(current_total as i32);
+            current_total = novarocks_functions::aggregate_scalar::checked_list_output_offset(
+                current_total,
+                top_entries.len(),
+            )?;
+            offsets.push(current_total);
 
             for (_key, (item, count)) in top_entries {
                 items.push(item);
@@ -2509,11 +2549,11 @@ fn compute_window_approx_top_k(
     }
 
     if offsets.len() != total_rows + 1 {
-        return Err(format!(
+        return Err(analytic_contract(format_args!(
             "approx_top_k window output size mismatch: offsets={} rows={}",
             offsets.len(),
             total_rows
-        ));
+        )));
     }
 
     let item_array = build_agg_scalar_array(struct_fields[0].data_type(), items)?;
@@ -2527,13 +2567,15 @@ fn compute_window_approx_top_k(
             struct_columns.push(build_agg_scalar_array(field.data_type(), values)?);
         }
     }
-    let struct_array = StructArray::new(struct_fields.clone(), struct_columns, None);
-    let list_array = ListArray::new(
+    let struct_array = StructArray::try_new(struct_fields.clone(), struct_columns, None)
+        .map_err(analytic_arrow)?;
+    let list_array = ListArray::try_new(
         list_field.clone(),
         OffsetBuffer::new(offsets.into()),
         Arc::new(struct_array),
         None,
-    );
+    )
+    .map_err(analytic_arrow)?;
     Ok(Arc::new(list_array))
 }
 
@@ -2573,19 +2615,24 @@ fn window_approx_top_k_scalar_to_i64(value: &Option<AggScalarValue>) -> Option<i
     }
 }
 
-fn encode_window_approx_top_k_optional_scalar(value: &Option<AggScalarValue>) -> Vec<u8> {
+fn encode_window_approx_top_k_optional_scalar(
+    value: &Option<AggScalarValue>,
+) -> ExecutionResult<Vec<u8>> {
     let mut out = Vec::new();
     match value {
         Some(v) => {
             out.push(1);
-            encode_window_approx_top_k_scalar(&mut out, v);
+            encode_window_approx_top_k_scalar(&mut out, v)?;
         }
         None => out.push(0),
     }
-    out
+    Ok(out)
 }
 
-fn encode_window_approx_top_k_scalar(buf: &mut Vec<u8>, value: &AggScalarValue) {
+fn encode_window_approx_top_k_scalar(
+    buf: &mut Vec<u8>,
+    value: &AggScalarValue,
+) -> ExecutionResult<()> {
     match value {
         AggScalarValue::Bool(v) => {
             buf.push(1);
@@ -2601,7 +2648,7 @@ fn encode_window_approx_top_k_scalar(buf: &mut Vec<u8>, value: &AggScalarValue) 
         }
         AggScalarValue::Utf8(v) => {
             buf.push(4);
-            let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
+            let len = analytic_failure::key_extent(v.len())?;
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(v.as_bytes());
         }
@@ -2620,25 +2667,25 @@ fn encode_window_approx_top_k_scalar(buf: &mut Vec<u8>, value: &AggScalarValue) 
         AggScalarValue::Decimal256(v) => {
             buf.push(11);
             let text = v.to_string();
-            let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
+            let len = analytic_failure::key_extent(text.len())?;
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(text.as_bytes());
         }
         AggScalarValue::Binary(v) => {
             buf.push(12);
-            let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
+            let len = analytic_failure::key_extent(v.len())?;
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(v);
         }
         AggScalarValue::Struct(items) => {
             buf.push(8);
-            let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
+            let len = analytic_failure::key_extent(items.len())?;
             buf.extend_from_slice(&len.to_le_bytes());
             for item in items {
                 match item {
                     Some(v) => {
                         buf.push(1);
-                        encode_window_approx_top_k_scalar(buf, v);
+                        encode_window_approx_top_k_scalar(buf, v)?;
                     }
                     None => buf.push(0),
                 }
@@ -2646,20 +2693,20 @@ fn encode_window_approx_top_k_scalar(buf: &mut Vec<u8>, value: &AggScalarValue) 
         }
         AggScalarValue::Map(items) => {
             buf.push(9);
-            let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
+            let len = analytic_failure::key_extent(items.len())?;
             buf.extend_from_slice(&len.to_le_bytes());
             for (k, v) in items {
                 match k {
                     Some(v) => {
                         buf.push(1);
-                        encode_window_approx_top_k_scalar(buf, v);
+                        encode_window_approx_top_k_scalar(buf, v)?;
                     }
                     None => buf.push(0),
                 }
                 match v {
                     Some(v) => {
                         buf.push(1);
-                        encode_window_approx_top_k_scalar(buf, v);
+                        encode_window_approx_top_k_scalar(buf, v)?;
                     }
                     None => buf.push(0),
                 }
@@ -2667,27 +2714,31 @@ fn encode_window_approx_top_k_scalar(buf: &mut Vec<u8>, value: &AggScalarValue) 
         }
         AggScalarValue::List(items) => {
             buf.push(10);
-            let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
+            let len = analytic_failure::key_extent(items.len())?;
             buf.extend_from_slice(&len.to_le_bytes());
             for item in items {
                 match item {
                     Some(v) => {
                         buf.push(1);
-                        encode_window_approx_top_k_scalar(buf, v);
+                        encode_window_approx_top_k_scalar(buf, v)?;
                     }
                     None => buf.push(0),
                 }
             }
         }
     }
+    Ok(())
 }
 
-fn decimal_input_scale(input_type: &DataType) -> Result<i8, String> {
+fn decimal_input_scale(input_type: &DataType) -> ExecutionResult<i8> {
     match input_type {
         DataType::Decimal128(_, scale) => Ok(*scale),
         DataType::Decimal256(_, scale) => Ok(*scale),
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(0),
-        other => Err(format!("unsupported decimal input type: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported decimal input type: {:?}",
+            other
+        ))),
     }
 }
 
@@ -2697,21 +2748,15 @@ fn compute_min_max(
     is_min: bool,
     return_type: &DataType,
     total_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let value = args
         .first()
         .cloned()
-        .ok_or_else(|| "min/max missing value argument".to_string())?;
+        .ok_or_else(|| analytic_contract("min/max missing value argument"))?;
     let value = if value.data_type() == return_type {
         value
     } else {
-        let from_type = value.data_type().clone();
-        cast(value.as_ref(), return_type).map_err(|e| {
-            format!(
-                "cast min/max argument from {:?} to {:?}: {}",
-                from_type, return_type, e
-            )
-        })?
+        cast(value.as_ref(), return_type).map_err(analytic_failure::cast)?
     };
 
     let mut indices = UInt32Builder::with_capacity(total_rows);
@@ -2726,7 +2771,7 @@ fn compute_min_max(
         )?;
         for i in idxs {
             if let Some(v) = i {
-                indices.append_value(v as u32);
+                indices.append_value(analytic_failure::row_index(v)?);
             } else {
                 indices.append_null();
             }
@@ -2734,7 +2779,7 @@ fn compute_min_max(
     }
 
     let idx_arr = Arc::new(indices.finish()) as ArrayRef;
-    let out = take(value.as_ref(), idx_arr.as_ref(), None).map_err(|e| e.to_string())?;
+    let out = take(value.as_ref(), idx_arr.as_ref(), None).map_err(analytic_arrow)?;
     Ok(out)
 }
 
@@ -2744,10 +2789,10 @@ fn compute_min_max_indices(
     part_end: usize,
     frames: &[(usize, usize)],
     is_min: bool,
-) -> Result<Vec<Option<usize>>, String> {
+) -> ExecutionResult<Vec<Option<usize>>> {
     let n = part_end - part_start;
     if frames.len() != n {
-        return Err("frame size mismatch".to_string());
+        return Err(analytic_contract("frame size mismatch"));
     }
     let mut out = Vec::with_capacity(n);
 
@@ -2802,7 +2847,7 @@ fn scan_min_max(
     start: usize,
     end: usize,
     is_min: bool,
-) -> Result<Option<usize>, String> {
+) -> ExecutionResult<Option<usize>> {
     if start >= end {
         return Ok(None);
     }
@@ -2824,55 +2869,55 @@ fn scan_min_max(
     Ok(best)
 }
 
-fn compare_at(array: &dyn Array, left: usize, right: usize) -> Result<std::cmp::Ordering, String> {
+fn compare_at(array: &dyn Array, left: usize, right: usize) -> ExecutionResult<std::cmp::Ordering> {
     match array.data_type() {
         DataType::Boolean => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| "failed to downcast BooleanArray".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast BooleanArray"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
         DataType::Int8 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
-                .ok_or_else(|| "failed to downcast Int8Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int8Array"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
         DataType::Int16 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
-                .ok_or_else(|| "failed to downcast Int16Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int16Array"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
         DataType::Int32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "failed to downcast Int32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int32Array"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
         DataType::Int64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "failed to downcast Int64Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int64Array"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
         DataType::Float32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
-                .ok_or_else(|| "failed to downcast Float32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Float32Array"))?;
             Ok(cmp_f64(a.value(left) as f64, a.value(right) as f64))
         }
         DataType::Float64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast Float64Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Float64Array"))?;
             Ok(cmp_f64(a.value(left), a.value(right)))
         }
         DataType::Timestamp(unit, _) => match unit {
@@ -2880,28 +2925,34 @@ fn compare_at(array: &dyn Array, left: usize, right: usize) -> Result<std::cmp::
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampSecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampSecondArray".to_string())?;
+                    .ok_or_else(|| analytic_contract("failed to downcast TimestampSecondArray"))?;
                 Ok(a.value(left).cmp(&a.value(right)))
             }
             arrow::datatypes::TimeUnit::Millisecond => {
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampMillisecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        analytic_contract("failed to downcast TimestampMillisecondArray")
+                    })?;
                 Ok(a.value(left).cmp(&a.value(right)))
             }
             arrow::datatypes::TimeUnit::Microsecond => {
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampMicrosecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        analytic_contract("failed to downcast TimestampMicrosecondArray")
+                    })?;
                 Ok(a.value(left).cmp(&a.value(right)))
             }
             arrow::datatypes::TimeUnit::Nanosecond => {
                 let a = array
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-                    .ok_or_else(|| "failed to downcast TimestampNanosecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        analytic_contract("failed to downcast TimestampNanosecondArray")
+                    })?;
                 Ok(a.value(left).cmp(&a.value(right)))
             }
         },
@@ -2909,31 +2960,34 @@ fn compare_at(array: &dyn Array, left: usize, right: usize) -> Result<std::cmp::
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| "failed to downcast StringArray".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast StringArray"))?;
             Ok(a.value(left).cmp(a.value(right)))
         }
         DataType::Date32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Date32Array>()
-                .ok_or_else(|| "failed to downcast Date32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Date32Array"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
         DataType::Decimal128(_, _) => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
-                .ok_or_else(|| "failed to downcast Decimal128Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Decimal128Array"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
         DataType::Decimal256(_, _) => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal256Array>()
-                .ok_or_else(|| "failed to downcast Decimal256Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Decimal256Array"))?;
             Ok(a.value(left).cmp(&a.value(right)))
         }
-        other => Err(format!("unsupported type for min/max: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported type for min/max: {:?}",
+            other
+        ))),
     }
 }
 
@@ -2951,7 +3005,7 @@ fn compute_frames_for_partition(
     part_end: usize,
     peer_groups: &[(usize, usize)],
     window: Option<&WindowFrame>,
-) -> Result<Vec<(usize, usize)>, String> {
+) -> ExecutionResult<Vec<(usize, usize)>> {
     let n = part_end - part_start;
     if n == 0 {
         return Ok(Vec::new());
@@ -3003,14 +3057,16 @@ fn rows_frame_bounds(
     part_start: usize,
     part_end: usize,
     w: &WindowFrame,
-) -> Result<(usize, usize), String> {
+) -> ExecutionResult<(usize, usize)> {
     let start = match w.start.as_ref() {
         None => part_start,
         Some(WindowBoundary::CurrentRow) => row,
         Some(WindowBoundary::Preceding(n)) => {
             let n = *n;
             if n < 0 {
-                return Err("window start PRECEDING offset must be non-negative".to_string());
+                return Err(analytic_failure::parameter(
+                    "window start PRECEDING offset must be non-negative",
+                ));
             }
             let n = n as usize;
             row.saturating_sub(n).max(part_start)
@@ -3018,7 +3074,9 @@ fn rows_frame_bounds(
         Some(WindowBoundary::Following(n)) => {
             let n = *n;
             if n < 0 {
-                return Err("window start FOLLOWING offset must be non-negative".to_string());
+                return Err(analytic_failure::parameter(
+                    "window start FOLLOWING offset must be non-negative",
+                ));
             }
             let n = n as usize;
             (row + n).min(part_end)
@@ -3031,7 +3089,9 @@ fn rows_frame_bounds(
         Some(WindowBoundary::Preceding(n)) => {
             let n = *n;
             if n < 0 {
-                return Err("window end PRECEDING offset must be non-negative".to_string());
+                return Err(analytic_failure::parameter(
+                    "window end PRECEDING offset must be non-negative",
+                ));
             }
             let v = (row as i64) - n + 1;
             if v <= part_start as i64 {
@@ -3043,7 +3103,9 @@ fn rows_frame_bounds(
         Some(WindowBoundary::Following(n)) => {
             let n = *n;
             if n < 0 {
-                return Err("window end FOLLOWING offset must be non-negative".to_string());
+                return Err(analytic_failure::parameter(
+                    "window end FOLLOWING offset must be non-negative",
+                ));
             }
             let n = n as usize;
             (row + n + 1).min(part_end)
@@ -3056,13 +3118,15 @@ fn rows_frame_bounds(
     Ok((start, end_exclusive))
 }
 
-fn parse_int64_literal(arena: &ExprArena, id: ExprId) -> Result<i64, String> {
-    let node = arena.node(id).ok_or_else(|| "invalid ExprId".to_string())?;
+fn parse_int64_literal(arena: &ExprArena, id: ExprId) -> ExecutionResult<i64> {
+    let node = arena
+        .node(id)
+        .ok_or_else(|| analytic_contract("invalid ExprId"))?;
     nullable_int64_parameter(node)?
-        .ok_or_else(|| format!("expected integer literal, got {:?}", node))
+        .ok_or_else(|| analytic_contract(format_args!("expected integer literal, got {:?}", node)))
 }
 
-fn nullable_int64_parameter(node: &ExprNode) -> Result<Option<i64>, String> {
+fn nullable_int64_parameter(node: &ExprNode) -> ExecutionResult<Option<i64>> {
     match node {
         ExprNode::Literal(LiteralValue::Null) => Ok(None),
         ExprNode::Literal(LiteralValue::Int64(value)) => Ok(Some(*value)),
@@ -3074,52 +3138,61 @@ fn nullable_int64_parameter(node: &ExprNode) -> Result<Option<i64>, String> {
             // Keep the window parameter domain narrower than try_i64's signed carriers.
             // Check the declared type before accepting a selected SQL NULL.
             match value.value_type().data_type() {
-                DataType::Int32 | DataType::Int64 => value
-                    .try_i64()
-                    .map_err(|error| format!("invalid integer constant: {error}")),
+                DataType::Int32 | DataType::Int64 => {
+                    value.try_i64().map_err(ExecutionFailure::from_domain)
+                }
                 DataType::Null => Ok(None),
-                _ => Err(format!("expected integer literal, got {:?}", node)),
+                _ => Err(analytic_contract(format_args!(
+                    "expected integer literal, got {:?}",
+                    node
+                ))),
             }
         }
-        _ => Err(format!("expected integer literal, got {:?}", node)),
+        _ => Err(analytic_contract(format_args!(
+            "expected integer literal, got {:?}",
+            node
+        ))),
     }
 }
 
-fn scalar_i64(array: &dyn Array, row: usize) -> Result<i64, String> {
+fn scalar_i64(array: &dyn Array, row: usize) -> ExecutionResult<i64> {
     match array.data_type() {
         DataType::Int8 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
-                .ok_or_else(|| "failed to downcast Int8Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int8Array"))?;
             Ok(a.value(row) as i64)
         }
         DataType::Int16 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
-                .ok_or_else(|| "failed to downcast Int16Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int16Array"))?;
             Ok(a.value(row) as i64)
         }
         DataType::Int64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "failed to downcast Int64Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int64Array"))?;
             Ok(a.value(row))
         }
         DataType::Int32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "failed to downcast Int32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Int32Array"))?;
             Ok(a.value(row) as i64)
         }
-        other => Err(format!("unsupported i64 scalar type: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported i64 scalar type: {:?}",
+            other
+        ))),
     }
 }
 
-fn scalar_i128(array: &dyn Array, row: usize) -> Result<i128, String> {
+fn scalar_i128(array: &dyn Array, row: usize) -> ExecutionResult<i128> {
     match array.data_type() {
         DataType::Int8 => scalar_i64(array, row).map(|v| v as i128),
         DataType::Int16 => scalar_i64(array, row).map(|v| v as i128),
@@ -3129,14 +3202,17 @@ fn scalar_i128(array: &dyn Array, row: usize) -> Result<i128, String> {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
-                .ok_or_else(|| "failed to downcast Decimal128Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Decimal128Array"))?;
             Ok(a.value(row))
         }
-        other => Err(format!("unsupported i128 scalar type: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported i128 scalar type: {:?}",
+            other
+        ))),
     }
 }
 
-fn scalar_i256(array: &dyn Array, row: usize) -> Result<i256, String> {
+fn scalar_i256(array: &dyn Array, row: usize) -> ExecutionResult<i256> {
     match array.data_type() {
         DataType::Int8 => scalar_i64(array, row).map(|v| i256::from_i128(v as i128)),
         DataType::Int16 => scalar_i64(array, row).map(|v| i256::from_i128(v as i128)),
@@ -3147,34 +3223,40 @@ fn scalar_i256(array: &dyn Array, row: usize) -> Result<i256, String> {
             let a = array
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| "failed to downcast Decimal256Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Decimal256Array"))?;
             Ok(a.value(row))
         }
-        other => Err(format!("unsupported i256 scalar type: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported i256 scalar type: {:?}",
+            other
+        ))),
     }
 }
 
-fn scalar_f64(array: &dyn Array, row: usize) -> Result<f64, String> {
+fn scalar_f64(array: &dyn Array, row: usize) -> ExecutionResult<f64> {
     match array.data_type() {
         DataType::Float64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast Float64Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Float64Array"))?;
             Ok(a.value(row))
         }
         DataType::Float32 => {
             let a = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
-                .ok_or_else(|| "failed to downcast Float32Array".to_string())?;
+                .ok_or_else(|| analytic_contract("failed to downcast Float32Array"))?;
             Ok(a.value(row) as f64)
         }
         DataType::Int8 => scalar_i64(array, row).map(|v| v as f64),
         DataType::Int16 => scalar_i64(array, row).map(|v| v as f64),
         DataType::Int64 => scalar_i64(array, row).map(|v| v as f64),
         DataType::Int32 => scalar_i64(array, row).map(|v| v as f64),
-        other => Err(format!("unsupported f64 scalar type: {:?}", other)),
+        other => Err(analytic_contract(format_args!(
+            "unsupported f64 scalar type: {:?}",
+            other
+        ))),
     }
 }
 
@@ -3359,7 +3441,7 @@ mod tests {
     fn runtime_state_with_limit(limit: i64) -> (RuntimeState, Arc<MemTracker>) {
         let tracker = MemTracker::new_root("analytic_test_root");
         tracker.install_limit_once(limit).unwrap();
-        let state = RuntimeState::new(
+        let state = RuntimeState::for_local_execution(
             None,
             None,
             None,
@@ -3543,12 +3625,15 @@ mod tests {
         .unwrap();
 
         let error = state
-            .push_input(&runtime, int32_chunk(vec![Some(1), Some(2)]))
+            .push_input(
+                &state.input_memory(&runtime),
+                int32_chunk(vec![Some(1), Some(2)]),
+            )
             .expect_err("input charge must enforce the hard limit");
-        assert!(
-            error.contains("ResourceExhausted"),
-            "unexpected error: {error}"
-        );
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(error.failure_fact().reason().code(), 8);
+        assert!(error.failure_fact().resource().is_some());
         assert_eq!(tracker.current(), 0, "failed input must release its charge");
     }
 
@@ -3578,15 +3663,17 @@ mod tests {
         )
         .unwrap();
 
-        state.push_input(&runtime, input).unwrap();
+        state
+            .push_input(&state.input_memory(&runtime), input)
+            .unwrap();
         assert_eq!(tracker.current(), input_bytes);
         let error = state
-            .finish(&runtime)
+            .finish(&state.input_memory(&runtime))
             .expect_err("output charge must enforce the hard limit");
-        assert!(
-            error.contains("ResourceExhausted"),
-            "unexpected error: {error}"
-        );
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(error.failure_fact().reason().code(), 8);
+        assert!(error.failure_fact().resource().is_some());
         assert_eq!(
             tracker.current(),
             input_bytes,
@@ -3617,7 +3704,7 @@ mod tests {
             .expect_err("descriptor drift should be rejected");
 
         assert!(
-            err.contains("analytic output type mismatch"),
+            err.to_string().contains("analytic output type mismatch"),
             "unexpected error: {err}"
         );
     }
@@ -3630,7 +3717,8 @@ mod tests {
             .expect_err("column count mismatch should be rejected");
 
         assert!(
-            err.contains("analytic output column count mismatch"),
+            err.to_string()
+                .contains("analytic output column count mismatch"),
             "unexpected error: {err}"
         );
     }
@@ -3643,7 +3731,7 @@ mod tests {
             .expect_err("column length mismatch should be rejected");
 
         assert!(
-            err.contains("analytic output length mismatch"),
+            err.to_string().contains("analytic output length mismatch"),
             "unexpected error: {err}"
         );
     }
@@ -3813,3 +3901,42 @@ mod by_window_required_original_tests;
 #[cfg(test)]
 #[path = "analytic_input_stage_tests.rs"]
 mod analytic_input_stage_tests;
+
+#[cfg(test)]
+mod source_operation_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    #[test]
+    fn actual_full_frame_sum_overflow_keeps_checked_narrowing_after_input_exit() {
+        let input: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![i64::MAX, 1]));
+        let weak = Arc::downgrade(&input);
+        let context = PartitionWindowContext::new(&[(0, 2)], &[], None).unwrap();
+        let failure = compute_sum(&[input], &context, &DataType::Int64, 2).unwrap_err();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 41);
+        assert!(
+            failure
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<std::num::TryFromIntError>()
+        );
+    }
+    #[test]
+    fn real_key_equality_guard_does_not_keep_its_input_array() {
+        let input: ArrayRef = Arc::new(arrow::array::BinaryArray::from(vec![
+            b"a".as_slice(),
+            b"b".as_slice(),
+        ]));
+        let weak = Arc::downgrade(&input);
+        let failure = compute_partitions(&[input], 2).unwrap_err();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 505);
+    }
+}

@@ -24,8 +24,8 @@
 use super::*;
 use crate::exec::chunk::root_schema_backing::RootSchemaInspection;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use crate::exec::operators::compiled_aggregate::expression_allocation_host;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::opaque_memory::OpaqueAllocationHost;
@@ -141,20 +141,52 @@ fn original_column_charge_is_shared_until_the_last_chunk_alias_exits() {
     assert_eq!(tracker.current(), 0);
 }
 
+fn assert_metadata_extent(refusal: &KernelFailure) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    let fact = refusal.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Representation);
+    assert!(fact.resource().is_none());
+    let representation = fact.representation().unwrap();
+    assert_eq!(
+        representation.boundary,
+        RepresentationBoundary::SingleOutput
+    );
+    assert_eq!(
+        representation.required,
+        u64::try_from((usize::MAX as u128) * (std::mem::size_of::<ArrayRef>() as u128)).ok()
+    );
+    assert_eq!(representation.extent_limit, Some(isize::MAX as u64));
+    assert_eq!(representation.representable_prefix, None);
+    let mut original: &dyn std::error::Error = refusal;
+    loop {
+        if original.downcast_ref::<std::alloc::LayoutError>().is_some() {
+            break;
+        }
+        original = original.source().expect("the actual std Layout source");
+    }
+}
+
 #[test]
 fn column_admission_refuses_overflow_and_the_real_host_limit_before_allocation() {
     let tracker = MemTracker::new_root("column-metadata-refusal");
     tracker.install_limit_once(1).unwrap();
     let host = expression_allocation_host(tracker.clone());
-    assert!(matches!(
-        OutputColumnMetadata::try_new(1, host.clone(), &Control::running()),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = OutputColumnMetadata::try_new(1, host.clone(), &Control::running())
+        .err()
+        .unwrap();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&refusal);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Resource
+    );
+    let resource = fact.resource().expect("the real positive tracker limit");
+    assert_eq!(resource.limit, Some(1));
+    assert!(resource.requested.unwrap() > 1);
     assert_eq!(tracker.current(), 0);
-    assert!(matches!(
-        OutputColumnMetadata::try_new(usize::MAX, host, &Control::running()),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = OutputColumnMetadata::try_new(usize::MAX, host, &Control::running())
+        .err()
+        .unwrap();
+    assert_metadata_extent(&refusal);
     assert_eq!(tracker.current(), 0);
 }
 
@@ -216,10 +248,10 @@ fn raw_column_capacity_is_paid_without_changing_the_logical_arity() {
 fn raw_column_capacity_rejects_overflow_and_preserves_actual_empty_capacity() {
     let tracker = MemTracker::new_root("raw-column-invalid-capacity");
     let host = expression_allocation_host(tracker.clone());
-    assert!(matches!(
-        retain_column_capacity(usize::MAX, host.clone()),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = retain_column_capacity(usize::MAX, host.clone())
+        .err()
+        .unwrap();
+    assert_metadata_extent(&refusal);
     let empty = Vec::<ArrayRef>::new();
     let zero = retain_column_capacity(empty.capacity(), host).unwrap();
     assert_eq!(zero.bytes(), 0);
@@ -344,10 +376,16 @@ fn unpublished_container_refusal_drops_the_batch_and_all_original_charges() {
         observed: AtomicBool::new(false),
         column_bytes: AtomicUsize::new(0),
     });
-    assert!(matches!(
-        publication(host.clone(), 2),
-        Err(failure) if matches!(failure.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(_)))
-    ));
+    let failure = publication(host.clone(), 2).unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&failure);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(
+        fact.reason(),
+        crate::runtime::fragment::ExecutionReason::ChunkOutputMetadata.reason()
+    );
     assert!(
         host.weak
             .lock()

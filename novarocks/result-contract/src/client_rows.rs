@@ -56,7 +56,16 @@ pub enum ClientBodyError {
 }
 impl fmt::Display for ClientBodyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.write_str(self.safe_detail())
+    }
+}
+impl std::error::Error for ClientBodyError {}
+
+impl ClientBodyError {
+    /// These fixed diagnostics contain no row payload or external credentials.
+    /// The boundary can install the text in its own bounded safe-detail type.
+    pub const fn safe_detail(&self) -> &'static str {
+        match self {
             Self::InvalidProfile => "invalid client-row profile",
             Self::EmptyBody => "empty client-row data body",
             Self::SegmentTooLarge => "client-row body exceeds segment limit",
@@ -64,10 +73,34 @@ impl fmt::Display for ClientBodyError {
             Self::InvalidRowLength => "client-row length exceeds the frozen profile",
             Self::RowCountOverflow => "client-row count overflow",
             Self::EndInsideRow => "client-row end occurs inside an unfinished row",
-        })
+        }
     }
 }
-impl std::error::Error for ClientBodyError {}
+
+impl novarocks_failure_contract::FailureProjection for ClientBodyError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::InvalidProfile => 1200,
+            Self::EmptyBody => 1201,
+            Self::SegmentTooLarge => 1202,
+            Self::PrefixWithoutPayload => 1203,
+            Self::InvalidRowLength => 1204,
+            Self::RowCountOverflow => 1205,
+            Self::EndInsideRow => 1206,
+        };
+        let class = match self {
+            // Valid completed rows can exceed the cursor's u64 representation.
+            // This unit reason carries no measured limit/request quantities.
+            Self::RowCountOverflow => FailureClass::Representation,
+            _ => FailureClass::Data,
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
 /// Validation frontier only. Socket delivery and cumulative ACK are separate
 /// owners and must not advance merely because a body validates.
@@ -205,6 +238,27 @@ mod tests {
     fn profile() -> ClientRowProfile {
         ClientRowProfile::try_new(16, 64).unwrap()
     }
+
+    fn assert_data_fact(error: ClientBodyError, code: u16) {
+        assert_body_fact(error, code, novarocks_failure_contract::FailureClass::Data);
+    }
+
+    fn assert_body_fact(
+        error: ClientBodyError,
+        code: u16,
+        class: novarocks_failure_contract::FailureClass,
+    ) {
+        use novarocks_failure_contract::{FailureEvidence, FailureProjection, domain};
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), class);
+        assert_eq!(fact.evidence(), FailureEvidence::Originating);
+        assert_eq!(fact.reason().domain(), domain::RESULT.get());
+        assert_eq!(fact.reason().code(), code);
+        assert_eq!(fact.resource(), None);
+        assert_eq!(fact.representation(), None);
+        assert!(error.safe_detail().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+        assert_eq!(error.safe_detail(), error.to_string());
+    }
     #[test]
     fn new_prefix_requires_payload_in_same_body() {
         let prefix = 3u32.to_le_bytes();
@@ -215,13 +269,16 @@ mod tests {
                     .unwrap_err(),
                 ClientBodyError::PrefixWithoutPayload
             );
+            assert_data_fact(ClientBodyError::PrefixWithoutPayload, 1203);
         }
         let body = [3, 0, 0, 0, b'a'];
         let v = ClientRowStreamCursor::new()
             .validate_body(profile(), &body)
             .unwrap();
         assert_eq!(v.after().remaining(), 2);
-        assert_eq!(v.after().validate_end(), Err(ClientBodyError::EndInsideRow));
+        let error = v.after().validate_end().unwrap_err();
+        assert_eq!(error, ClientBodyError::EndInsideRow);
+        assert_data_fact(error, 1206);
     }
     #[test]
     fn short_continuations_and_multiple_rows_preserve_payload() {
@@ -262,21 +319,25 @@ mod tests {
     }
     #[test]
     fn bounds_and_overflow_are_checked_before_frontier_changes() {
-        assert!(ClientRowProfile::try_new(4, 1).is_err());
-        assert!(ClientRowProfile::try_new(5, 0).is_err());
-        assert!(ClientRowProfile::try_new(5, (1 << 30) + 1).is_err());
+        for (segment, row) in [(4, 1), (5, 0), (5, (1 << 30) + 1)] {
+            let error = ClientRowProfile::try_new(segment, row).unwrap_err();
+            assert_eq!(error, ClientBodyError::InvalidProfile);
+            assert_data_fact(error, 1200);
+        }
         assert_eq!(
             ClientRowStreamCursor::new()
                 .validate_body(profile(), &[])
                 .unwrap_err(),
             ClientBodyError::EmptyBody
         );
+        assert_data_fact(ClientBodyError::EmptyBody, 1201);
         assert_eq!(
             ClientRowStreamCursor::new()
                 .validate_body(profile(), &[0; 17])
                 .unwrap_err(),
             ClientBodyError::SegmentTooLarge
         );
+        assert_data_fact(ClientBodyError::SegmentTooLarge, 1202);
         for length in [0u32, 65] {
             let mut body = length.to_le_bytes().to_vec();
             body.push(0);
@@ -286,6 +347,7 @@ mod tests {
                     .unwrap_err(),
                 ClientBodyError::InvalidRowLength
             );
+            assert_data_fact(ClientBodyError::InvalidRowLength, 1204);
         }
         let cursor = ClientRowStreamCursor {
             remaining: 0,
@@ -296,6 +358,11 @@ mod tests {
                 .validate_body(profile(), &[1, 0, 0, 0, 0])
                 .unwrap_err(),
             ClientBodyError::RowCountOverflow
+        );
+        assert_body_fact(
+            ClientBodyError::RowCountOverflow,
+            1205,
+            novarocks_failure_contract::FailureClass::Representation,
         );
         assert_eq!(cursor.completed_rows(), u64::MAX);
     }

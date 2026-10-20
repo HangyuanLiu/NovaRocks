@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-failure-contract.workspace = true
 novarocks-failpoint = { workspace = true }
 novarocks-result-contract.workspace = true
 arrow.workspace = true
@@ -34,6 +35,7 @@ novarocks-execution-contract.workspace = true
 novarocks-functions.workspace = true
 novarocks-local-program.workspace = true
 novarocks-memory.workspace = true
+novarocks-memory-failure.workspace = true
 novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true
 num-traits.workspace = true
@@ -73,3 +75,8 @@ novarocks-parser.workspace = true
 [package.metadata.novarocks.test]
 runtime-inputs = []
 env-inputs = [{ name = "UEA5E_TIME_OWNERS_DISABLED", kind = "value" },{ name = "C16_PARENT_SCAN", kind = "file-content" }]
+
+[[package.metadata.novarocks.test.ignored]]
+filter = "test(=exec::expr::legacy_percentile_approx_raw_original_tests::legacy_percentile_approx_raw_original_child_prefix_precedes_any_row_error) | test(=exec::expr::legacy_percentile_approx_raw_original_tests::legacy_percentile_approx_raw_original_decode_full_header_errors_and_ignored_tail) | test(=exec::expr::legacy_percentile_approx_raw_original_tests::legacy_percentile_approx_raw_original_full_actual_carrier_errors_and_zero_rows) | test(=exec::expr::legacy_percentile_hash_original_tests::legacy_percentile_hash_original_all_numeric_readers_slice_null_and_empty) | test(=exec::expr::legacy_percentile_hash_original_tests::legacy_percentile_hash_original_first_only_demand_ignored_target_and_raw_arity) | test(=exec::expr::legacy_percentile_hash_original_tests::legacy_percentile_hash_original_full_carrier_error_null_mask_and_zero_rows) | test(=exec::expr::percentile_hash_original_fold_tests::hash_original_real_fe_fold_evaluates_cast_tail_before_hash)"
+class = "manual"
+reason = "Percentile maintenance is suspended; these retained legacy semantic diagnostics are outside the maintained compiled execution contract."

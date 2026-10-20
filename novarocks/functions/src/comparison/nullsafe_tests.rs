@@ -35,7 +35,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at + 1
         {
             Err(cause)
@@ -671,7 +671,7 @@ fn compile_original_three_causes_keep_entry_observed_metadata_quantum_and_tail()
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = CompileControl {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 let error = PreparedNullSafeComparisonRecipe::try_new(&source, &source, &control)

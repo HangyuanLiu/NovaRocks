@@ -38,7 +38,7 @@ impl PureCompileControl for Control {
         assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
         self.observations.lock().unwrap().push((phase, units));
         if units > 0
-            && let Some((failed_phase, failure)) = self.failure
+            && let Some((failed_phase, failure)) = self.failure.clone()
             && phase == failed_phase
         {
             Err(failure)
@@ -845,7 +845,7 @@ fn each_projection_and_validation_phase_observes_midwork_typed_control_failures(
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                failure: Some((phase, failure)),
+                failure: Some((phase, failure.clone())),
                 ..Control::default()
             };
             let error = if phase == CompilePhase::Encode {

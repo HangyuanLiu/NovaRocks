@@ -170,19 +170,7 @@ impl From<novarocks_type_contract::owned_resources::hashmap::HashMapResourceErro
 }
 impl From<novarocks_type_contract::ControlResourceError> for InvocationPreparationFailure {
     fn from(cause: novarocks_type_contract::ControlResourceError) -> Self {
-        use novarocks_type_contract::ControlResourceError;
-        Self::Source(match cause {
-            ControlResourceError::SourceModel(detail) => ScalarResourceError::SourceModel(detail),
-            ControlResourceError::Control(
-                novarocks_type_contract::CompileControlError::ResourceExhausted,
-            ) => ScalarResourceError::Arithmetic,
-            ControlResourceError::Control(
-                novarocks_type_contract::CompileControlError::Cancelled
-                | novarocks_type_contract::CompileControlError::DeadlineExceeded,
-            ) => ScalarResourceError::Invariant(
-                "whole-invocation numerical Vec author returned a control refusal",
-            ),
-        })
+        Self::Kernel(KernelFailure::from_domain(cause))
     }
 }
 
@@ -887,8 +875,8 @@ mod tests {
         let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
         let value: ArrayRef = Arc::new(StringArray::from(vec!["{\"z\":[2,1],\"a\":\"µ\"}"; 9]));
         let empty: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
-        // Anonymous List roles are canonical. Keep the original long Data
-        // diagnostic in a named Struct field, whose authored name is exact.
+        // Complex source metadata must produce a bounded contract cause,
+        // rather than a whole-call Data String that retains its complete Debug.
         let unsupported_item = DataType::Struct(
             vec![Arc::new(Field::new(
                 "field\0µ".repeat(100),
@@ -903,7 +891,7 @@ mod tests {
             new_empty_array(&unsupported_item),
             None,
         ));
-        for (arguments, selection, activation, data) in [
+        for (arguments, selection, activation, contract_failure) in [
             (
                 vec![
                     EvaluatedArgument::Scalar(&key),
@@ -973,10 +961,12 @@ mod tests {
             assert!(actual.0 <= bound.requested_bytes, "{actual:?} > {bound:?}");
             assert!(actual.1 <= bound.requests, "{actual:?} > {bound:?}");
             assert!(actual.2 <= bound.peak_bytes, "{actual:?} > {bound:?}");
-            if data {
+            if contract_failure {
                 assert!(
-                    matches!(&result, Err(crate::ScalarInvocationFailure::Data(cause))
-                    if cause.message().len() > crate::MAX_ROW_ERROR_MESSAGE_BYTES)
+                    matches!(&result, Err(crate::ScalarInvocationFailure::Kernel(cause))
+                    if novarocks_failure_contract::FailureProjection::failure_fact(cause).class()
+                        == novarocks_failure_contract::FailureClass::Invariant
+                        && cause.to_string().len() <= crate::MAX_ROW_ERROR_MESSAGE_BYTES)
                 );
             } else {
                 assert!(result.is_ok(), "{result:?}");
@@ -1094,16 +1084,22 @@ mod tests {
         ]));
         let null: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(7)]));
         let expected = [ty(DataType::Int64, false), ty(DataType::Utf8, true)];
-        for (first, message) in [
+        for (first, contract, message) in [
             (
                 &short,
-                "evaluated argument violates its exact selected carrier",
+                Some(crate::EvaluationContractError::ArgumentLength),
+                "",
             ),
             (
                 &wrong,
+                None,
                 "evaluated argument differs from its exact selected type",
             ),
-            (&null, "non-null argument contains a selected SQL NULL"),
+            (
+                &null,
+                None,
+                "non-null argument contains a selected SQL NULL",
+            ),
         ] {
             let args = [
                 EvaluatedArgument::Column(first),
@@ -1133,10 +1129,15 @@ mod tests {
                         &ProbeControl::default(),
                     )
                 });
-            assert!(
-                matches!(original, Err(KernelFailure::InvalidProgram(ref cause))
-                if cause.message() == message)
-            );
+            let cause = original.unwrap_err();
+            if let Some(contract) = contract {
+                crate::kernel_control::test_contract::exact(&cause, contract);
+            } else {
+                assert!(
+                    matches!(cause, KernelFailure::InvalidProgram(ref diagnostic)
+                    if diagnostic.message() == message)
+                );
+            }
         }
     }
 
@@ -1339,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn invocation_scalar_resources_body_and_long_data_count_original_requests_once() {
+    fn invocation_scalar_resources_body_and_contract_error_stay_within_actual_requests() {
         let unsupported: ArrayRef = Arc::new(LargeListArray::new(
             Arc::new(Field::new("field\0µ".repeat(1024), DataType::Utf8, true)),
             OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 0])),
@@ -1369,8 +1370,13 @@ mod tests {
             assert!(actual.0 <= bound.requested_bytes, "{actual:?} > {bound:?}");
             assert!(actual.1 <= bound.requests, "{actual:?} > {bound:?}");
             assert!(actual.2 <= bound.peak_bytes, "{actual:?} > {bound:?}");
-            if let Err(message) = &result {
-                assert!(message.len() > crate::MAX_ROW_ERROR_MESSAGE_BYTES);
+            if let Err(cause) = &result {
+                assert_eq!(
+                    novarocks_failure_contract::FailureProjection::failure_fact(cause).class(),
+                    novarocks_failure_contract::FailureClass::Invariant
+                );
+                let message = cause.to_string();
+                assert!(message.len() <= crate::MAX_ROW_ERROR_MESSAGE_BYTES);
                 assert!(message.starts_with("unsupported scalar type: LargeList"));
             }
             drop(result);

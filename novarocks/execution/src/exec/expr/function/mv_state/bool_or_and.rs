@@ -20,20 +20,28 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryBuilder, BooleanBuilder};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use crate::exec::mv::state_codec::{decode_bool_state, encode_bool_state};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
-pub fn bool_or_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn bool_or_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     bool_state_union(a, b, "bool_or_state_union")
 }
 
-pub fn bool_and_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn bool_and_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     bool_state_union(a, b, "bool_and_state_union")
 }
 
-pub fn bool_or_state_visible(s: &[u8]) -> Result<Option<bool>, String> {
+pub fn bool_or_state_visible(
+    s: &[u8],
+) -> Result<Option<bool>, crate::runtime::fragment::ExecutionFailure> {
     let (count_true, count_false) = decode_bool_state(s)?;
     if count_true == 0 && count_false == 0 {
         Ok(None)
@@ -46,7 +54,9 @@ pub fn bool_or_state_visible(s: &[u8]) -> Result<Option<bool>, String> {
     }
 }
 
-pub fn bool_and_state_visible(s: &[u8]) -> Result<Option<bool>, String> {
+pub fn bool_and_state_visible(
+    s: &[u8],
+) -> Result<Option<bool>, crate::runtime::fragment::ExecutionFailure> {
     let (count_true, count_false) = decode_bool_state(s)?;
     if count_true == 0 && count_false == 0 {
         Ok(None)
@@ -64,14 +74,14 @@ pub fn eval_bool_or_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_bool_state_union(
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_bool_state_union(
         "bool_or_state_union",
         bool_or_state_union,
         arena,
         args,
         chunk,
-    ))?)
+    )
 }
 
 pub fn eval_bool_and_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -79,14 +89,14 @@ pub fn eval_bool_and_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Si
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_bool_state_union(
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_bool_state_union(
         "bool_and_state_union",
         bool_and_state_union,
         arena,
         args,
         chunk,
-    ))?)
+    )
 }
 
 pub fn eval_bool_or_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -94,14 +104,14 @@ pub fn eval_bool_or_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?S
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_bool_state_visible(
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_bool_state_visible(
         "bool_or_state_visible",
         bool_or_state_visible,
         arena,
         args,
         chunk,
-    ))?)
+    )
 }
 
 pub fn eval_bool_and_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -109,25 +119,29 @@ pub fn eval_bool_and_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_bool_state_visible(
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_bool_state_visible(
         "bool_and_state_visible",
         bool_and_state_visible,
         arena,
         args,
         chunk,
-    ))?)
+    )
 }
 
-fn bool_state_union(a: &[u8], b: &[u8], fn_name: &str) -> Result<Vec<u8>, String> {
+fn bool_state_union(
+    a: &[u8],
+    b: &[u8],
+    fn_name: &str,
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     let (left_true, left_false) = decode_bool_state(a)?;
     let (right_true, right_false) = decode_bool_state(b)?;
     let count_true = left_true
         .checked_add(right_true)
-        .ok_or_else(|| format!("{fn_name} true count overflow"))?;
+        .ok_or_else(|| super::failure::numeric(format_args!("{fn_name} true count overflow")))?;
     let count_false = left_false
         .checked_add(right_false)
-        .ok_or_else(|| format!("{fn_name} false count overflow"))?;
+        .ok_or_else(|| super::failure::numeric(format_args!("{fn_name} false count overflow")))?;
     if count_true == 0 && count_false == 0 {
         Ok(Vec::new())
     } else {
@@ -135,7 +149,7 @@ fn bool_state_union(a: &[u8], b: &[u8], fn_name: &str) -> Result<Vec<u8>, String
     }
 }
 
-type BoolStateOp = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+type BoolStateOp = fn(&[u8], &[u8]) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure>;
 
 fn eval_bool_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
@@ -143,27 +157,33 @@ fn eval_bool_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("{fn_name} expects 2 arguments, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "{fn_name} expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_bool_state_union_arrays(fn_name, op, &lhs, &rhs))?)
+    eval_bool_state_union_arrays(fn_name, op, &lhs, &rhs)
 }
 
 fn eval_bool_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
-    op: fn(&[u8]) -> Result<Option<bool>, String>,
+    op: fn(&[u8]) -> Result<Option<bool>, crate::runtime::fragment::ExecutionFailure>,
     arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 1 {
-        return Err((format!("{fn_name} expects 1 argument, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "{fn_name} expects 1 argument, got {}",
+            args.len()
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
-    Ok((eval_bool_state_visible_array(fn_name, op, &input))?)
+    eval_bool_state_visible_array(fn_name, op, &input)
 }
 
 fn eval_bool_state_union_arrays(
@@ -171,22 +191,25 @@ fn eval_bool_state_union_arrays(
     op: BoolStateOp,
     lhs: &ArrayRef,
     rhs: &ArrayRef,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count(fn_name, lhs.len(), rhs.len())?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::StateOutputTally::default();
     for row in 0..rows {
         let left = binary_value_or_empty(lhs, row_index(row, lhs.len())?, fn_name, 0)?;
         let right = binary_value_or_empty(rhs, row_index(row, rhs.len())?, fn_name, 1)?;
-        builder.append_value(op(left, right)?);
+        let payload = op(left, right)?;
+        extent.append(payload.len())?;
+        builder.append_value(payload);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 fn eval_bool_state_visible_array(
     fn_name: &str,
-    op: fn(&[u8]) -> Result<Option<bool>, String>,
+    op: fn(&[u8]) -> Result<Option<bool>, crate::runtime::fragment::ExecutionFailure>,
     input: &ArrayRef,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = BooleanBuilder::new();
     for row in 0..input.len() {
         let state = binary_value_or_empty(input, row, fn_name, 0)?;

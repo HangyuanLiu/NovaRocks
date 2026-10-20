@@ -21,12 +21,14 @@
 use super::{ExprArena, ExprNode, LiteralValue};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::eval_string_function;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, Int64Array, LargeBinaryArray, LargeStringArray, NullArray,
     StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::SlotId;
 use std::sync::Arc;
 
@@ -47,7 +49,7 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn eval(name: &str, columns: Vec<ArrayRef>) -> ExecutionResult<ArrayRef> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -154,30 +156,27 @@ fn legacy_crc32_shared_baseline_long_byte_boundaries_have_independent_zlib_oracl
     }
 }
 #[test]
-fn legacy_crc32_shared_baseline_raw_tail_is_ignored_zero_arity_panics_and_child_error_wins() {
+fn crc32_exact_unary_shape_precedes_execution_and_valid_child_error_is_preserved() {
     let mut arena = ExprArena::default();
     let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
     let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Utf8);
     let source_chunk = chunk(vec![column(vec![Some("hello")])]);
+    for arguments in [&[][..], &[source, missing][..]] {
+        let failure =
+            eval_string_function("crc32", &arena, source, arguments, &source_chunk).unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 430);
+    }
     assert_rows(
-        eval_string_function("crc32", &arena, source, &[source, missing], &source_chunk).unwrap(),
+        eval_string_function("crc32", &arena, source, &[source], &source_chunk).unwrap(),
         vec![Some(907060870)],
     );
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_string_function(
-            "crc32",
-            &arena,
-            source,
-            &[],
-            &source_chunk
-        )))
-        .is_err()
-    );
     let expected = arena.eval(missing, &source_chunk).unwrap_err();
-    assert_eq!(
-        eval_string_function("crc32", &arena, source, &[missing], &source_chunk).unwrap_err(),
-        expected
-    );
+    let failure =
+        eval_string_function("crc32", &arena, source, &[missing], &source_chunk).unwrap_err();
+    assert_eq!(failure.failure_fact(), expected.failure_fact());
+    assert_eq!(failure.to_string(), expected.to_string());
+    assert!(!failure.same_occurrence(&expected));
 }
 #[test]
 fn legacy_crc32_shared_baseline_literal_pool_and_result_metadata_ignore_match() {
@@ -235,7 +234,10 @@ fn legacy_crc32_shared_baseline_unsupported_null_and_long_dtype_errors_are_full_
             "crc32 expects VARCHAR/BINARY input, got {:?}",
             array.data_type()
         );
-        assert_eq!(eval("crc32", vec![array]).unwrap_err(), expected);
+        assert_eq!(
+            eval("crc32", vec![array]).unwrap_err().to_string(),
+            expected
+        );
     }
     let field = Arc::new(Field::new("long_field_".repeat(90), DataType::Int64, true));
     let array = Arc::new(arrow::array::StructArray::from(vec![(
@@ -247,8 +249,11 @@ fn legacy_crc32_shared_baseline_unsupported_null_and_long_dtype_errors_are_full_
         array.data_type()
     );
     assert!(expected.len() > 512);
+    let failure = eval("crc32", vec![array]).unwrap_err();
     assert_eq!(
-        eval("crc32", vec![array]).unwrap_err().as_bytes(),
-        expected.as_bytes()
+        failure.to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(&expected).to_string()
     );
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 360);
 }

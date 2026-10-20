@@ -37,8 +37,6 @@ impl DistinctSetSemantics for ExceptSemantics {
     type Marker = bool;
 
     const NODE_NAME: &'static str = "EXCEPT_NODE";
-    const GROUP_ID_SEQUENCE_MISMATCH: &'static str = "except group id sequence mismatch";
-    const GROUP_ID_OUT_OF_BOUNDS: &'static str = "except deleted flag group id out of bounds";
     const SINK_OPERATOR_NAME: &'static str = "ExceptSink";
     const SOURCE_OPERATOR_NAME: &'static str = "ExceptSource";
     const SOURCE_REJECT_INPUT_ERROR: &'static str = "except source operator does not accept input";
@@ -48,13 +46,12 @@ impl DistinctSetSemantics for ExceptSemantics {
         false
     }
 
-    fn apply_probe(marker: &mut Self::Marker, _stage: usize) -> Result<(), String> {
+    fn apply_probe(marker: &mut Self::Marker, _stage: usize) {
         *marker = true;
-        Ok(())
     }
 
-    fn marker_selected(marker: &Self::Marker, _stage_total: usize) -> Result<bool, String> {
-        Ok(!*marker)
+    fn marker_selected(marker: &Self::Marker, _stage_total: usize) -> bool {
+        !*marker
     }
 }
 

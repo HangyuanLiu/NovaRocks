@@ -45,7 +45,11 @@ fn setup(input: ArrayRef) -> (ExprArena, ExprId, Chunk) {
 fn strings(v: Vec<Option<&str>>) -> ArrayRef {
     Arc::new(StringArray::from(v))
 }
-fn call(arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> Result<ArrayRef, String> {
+fn call(
+    arena: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     super::function::variant::eval_variant_function(
         "parse_json",
         arena,
@@ -63,7 +67,7 @@ fn values(a: ArrayRef) -> Vec<Option<String>> {
         .map(|v| v.map(str::to_owned))
         .collect()
 }
-fn raw(a: ArrayRef) -> Result<ArrayRef, String> {
+fn raw(a: ArrayRef) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, child, chunk) = setup(a);
     call(&arena, &[child], &chunk)
 }
@@ -135,7 +139,10 @@ fn original_parse_json_slice_empty_and_null_carrier_downcast_before_mask() {
             Arc::new(LargeStringArray::from(vec![None::<&str>; rows])) as ArrayRef,
             Arc::new(BinaryArray::from(vec![None::<&[u8]>; rows])) as ArrayRef,
         ] {
-            assert_eq!(raw(a).unwrap_err(), "parse_json expects VARCHAR input");
+            assert_eq!(
+                (raw(a).unwrap_err()).to_string(),
+                "parse_json expects VARCHAR input"
+            );
         }
     }
 }
@@ -145,12 +152,12 @@ fn original_parse_json_local_and_arena_arity_before_child_and_required_child_err
     let missing = ExprId(usize::MAX);
     for args in [vec![], vec![child, missing]] {
         assert_eq!(
-            call(&arena, &args, &chunk).unwrap_err(),
+            (call(&arena, &args, &chunk).unwrap_err()).to_string(),
             format!("parse_json expects 1 argument, got {}", args.len())
         );
     }
     assert_eq!(
-        call(&arena, &[missing], &chunk).unwrap_err(),
+        (call(&arena, &[missing], &chunk).unwrap_err()).to_string(),
         "invalid ExprId"
     );
     let kind = super::function::lookup_function("parse_json").unwrap();
@@ -161,7 +168,7 @@ fn original_parse_json_local_and_arena_arity_before_child_and_required_child_err
             arrow::datatypes::DataType::Utf8,
         );
         assert_eq!(
-            arena.eval(root, &chunk).unwrap_err(),
+            (arena.eval(root, &chunk).unwrap_err()).to_string(),
             format!("parse_json expects 1 to 1 arguments, got {arity}")
         );
     }

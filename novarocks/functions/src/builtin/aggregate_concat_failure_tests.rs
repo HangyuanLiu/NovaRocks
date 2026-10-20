@@ -707,9 +707,7 @@ fn concat_runtime_borrowed_types_preserve_raw_source_child_nulls_and_primary_con
         let mut checkpoints = crate::kernel_input::EvaluationCheckpoints::new(control);
         let outcome = {
             let mut work = ScalarWork::new(Some(&mut checkpoints));
-            merge
-                .merge_row(&mut state, 0, &ty, &mut work)
-                .map_err(ScalarStateError::into_kernel_failure)
+            merge.merge_row(&mut state, 0, &ty, &mut work)
         };
         let outcome = checkpoints.finish_result(outcome);
         if outcome.is_ok() {
@@ -881,4 +879,55 @@ fn concat_runtime_keeps_original_dictionary_field_equality_and_real_child_negati
     }
     drop(allocator);
     assert_released(&host);
+}
+
+#[test]
+fn real_concat_intermediate_constructor_refusal_preserves_arrow_source_without_keeping_input_graph()
+{
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    let host = Arc::new(Host::default());
+    let weak_host = Arc::downgrade(&host);
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut state = GroupConcatState::new(allocator);
+    let mut row = allocator_api2::vec::Vec::new_in(state.allocator.clone());
+    row.push(None);
+    state.push_row(row, &mut ScalarWork::new(None)).unwrap();
+    let item = Arc::new(arrow_schema::Field::new(
+        "required child",
+        DataType::Utf8,
+        false,
+    ));
+    let weak_field = Arc::downgrade(&item);
+    let schema = DataType::Struct(
+        vec![arrow_schema::Field::new(
+            "values",
+            DataType::List(item.clone()),
+            true,
+        )]
+        .into(),
+    );
+    let cause = core::build_intermediate_array(
+        &schema,
+        std::iter::once(&state),
+        &mut ScalarWork::new(None),
+    )
+    .unwrap_err();
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(cause.failure_fact().reason().code(), 337);
+    let mut source = cause.source();
+    let mut actual_arrow = false;
+    while let Some(actual) = source {
+        actual_arrow |= actual.is::<arrow_schema::ArrowError>();
+        source = actual.source();
+    }
+    assert!(actual_arrow);
+    drop(schema);
+    drop(item);
+    drop(state);
+    assert!(weak_field.upgrade().is_none());
+    assert_released(&host);
+    drop(host);
+    assert!(weak_host.upgrade().is_none());
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
 }

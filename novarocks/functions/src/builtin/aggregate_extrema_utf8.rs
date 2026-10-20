@@ -52,23 +52,14 @@ fn observed<T>(
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
     let result = body(&mut work);
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
+    if matches!(&result, Err(cause) if cause.is_interruption()) {
         return result;
     }
     work.finish()?;
     result
 }
 fn copy_error(error: crate::selected_copy::CopyError) -> KernelFailure {
-    match error {
-        crate::selected_copy::CopyError::Control(cause) => cause,
-        crate::selected_copy::CopyError::Extent => KernelFailure::ResourceExhausted,
-        _ => internal("UTF8 MIN/MAX shared copy representation differs"),
-    }
+    error.into_kernel()
 }
 fn reserve<T>(count: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, KernelFailure> {
     Layout::array::<T>(count).map_err(|_| KernelFailure::ResourceExhausted)?;

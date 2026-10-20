@@ -40,7 +40,11 @@ unsafe impl Allocator for TestAllocator {
     }
 }
 impl ScalarStateAllocator for TestAllocator {
-    fn scalar_allocation_error(&self, _: &str) -> ScalarStateError {
+    fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+        &self,
+        _: &str,
+        _source: E,
+    ) -> crate::KernelFailure {
         KernelFailure::ResourceExhausted.into()
     }
 }
@@ -249,7 +253,7 @@ fn n_sort_before_refusal_preserves_every_cause_without_sort_or_footer() {
                 &mut ScalarWork::new(None),
             )
             .unwrap_err();
-        assert!(matches!(error, ScalarStateError::Kernel(actual) if actual == cause));
+        assert_eq!(error, cause);
         assert_eq!(*trace.events.lock().unwrap(), [Event::Enter(513)]);
         assert_eq!(state.values.len(), 513);
         assert!(matches!(
@@ -276,7 +280,7 @@ fn n_sort_original_leading_flush_refuses_before_scope_birth() {
         let mut state = state();
         let before = values(&state);
         let error = state.sort_values(&mut resources, &mut work).unwrap_err();
-        assert!(matches!(error, ScalarStateError::Kernel(actual) if actual == cause));
+        assert_eq!(error, cause);
         assert_eq!(*trace.events.lock().unwrap(), [Event::Check(1, false)]);
         assert_eq!(values(&state), before);
     }
@@ -373,7 +377,7 @@ fn n_sort_comparator_refusal_keeps_cause_and_releases_scope_without_footer() {
                 &mut ScalarWork::new(Some(&mut checkpoints)),
             )
             .unwrap_err();
-        assert!(matches!(error, ScalarStateError::Kernel(actual) if actual == cause));
+        assert_eq!(error, cause);
         let events = trace.events.lock().unwrap();
         let refusal = events
             .iter()

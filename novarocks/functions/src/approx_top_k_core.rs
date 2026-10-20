@@ -16,6 +16,7 @@
 // under the License.
 //! Original tracked ApproxTopK state, codec, directional count update and output.
 //! The allocator is supplied by its existing consumer; no runtime context is read.
+use crate::KernelFailure;
 use crate::aggregate_scalar::{
     self as scalar, AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
 };
@@ -24,7 +25,10 @@ use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::{Array, ArrayRef, ListArray, StructArray, new_null_array};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::DataType;
+#[path = "approx_top_k_source_failure.rs"]
+mod source_failure;
 use hashbrown::{HashMap, hash_map::DefaultHashBuilder};
+use source_failure::{self as failure, Length};
 use std::{cmp::Ordering, sync::Arc};
 pub const DEFAULT_K: usize = 5;
 pub const MAX_COUNTER_NUM: usize = 100_000;
@@ -99,12 +103,12 @@ fn scalar_to_i64(value: &Option<AggScalarValue>) -> Option<i64> {
 fn encode_optional_scalar(
     value: &Option<AggScalarValue>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<u8>, TopKFailure> {
+) -> Result<Vec<u8>, KernelFailure> {
     fn encode_into(
         buf: &mut Vec<u8>,
         value: &AggScalarValue,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), TopKFailure> {
+    ) -> Result<(), KernelFailure> {
         work.step()?;
         match value {
             AggScalarValue::Bool(v) => {
@@ -121,7 +125,7 @@ fn encode_optional_scalar(
             }
             AggScalarValue::Utf8(v) => {
                 buf.push(4);
-                let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
+                let len = failure::length(Length::Utf8, v.len())?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(v.as_bytes());
             }
@@ -140,19 +144,19 @@ fn encode_optional_scalar(
             AggScalarValue::Decimal256(v) => {
                 buf.push(11);
                 let text = v.to_string();
-                let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
+                let len = failure::length(Length::DecimalText, text.len())?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(text.as_bytes());
             }
             AggScalarValue::Binary(v) => {
                 buf.push(12);
-                let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
+                let len = failure::length(Length::Binary, v.len())?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(v);
             }
             AggScalarValue::Struct(items) => {
                 buf.push(8);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
+                let len = failure::length(Length::Struct, items.len())?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 for item in items {
                     match item {
@@ -166,7 +170,7 @@ fn encode_optional_scalar(
             }
             AggScalarValue::Map(items) => {
                 buf.push(9);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
+                let len = failure::length(Length::Map, items.len())?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 for (k, v) in items {
                     match k {
@@ -187,7 +191,7 @@ fn encode_optional_scalar(
             }
             AggScalarValue::List(items) => {
                 buf.push(10);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
+                let len = failure::length(Length::List, items.len())?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 for item in items {
                     match item {
@@ -219,66 +223,66 @@ fn aggregate_vec_with_capacity<T, A: ScalarStateAllocator>(
     capacity: usize,
     operation: &str,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ScalarVec<T, A>, TopKFailure> {
+) -> Result<ScalarVec<T, A>, KernelFailure> {
     scalar::aggregate_vec_with_capacity(allocator, capacity, operation, work)
-        .map_err(TopKFailure::Scalar)
 }
 fn aggregate_bytes<A: ScalarStateAllocator>(
     allocator: A,
     bytes: &[u8],
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ScalarVec<u8, A>, TopKFailure> {
-    scalar::scalar_bytes(allocator, bytes, work).map_err(TopKFailure::Scalar)
+) -> Result<ScalarVec<u8, A>, KernelFailure> {
+    scalar::scalar_bytes(allocator, bytes, work)
 }
 fn tracked_optional_key_fingerprint<A: ScalarStateAllocator>(
     value: &Option<TrackedAggScalarValue<A>>,
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ScalarVec<u8, A>, TopKFailure> {
+) -> Result<ScalarVec<u8, A>, KernelFailure> {
     aggregate_scalar_fingerprint::tracked_optional_key_fingerprint(value, allocator, work)
-        .map_err(TopKFailure::Scalar)
 }
 fn tracked_scalar_from_array<A: ScalarStateAllocator>(
     array: &ArrayRef,
     row: usize,
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<TrackedAggScalarValue<A>>, TopKFailure> {
-    scalar::tracked_scalar_from_array(array, row, allocator, work).map_err(TopKFailure::Scalar)
+) -> Result<Option<TrackedAggScalarValue<A>>, KernelFailure> {
+    scalar::tracked_scalar_from_array(array, row, allocator, work)
 }
 fn tracked_scalar_to_output<A: ScalarStateAllocator>(
     value: &TrackedAggScalarValue<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<AggScalarValue, TopKFailure> {
-    scalar::tracked_scalar_to_output(value, work).map_err(TopKFailure::Scalar)
+) -> Result<AggScalarValue, KernelFailure> {
+    scalar::tracked_scalar_to_output(value, work)
 }
 fn scalar_from_array(
     array: &ArrayRef,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<AggScalarValue>, TopKFailure> {
-    scalar::scalar_from_array(array, row, work).map_err(TopKFailure::Scalar)
+) -> Result<Option<AggScalarValue>, KernelFailure> {
+    scalar::scalar_from_array(array, row, work)
 }
 fn build_scalar_array(
     ty: &DataType,
     values: Vec<Option<AggScalarValue>>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, TopKFailure> {
-    scalar::build_scalar_array(ty, values, work).map_err(TopKFailure::Scalar)
+) -> Result<ArrayRef, KernelFailure> {
+    scalar::build_scalar_array(ty, values, work)
 }
 pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
     bytes: &[u8],
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<TrackedAggScalarValue<A>>, TopKFailure> {
-    fn need(bytes: &[u8], pos: usize, len: usize, label: &str) -> Result<(), TopKFailure> {
+) -> Result<Option<TrackedAggScalarValue<A>>, KernelFailure> {
+    fn need(bytes: &[u8], pos: usize, len: usize, label: &str) -> Result<(), KernelFailure> {
         if pos.checked_add(len).is_none_or(|end| end > bytes.len()) {
-            Err(format!("approx_top_k decode {label}: buffer too short").into())
+            Err(failure::malformed(format_args!(
+                "approx_top_k decode {label}: buffer too short"
+            )))
         } else {
             Ok(())
         }
     }
-    fn read_u32(bytes: &[u8], pos: &mut usize, label: &str) -> Result<usize, TopKFailure> {
+    fn read_u32(bytes: &[u8], pos: &mut usize, label: &str) -> Result<usize, KernelFailure> {
         need(bytes, *pos, 4, label)?;
         let value = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
         *pos += 4;
@@ -289,16 +293,17 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
         pos: &mut usize,
         allocator: &A,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<TrackedAggScalarValue<A>>, TopKFailure> {
+        depth: usize,
+    ) -> Result<Option<TrackedAggScalarValue<A>>, KernelFailure> {
         need(bytes, *pos, 1, "optional marker")?;
         let present = bytes[*pos];
         *pos += 1;
         match present {
             0 => Ok(None),
-            1 => decode_value(bytes, pos, allocator, work).map(Some),
-            _ => Err("approx_top_k decode: invalid optional marker"
-                .to_string()
-                .into()),
+            1 => decode_value(bytes, pos, allocator, work, depth).map(Some),
+            _ => Err(failure::malformed(
+                "approx_top_k decode: invalid optional marker",
+            )),
         }
     }
     fn decode_values<A: ScalarStateAllocator>(
@@ -307,8 +312,10 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
         allocator: &A,
         label: &str,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<ScalarVec<Option<TrackedAggScalarValue<A>>, A>, TopKFailure> {
+        depth: usize,
+    ) -> Result<ScalarVec<Option<TrackedAggScalarValue<A>>, A>, KernelFailure> {
         let len = read_u32(bytes, pos, label)?;
+        need(bytes, *pos, len, label)?;
         let mut values = aggregate_vec_with_capacity(
             allocator,
             len,
@@ -317,7 +324,7 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
         )?;
         for _ in 0..len {
             work.step()?;
-            values.push(decode_optional(bytes, pos, allocator, work)?);
+            values.push(decode_optional(bytes, pos, allocator, work, depth + 1)?);
         }
         Ok(values)
     }
@@ -326,7 +333,13 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
         pos: &mut usize,
         allocator: &A,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<TrackedAggScalarValue<A>, TopKFailure> {
+        depth: usize,
+    ) -> Result<TrackedAggScalarValue<A>, KernelFailure> {
+        if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+            return Err(failure::malformed(
+                "approx_top_k decode value exceeds maximum nesting depth",
+            ));
+        }
         need(bytes, *pos, 1, "tag")?;
         let tag = bytes[*pos];
         *pos += 1;
@@ -357,8 +370,7 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
                 let value = aggregate_bytes(allocator.clone(), &bytes[*pos..*pos + len], work)?;
                 *pos += len;
                 if tag == 4 {
-                    std::str::from_utf8(&value)
-                        .map_err(|error| format!("approx_top_k decode utf8: {error}"))?;
+                    std::str::from_utf8(&value).map_err(|source| failure::utf8("utf8", source))?;
                     TrackedAggScalarValue::Utf8(value)
                 } else {
                     TrackedAggScalarValue::Binary(value)
@@ -379,9 +391,16 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
                 allocator,
                 "struct length",
                 work,
+                depth,
             )?),
             9 => {
                 let len = read_u32(bytes, pos, "map length")?;
+                let remaining = bytes.len().saturating_sub(*pos);
+                if len > remaining / 2 {
+                    return Err(failure::malformed(
+                        "approx_top_k decode map: buffer too short",
+                    ));
+                }
                 let mut entries = aggregate_vec_with_capacity(
                     allocator,
                     len,
@@ -391,8 +410,8 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
                 for _ in 0..len {
                     work.step()?;
                     entries.push((
-                        decode_optional(bytes, pos, allocator, work)?,
-                        decode_optional(bytes, pos, allocator, work)?,
+                        decode_optional(bytes, pos, allocator, work, depth + 1)?,
+                        decode_optional(bytes, pos, allocator, work, depth + 1)?,
                     ));
                 }
                 TrackedAggScalarValue::Map(entries)
@@ -403,26 +422,28 @@ pub fn decode_optional_scalar_tracked_observed<A: ScalarStateAllocator>(
                 allocator,
                 "list length",
                 work,
+                depth,
             )?),
             11 => {
                 let len = read_u32(bytes, pos, "decimal256 length")?;
                 need(bytes, *pos, len, "decimal256 payload")?;
                 let text = std::str::from_utf8(&bytes[*pos..*pos + len])
-                    .map_err(|error| format!("approx_top_k decode decimal256: {error}"))?;
+                    .map_err(|source| failure::utf8("decimal256", source))?;
                 *pos += len;
-                TrackedAggScalarValue::Decimal256(
-                    text.parse()
-                        .map_err(|error| format!("approx_top_k decode decimal256: {error}"))?,
-                )
+                TrackedAggScalarValue::Decimal256(text.parse().map_err(failure::decimal)?)
             }
-            other => return Err(format!("approx_top_k decode: unknown tag {other}").into()),
+            other => {
+                return Err(failure::malformed(format_args!(
+                    "approx_top_k decode: unknown tag {other}"
+                )));
+            }
         })
     }
 
     let mut pos = 0;
-    let value = decode_optional(bytes, &mut pos, allocator, work)?;
+    let value = decode_optional(bytes, &mut pos, allocator, work, 0)?;
     if pos != bytes.len() {
-        return Err("approx_top_k decode: trailing bytes".to_string().into());
+        return Err(failure::malformed("approx_top_k decode: trailing bytes"));
     }
     Ok(value)
 }
@@ -438,7 +459,7 @@ pub fn ensure_initialized<A: ScalarStateAllocator>(state: &mut ApproxTopKState<A
 pub fn evict_one_counter_observed<A: ScalarStateAllocator>(
     state: &mut ApproxTopKState<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<i64, TopKFailure> {
+) -> Result<i64, KernelFailure> {
     work.flush()?;
     let victim = state
         .counts
@@ -462,7 +483,7 @@ pub fn evict_one_counter_observed<A: ScalarStateAllocator>(
 pub fn enforce_counter_limit_observed<A: ScalarStateAllocator>(
     state: &mut ApproxTopKState<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), TopKFailure> {
+) -> Result<(), KernelFailure> {
     while state.counts.len() > state.counter_num {
         evict_one_counter_observed(state, work)?;
     }
@@ -474,7 +495,7 @@ pub fn update_one_observed<A: ScalarStateAllocator>(
     value: Option<TrackedAggScalarValue<A>>,
     count: i64,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), TopKFailure> {
+) -> Result<(), KernelFailure> {
     if count <= 0 {
         return Ok(());
     }
@@ -489,10 +510,10 @@ pub fn update_one_observed<A: ScalarStateAllocator>(
     } else {
         0
     };
-    state.counts.try_reserve(1).map_err(|_| {
+    state.counts.try_reserve(1).map_err(|source| {
         state
             .allocator
-            .scalar_allocation_error("reserve approx_top_k counter")
+            .scalar_allocation_error("reserve approx_top_k counter", source)
     })?;
     state.counts.insert(
         key,
@@ -507,13 +528,13 @@ pub fn update_one_observed<A: ScalarStateAllocator>(
 pub fn serialize_state_observed<A: ScalarStateAllocator>(
     state: &ApproxTopKState<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<u8>, TopKFailure> {
+) -> Result<Vec<u8>, KernelFailure> {
     let mut out = Vec::new();
-    let k = u32::try_from(state.k).unwrap_or(DEFAULT_K as u32);
-    let counter_num = u32::try_from(state.counter_num).unwrap_or(MAX_COUNTER_NUM as u32);
+    let k = failure::length(Length::K, state.k)?;
+    let counter_num = failure::length(Length::Counter, state.counter_num)?;
     out.extend_from_slice(&k.to_le_bytes());
     out.extend_from_slice(&counter_num.to_le_bytes());
-    let count = u32::try_from(state.counts.len()).unwrap_or(u32::MAX);
+    let count = failure::length(Length::StateCount, state.counts.len())?;
     out.extend_from_slice(&count.to_le_bytes());
     for entry in state.counts.values() {
         work.step()?;
@@ -523,7 +544,7 @@ pub fn serialize_state_observed<A: ScalarStateAllocator>(
             .map(|value| tracked_scalar_to_output(value, work))
             .transpose()?;
         let value_bytes = encode_optional_scalar(&value, work)?;
-        let len = u32::try_from(value_bytes.len()).unwrap_or(u32::MAX);
+        let len = failure::length(Length::ValueBytes, value_bytes.len())?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&value_bytes);
         out.extend_from_slice(&entry.count.to_le_bytes());
@@ -535,18 +556,22 @@ pub fn deserialize_state_tracked_observed<A: ScalarStateAllocator>(
     bytes: &[u8],
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<TrackedDecodedTopK<A>, TopKFailure> {
+) -> Result<TrackedDecodedTopK<A>, KernelFailure> {
     if bytes.len() < 12 {
-        return Err("approx_top_k merge payload too short".to_string().into());
+        return Err(failure::malformed("approx_top_k merge payload too short"));
     }
     let k = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let counter_num = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let entry_num = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     if entry_num > MAX_COUNTER_NUM {
-        return Err(format!(
+        return Err(failure::malformed(format_args!(
             "approx_top_k merge entry count {entry_num} exceeds {MAX_COUNTER_NUM}"
-        )
-        .into());
+        )));
+    }
+    if entry_num > (bytes.len() - 12) / 13 {
+        return Err(failure::malformed(
+            "approx_top_k decode entries: buffer too short",
+        ));
     }
     let mut entries = aggregate_vec_with_capacity(
         allocator,
@@ -559,24 +584,24 @@ pub fn deserialize_state_tracked_observed<A: ScalarStateAllocator>(
         work.step()?;
         let value_len_end = pos
             .checked_add(4)
-            .ok_or_else(|| "approx_top_k decode entry length overflow".to_string())?;
+            .ok_or_else(|| failure::malformed("approx_top_k decode entry length overflow"))?;
         let value_len_bytes = bytes
             .get(pos..value_len_end)
-            .ok_or_else(|| "approx_top_k decode entry len failed".to_string())?;
+            .ok_or_else(|| failure::malformed("approx_top_k decode entry len failed"))?;
         let value_len = u32::from_le_bytes(value_len_bytes.try_into().unwrap()) as usize;
         pos = value_len_end;
         let value_end = pos
             .checked_add(value_len)
-            .ok_or_else(|| "approx_top_k decode value length overflow".to_string())?;
+            .ok_or_else(|| failure::malformed("approx_top_k decode value length overflow"))?;
         let count_end = value_end
             .checked_add(8)
-            .ok_or_else(|| "approx_top_k decode count offset overflow".to_string())?;
+            .ok_or_else(|| failure::malformed("approx_top_k decode count offset overflow"))?;
         let value_bytes = bytes
             .get(pos..value_end)
-            .ok_or_else(|| "approx_top_k decode value out of bounds".to_string())?;
+            .ok_or_else(|| failure::malformed("approx_top_k decode value out of bounds"))?;
         let count_bytes = bytes
             .get(value_end..count_end)
-            .ok_or_else(|| "approx_top_k decode count out of bounds".to_string())?;
+            .ok_or_else(|| failure::malformed("approx_top_k decode count out of bounds"))?;
         entries.push(TopKEntry {
             value: decode_optional_scalar_tracked_observed(value_bytes, allocator, work)?,
             count: i64::from_le_bytes(count_bytes.try_into().unwrap()),
@@ -584,7 +609,7 @@ pub fn deserialize_state_tracked_observed<A: ScalarStateAllocator>(
         pos = count_end;
     }
     if pos != bytes.len() {
-        return Err("approx_top_k decode trailing bytes".to_string().into());
+        return Err(failure::malformed("approx_top_k decode trailing bytes"));
     }
     Ok(TrackedDecodedTopK {
         k,
@@ -596,7 +621,7 @@ pub fn deserialize_state_tracked_observed<A: ScalarStateAllocator>(
 pub fn sorted_top_entries_observed<'a, A: ScalarStateAllocator>(
     state: &'a ApproxTopKState<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<(&'a ScalarVec<u8, A>, &'a TopKEntry<A>)>, TopKFailure> {
+) -> Result<Vec<(&'a ScalarVec<u8, A>, &'a TopKEntry<A>)>, KernelFailure> {
     work.flush()?;
     let mut entries = state.counts.iter().collect::<Vec<_>>();
     entries.sort_by(|(lk, lv), (rk, rv)| match rv.count.cmp(&lv.count) {
@@ -614,30 +639,28 @@ pub fn output_topk_array_observed<'a, A: ScalarStateAllocator>(
     output_type: &DataType,
     group_states: impl ExactSizeIterator<Item = &'a ApproxTopKState<A>>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, TopKFailure> {
+) -> Result<ArrayRef, KernelFailure> {
     let DataType::List(list_field) = output_type else {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "approx_top_k output type must be LIST<STRUCT>, got {:?}",
             output_type
-        )
-        .into());
+        )));
     };
     let DataType::Struct(struct_fields) = list_field.data_type() else {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "approx_top_k list element type must be STRUCT, got {:?}",
             list_field.data_type()
-        )
-        .into());
+        )));
     };
     if struct_fields.len() < 2 {
-        return Err("approx_top_k output struct must have at least 2 fields"
-            .to_string()
-            .into());
+        return Err(failure::contract(
+            "approx_top_k output struct must have at least 2 fields",
+        ));
     }
 
     let mut offsets = Vec::with_capacity(group_states.len() + 1);
     offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current: i32 = 0;
     let mut items = Vec::new();
     let mut counts = Vec::new();
     let mut extras: Vec<Vec<Option<AggScalarValue>>> =
@@ -646,11 +669,8 @@ pub fn output_topk_array_observed<'a, A: ScalarStateAllocator>(
     for state in group_states {
         work.step()?;
         let top_entries = sorted_top_entries_observed(state, work)?;
-        current += top_entries.len() as i64;
-        if current > i32::MAX as i64 {
-            return Err("approx_top_k output offset overflow".to_string().into());
-        }
-        offsets.push(current as i32);
+        current = scalar::checked_list_output_offset(current, top_entries.len())?;
+        offsets.push(current);
         for (_key, entry) in top_entries {
             work.step()?;
             items.push(
@@ -678,18 +698,20 @@ pub fn output_topk_array_observed<'a, A: ScalarStateAllocator>(
             struct_columns.push(build_scalar_array(field.data_type(), values, work)?);
         }
     }
-    let struct_array = StructArray::new(struct_fields.clone(), struct_columns, None);
-    let list_array = ListArray::new(
+    let struct_array = StructArray::try_new(struct_fields.clone(), struct_columns, None)
+        .map_err(failure::constructor)?;
+    let list_array = ListArray::try_new(
         list_field.clone(),
         OffsetBuffer::new(offsets.into()),
         Arc::new(struct_array),
         None,
-    );
+    )
+    .map_err(failure::constructor)?;
     Ok(Arc::new(list_array))
 }
 
 /// The original pre-row setup check, shared even for zero selected rows.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopKInputFailure {
     EmptyStruct,
 }
@@ -702,6 +724,15 @@ impl std::fmt::Display for TopKInputFailure {
         }
     }
 }
+impl std::error::Error for TopKInputFailure {}
+impl novarocks_failure_contract::FailureProjection for TopKInputFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &crate::DataFailureReason::InvalidValue,
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for TopKInputFailure {}
 pub fn update_input_failure(array: &ArrayRef) -> Option<TopKInputFailure> {
     if let Some(array) = array.as_any().downcast_ref::<StructArray>() {
         if array.columns().is_empty() {
@@ -710,9 +741,9 @@ pub fn update_input_failure(array: &ArrayRef) -> Option<TopKInputFailure> {
     }
     None
 }
-pub fn check_update_array(array: &ArrayRef) -> Result<(), String> {
+pub fn check_update_array(array: &ArrayRef) -> Result<(), KernelFailure> {
     match update_input_failure(array) {
-        Some(failure) => Err(failure.to_string()),
+        Some(failure) => Err(KernelFailure::from_domain(failure)),
         None => Ok(()),
     }
 }
@@ -728,7 +759,7 @@ fn update_packed_observed<A: ScalarStateAllocator>(
     counter_argument: Option<TopKArgument<'_>>,
     root_is_null: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), TopKFailure> {
+) -> Result<(), KernelFailure> {
     ensure_initialized(state);
     if let Some(argument) = k_argument {
         let k = scalar_to_i64(&scalar_from_array(argument.array, argument.row, work)?)
@@ -761,7 +792,7 @@ pub fn update_row_observed<A: ScalarStateAllocator>(
     array: &ArrayRef,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), TopKFailure> {
+) -> Result<(), KernelFailure> {
     if let Some(struct_arr) = array.as_any().downcast_ref::<StructArray>() {
         let cols = struct_arr.columns();
         check_update_array(array)?;
@@ -786,7 +817,7 @@ pub fn update_arguments_observed<A: ScalarStateAllocator>(
     state: &mut ApproxTopKState<A>,
     arguments: &[TopKArgument<'_>],
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), TopKFailure> {
+) -> Result<(), KernelFailure> {
     if arguments.len() == 1 {
         return update_row_observed(state, arguments[0].array, arguments[0].row, work);
     }
@@ -803,7 +834,7 @@ pub fn merge_payload_observed<A: ScalarStateAllocator>(
     state: &mut ApproxTopKState<A>,
     payload: &[u8],
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), TopKFailure> {
+) -> Result<(), KernelFailure> {
     let decoded = deserialize_state_tracked_observed(payload, &state.allocator, work)?;
     ensure_initialized(state);
     let has_entries = !decoded.entries.is_empty();
@@ -824,87 +855,61 @@ pub fn merge_payload_observed<A: ScalarStateAllocator>(
     Ok(())
 }
 
-#[derive(Debug)]
-pub enum TopKFailure {
-    Original(String),
-    Scalar(scalar::ScalarStateError),
-}
-impl From<String> for TopKFailure {
-    fn from(v: String) -> Self {
-        Self::Original(v)
-    }
-}
-impl From<scalar::ScalarStateError> for TopKFailure {
-    fn from(v: scalar::ScalarStateError) -> Self {
-        Self::Scalar(v)
-    }
-}
-impl std::fmt::Display for TopKFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Original(v) => v.fmt(f),
-            Self::Scalar(v) => v.fmt(f),
-        }
-    }
-}
-impl std::error::Error for TopKFailure {}
 pub fn decode_optional_scalar_tracked<A: ScalarStateAllocator>(
     bytes: &[u8],
     allocator: &A,
-) -> Result<Option<TrackedAggScalarValue<A>>, String> {
+) -> Result<Option<TrackedAggScalarValue<A>>, KernelFailure> {
     decode_optional_scalar_tracked_observed(bytes, allocator, &mut ScalarWork::new(None))
-        .map_err(|e| e.to_string())
 }
-pub fn evict_one_counter<A: ScalarStateAllocator>(state: &mut ApproxTopKState<A>) -> i64 {
+pub fn evict_one_counter<A: ScalarStateAllocator>(
+    state: &mut ApproxTopKState<A>,
+) -> Result<i64, KernelFailure> {
     evict_one_counter_observed(state, &mut ScalarWork::new(None))
-        .expect("tracked approx_top_k value must materialize")
 }
-pub fn enforce_counter_limit<A: ScalarStateAllocator>(state: &mut ApproxTopKState<A>) -> () {
+pub fn enforce_counter_limit<A: ScalarStateAllocator>(
+    state: &mut ApproxTopKState<A>,
+) -> Result<(), KernelFailure> {
     enforce_counter_limit_observed(state, &mut ScalarWork::new(None))
-        .expect("tracked approx_top_k value must materialize")
 }
 pub fn update_one<A: ScalarStateAllocator>(
     state: &mut ApproxTopKState<A>,
     value: Option<TrackedAggScalarValue<A>>,
     count: i64,
-) -> Result<(), String> {
-    update_one_observed(state, value, count, &mut ScalarWork::new(None)).map_err(|e| e.to_string())
+) -> Result<(), KernelFailure> {
+    update_one_observed(state, value, count, &mut ScalarWork::new(None))
 }
-pub fn serialize_state<A: ScalarStateAllocator>(state: &ApproxTopKState<A>) -> Vec<u8> {
+pub fn serialize_state<A: ScalarStateAllocator>(
+    state: &ApproxTopKState<A>,
+) -> Result<Vec<u8>, KernelFailure> {
     serialize_state_observed(state, &mut ScalarWork::new(None))
-        .map_err(|error| error.to_string())
-        .expect("tracked approx_top_k value must materialize")
 }
 pub fn deserialize_state_tracked<A: ScalarStateAllocator>(
     bytes: &[u8],
     allocator: &A,
-) -> Result<TrackedDecodedTopK<A>, String> {
+) -> Result<TrackedDecodedTopK<A>, KernelFailure> {
     deserialize_state_tracked_observed(bytes, allocator, &mut ScalarWork::new(None))
-        .map_err(|e| e.to_string())
 }
 pub fn sorted_top_entries<A: ScalarStateAllocator>(
     state: &ApproxTopKState<A>,
-) -> Vec<(&ScalarVec<u8, A>, &TopKEntry<A>)> {
+) -> Result<Vec<(&ScalarVec<u8, A>, &TopKEntry<A>)>, KernelFailure> {
     sorted_top_entries_observed(state, &mut ScalarWork::new(None))
-        .expect("tracked approx_top_k value must materialize")
 }
 pub fn output_topk_array<'a, A: ScalarStateAllocator>(
     output_type: &DataType,
     group_states: impl ExactSizeIterator<Item = &'a ApproxTopKState<A>>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, KernelFailure> {
     output_topk_array_observed(output_type, group_states, &mut ScalarWork::new(None))
-        .map_err(|e| e.to_string())
 }
 pub fn update_row<A: ScalarStateAllocator>(
     state: &mut ApproxTopKState<A>,
     array: &ArrayRef,
     row: usize,
-) -> Result<(), String> {
-    update_row_observed(state, array, row, &mut ScalarWork::new(None)).map_err(|e| e.to_string())
+) -> Result<(), KernelFailure> {
+    update_row_observed(state, array, row, &mut ScalarWork::new(None))
 }
 pub fn merge_payload<A: ScalarStateAllocator>(
     state: &mut ApproxTopKState<A>,
     payload: &[u8],
-) -> Result<(), String> {
-    merge_payload_observed(state, payload, &mut ScalarWork::new(None)).map_err(|e| e.to_string())
+) -> Result<(), KernelFailure> {
+    merge_payload_observed(state, payload, &mut ScalarWork::new(None))
 }

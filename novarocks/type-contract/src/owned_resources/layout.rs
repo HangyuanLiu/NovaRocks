@@ -35,6 +35,19 @@ pub enum LayoutResourceError {
     BytesShared,
 }
 
+impl std::fmt::Display for LayoutResourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SourceModel => "allocation layout source model is unsupported",
+            Self::ArcHeader => "Arc header layout cannot be represented",
+            Self::ArcBacking => "Arc backing layout cannot be represented",
+            Self::Arithmetic => "allocation request layout arithmetic overflow",
+            Self::BytesShared => "shared Bytes backing layout cannot be represented",
+        })
+    }
+}
+impl std::error::Error for LayoutResourceError {}
+
 pub fn arc_layout(payload: Layout) -> Result<Layout, LayoutResourceError> {
     if !LOCKED_TOOLCHAIN {
         return Err(LayoutResourceError::SourceModel);

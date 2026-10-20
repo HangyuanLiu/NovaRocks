@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 use arrow::array::{Array, ArrayRef, MapArray, StructArray, make_array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -28,24 +28,34 @@ pub fn eval_map_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if args.is_empty() {
-        return Err(("map_concat expects at least one argument".to_string()).into());
+        return Err(expression_contract(
+            "map_concat expects at least one argument",
+        ));
     }
 
     let mut map_arrays = Vec::<ArrayRef>::with_capacity(args.len());
     for arg in args {
         let arr = arena.eval(*arg, chunk)?;
-        arr.as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| format!("map_concat expects MapArray, got {:?}", arr.data_type()))?;
+        arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+            expression_contract(format_args!(
+                "map_concat expects MapArray, got {:?}",
+                arr.data_type()
+            ))
+        })?;
+        crate::exec::expr::function::array::common::validate_rows(
+            arr.len(),
+            chunk.len(),
+            "map_concat input",
+        )?;
         map_arrays.push(arr);
     }
 
     let first_map = map_arrays[0]
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| "map_concat internal type mismatch".to_string())?;
+        .ok_or_else(|| expression_contract("map_concat internal type mismatch"))?;
     let mut all_keys = Vec::<ArrayRef>::with_capacity(map_arrays.len());
     let mut all_values = Vec::<ArrayRef>::with_capacity(map_arrays.len());
 
@@ -56,36 +66,30 @@ pub fn eval_map_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         "map_concat",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err(("map_concat map entries type must be Struct".to_string()).into());
+        return Err(expression_contract(
+            "map_concat map entries type must be Struct",
+        ));
     };
     if fields.len() != 2 {
-        return Err(("map_concat map entries type must have 2 fields".to_string()).into());
+        return Err(expression_contract(
+            "map_concat map entries type must have 2 fields",
+        ));
     }
 
     for arr in &map_arrays {
         let map = arr
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "map_concat internal map downcast failed".to_string())?;
+            .ok_or_else(|| expression_contract("map_concat internal map downcast failed"))?;
         let mut keys = map.keys().clone();
         let mut values = map.values().clone();
         if keys.data_type() != fields[0].data_type() {
-            keys = cast(&keys, fields[0].data_type()).map_err(|e| {
-                format!(
-                    "map_concat failed to cast keys to output type {:?}: {}",
-                    fields[0].data_type(),
-                    e
-                )
-            })?;
+            keys = cast(&keys, fields[0].data_type())
+                .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
         }
         if values.data_type() != fields[1].data_type() {
-            values = cast(&values, fields[1].data_type()).map_err(|e| {
-                format!(
-                    "map_concat failed to cast values to output type {:?}: {}",
-                    fields[1].data_type(),
-                    e
-                )
-            })?;
+            values = cast(&values, fields[1].data_type())
+                .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
         }
         all_keys.push(keys);
         all_values.push(values);
@@ -110,7 +114,7 @@ pub fn eval_map_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let map = map_arrays[src_idx]
                 .as_any()
                 .downcast_ref::<MapArray>()
-                .ok_or_else(|| "map_concat internal map downcast failed".to_string())?;
+                .ok_or_else(|| expression_contract("map_concat internal map downcast failed"))?;
             let row_idx = super::common::row_index(row, map.len());
             if map.is_null(row_idx) {
                 continue;
@@ -146,12 +150,12 @@ pub fn eval_map_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         }
 
         for (src, idx) in picked {
+            current = novarocks_functions::aggregate_scalar::checked_map_output_offset(
+                current as i32,
+                1,
+            )? as i64;
             keys_mutable.extend(src, idx, idx + 1);
             values_mutable.extend(src, idx, idx + 1);
-            current += 1;
-        }
-        if current > i32::MAX as i64 {
-            return Err(("map_concat offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
@@ -159,7 +163,13 @@ pub fn eval_map_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let out_keys = make_array(keys_mutable.freeze());
     let out_values = make_array(values_mutable.freeze());
-    let out_entries = StructArray::new(fields.clone(), vec![out_keys, out_values], None);
+    let out_entries = StructArray::try_new(fields.clone(), vec![out_keys, out_values], None)
+        .map_err(|source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "map_concat StructArray",
+                source,
+            )
+        })?;
     let out = MapArray::try_new(
         map_field,
         OffsetBuffer::new(out_offsets.into()),
@@ -167,6 +177,11 @@ pub fn eval_map_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         null_builder.finish(),
         ordered,
     )
-    .map_err(|e| format!("map_concat: {}", e))?;
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_concat constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }

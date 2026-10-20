@@ -20,7 +20,7 @@ use arrow::array::{Array, ArrayRef, BinaryArray, StringBuilder};
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 
 fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
@@ -31,7 +31,12 @@ pub fn eval_bitmap_to_string<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "bitmap_to_string requires exactly one argument",
+        ));
+    }
     let input = arena.eval(args[0], chunk)?;
 
     // NullArray (literal NULL) → all-null output
@@ -47,12 +52,18 @@ pub fn eval_bitmap_to_string<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
         .as_any()
         .downcast_ref::<BinaryArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "bitmap_to_string expects BITMAP/BINARY input, got {:?}",
                 input.data_type()
-            )
+            ))
         })?;
     let mut builder = StringBuilder::new();
+    let mut bytes = 0i32;
+    crate::exec::expr::function::array::common::validate_rows(
+        arr.len(),
+        chunk.len(),
+        "bitmap_to_string input",
+    )?;
     for row in 0..chunk.len() {
         let idx = row_index(row, arr.len());
         if arr.is_null(idx) {
@@ -60,6 +71,8 @@ pub fn eval_bitmap_to_string<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
             continue;
         }
         let out = novarocks_functions::bitmap_to_string_core::render(arr.value(idx))?;
+        bytes =
+            novarocks_functions::aggregate_scalar::checked_utf8_output_offset(bytes, out.len())?;
         builder.append_value(out);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)

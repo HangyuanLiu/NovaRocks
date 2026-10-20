@@ -83,7 +83,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.fail {
+        match self.fail.clone() {
             Some((refusal, cause)) if at == refusal => Err(cause),
             _ => Ok(()),
         }
@@ -131,7 +131,7 @@ fn prefixes(
 ) {
     for at in positions {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(preflight_flat_constant_stream(input, field, bound, &verifier(), &control), Err(TypeCodecError::Control(actual)) if actual == cause)
             );
@@ -805,7 +805,7 @@ fn pool_prefixes(
 ) {
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(matches!(
                 projected.preflight_pool_resources(ty, policy, &control),
                 Err(FlatPoolResourceError::Control(actual)) if actual == cause

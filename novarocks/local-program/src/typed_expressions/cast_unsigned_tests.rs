@@ -253,7 +253,7 @@ fn unsigned_cast_type_checks_preserve_original_control_at_success_and_error_tail
                 ] {
                     let control = Trace {
                         at: Some(at),
-                        cause,
+                        cause: cause.clone(),
                         seen: Mutex::new(vec![]),
                         refused: Mutex::new(false),
                     };

@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, Int64Array, ListArray};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -25,7 +27,7 @@ fn try_eval_cast_literal_json_array_length<__Eval: crate::exec::expr::ExprEvalua
     out_expr: ExprId,
     arg_expr: ExprId,
     num_rows: usize,
-) -> Option<Result<ArrayRef, String>> {
+) -> Option<ExecutionResult<ArrayRef>> {
     let ExprNode::Cast(child_expr, _) = arena.node(arg_expr)? else {
         return None;
     };
@@ -40,10 +42,7 @@ fn try_eval_cast_literal_json_array_length<__Eval: crate::exec::expr::ExprEvalua
     let parsed: JsonValue = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            return Some(Err(format!(
-                "array_length constant json array parse failed: {}",
-                e
-            )));
+            return Some(Err(super::common::json_literal_failure(e)));
         }
     };
     let out = match parsed {
@@ -53,9 +52,7 @@ fn try_eval_cast_literal_json_array_length<__Eval: crate::exec::expr::ExprEvalua
         }
         JsonValue::Null => Arc::new(Int64Array::from(vec![None; num_rows])) as ArrayRef,
         _ => {
-            return Some(Err(
-                "array_length constant cast source must be a JSON array".to_string(),
-            ));
+            return Some(Err(super::common::json_array_required_failure()));
         }
     };
     Some(super::common::cast_output(
@@ -70,7 +67,12 @@ pub fn eval_array_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "array_length requires exactly 1 prepared argument(s)",
+        ));
+    }
     if let Some(result) = try_eval_cast_literal_json_array_length(arena, expr, args[0], chunk.len())
     {
         return Ok((result)?);
@@ -81,10 +83,12 @@ pub fn eval_array_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let out = Arc::new(Int64Array::from(vec![None; chunk.len()])) as ArrayRef;
         return Ok((super::common::cast_output(out, arena.data_type(expr), "array_length"))?);
     }
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_length expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_length expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
 
     let mut out = Vec::with_capacity(list.len());
     let offsets = list.value_offsets();

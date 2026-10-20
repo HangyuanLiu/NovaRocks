@@ -126,7 +126,7 @@ fn compare(
                 panic!("missing original Data error: {result:?}")
             };
             assert_eq!(error.selected_ordinal(), ordinal);
-            assert_eq!(error.message(), message);
+            assert_eq!(error.message(), message.to_string());
         }
     }
 }
@@ -383,7 +383,7 @@ fn decimal128_rescale_original_core_large_work_observation_and_host_refusal_keep
                 Ok(array)
             }
             Err(crate::decimal128_rescale::DecimalRescaleError::Host(cause)) => Err(cause),
-            Err(crate::decimal128_rescale::DecimalRescaleError::Data(message)) => {
+            Err(crate::decimal128_rescale::DecimalRescaleError::Domain(message)) => {
                 panic!("valid original input failed: {message}")
             }
         }
@@ -418,7 +418,7 @@ fn decimal128_rescale_prepare_every_callback_preserves_three_compile_causes_no_f
                 assert!(at <= stop);
             }
             t.push(n);
-            if let Some((stop, cause)) = self.refusal
+            if let Some((stop, cause)) = self.refusal.clone()
                 && at == stop
             {
                 return Err(cause);
@@ -450,7 +450,7 @@ fn decimal128_rescale_prepare_every_callback_preserves_three_compile_causes_no_f
         ] {
             let c = CompileControl {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             let error = PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
@@ -468,28 +468,20 @@ fn decimal128_rescale_prepare_every_callback_preserves_three_compile_causes_no_f
 }
 
 #[test]
-fn decimal128_rescale_recipe_original_extreme_delta_panic_is_not_a_kernel_failure() {
-    fn difference(left: i8, right: i8) -> i8 {
-        left - right
-    }
-    let arithmetic = std::panic::catch_unwind(|| {
-        difference(std::hint::black_box(38), std::hint::black_box(i8::MIN))
-    });
+fn decimal128_rescale_extreme_delta_is_exact_and_never_overflows_i8() {
     for (policy, allow) in modes() {
         let r = recipe(38, 38, 38, i8::MIN, true, policy, allow);
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let a = input(38, 38, vec![Some(1)]);
-            r.evaluate_row(EvaluatedArgument::Column(&a), 0, 0, &Control::default())
-        }));
-        if arithmetic.is_err() {
-            assert!(out.is_err());
-        } else {
-            let CastRowResult::RowError(error) = out.unwrap().unwrap() else {
-                panic!("original wrapped delta must produce its Data error")
-            };
+        let values = input(38, 38, vec![Some(i128::MIN), Some(i128::MAX), Some(1)]);
+        for row in 0..values.len() {
             assert_eq!(
-                error.message(),
-                "CAST failed: from Decimal128(38, 38) to Decimal128(38, -128): decimal scale overflow while casting DECIMAL"
+                r.evaluate_row(
+                    EvaluatedArgument::Column(&values),
+                    row,
+                    row,
+                    &Control::default()
+                )
+                .unwrap(),
+                CastRowResult::Decimal128(0)
             );
         }
         let hidden: ArrayRef = Arc::new(
@@ -521,15 +513,18 @@ fn decimal128_rescale_single_pow_option_and_original_result_projection() {
             Some(10_i128.pow(exp as u32))
         );
         assert_eq!(
-            crate::legacy_decimal::pow10_i128(exp),
-            Ok(10_i128.pow(exp as u32))
+            crate::legacy_decimal::pow10_i128(exp).unwrap(),
+            10_i128.pow(exp as u32)
         );
     }
     for exp in [39, 128, u32::MAX as usize] {
         assert_eq!(crate::legacy_decimal::checked_pow10_i128(exp), None);
         assert_eq!(
             crate::legacy_decimal::pow10_i128(exp),
-            Err("decimal overflow".to_string())
+            Err(crate::legacy_decimal::DecimalMathFailure::Power {
+                exponent: exp,
+                bits: 128
+            })
         );
     }
 }

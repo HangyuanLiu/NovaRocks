@@ -21,8 +21,8 @@
 //! allocator/library internals and formal host memory grants remain open.
 
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallInput,
-    SelectedValues,
+    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError,
+    ScalarCallInput, SelectedValues, Selection,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
@@ -31,16 +31,18 @@ use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::{
-    alloc::Layout,
     fmt::{self, Write},
     sync::Arc,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DecodeError {
     ShortPercent,
     HexPair(u8, u8),
-    Utf8 { index: usize, length: Option<usize> },
+    Utf8 {
+        index: usize,
+        source: std::str::Utf8Error,
+    },
 }
 fn hex(byte: u8) -> Option<u8> {
     match byte {
@@ -133,7 +135,7 @@ impl Utf8Scan {
             Some(error) if final_block || error.error_len().is_some() => {
                 self.failure = Some(DecodeError::Utf8 {
                     index: self.processed + error.valid_up_to(),
-                    length: error.error_len(),
+                    source: error,
                 });
             }
             Some(error) => {
@@ -210,31 +212,7 @@ fn row_error(
         work,
         refusal: None,
     };
-    let result = match error {
-        DecodeError::ShortPercent => {
-            write!(diagnostic, "decode string contains illegal hex chars: %")
-        }
-        DecodeError::HexPair(left, right) => write!(
-            diagnostic,
-            "decode string contains illegal hex chars: {}{}",
-            char::from(left),
-            char::from(right)
-        ),
-        DecodeError::Utf8 {
-            index,
-            length: Some(length),
-        } => write!(
-            diagnostic,
-            "url_decode utf8 decode failed: invalid utf-8 sequence of {length} bytes from index {index}"
-        ),
-        DecodeError::Utf8 {
-            index,
-            length: None,
-        } => write!(
-            diagnostic,
-            "url_decode utf8 decode failed: incomplete utf-8 byte sequence from index {index}"
-        ),
-    };
+    let result = write!(diagnostic, "{error}");
     if let Some(cause) = diagnostic.refusal {
         return Err(cause);
     }
@@ -243,34 +221,29 @@ fn row_error(
     let text = std::str::from_utf8(&diagnostic.bytes[..diagnostic.length])
         .map_err(|_| internal("url_decode diagnostic is not UTF-8"))?;
     diagnostic.work.flush()?;
-    let error = RowDataError::new(ordinal, text);
+    let error = RowDataError::with_reason(ordinal, crate::DataFailureReason::InvalidEncoding, text);
     diagnostic.work.flush()?;
     Ok(error)
 }
-fn output_capacity(rows: usize, bytes: usize, errors: usize) -> Result<(), KernelFailure> {
-    let error_slots = Layout::array::<RowDataError>(errors)
-        .map_err(|_| KernelFailure::ResourceExhausted)?
-        .size();
+fn output_layout(rows: usize, bytes: usize, errors: usize) -> Result<(), KernelFailure> {
+    let error_slots = super::string_failure::array_layout::<RowDataError>(errors)?.size();
     let messages = errors
         .checked_mul(crate::MAX_ROW_ERROR_MESSAGE_BYTES)
         .ok_or(KernelFailure::ResourceExhausted)?;
-    Layout::array::<u8>(messages).map_err(|_| KernelFailure::ResourceExhausted)?;
+    super::string_failure::array_layout::<u8>(messages)?;
     error_slots
         .checked_add(messages)
         .ok_or(KernelFailure::ResourceExhausted)?;
-    i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
     let offsets = rows
         .checked_add(1)
         .ok_or(KernelFailure::ResourceExhausted)?;
-    let offsets = Layout::array::<i32>(offsets)
-        .map_err(|_| KernelFailure::ResourceExhausted)?
-        .size();
+    let offsets = super::string_failure::array_layout::<i32>(offsets)?.size();
     let bitmap = rows
         .checked_add(63)
         .map(|bits| bits / 64)
         .and_then(|words| words.checked_mul(8))
         .ok_or(KernelFailure::ResourceExhausted)?;
-    Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
+    super::string_failure::array_layout::<u8>(bitmap)?;
     bytes
         .checked_add(offsets)
         .and_then(|value| value.checked_add(bitmap))
@@ -304,116 +277,14 @@ pub(super) fn evaluate_string_url_decode<'a>(
                 "URL decoding differs from its exact installed profile",
             ));
         }
-        let values = argument
-            .array()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| internal("URL decoding selected carrier is not Utf8"))?;
         let selection = input.selection();
-        output_capacity(selection.len(), 0, 0)?;
-        let mut error_count = 0usize;
-        let mut output_bytes = 0usize;
-        for (ordinal, batch_row) in selection.iter().enumerate() {
-            let row = argument.value_row(ordinal, batch_row);
-            work.step()?;
-            if row >= values.len() {
-                return Err(internal("URL decoding selected row is outside its carrier"));
-            }
-            if values.is_null(row) {
-                if !source.nullable() {
-                    return Err(internal(
-                        "URL decoding non-null source contains selected SQL NULL",
-                    ));
-                }
-                continue;
-            }
-            let selected = values.value(row);
-            match inspect(selected, &mut work)? {
-                Ok(length) => {
-                    output_bytes = output_bytes
-                        .checked_add(length)
-                        .ok_or(KernelFailure::ResourceExhausted)?;
-                }
-                Err(_) => {
-                    error_count = error_count
-                        .checked_add(1)
-                        .ok_or(KernelFailure::ResourceExhausted)?;
-                }
-            }
-        }
-        output_capacity(selection.len(), output_bytes, error_count)?;
-        work.flush()?;
-        let mut errors = Vec::new();
-        errors
-            .try_reserve_exact(error_count)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        work.flush()?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(output_bytes)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        work.flush()?;
-        let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(selection.len() + 1)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        work.flush()?;
-        let mut validity = BooleanBufferBuilder::new(selection.len());
-        work.flush()?;
-        offsets.push(0i32);
-        let mut has_null = false;
-        for (ordinal, batch_row) in selection.iter().enumerate() {
-            let row = argument.value_row(ordinal, batch_row);
-            if values.is_null(row) {
-                has_null = true;
-                validity.append(false);
-            } else {
-                let selected = values.value(row);
-                match inspect(selected, &mut work)? {
-                    Err(error) => {
-                        has_null = true;
-                        validity.append(false);
-                        errors.push(row_error(error, ordinal, &mut work)?);
-                        work.step()?;
-                    }
-                    Ok(length) => {
-                        if length > output_bytes - bytes.len() {
-                            return Err(internal("url_decode exceeded its measured output extent"));
-                        }
-                        let start = bytes.len();
-                        let copied = walk_decoded(selected, &mut work, |byte, work| {
-                            bytes.push(byte);
-                            work.step()
-                        })?
-                        .map_err(|_| {
-                            internal("url_decode immutable source changed after inspection")
-                        })?;
-                        if copied != length || bytes.len() - start != length {
-                            return Err(internal(
-                                "url_decode differs from its measured row extent",
-                            ));
-                        }
-                        validity.append(true);
-                    }
-                }
-            }
-            offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
-            work.step()?;
-        }
-        if bytes.len() != output_bytes || errors.len() != error_count {
-            return Err(internal(
-                "URL decoding differs from its measured output extent",
-            ));
-        }
-        work.flush()?;
-        let array = Arc::new(StringArray::new(
-            OffsetBuffer::new(offsets.into()),
-            Buffer::from(bytes),
-            has_null.then(|| NullBuffer::new(validity.finish())),
-        )) as ArrayRef;
-        work.flush()?;
-        let errors = errors.into_boxed_slice();
-        work.flush()?;
+        let (array, errors) = build_decoded(
+            *argument,
+            selection,
+            source.nullable(),
+            DecodeDemand::Journal,
+            &mut work,
+        )?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
             target.data_type(),
@@ -422,16 +293,252 @@ pub(super) fn evaluate_string_url_decode<'a>(
             || work.step(),
         )
     })();
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
-        return result;
+    work.finish_result(result)
+}
+
+#[derive(Clone, Copy)]
+enum DecodeDemand {
+    Journal,
+    Required,
+}
+fn build_decoded(
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    nullable: bool,
+    demand: DecodeDemand,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<(ArrayRef, Box<[RowDataError]>), KernelFailure> {
+    let values = argument
+        .array()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| internal("URL decoding selected carrier is not Utf8"))?;
+    output_layout(selection.len(), 0, 0)?;
+    let mut error_count = 0usize;
+    let mut output_offset = 0i32;
+    for (ordinal, batch_row) in selection.iter().enumerate() {
+        let row = argument.value_row(ordinal, batch_row);
+        work.step()?;
+        if row >= values.len() {
+            return Err(internal("URL decoding selected row is outside its carrier"));
+        }
+        if values.is_null(row) {
+            if !nullable {
+                return Err(internal(
+                    "URL decoding non-null source contains selected SQL NULL",
+                ));
+            }
+            continue;
+        }
+        let selected = values.value(row);
+        match inspect(selected, work)? {
+            Ok(length) => {
+                output_offset =
+                    crate::aggregate_scalar::checked_utf8_output_offset(output_offset, length)?;
+            }
+            Err(error) => {
+                if matches!(demand, DecodeDemand::Required) {
+                    return Err(KernelFailure::from_domain(RequiredDecodeFailure {
+                        ordinal,
+                        cause: error,
+                    }));
+                }
+                error_count = error_count
+                    .checked_add(1)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+            }
+        }
     }
-    work.finish()?;
-    result
+    let output_bytes = output_offset as usize;
+    output_layout(selection.len(), output_bytes, error_count)?;
+    work.flush()?;
+    let mut errors = Vec::new();
+    errors.try_reserve_exact(error_count).map_err(|source| {
+        super::string_failure::reservation::<RowDataError>(error_count, source)
+    })?;
+    work.flush()?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(output_bytes)
+        .map_err(|source| super::string_failure::reservation::<u8>(output_bytes, source))?;
+    work.flush()?;
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve_exact(selection.len() + 1)
+        .map_err(|source| super::string_failure::reservation::<i32>(selection.len() + 1, source))?;
+    work.flush()?;
+    let mut validity = BooleanBufferBuilder::new(selection.len());
+    work.flush()?;
+    offsets.push(0i32);
+    let mut has_null = false;
+    for (ordinal, batch_row) in selection.iter().enumerate() {
+        let row = argument.value_row(ordinal, batch_row);
+        if values.is_null(row) {
+            has_null = true;
+            validity.append(false);
+        } else {
+            let selected = values.value(row);
+            match inspect(selected, work)? {
+                Err(error) => {
+                    has_null = true;
+                    validity.append(false);
+                    errors.push(row_error(error, ordinal, work)?);
+                    work.step()?;
+                }
+                Ok(length) => {
+                    if length > output_bytes - bytes.len() {
+                        return Err(internal("url_decode exceeded its measured output extent"));
+                    }
+                    let start = bytes.len();
+                    let copied = walk_decoded(selected, work, |byte, work| {
+                        bytes.push(byte);
+                        work.step()
+                    })?
+                    .map_err(|_| {
+                        internal("url_decode immutable source changed after inspection")
+                    })?;
+                    if copied != length || bytes.len() - start != length {
+                        return Err(internal("url_decode differs from its measured row extent"));
+                    }
+                    validity.append(true);
+                }
+            }
+        }
+        offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
+        work.step()?;
+    }
+    if bytes.len() != output_bytes || errors.len() != error_count {
+        return Err(internal(
+            "URL decoding differs from its measured output extent",
+        ));
+    }
+    work.flush()?;
+    let array = Arc::new(StringArray::new(
+        OffsetBuffer::new(offsets.into()),
+        Buffer::from(bytes),
+        has_null.then(|| NullBuffer::new(validity.finish())),
+    )) as ArrayRef;
+    work.flush()?;
+    let errors = errors.into_boxed_slice();
+    work.flush()?;
+    Ok((array, errors))
+}
+
+/// Required consumers fail on their first selected invalid value. The bounded
+/// journal remains a selected-call product and never owns source arrays.
+pub fn evaluate_required(input: &ArrayRef, batch_rows: usize) -> Result<ArrayRef, KernelFailure> {
+    let values = input
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| decode_contract("url_decode expects string"))?;
+    let rows = values.len().max(batch_rows);
+    if values.len() != 1 && values.len() != rows {
+        return Err(decode_contract(format_args!(
+            "url_decode input length mismatch: {} vs {rows}",
+            values.len()
+        )));
+    }
+    let argument = if values.len() == 1 {
+        EvaluatedArgument::Scalar(input)
+    } else {
+        EvaluatedArgument::Column(input)
+    };
+    let mut work = EvaluationCheckpoints::new(&DirectControl);
+    let result = build_decoded(
+        argument,
+        Selection::all(rows),
+        true,
+        DecodeDemand::Required,
+        &mut work,
+    )
+    .map(|(array, _)| array);
+    work.finish_result(result)
+}
+struct DirectControl;
+impl KernelEvaluationControl for DirectControl {
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        Err(internal("direct URL decoding must not wait"))
+    }
+}
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShortPercent => f.write_str("decode string contains illegal hex chars: %"),
+            Self::HexPair(left, right) => write!(
+                f,
+                "decode string contains illegal hex chars: {}{}",
+                char::from(*left),
+                char::from(*right)
+            ),
+            Self::Utf8 { index, source } => match source.error_len() {
+                Some(length) => write!(
+                    f,
+                    "url_decode utf8 decode failed: invalid utf-8 sequence of {length} bytes from index {index}"
+                ),
+                None => write!(
+                    f,
+                    "url_decode utf8 decode failed: incomplete utf-8 byte sequence from index {index}"
+                ),
+            },
+        }
+    }
+}
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Utf8 { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug)]
+struct RequiredDecodeFailure {
+    ordinal: usize,
+    cause: DecodeError,
+}
+impl std::fmt::Display for RequiredDecodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl std::error::Error for RequiredDecodeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for RequiredDecodeFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &crate::DataFailureReason::InvalidEncoding,
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for RequiredDecodeFailure {}
+#[derive(Debug)]
+struct DecodeContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for DecodeContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for DecodeContract {}
+impl novarocks_failure_contract::FailureProjection for DecodeContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(364).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for DecodeContract {}
+fn decode_contract(detail: impl std::fmt::Display) -> KernelFailure {
+    KernelFailure::from_domain(DecodeContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
 }
 
 #[cfg(test)]

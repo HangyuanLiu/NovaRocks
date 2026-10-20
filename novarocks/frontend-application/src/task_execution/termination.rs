@@ -37,7 +37,7 @@ pub(crate) fn render_termination_detail(detail: Option<&TerminationDetail>) -> S
 mod tests {
     use super::render_termination_detail;
     use novarocks_execution::task_execution::{
-        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TerminationDetail,
+        AbortCause, CancelReason, SafeDetail, TaskFailure, TerminationDetail,
     };
     use novarocks_execution_contract::TaskFailurePhase;
 
@@ -48,7 +48,13 @@ mod tests {
             (TaskFailurePhase::Preparation, "PREPARATION"),
         ] {
             let failure = TerminationDetail::Failed(TaskFailure::new_in_phase(
-                TaskFailureCategory::Execution,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Data,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
                 SafeDetail::new("map key must not be NULL").expect("bounded safe detail"),
                 phase,
             ));

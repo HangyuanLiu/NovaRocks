@@ -264,9 +264,9 @@ mod compile_control_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let failure = MvCreateProviderError::from_compile(control.into());
+            let failure = MvCreateProviderError::from_compile(control.clone().into());
             let direct = engine_error(failure.clone());
-            assert_eq!(direct.compile_control_error(), Some(control));
+            assert_eq!(direct.compile_control_error(), Some(control.clone()));
             assert_eq!(direct.kind(), MvApplicationErrorKind::Engine);
             let product = provider_failure(failure).into_product_error();
             let terminal = product_error(product);

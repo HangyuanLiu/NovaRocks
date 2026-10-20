@@ -93,7 +93,7 @@ fn prefixes<T>(phase: CompilePhase, mut run: impl FnMut(&TestControl) -> Result<
     for at in 1..=baseline.len() {
         for cause in causes() {
             let c = TestControl {
-                failure: Some((at, cause)),
+                failure: Some((at, cause.clone())),
                 events: Mutex::new(Vec::new()),
             };
             assert!(
@@ -435,7 +435,7 @@ fn semantic_known_root_requests_win_before_caller_pending_255_late_causes() {
     .unwrap();
     for cause in causes() {
         let c = TestControl {
-            failure: Some((2, cause)),
+            failure: Some((2, cause.clone())),
             events: Mutex::new(Vec::new()),
         };
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
@@ -505,7 +505,7 @@ fn semantic_real_wide_paths_preserve_order_and_sample_actual_quantum() {
     for at in [1, quantum + 1, baseline.len()] {
         for cause in causes() {
             let c = TestControl {
-                failure: Some((at, cause)),
+                failure: Some((at, cause.clone())),
                 events: Mutex::new(Vec::new()),
             };
             assert!(
@@ -574,12 +574,12 @@ fn pruning_original_constructor_prefunds_actual_dynamic_walk_work_independently(
     for at in 1..=baseline.len() {
         for cause in causes() {
             let c = TestControl {
-                failure: Some((at, cause)),
+                failure: Some((at, cause.clone())),
                 events: Mutex::new(Vec::new()),
             };
             let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Decode);
             let result = match &mut w {
-                Err(cause) => Err(FrozenPruningError::Control(*cause)),
+                Err(cause) => Err(FrozenPruningError::Control(cause.clone())),
                 Ok(w) => FrozenFragmentPruning::try_new_in(
                     source.fragment(),
                     source.witnesses().to_vec(),

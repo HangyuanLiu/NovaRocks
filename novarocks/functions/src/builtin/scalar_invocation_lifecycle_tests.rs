@@ -96,9 +96,10 @@ impl InvocationScalarKernelInstance for Instance {
                 let original = "original whole scalar µ diagnostic: ".repeat(101);
                 assert!(original.capacity() <= 8192);
                 control.checkpoint(19)?;
-                Err(ScalarInvocationFailure::Data(
-                    slot.publish_original(original),
-                ))
+                Err(ScalarInvocationFailure::Data(slot.publish_original(
+                    crate::DataFailureReason::InvalidValue,
+                    original,
+                )))
             }
         }
     }

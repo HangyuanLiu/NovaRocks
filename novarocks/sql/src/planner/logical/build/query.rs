@@ -851,7 +851,7 @@ mod constant_identity_tests {
             let mut trace = self.trace.lock().unwrap();
             trace.push((phase, units));
             if self.refuse == Some(trace.len() - 1) {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -948,11 +948,11 @@ mod constant_identity_tests {
                 let control = Control {
                     trace: Default::default(),
                     refuse: Some(stop),
-                    cause,
+                    cause: cause.clone(),
                 };
                 let error = run(&control).unwrap_err();
                 assert!(matches!(
-                    (cause, error),
+                    (cause.clone(), error),
                     (CompileControlError::Cancelled, SqlCompileError::Cancelled)
                         | (
                             CompileControlError::DeadlineExceeded,

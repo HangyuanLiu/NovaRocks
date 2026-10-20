@@ -49,8 +49,11 @@ fn config(spec: &AggSpec) -> ArrayAggConfig<'_> {
         input_arg_type: spec.input_arg_type.as_ref(),
     }
 }
-fn merge_input_list_array(array: &ArrayRef) -> Result<(&ListArray, Option<&StructArray>), String> {
-    core::merge_input_list_array(array).map_err(|e| e.to_string())
+fn merge_input_list_array(
+    array: &ArrayRef,
+) -> crate::runtime::fragment::ExecutionResult<(&ListArray, Option<&StructArray>)> {
+    core::merge_input_list_array(array)
+        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
 }
 use super::common::tracked_optional_key_fingerprint;
 #[cfg(test)]
@@ -65,21 +68,27 @@ fn to_common_scalar(value: &ArrayAggValue) -> super::common::AggScalarValue {
     core::to_common_scalar(value, &mut ScalarWork::new(None))
         .expect("legacy scalar observer cannot fail")
 }
-fn first_field_item_type(field: &Field) -> Result<DataType, String> {
+fn first_field_item_type(field: &Field) -> crate::runtime::fragment::ExecutionResult<DataType> {
     match field.data_type() {
         DataType::List(item) => Ok(item.data_type().clone()),
-        other => Err(format!(
-            "array_agg intermediate struct field must be ARRAY, got {:?}",
-            other
-        )),
+        other => Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "array_agg intermediate struct field must be ARRAY, got {:?}",
+                other
+            )),
+        ),
     }
 }
 
-fn first_item_type_from_update_input(input_type: &DataType) -> Result<DataType, String> {
+fn first_item_type_from_update_input(
+    input_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<DataType> {
     match input_type {
         DataType::Struct(fields) => {
             let first = fields.first().ok_or_else(|| {
-                "array_agg input struct must contain at least 1 field".to_string()
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "array_agg input struct must contain at least 1 field",
+                )
             })?;
             Ok(first.data_type().clone())
         }
@@ -87,12 +96,16 @@ fn first_item_type_from_update_input(input_type: &DataType) -> Result<DataType, 
     }
 }
 
-fn unique_item_type_from_update_input(input_type: &DataType) -> Result<DataType, String> {
+fn unique_item_type_from_update_input(
+    input_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<DataType> {
     match input_type {
         DataType::List(item) => Ok(item.data_type().clone()),
         DataType::Struct(fields) => {
             let first = fields.first().ok_or_else(|| {
-                "array_unique_agg input struct must contain at least 1 field".to_string()
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "array_unique_agg input struct must contain at least 1 field",
+                )
             })?;
             if let DataType::List(item) = first.data_type() {
                 Ok(item.data_type().clone())
@@ -104,28 +117,35 @@ fn unique_item_type_from_update_input(input_type: &DataType) -> Result<DataType,
     }
 }
 
-fn first_item_type_from_intermediate_input(input_type: &DataType) -> Result<DataType, String> {
+fn first_item_type_from_intermediate_input(
+    input_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<DataType> {
     match input_type {
-        DataType::List(field) => match field.data_type() {
-            DataType::Struct(fields) => {
-                let first = fields.first().ok_or_else(|| {
-                    "array_agg merge ARRAY<STRUCT> input must contain at least 1 struct field"
-                        .to_string()
+        DataType::List(field) => {
+            match field.data_type() {
+                DataType::Struct(fields) => {
+                    let first = fields.first().ok_or_else(|| {
+                    crate::exec::expr::agg::functions::aggregate_binding_contract("array_agg merge ARRAY<STRUCT> input must contain at least 1 struct field")
                 })?;
-                Ok(first.data_type().clone())
+                    Ok(first.data_type().clone())
+                }
+                other => Ok(other.clone()),
             }
-            other => Ok(other.clone()),
-        },
+        }
         DataType::Struct(fields) => {
             let first = fields.first().ok_or_else(|| {
-                "array_agg merge struct input must contain at least 1 field".to_string()
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "array_agg merge struct input must contain at least 1 field",
+                )
             })?;
             first_field_item_type(first)
         }
-        other => Err(format!(
-            "array_agg merge input must be ARRAY or STRUCT, got {:?}",
-            other
-        )),
+        other => Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "array_agg merge input must be ARRAY or STRUCT, got {:?}",
+                other
+            )),
+        ),
     }
 }
 
@@ -164,8 +184,12 @@ impl AggregateFunction for ArrayAggAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let input_type = input_type.ok_or_else(|| "array_agg input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "array_agg input type missing",
+            )
+        })?;
         let base_name = func.name.as_str();
         let is_asc_order = func.order.is_asc_order.clone();
         let nulls_first = func.order.nulls_first.clone();
@@ -181,7 +205,14 @@ impl AggregateFunction for ArrayAggAgg {
                 nulls_first,
             },
             "array_unique_agg" => AggKind::ArrayUniqueAgg,
-            other => return Err(format!("unsupported array agg function: {}", other)),
+            other => {
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "unsupported array agg function: {}",
+                        other
+                    )),
+                );
+            }
         };
 
         let arg_types = extract_arg_types(input_type);
@@ -247,10 +278,10 @@ impl AggregateFunction for ArrayAggAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "array_agg input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("array_agg input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -258,10 +289,10 @@ impl AggregateFunction for ArrayAggAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "array_agg merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("array_agg merge input missing")
+        })?;
         let _ = merge_input_list_array(arr)?;
         Ok(AggInputView::Any(arr))
     }
@@ -276,9 +307,11 @@ impl AggregateFunction for ArrayAggAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked array_agg requires an aggregate memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked array_agg requires an aggregate memory tracker",
+            )
         })?;
         unsafe {
             std::ptr::write(
@@ -310,9 +343,11 @@ impl AggregateFunction for ArrayAggAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("array_agg batch input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "array_agg batch input type mismatch",
+            ));
         };
         let config = config(spec);
         if matches!(spec.kind, AggKind::ArrayUniqueAgg) && array.as_any().is::<ListArray>() {
@@ -326,13 +361,13 @@ impl AggregateFunction for ArrayAggAgg {
                     false,
                     &mut ScalarWork::new(None),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
             }
             return Ok(());
         }
         let (value, wrapper) =
             core::unwrap_update_value_array(&config, array, &mut ScalarWork::new(None))
-                .map_err(|e| e.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
             if let Some(wrapper) = wrapper {
@@ -344,7 +379,7 @@ impl AggregateFunction for ArrayAggAgg {
                     wrapper.is_null(row),
                     &mut ScalarWork::new(None),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
             } else {
                 core::update_row(
                     state,
@@ -354,7 +389,7 @@ impl AggregateFunction for ArrayAggAgg {
                     false,
                     &mut ScalarWork::new(None),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
             }
         }
 
@@ -367,17 +402,20 @@ impl AggregateFunction for ArrayAggAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("array_agg merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "array_agg merge input type mismatch",
+            ));
         };
         // Preserve original validation before any group iteration, including an empty batch.
-        let _ = core::merge_input_list_array(array).map_err(|e| e.to_string())?;
+        let _ = core::merge_input_list_array(array)
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
         let config = config(spec);
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
             core::merge_row(state, config.kind, array, row, &mut ScalarWork::new(None))
-                .map_err(|e| e.to_string())?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from)?;
         }
         Ok(())
     }
@@ -388,7 +426,7 @@ impl AggregateFunction for ArrayAggAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         core::build_array(
             &config(spec),
             group_states
@@ -397,7 +435,7 @@ impl AggregateFunction for ArrayAggAgg {
             output_intermediate,
             &mut ScalarWork::new(None),
         )
-        .map_err(|e| e.to_string())
+        .map_err(crate::runtime::fragment::ExecutionFailure::from)
     }
 }
 
@@ -581,9 +619,10 @@ mod tests {
             Some(ArrayAggValue::Utf8("x".to_string())),
         ]));
         let mut expected = vec![1];
-        expected.extend(super::super::common::key_fingerprint(&to_common_scalar(
-            value.as_ref().unwrap(),
-        )));
+        expected.extend(
+            super::super::common::key_fingerprint(&to_common_scalar(value.as_ref().unwrap()))
+                .unwrap(),
+        );
 
         assert_eq!(distinct_key(&value), expected);
         assert_eq!(distinct_key(&None), vec![0]);

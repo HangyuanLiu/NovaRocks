@@ -229,10 +229,8 @@ impl MvProductError {
         self.compile_control = error;
         self
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 
     pub const fn kind(&self) -> MvProductErrorKind {

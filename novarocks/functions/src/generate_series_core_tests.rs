@@ -53,51 +53,100 @@ fn generate_series_shared_core_keeps_raw_values_counts_null_and_return_conversio
     }
 }
 #[test]
-fn generate_series_shared_core_keeps_whole_call_data_and_original_math_edges() {
+fn generate_series_whole_call_causes_distinguish_data_contract_and_output_extent() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
     let a = values(&[Some(1)]);
     let b = values(&[Some(2)]);
     let zero = values(&[Some(0)]);
-    match expand_observed(&a, &b, Some(&zero), 1, false, &mut |_| {
+    let cause = match expand_observed(&a, &b, Some(&zero), 1, false, &mut |_| {
         Ok::<(), KernelFailure>(())
     }) {
-        Err(SeriesFailure::Data(message)) => assert_eq!(
-            message,
-            "table function generate_series step size cannot equal zero"
-        ),
-        other => panic!("expected original whole-call Data, got {other:?}"),
-    }
+        Err(SeriesFailure::Cause(cause @ SeriesError::ZeroStep)) => cause,
+        other => panic!("expected zero-step cause, got {other:?}"),
+    };
+    assert_eq!(cause.failure_fact().class(), FailureClass::Data);
+    let narrow = result_column(vec![Some(128)], &[DataType::Int8]).unwrap_err();
+    assert!(matches!(
+        narrow,
+        SeriesError::ValueOutOfRange {
+            value: 128,
+            data_type: DataType::Int8
+        }
+    ));
+    assert_eq!(narrow.failure_fact().class(), FailureClass::Data);
     assert_eq!(
-        result_column(vec![Some(128)], &[DataType::Int8]).unwrap_err(),
-        "table function generate_series value out of TINYINT range: 128"
+        narrow.failure_fact(),
+        crate::DataFailureReason::NumericOutOfRange.failure_fact()
     );
-    assert_eq!(
-        result_column(vec![Some(1)], &[]).unwrap_err(),
-        "table function generate_series expects 1 return type, got 0"
+    assert_ne!(
+        narrow.failure_fact().reason(),
+        cause.failure_fact().reason()
     );
-    let ty = DataType::FixedSizeBinary(16);
-    let max = largeint::array_from_i128(&[Some(i128::MAX)]).unwrap();
-    let step = largeint::array_from_i128(&[Some(1)]).unwrap();
-    assert_eq!(
-        expand(&max, &max, Some(&step), 1, false).unwrap_err(),
-        format!(
-            "table function generate_series value overflow: current={} step=1",
-            i128::MAX
-        )
-    );
-    assert_eq!(ty, DataType::FixedSizeBinary(16));
+    let missing = result_column(vec![Some(1)], &[]).unwrap_err();
+    assert!(matches!(missing, SeriesError::ReturnCount { actual: 0 }));
+    assert_eq!(missing.failure_fact().class(), FailureClass::Invariant);
     let mut total = MAX_TABLE_FUNCTION_OUTPUT_ROWS;
+    let extent = checked_add_output_rows(&mut total, 1).unwrap_err();
+    assert_eq!(total, MAX_TABLE_FUNCTION_OUTPUT_ROWS);
+    assert_eq!(extent.failure_fact().class(), FailureClass::Representation);
+    let representation = extent.failure_fact().representation().unwrap();
     assert_eq!(
-        checked_add_output_rows(&mut total, 1).unwrap_err(),
-        "table function output too large"
+        representation.boundary,
+        RepresentationBoundary::SingleOutput
     );
-    assert_eq!(total, MAX_TABLE_FUNCTION_OUTPUT_ROWS + 1);
-    let before = std::panic::catch_unwind(|| count(i128::MIN, i128::MAX, 1));
-    if cfg!(debug_assertions) {
-        assert!(before.is_err());
-    } else {
-        assert_eq!(before.unwrap().unwrap(), 0);
-    }
+    assert_eq!(representation.required, Some(u64::from(u32::MAX) + 1));
+    assert_eq!(representation.extent_limit, Some(u64::from(u32::MAX)));
+    let extreme = count(i128::MIN, i128::MAX, 1).unwrap_err();
+    assert!(matches!(
+        extreme,
+        SeriesError::OutputRows { required: None }
+    ));
+    assert_eq!(extreme.failure_fact().class(), FailureClass::Representation);
+    assert_eq!(
+        extreme.failure_fact().representation().unwrap().required,
+        None
+    );
+    assert!(matches!(count(1, 2, 0), Err(SeriesError::ZeroStep)));
 }
+
+#[test]
+fn generate_series_signed_extremes_do_not_require_an_unused_successor() {
+    for (start, stop, step, expected) in [
+        (i128::MAX, i128::MAX, 1, vec![Some(i128::MAX)]),
+        (i128::MIN, i128::MIN, -1, vec![Some(i128::MIN)]),
+        (0, i128::MIN, i128::MIN, vec![Some(0), Some(i128::MIN)]),
+        (
+            i128::MIN,
+            i128::MAX,
+            i128::MAX,
+            vec![Some(i128::MIN), Some(-1), Some(i128::MAX - 1)],
+        ),
+        (
+            i128::MAX,
+            i128::MIN,
+            i128::MIN,
+            vec![Some(i128::MAX), Some(-1)],
+        ),
+    ] {
+        let a = largeint::array_from_i128(&[Some(start)]).unwrap();
+        let b = largeint::array_from_i128(&[Some(stop)]).unwrap();
+        let c = largeint::array_from_i128(&[Some(step)]).unwrap();
+        let expanded = expand(&a, &b, Some(&c), 1, false).unwrap();
+        assert_eq!(expanded.values, expected);
+        assert_eq!(expanded.total_rows, expected.len());
+        assert_eq!(expanded.row_counts, vec![expected.len()]);
+    }
+    let argument = values(&[Some(1)]);
+    assert!(matches!(
+        integer_argument(&argument, 1, 2, IntegerDiagnosticContext::GenerateSeries),
+        Err(SeriesError::ArgumentBounds {
+            argument: 2,
+            row: 1,
+            rows: 1
+        })
+    ));
+}
+
 fn causes() -> [KernelFailure; 7] {
     [
         KernelFailure::Cancelled,

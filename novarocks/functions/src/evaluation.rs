@@ -214,33 +214,101 @@ impl<'a> EvaluatedArgument<'a> {
 enum RowDiagnostic {
     Bounded(Box<str>),
     Host(crate::aggregate_invocation_backing::HostDiagnostic),
+    Domain(novarocks_failure_contract::SharedFailureCause),
 }
+/// Semantic data failure retained independently of its diagnostic and row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataFailureReason {
+    InvalidValue,
+    NumericOutOfRange,
+    InvalidEncoding,
+    /// Stable Data reason authored by a more specific value domain.
+    Domain(novarocks_failure_contract::FailureReason),
+}
+
 #[derive(Clone, Debug)]
 pub struct RowDataError {
     selected_ordinal: usize,
+    reason: DataFailureReason,
     message: RowDiagnostic,
 }
 impl PartialEq for RowDataError {
     fn eq(&self, other: &Self) -> bool {
-        self.selected_ordinal == other.selected_ordinal && self.message() == other.message()
+        self.selected_ordinal == other.selected_ordinal
+            && self.reason == other.reason
+            && self.message() == other.message()
     }
 }
 impl Eq for RowDataError {}
 
+impl fmt::Display for RowDataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for RowDataError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.message {
+            RowDiagnostic::Domain(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
 pub const MAX_ROW_ERROR_MESSAGE_BYTES: usize = 512;
 
 impl RowDataError {
+    /// Admit only a domain's actual Data failure into the maskable journal.
+    /// Other facts return on the outer channel with the SAME original source.
+    /// No caller-provided diagnostic can change this decision.
+    pub(crate) fn from_domain<E>(
+        selected_ordinal: usize,
+        cause: E,
+    ) -> Result<Self, crate::KernelFailure>
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        let source = SharedFailureCause::new(cause);
+        let fact = source.failure_fact();
+        if fact.class() != FailureClass::Data {
+            return Err(crate::KernelFailure::rejected_row_source(source));
+        }
+        Ok(Self {
+            selected_ordinal,
+            reason: DataFailureReason::Domain(fact.reason()),
+            message: RowDiagnostic::Domain(source),
+        })
+    }
+    pub(crate) fn projected_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::FailureProjection;
+        match &self.message {
+            RowDiagnostic::Domain(source) => source.failure_fact(),
+            _ => self.reason.failure_fact(),
+        }
+    }
     pub fn new(selected_ordinal: usize, message: &str) -> Self {
+        Self::with_reason(selected_ordinal, DataFailureReason::InvalidValue, message)
+    }
+    pub fn with_reason(selected_ordinal: usize, reason: DataFailureReason, message: &str) -> Self {
         let mut end = message.len().min(MAX_ROW_ERROR_MESSAGE_BYTES);
         while !message.is_char_boundary(end) {
             end -= 1;
         }
         Self {
             selected_ordinal,
+            reason,
             message: RowDiagnostic::Bounded(message[..end].into()),
         }
     }
 
+    pub const fn reason(&self) -> DataFailureReason {
+        self.reason
+    }
     pub const fn selected_ordinal(&self) -> usize {
         self.selected_ordinal
     }
@@ -249,6 +317,7 @@ impl RowDataError {
         match &self.message {
             RowDiagnostic::Bounded(message) => message,
             RowDiagnostic::Host(message) => message.message(),
+            RowDiagnostic::Domain(source) => source.detail(),
         }
     }
     /// Remap the true selected ordinal without clipping or reformatting the
@@ -256,6 +325,7 @@ impl RowDataError {
     pub fn with_selected_ordinal(&self, selected_ordinal: usize) -> Self {
         Self {
             selected_ordinal,
+            reason: self.reason,
             message: self.message.clone(),
         }
     }
@@ -265,11 +335,27 @@ impl RowDataError {
         work: &mut crate::kernel_input::EvaluationCheckpoints<'_>,
         formatter: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
     ) -> Result<Self, crate::KernelFailure> {
+        Self::prepare_host_with_reason(
+            selected_ordinal,
+            DataFailureReason::InvalidValue,
+            allocator,
+            work,
+            formatter,
+        )
+    }
+    pub(crate) fn prepare_host_with_reason(
+        selected_ordinal: usize,
+        reason: DataFailureReason,
+        allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
+        work: &mut crate::kernel_input::EvaluationCheckpoints<'_>,
+        formatter: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+    ) -> Result<Self, crate::KernelFailure> {
         let diagnostic = crate::aggregate_invocation_backing::HostDiagnostic::prepare(
             allocator, work, formatter,
         )?;
         Ok(Self {
             selected_ordinal,
+            reason,
             message: RowDiagnostic::Host(diagnostic),
         })
     }
@@ -671,7 +757,9 @@ mod tests {
                         );
                     }
                 }
-                (Err(bare), Err(observed)) => assert_eq!(observed, KernelFailure::from(bare)),
+                (Err(bare), Err(observed)) => {
+                    crate::kernel_control::test_contract::exact(&observed, bare)
+                }
                 _ => panic!("observed result author changed the bare acceptance contract"),
             }
         }
@@ -692,16 +780,16 @@ mod tests {
                     .unwrap_err(),
                 expected,
             );
-            assert_eq!(
-                SelectedValues::try_new_observed::<KernelFailure>(
+            crate::kernel_control::test_contract::exact(
+                &SelectedValues::try_new_observed::<KernelFailure>(
                     selection,
                     &exact_type,
                     values.clone(),
                     Box::default(),
-                    || Ok(())
+                    || Ok(()),
                 )
                 .unwrap_err(),
-                KernelFailure::from(expected),
+                expected,
             );
         }
     }
@@ -803,6 +891,48 @@ mod tests {
                 assert!(refused);
                 assert_eq!(observed, stop_at);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_domain_source_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    #[test]
+    fn actual_map_data_keeps_its_reason_source_and_remapped_ordinal() {
+        let cause = crate::builtin::map_lookup_core::LookupRowFailure::MissingKey;
+        let expected = cause.failure_fact();
+        let error = RowDataError::from_domain(7, cause).unwrap();
+        let moved = error.with_selected_ordinal(2);
+        assert_eq!(moved.selected_ordinal(), 2);
+        assert_eq!(moved.failure_fact(), expected);
+        assert_eq!(moved.reason().failure_fact(), expected);
+        let original = error.source().unwrap().source().unwrap();
+        let remapped = moved.source().unwrap().source().unwrap();
+        assert!(std::ptr::eq(original, remapped));
+        assert!(original.is::<crate::builtin::map_lookup_core::LookupRowFailure>());
+    }
+    #[test]
+    fn resource_control_and_contract_sources_cannot_become_maskable_data() {
+        for cause in [
+            crate::KernelFailure::ResourceExhausted,
+            crate::KernelFailure::Cancelled,
+            crate::KernelFailure::Internal(crate::KernelDiagnostic::new("invalid value")),
+        ] {
+            let expected = cause.failure_fact();
+            assert_ne!(expected.class(), FailureClass::Data);
+            let error = RowDataError::from_domain(0, cause).unwrap_err();
+            assert_eq!(error.failure_fact(), expected);
+            assert!(
+                error
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .is::<crate::KernelFailure>()
+            );
         }
     }
 }

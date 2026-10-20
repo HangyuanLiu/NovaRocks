@@ -40,10 +40,162 @@ pub enum MapPart {
 }
 #[derive(Debug)]
 pub enum ProjectionFailure<E> {
-    Data(String),
-    Take(String),
+    Domain(MapProjectionFailure),
     Control(E),
 }
+
+#[derive(Debug)]
+pub enum MapProjectionFailure {
+    Contract(novarocks_failure_contract::BoundedDetail),
+    UnsupportedKey(novarocks_failure_contract::BoundedDetail),
+    LargeIntWidth(std::array::TryFromSliceError),
+    Index {
+        index: usize,
+        source: std::num::TryFromIntError,
+    },
+    Offsets {
+        required: u128,
+        minimum_unit: bool,
+    },
+    Backing {
+        required: u128,
+    },
+    Arrow(arrow_schema::ArrowError),
+}
+impl MapProjectionFailure {
+    fn contract(detail: impl std::fmt::Display) -> Self {
+        Self::Contract(novarocks_failure_contract::BoundedDetail::truncating_display(detail))
+    }
+}
+impl std::fmt::Display for MapProjectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contract(detail) | Self::UnsupportedKey(detail) => f.write_str(detail.as_str()),
+            Self::LargeIntWidth(cause) => write!(f, "map key LARGEINT decode failed: {cause}"),
+            Self::Index { index, .. } => {
+                write!(f, "map entry index {index} exceeds u32 take addressing")
+            }
+            Self::Offsets {
+                required,
+                minimum_unit,
+            } => write!(
+                f,
+                "map {} requires {required} child positions, i32 offset maximum {}",
+                if *minimum_unit { "row" } else { "output" },
+                i32::MAX
+            ),
+            Self::Backing { required } => write!(f, "map offsets require {required} backing bytes"),
+            Self::Arrow(source) => write!(f, "map projection Arrow operation: {source}"),
+        }
+    }
+}
+impl std::error::Error for MapProjectionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LargeIntWidth(source) => Some(source),
+            Self::Index { source, .. } => Some(source),
+            Self::Arrow(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MapProjectionFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use arrow_schema::ArrowError;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, ResourceDimension, ResourceFacts, ResourceScope, domain,
+        };
+        if matches!(self, Self::UnsupportedKey(_)) {
+            return crate::DataFailureReason::InvalidValue.failure_fact();
+        }
+        let (class, code) = match self {
+            Self::Contract(_) => (FailureClass::Invariant, 225),
+            Self::UnsupportedKey(_) => unreachable!("data returned above"),
+            Self::LargeIntWidth(_) => (FailureClass::Invariant, 226),
+            Self::Index { .. }
+            | Self::Offsets { .. }
+            | Self::Arrow(ArrowError::OffsetOverflowError(_)) => {
+                (FailureClass::Representation, 227)
+            }
+            Self::Backing { .. } => (FailureClass::Representation, 401),
+            Self::Arrow(ArrowError::MemoryError(_) | ArrowError::ArithmeticOverflow(_)) => {
+                (FailureClass::Resource, 228)
+            }
+            Self::Arrow(ArrowError::IoError(..)) => (FailureClass::Unexpected, 229),
+            Self::Arrow(_) => (FailureClass::Invariant, 230),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        match self {
+            Self::Offsets {
+                required,
+                minimum_unit,
+            } => fact.with_representation(RepresentationFacts {
+                boundary: if *minimum_unit {
+                    RepresentationBoundary::MinimumUnit
+                } else {
+                    RepresentationBoundary::SingleOutput
+                },
+                layout: RepresentationLayout {
+                    domain: domain::KERNEL,
+                    code: std::num::NonZeroU16::new(36).unwrap(),
+                },
+                required: u64::try_from(*required).ok(),
+                extent_limit: Some(i32::MAX as u64),
+                representable_prefix: None,
+            }),
+            Self::Index { index, .. } => fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::KERNEL,
+                    code: std::num::NonZeroU16::new(37).unwrap(),
+                },
+                required: u64::try_from(*index as u128 + 1).ok(),
+                extent_limit: Some(u32::MAX as u64 + 1),
+                representable_prefix: None,
+            }),
+            Self::Arrow(ArrowError::OffsetOverflowError(_)) => {
+                fact.with_representation(RepresentationFacts {
+                    boundary: RepresentationBoundary::SingleOutput,
+                    layout: RepresentationLayout {
+                        domain: domain::KERNEL,
+                        code: std::num::NonZeroU16::new(36).unwrap(),
+                    },
+                    required: None,
+                    extent_limit: None,
+                    representable_prefix: None,
+                })
+            }
+            Self::Backing { required } => {
+                crate::allocation_failure::rust_array_backing_failure_fact(
+                    fact.reason(),
+                    *required,
+                    RepresentationBoundary::SingleOutput,
+                )
+            }
+            _ => fact,
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for MapProjectionFailure {}
+fn checked_output_extent(current: usize, incoming: usize) -> Result<(), MapProjectionFailure> {
+    let required = current as u128 + incoming as u128;
+    if required > i32::MAX as u128 {
+        return Err(MapProjectionFailure::Offsets {
+            required: if incoming > i32::MAX as usize {
+                incoming as u128
+            } else {
+                required
+            },
+            minimum_unit: incoming > i32::MAX as usize,
+        });
+    }
+    Ok(())
+}
+
 fn observe<E>(
     o: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
     event: CollectionObservation,
@@ -58,31 +210,36 @@ pub fn part_array(map: &MapArray, part: MapPart) -> &ArrayRef {
 }
 pub fn sorted_map_offsets_and_indices(
     map: &MapArray,
-) -> Result<(OffsetBuffer<i32>, Vec<u32>), String> {
+) -> Result<(OffsetBuffer<i32>, Vec<u32>), MapProjectionFailure> {
     sort_observed(
         map,
         crate::Selection::all(map.len()),
-        |_, row| Ok::<_, String>(row),
+        |_, row| Ok::<_, std::convert::Infallible>(row),
         None,
         |_, _, _| Ok(()),
         &mut |_| Ok(()),
     )
     .map_err(|e| match e {
-        ProjectionFailure::Data(s) | ProjectionFailure::Take(s) | ProjectionFailure::Control(s) => {
-            s
-        }
+        ProjectionFailure::Domain(cause) => cause,
+        ProjectionFailure::Control(never) => match never {},
     })
 }
 pub fn sort_observed<E>(
     map: &MapArray,
     selection: crate::Selection<'_>,
     mut row: impl FnMut(usize, usize) -> Result<usize, E>,
-    mut row_error: Option<&mut dyn FnMut(usize, String) -> Result<(), E>>,
+    mut row_error: Option<&mut dyn FnMut(usize, MapProjectionFailure) -> Result<(), E>>,
     mut outcome: impl FnMut(usize, usize, bool) -> Result<(), E>,
     observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
 ) -> Result<(OffsetBuffer<i32>, Vec<u32>), ProjectionFailure<E>> {
     let offsets = map.value_offsets();
     let keys = map.keys();
+    let backing = (selection.len() as u128 + 1) * std::mem::size_of::<i32>() as u128;
+    if backing > isize::MAX as u128 {
+        return Err(ProjectionFailure::Domain(MapProjectionFailure::Backing {
+            required: backing,
+        }));
+    }
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let mut sorted_indices: Vec<u32> = Vec::new();
     let mut sorted_offsets: Vec<i32> = Vec::with_capacity(selection.len() + 1);
@@ -101,23 +258,21 @@ pub fn sort_observed<E>(
         let result = (|| {
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
+            // Check the exact next output before allocating or appending its row.
+            checked_output_extent(sorted_indices.len(), end - start)
+                .map_err(ProjectionFailure::Domain)?;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
             let mut row_indices: Vec<usize> = (start..end).collect();
             observe(observer, CollectionObservation::OpaqueBoundary)?;
             sort_indices_by_key_observed(keys, &mut row_indices, observer)?;
             for idx in row_indices {
                 observe(observer, CollectionObservation::Step)?;
-                let idx_u32 = u32::try_from(idx).map_err(|_| {
-                    ProjectionFailure::Data(format!(
-                        "map entry index overflow while sorting: {}",
-                        idx
-                    ))
+                let idx_u32 = u32::try_from(idx).map_err(|source| {
+                    ProjectionFailure::Domain(MapProjectionFailure::Index { index: idx, source })
                 })?;
                 sorted_indices.push(idx_u32);
             }
-            let next = i32::try_from(sorted_indices.len()).map_err(|_| {
-                ProjectionFailure::Data("map offset overflow while sorting entries".to_string())
-            })?;
+            let next = sorted_indices.len() as i32; // checked before appending
             Ok(next)
         })();
         match result {
@@ -125,9 +280,11 @@ pub fn sort_observed<E>(
                 sorted_offsets.push(next);
                 outcome(ordinal, row, false).map_err(ProjectionFailure::Control)?;
             }
-            Err(ProjectionFailure::Data(text)) if row_error.is_some() => {
+            Err(ProjectionFailure::Domain(cause @ MapProjectionFailure::UnsupportedKey(_)))
+                if row_error.is_some() =>
+            {
                 sorted_indices.truncate(first);
-                row_error.as_mut().unwrap()(ordinal, text).map_err(ProjectionFailure::Control)?;
+                row_error.as_mut().unwrap()(ordinal, cause).map_err(ProjectionFailure::Control)?;
                 sorted_offsets.push(current);
                 outcome(ordinal, row, true).map_err(ProjectionFailure::Control)?;
             }
@@ -151,7 +308,7 @@ fn sort_indices_by_key_observed<E>(
             observe(observer, CollectionObservation::Step)?;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
             let ord = compare_keys_ordered(keys, indices[j - 1], indices[j])
-                .map_err(ProjectionFailure::Data)?;
+                .map_err(ProjectionFailure::Domain)?;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
             if ord.is_gt() {
                 indices.swap(j - 1, j);
@@ -163,7 +320,11 @@ fn sort_indices_by_key_observed<E>(
     }
     Ok(())
 }
-fn compare_keys_ordered(keys: &ArrayRef, left: usize, right: usize) -> Result<Ordering, String> {
+fn compare_keys_ordered(
+    keys: &ArrayRef,
+    left: usize,
+    right: usize,
+) -> Result<Ordering, MapProjectionFailure> {
     match (keys.is_null(left), keys.is_null(right)) {
         (true, true) => return Ok(Ordering::Equal),
         (true, false) => return Ok(Ordering::Less),
@@ -254,16 +415,27 @@ fn compare_keys_ordered(keys: &ArrayRef, left: usize, right: usize) -> Result<Or
             let arr = keys
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast map key to FixedSizeBinaryArray".to_string())?;
-            let left_value = largeint::i128_from_be_bytes(arr.value(left))
-                .map_err(|e| format!("map key LARGEINT decode failed: {}", e))?;
-            let right_value = largeint::i128_from_be_bytes(arr.value(right))
-                .map_err(|e| format!("map key LARGEINT decode failed: {}", e))?;
+                .ok_or_else(|| {
+                    MapProjectionFailure::contract(
+                        "failed to downcast map key to FixedSizeBinaryArray",
+                    )
+                })?;
+            let left_value = i128::from_be_bytes(
+                arr.value(left)
+                    .try_into()
+                    .map_err(MapProjectionFailure::LargeIntWidth)?,
+            );
+            let right_value = i128::from_be_bytes(
+                arr.value(right)
+                    .try_into()
+                    .map_err(MapProjectionFailure::LargeIntWidth)?,
+            );
             Ok(left_value.cmp(&right_value))
         }
-        other => Err(format!(
-            "map key ordered compare unsupported type: {:?}",
-            other
+        other => Err(MapProjectionFailure::UnsupportedKey(
+            novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                "map key ordered compare unsupported type: {other:?}"
+            )),
         )),
     }
 }
@@ -276,7 +448,7 @@ pub fn project_observed<E>(
     field: Arc<Field>,
     selection: crate::Selection<'_>,
     row: impl FnMut(usize, usize) -> Result<usize, E>,
-    row_error: Option<&mut dyn FnMut(usize, String) -> Result<(), E>>,
+    row_error: Option<&mut dyn FnMut(usize, MapProjectionFailure) -> Result<(), E>>,
     outcome: impl FnMut(usize, usize, bool) -> Result<(), E>,
     nulls: impl FnOnce() -> Option<NullBuffer>,
     mut before_take: impl FnMut(&dyn Array, &[u32]) -> Result<(), E>,
@@ -289,10 +461,62 @@ pub fn project_observed<E>(
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let sorted_indices = UInt32Array::from(sorted_indices);
     let sorted = take(source.as_ref(), &sorted_indices, None)
-        .map_err(|e| ProjectionFailure::Take(e.to_string()))?;
+        .map_err(|cause| ProjectionFailure::Domain(MapProjectionFailure::Arrow(cause)))?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let list = ListArray::new(field, sorted_offsets, sorted, nulls());
+    let list = ListArray::try_new(field, sorted_offsets, sorted, nulls())
+        .map_err(|cause| ProjectionFailure::Domain(MapProjectionFailure::Arrow(cause)))?;
     let out = Arc::new(list) as ArrayRef;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    #[test]
+    fn map_projection_extent_refuses_before_append_with_exact_boundary() {
+        checked_output_extent(i32::MAX as usize - 1, 1).unwrap();
+        let batch = checked_output_extent(i32::MAX as usize, 1)
+            .unwrap_err()
+            .failure_fact();
+        assert_eq!(batch.class(), FailureClass::Representation);
+        assert_eq!(
+            batch.representation().unwrap().boundary,
+            RepresentationBoundary::SingleOutput
+        );
+        assert_eq!(
+            batch.representation().unwrap().required,
+            Some(i32::MAX as u64 + 1)
+        );
+        let single = checked_output_extent(0, i32::MAX as usize + 1)
+            .unwrap_err()
+            .failure_fact();
+        assert_eq!(
+            single.representation().unwrap().boundary,
+            RepresentationBoundary::MinimumUnit
+        );
+    }
+    #[test]
+    fn map_projection_preserves_actual_arrow_source_without_payload_owner() {
+        use std::error::Error;
+        let cause = MapProjectionFailure::Arrow(arrow_schema::ArrowError::MemoryError(
+            "CAST numeric cancelled".into(),
+        ));
+        assert_eq!(cause.failure_fact().class(), FailureClass::Resource);
+        assert!(cause.source().unwrap().is::<arrow_schema::ArrowError>());
+        let values: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None]));
+        let weak = Arc::downgrade(&values);
+        let error = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            values,
+            None,
+        )
+        .unwrap_err();
+        let retained = MapProjectionFailure::Arrow(error);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(retained.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(cause.failure_fact().class(), FailureClass::Resource);
+    }
 }

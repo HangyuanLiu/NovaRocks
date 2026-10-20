@@ -43,7 +43,11 @@
 //! fails them. The instance's one build driver is their one local partition.
 
 use super::join_hash_map::build_store::BuildStoreChunkProjection;
-use std::collections::VecDeque;
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
@@ -59,13 +63,15 @@ use super::build_requirements::{
     BuildComponentRequirements, NullKeyRequirement, required_build_components,
 };
 use super::join_hash_map::build_store::BuildStoreBuilder;
-use super::join_hash_map::finalize::{finalize_probe_rows, is_all_match_one};
+use super::join_hash_map::finalize::is_all_match_one;
 use super::join_hash_map::gather::{
     JoinGatherError, MAX_JOIN_OUTPUT_ROWS_PER_BATCH, TypedJoinBatch, filter_probe_typed,
     gather_left_with_null_right_typed, gather_probe_build_batches_typed,
 };
-use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
-use super::join_hash_map::search::{JoinSelection, append_cross_selection};
+use super::join_hash_map::method::{
+    BuildKeyBatch, JoinCursorFailure, JoinHashMap, JoinHashMapBuildOptions, JoinPairCursor,
+};
+use super::join_hash_map::search::JoinSelection;
 use super::native_runtime_filter::{
     NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet,
 };
@@ -75,16 +81,76 @@ use crate::exec::node::join::JoinType;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    shape::{Transform, TransformKernel},
+    step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime_filter::RuntimeFilterProducerFailure;
 
-fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
-    ExecutionFailure::from(format!("{context}: {error}"))
+#[derive(Debug)]
+struct HashJoinContractFailure(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for HashJoinContractFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for HashJoinContractFailure {}
+impl novarocks_failure_contract::FailureProjection for HashJoinContractFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::HashJoinExecutionContract.reason(),
+        )
+    }
+}
+fn hash_join_contract(detail: &'static str) -> ExecutionFailure {
+    ExecutionFailure::from_domain(HashJoinContractFailure(
+        novarocks_failure_contract::BoundedDetail::truncating(detail),
+    ))
+}
+#[derive(Debug)]
+struct JoinBuildCountOverflow {
+    current: usize,
+    incoming: usize,
+}
+impl std::fmt::Display for JoinBuildCountOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hash join build cannot add {} rows to {}",
+            self.incoming, self.current
+        )
+    }
+}
+impl std::error::Error for JoinBuildCountOverflow {}
+impl novarocks_failure_contract::FailureProjection for JoinBuildCountOverflow {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope,
+        };
+        FailureFact::new(
+            FailureClass::Resource,
+            crate::runtime::fragment::ExecutionReason::JoinBuildCountExtent.reason(),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Operator),
+            constraint_scope: Some(ResourceScope::Operator),
+            dimension: ResourceDimension::Positions,
+            requested: u64::try_from(self.incoming).ok(),
+            required_growth: u64::try_from(self.incoming).ok(),
+            limit: u64::try_from(usize::MAX).ok(),
+            live: u64::try_from(self.current).ok(),
+            committed: None,
+        })
+    }
 }
 
 /// Runtime role schemas retain their own finite source/new storage holds.
@@ -126,12 +192,13 @@ pub(crate) struct CompiledHashJoinPlan {
 }
 
 impl CompiledHashJoinPlan {
-    pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> Result<Self, String> {
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or_else(|| format!("compiled join node {} is absent", node.index()))?;
+    pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> ExecutionResult<Self> {
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled join node {} is absent", node.index()),
+            )
+        })?;
         let ProgramNodeKind::Join {
             join_type,
             distribution_mode,
@@ -145,7 +212,10 @@ impl CompiledHashJoinPlan {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!("compiled node {} is not a hash join", node.index()));
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled node {} is not a hash join", node.index()),
+            ));
         };
         validate_join_scope(node, left_layout, right_layout, join_scope_layout)?;
         let join_type = match join_type {
@@ -155,29 +225,45 @@ impl CompiledHashJoinPlan {
             novarocks_local_program::JoinType::LeftAnti => JoinType::LeftAnti,
             novarocks_local_program::JoinType::NullAwareLeftAnti => JoinType::NullAwareLeftAnti,
             other => {
-                return Err(format!(
-                    "compiled {other:?} hash join at local node {} publishes build rows and is not executable yet",
-                    node.index()
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled {other:?} hash join at local node {} publishes build rows and is not executable yet",
+                        node.index()
+                    ),
                 ));
             }
         };
         if *distribution_mode != JoinDistributionMode::Broadcast {
-            return Err(format!(
-                "compiled hash join at local node {} with a local partitioned build is not executable yet",
-                node.index()
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled hash join at local node {} with a local partitioned build is not executable yet",
+                    node.index()
+                ),
             ));
         }
         if probe_keys.is_empty()
             || probe_keys.len() != build_keys.len()
             || probe_keys.len() != eq_null_safe.len()
         {
-            return Err(format!(
-                "compiled hash join at local node {} has no exact key pairs",
-                node.index()
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled hash join at local node {} has no exact key pairs",
+                    node.index()
+                ),
             ));
         }
         let site = |role| ProgramExpressionRootSite::Node { node, role };
-        let ordinal = |key: usize| u32::try_from(key).map_err(|_| "join key count exceeds u32");
+        let ordinal = |key: usize| {
+            u32::try_from(key).map_err(|_| {
+                program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    "join key count exceeds u32",
+                )
+            })
+        };
         let mut probe_sites = Vec::with_capacity(probe_keys.len());
         let mut build_sites = Vec::with_capacity(build_keys.len());
         for key in 0..probe_keys.len() {
@@ -247,7 +333,7 @@ impl CompiledHashJoinBuildSinkFactory {
 /// local partition, or why they could not be created, reported at bind.
 struct BuildRuntimeFilterProducers {
     producers: Option<NativeRuntimeFilterProducerSet>,
-    create_error: Option<String>,
+    create_error: Option<ExecutionFailure>,
     local_partition_count: u32,
 }
 
@@ -269,27 +355,29 @@ impl OperatorFactory for CompiledHashJoinBuildSinkFactory {
                 local_partition_count: factory.local_partition_count(),
             }
         });
-        Box::new(CompiledHashJoinBuildSink {
-            name: self.name.clone(),
-            program: Arc::clone(&self.program),
-            plan: Arc::clone(&self.plan),
-            state: Arc::clone(&self.state),
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
-            instances: None,
-            store: BuildStoreBuilder::new(),
-            construction: None,
-            prepared_build: None,
-            prepare_failure: None,
-            input_chunks: Vec::new(),
-            key_batches: Vec::new(),
-            row_count: 0,
-            has_null_key: false,
-            null_key_rows,
-            chunks_tracker: None,
-            table_tracker: None,
-            finished: false,
-            runtime_filters,
-        })
+        Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+            CompiledHashJoinBuildSink {
+                name: self.name.clone(),
+                program: Arc::clone(&self.program),
+                plan: Arc::clone(&self.plan),
+                state: Arc::clone(&self.state),
+                control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+                instances: None,
+                store: BuildStoreBuilder::new(),
+                construction: None,
+                prepared_build: None,
+                prepare_failure: None,
+                input_chunks: Vec::new(),
+                key_batches: Vec::new(),
+                row_count: 0,
+                has_null_key: false,
+                null_key_rows,
+                chunks_tracker: None,
+                table_tracker: None,
+                artifact_memory: None,
+                runtime_filters,
+            },
+        ))
     }
     fn is_sink(&self) -> bool {
         true
@@ -316,11 +404,16 @@ struct CompiledHashJoinBuildSink {
     null_key_rows: Option<Vec<u32>>,
     chunks_tracker: Option<Arc<MemTracker>>,
     table_tracker: Option<Arc<MemTracker>>,
-    finished: bool,
+    artifact_memory: Option<BuildArtifactMemory>,
     runtime_filters: Option<BuildRuntimeFilterProducers>,
 }
 
-impl Operator for CompiledHashJoinBuildSink {
+struct BuildArtifactMemory {
+    table: Option<Arc<MemTracker>>,
+    store: Option<Arc<MemTracker>>,
+}
+
+impl OperatorLifecycle for CompiledHashJoinBuildSink {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -349,7 +442,6 @@ impl Operator for CompiledHashJoinBuildSink {
             }
             Err(first) => {
                 self.prepare_failure = Some(first.clone());
-                self.finished = true;
                 Err(first)
             }
         }
@@ -359,6 +451,20 @@ impl Operator for CompiledHashJoinBuildSink {
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
+        let artifact = state.mem_tracker().map(|root| {
+            MemTracker::new_child(
+                format!("JoinBuildArtifact: {}", self.state.dep_name()),
+                &root,
+            )
+        });
+        self.artifact_memory = Some(BuildArtifactMemory {
+            table: artifact
+                .as_ref()
+                .map(|tracker| MemTracker::new_child("BuildHashTable", tracker)),
+            store: artifact
+                .as_ref()
+                .map(|tracker| MemTracker::new_child("BuildStore", tracker)),
+        });
         let Some(filters) = self.runtime_filters.as_mut() else {
             return Ok(());
         };
@@ -385,50 +491,40 @@ impl Operator for CompiledHashJoinBuildSink {
         self.chunks_tracker = Some(chunks);
         self.table_tracker = Some(MemTracker::new_child("BuildHashTable", &tracker));
     }
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
-
-impl ProcessorOperator for CompiledHashJoinBuildSink {
-    fn need_input(&self) -> bool {
-        !self.finished
-    }
-    fn has_output(&self) -> bool {
-        false
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl crate::exec::pipeline::operator::InputEncodingPolicy for CompiledHashJoinBuildSink {}
+impl crate::exec::pipeline::shape::SinkKernel for CompiledHashJoinBuildSink {
+    fn consume(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        input: crate::exec::pipeline::input::PreparedInput,
+    ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+        use crate::exec::pipeline::{shape::SinkStep, step::NextStep};
         if let Some(first) = &self.prepare_failure {
             return Err(first.clone());
         }
-        if self.finished || chunk.is_empty() {
-            return Ok(());
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        if !chunk.is_empty() {
+            if let Err(failure) = self.push_build_chunk(chunk) {
+                ctx.report_failure(failure.clone());
+                let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
+                return Err(failure);
+            }
         }
-        let result = self.push_build_chunk(chunk);
-        if result.is_err() {
-            let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
-        }
-        result
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
-        let result = self.publish_build(state);
-        if result.is_err() {
+    fn finish(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+        use crate::exec::pipeline::{shape::SinkStep, step::NextStep};
+        if let Err(failure) = self.publish_build() {
+            ctx.report_failure(failure.clone());
             let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
+            return Err(failure);
         }
-        result
+        Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }
 
@@ -460,9 +556,12 @@ impl CompiledHashJoinBuildSink {
         }
         let base = self.row_count;
         let rows = chunk.len();
-        self.row_count = base
-            .checked_add(rows)
-            .ok_or("hash join build row count overflow")?;
+        self.row_count = base.checked_add(rows).ok_or_else(|| {
+            ExecutionFailure::from_domain(JoinBuildCountOverflow {
+                current: base,
+                incoming: rows,
+            })
+        })?;
         self.has_null_key |= keys.iter().any(|key| key.null_count() > 0);
         if let Some(null_key_rows) = self.null_key_rows.as_mut() {
             // A row whose non-null-safe key is NULL can never be an equal
@@ -476,7 +575,9 @@ impl CompiledHashJoinBuildSink {
                     let flat = base
                         .checked_add(row)
                         .and_then(|row| u32::try_from(row).ok())
-                        .ok_or("hash join build null-key row id overflow")?;
+                        .ok_or_else(|| {
+                            ExecutionFailure::from_domain(JoinCursorFailure::RowIdExtent)
+                        })?;
                     null_key_rows.push(flat);
                 }
             }
@@ -501,7 +602,7 @@ impl CompiledHashJoinBuildSink {
 
     /// Builds and publishes the instance's one artifact, then closes the
     /// runtime-filter producers: the published build is what they describe.
-    fn publish_build(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+    fn publish_build(&mut self) -> ExecutionResult<()> {
         if let Some(first) = &self.prepare_failure {
             return Err(first.clone());
         }
@@ -510,6 +611,11 @@ impl CompiledHashJoinBuildSink {
             .as_ref()
             .ok_or(ConstructionFailure::MissingOwner)?;
         let owner = self.control.construction_owner(prepared)?;
+        let memory = self.artifact_memory.as_ref().ok_or_else(|| {
+            KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "compiled hash build runtime binding is missing",
+            ))
+        })?;
         let requirements = self.plan.requirements;
         let mut table = match self.key_batches.first() {
             Some(first) => {
@@ -524,9 +630,11 @@ impl CompiledHashJoinBuildSink {
                         self.plan.eq_null_safe.clone(),
                         &self.key_batches,
                         JoinHashMapBuildOptions {
-                            purpose: requirements.join_hash_map_purpose().ok_or(
-                                "compiled hash join lookup purpose missing for keyed build",
-                            )?,
+                            purpose: requirements.join_hash_map_purpose().ok_or_else(|| {
+                                hash_join_contract(
+                                    "compiled hash join lookup purpose missing for keyed build",
+                                )
+                            })?,
                             ..JoinHashMapBuildOptions::default()
                         },
                         self.table_tracker.as_ref().map(Arc::clone),
@@ -544,20 +652,11 @@ impl CompiledHashJoinBuildSink {
             None
         };
         self.input_chunks.clear();
-        if let Some(root) = state.mem_tracker() {
-            let artifact = MemTracker::new_child(
-                format!("JoinBuildArtifact: {}", self.state.dep_name()),
-                &root,
-            );
-            if let Some(table) = table.as_mut() {
-                table.set_mem_tracker(MemTracker::new_child("BuildHashTable", &artifact));
-            }
-            if let Some(store) = store.as_mut() {
-                store.transfer_to_with_header_owner(
-                    &MemTracker::new_child("BuildStore", &artifact),
-                    owner.as_ref(),
-                )?;
-            }
+        if let (Some(table), Some(tracker)) = (table.as_mut(), memory.table.as_ref()) {
+            table.set_mem_tracker(Arc::clone(tracker));
+        }
+        if let (Some(store), Some(tracker)) = (store.as_mut(), memory.store.as_ref()) {
+            store.transfer_to_with_header_owner(tracker, owner.as_ref())?;
         }
         let artifact = Arc::new(JoinBuildArtifact::new_native(
             requirements,
@@ -577,7 +676,7 @@ impl CompiledHashJoinBuildSink {
         Ok(())
     }
 
-    fn submit_runtime_filters(&mut self, keys: &[ArrayRef]) -> Result<(), String> {
+    fn submit_runtime_filters(&mut self, keys: &[ArrayRef]) -> ExecutionResult<()> {
         match self
             .runtime_filters
             .as_mut()
@@ -588,7 +687,7 @@ impl CompiledHashJoinBuildSink {
         }
     }
 
-    fn finish_runtime_filters(&mut self) -> Result<(), String> {
+    fn finish_runtime_filters(&mut self) -> ExecutionResult<()> {
         match self
             .runtime_filters
             .as_mut()
@@ -599,7 +698,10 @@ impl CompiledHashJoinBuildSink {
         }
     }
 
-    fn fail_runtime_filters(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
+    fn fail_runtime_filters(
+        &mut self,
+        reason: RuntimeFilterProducerFailure,
+    ) -> ExecutionResult<()> {
         match self
             .runtime_filters
             .as_mut()
@@ -645,7 +747,7 @@ impl OperatorFactory for CompiledHashJoinProbeProcessorFactory {
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
         let mut sites = self.plan.probe_sites.clone();
         sites.extend(self.plan.residual);
-        Box::new(CompiledHashJoinProbe {
+        Box::new(Transform::hydrating(CompiledHashJoinProbe {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             plan: Arc::clone(&self.plan),
@@ -658,10 +760,8 @@ impl OperatorFactory for CompiledHashJoinProbeProcessorFactory {
             sites,
             instances: None,
             build: None,
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
-        })
+            cursor: None,
+        }))
     }
 }
 
@@ -688,12 +788,10 @@ struct CompiledHashJoinProbe {
     sites: Vec<ProgramExpressionRootSite>,
     instances: Option<Vec<CompiledExpressionInstance>>,
     build: Option<LoadedBuild>,
-    pending: VecDeque<Chunk>,
-    finishing: bool,
-    finished: bool,
+    cursor: Option<HashProbeCursor>,
 }
 
-impl Operator for CompiledHashJoinProbe {
+impl OperatorLifecycle for CompiledHashJoinProbe {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -729,8 +827,6 @@ impl Operator for CompiledHashJoinProbe {
                 // Only complete schema preparation is published. Earlier
                 // temporary schemas have already dropped on this refusal.
                 self.prepare_failure = Some(first.clone());
-                self.finishing = true;
-                self.finished = true;
                 Err(first)
             }
         }
@@ -746,115 +842,128 @@ impl Operator for CompiledHashJoinProbe {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.release_owned();
+        Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.release_owned();
+    }
+    fn on_driver_failure(&mut self) {
+        self.release_owned();
     }
 }
 
-impl ProcessorOperator for CompiledHashJoinProbe {
-    fn need_input(&self) -> bool {
-        self.prepare_failure.is_none()
-            && self.schemas.is_some()
-            && !self.finishing
-            && !self.finished
-            && self.pending.is_empty()
-            && (self.build.is_some() || self.state.has_build())
-    }
-    fn has_output(&self) -> bool {
-        self.prepare_failure.is_none() && !self.pending.is_empty()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        self.prepared_schemas()?;
-        if self.finishing || self.finished {
-            return Err("compiled hash join probe received input after finishing".into());
-        }
-        if !self.pending.is_empty() {
-            return Err("compiled hash join probe received input while output is pending".into());
-        }
-        self.load_build()?;
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        instances(
-            &mut self.instances,
-            &self.program,
-            &self.sites,
-            &self.control,
-        )?;
-        let keys = self.plan.probe_sites.len();
-        let mut arrays = Vec::with_capacity(keys);
-        {
-            let roots = self.instances.as_mut().expect("instances were created");
-            for (instance, site) in roots.iter_mut().zip(&self.sites).take(keys) {
-                arrays.push(evaluate_all(
-                    instance,
-                    *site,
-                    chunk.record_batch(),
-                    &self.control,
-                )?);
-            }
-        }
-        let batches = match self.plan.join_type {
-            JoinType::Inner => self.join_inner(&chunk, &arrays)?,
-            JoinType::LeftOuter => self.join_left_outer(&chunk, &arrays)?,
-            JoinType::LeftSemi | JoinType::LeftAnti => self.join_semi_anti(&chunk, &arrays)?,
-            JoinType::NullAwareLeftAnti => self.join_null_aware_anti(&chunk, &arrays)?,
-            other => {
-                return Err(failure(
-                    "compiled hash join",
-                    format!("{other:?} is not executable yet"),
-                ));
-            }
-        };
-        for batch in batches {
-            if batch.num_rows() > 0 {
-                let owner = self
-                    .control
-                    .construction_owner(&self.prepared_schemas()?.output)?;
-                self.pending.push_back(
-                    batch
-                        .into_chunk(owner.as_ref())
-                        .map_err(JoinGatherError::into_execution)?,
-                );
-            }
-        }
-        Ok(())
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        self.prepared_schemas()?;
-        let output = self.pending.pop_front();
-        if self.finishing && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.prepared_schemas()?;
-        self.finishing = true;
-        if self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(())
-    }
-    fn precondition_dependency(&self) -> Option<DependencyHandle> {
-        if self.prepare_failure.is_some() {
-            return None;
-        }
+#[derive(Clone, Copy)]
+enum HashProbePhase {
+    EqualPairs,
+    NullKeys,
+    NullProbe,
+    Tail,
+}
+struct HashProbeCursor {
+    input: Chunk,
+    pairs: Option<JoinPairCursor>,
+    phase: HashProbePhase,
+    matched: Vec<bool>,
+    null_probe: Vec<bool>,
+    matched_null: Vec<bool>,
+    matched_any: Vec<bool>,
+    probe_position: usize,
+    build_position: usize,
+}
+impl InputEncodingPolicy for CompiledHashJoinProbe {}
+impl TransformKernel for CompiledHashJoinProbe {
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let observable = self.dep.observable();
+        let observed_generation = observable.generation();
         if self.build.is_some() || self.state.has_build() {
-            None
-        } else {
-            Some(self.dep.clone())
+            return Ok(None);
         }
+        Ok(Some(AdmissionNext::Wait(WaitFact {
+            reason: WaitReason::Dependency,
+            observable,
+            observed_generation,
+            deadline: None,
+        })))
+    }
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let result = self.start_probe(chunk).map(|output| {
+            let next = if self.cursor.is_some() {
+                NextStep::Runnable
+            } else {
+                NextStep::NeedInput
+            };
+            StepResult::new(output, next, rows)
+        });
+        self.complete_step(ctx, result)
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.cursor.is_none() {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
+        }
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        let mut cursor = self.cursor.take().expect("live hash probe cursor");
+        let result = self.advance_probe(&mut cursor);
+        match result {
+            Err(error) => {
+                // Report before destroying the accepted input or any unreported work.
+                ctx.report_failure(error.clone());
+                self.release_owned();
+                Err(error)
+            }
+            Ok(step) => {
+                if matches!(step.next, NextStep::Runnable) {
+                    self.cursor = Some(cursor);
+                }
+                Ok(step)
+            }
+        }
+    }
+
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        let result = self
+            .prepared_schemas()
+            .map(|_| StepResult::new(None, NextStep::Finished, 0));
+        let step = self.complete_step(ctx, result)?;
+        self.release_owned();
+        Ok(step)
     }
 }
 
 impl CompiledHashJoinProbe {
+    fn release_owned(&mut self) {
+        self.cursor = None;
+        self.build = None;
+        self.instances = None;
+    }
+    fn complete_step(
+        &mut self,
+        ctx: &StepContext<'_>,
+        result: ExecutionResult<StepResult>,
+    ) -> ExecutionResult<StepResult> {
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+            self.release_owned();
+        }
+        result
+    }
+
     fn prepared_schemas(&self) -> ExecutionResult<&PreparedJoinSchemas> {
         if let Some(first) = &self.prepare_failure {
             return Err(first.clone());
@@ -871,7 +980,7 @@ impl CompiledHashJoinProbe {
         let artifact = self
             .state
             .get_build()
-            .ok_or("compiled hash join build is not ready")?;
+            .ok_or_else(|| hash_join_contract("compiled hash join build is not ready"))?;
         let row_count = artifact.build_row_count;
         let has_null_key = artifact.build_has_null_key;
         let view =
@@ -889,7 +998,7 @@ impl CompiledHashJoinProbe {
     fn loaded(&self) -> ExecutionResult<&LoadedBuild> {
         self.build
             .as_ref()
-            .ok_or_else(|| "compiled hash join build is not loaded".into())
+            .ok_or_else(|| hash_join_contract("compiled hash join build is not loaded"))
     }
 
     /// The build rows the decision needs, present exactly when the build has
@@ -903,100 +1012,332 @@ impl CompiledHashJoinProbe {
             .chunk
             .clone()
             .map(Some)
-            .ok_or_else(|| "compiled hash join build rows are missing".into())
+            .ok_or_else(|| hash_join_contract("compiled hash join build rows are missing"))
     }
 
-    /// The residual root over every candidate pair of `selection`, in
-    /// bounded scope batches. Returns the kept pairs and their scope rows.
-    fn residual(
+    fn start_probe(&mut self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
+        self.prepared_schemas()?;
+        self.load_build()?;
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        instances(
+            &mut self.instances,
+            &self.program,
+            &self.sites,
+            &self.control,
+        )?;
+        let keys = self.plan.probe_sites.len();
+        let mut arrays = Vec::with_capacity(keys);
+        for (instance, site) in self
+            .instances
+            .as_mut()
+            .expect("instances installed")
+            .iter_mut()
+            .zip(&self.sites)
+            .take(keys)
+        {
+            arrays.push(evaluate_all(
+                instance,
+                *site,
+                chunk.record_batch(),
+                &self.control,
+            )?);
+        }
+        let rows = chunk.len();
+        let table = self
+            .loaded()?
+            .table
+            .clone()
+            .filter(|table| !table.is_empty());
+        let null_aware = self.plan.join_type == JoinType::NullAwareLeftAnti;
+        let null_probe = if null_aware {
+            (0..rows)
+                .map(|row| arrays.iter().any(|array| array.is_null(row)))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if self.plan.residual.is_none()
+            && matches!(
+                self.plan.join_type,
+                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::NullAwareLeftAnti
+            )
+        {
+            let matched = match table {
+                Some(table) => table
+                    .search_membership_arrays(&arrays, rows)
+                    .map_err(ExecutionFailure::from)?
+                    .0
+                    .into_vec(),
+                None => vec![false; rows],
+            };
+            let keep = match self.plan.join_type {
+                JoinType::LeftSemi => matched,
+                JoinType::LeftAnti => matched.into_iter().map(|matched| !matched).collect(),
+                JoinType::NullAwareLeftAnti if self.loaded()?.row_count == 0 => vec![true; rows],
+                JoinType::NullAwareLeftAnti if self.loaded()?.has_null_key => vec![false; rows],
+                JoinType::NullAwareLeftAnti => matched
+                    .iter()
+                    .zip(&null_probe)
+                    .map(|(matched, null)| !matched && !null)
+                    .collect(),
+                _ => unreachable!("decision-only join selected"),
+            };
+            return self.keep_probe(&chunk, &keep);
+        }
+        if null_aware && self.loaded()?.row_count == 0 {
+            return self.keep_probe(&chunk, &vec![true; rows]);
+        }
+        let groups = match table {
+            Some(table) => table
+                .lookup_group_ids_arrays(&arrays, rows)
+                .map_err(ExecutionFailure::from)?,
+            None => vec![None; rows],
+        };
+        self.cursor = Some(HashProbeCursor {
+            input: chunk,
+            pairs: Some(JoinPairCursor::new(groups)),
+            phase: HashProbePhase::EqualPairs,
+            matched: vec![false; rows],
+            null_probe,
+            matched_null: if null_aware {
+                vec![false; rows]
+            } else {
+                Vec::new()
+            },
+            matched_any: if null_aware {
+                vec![false; rows]
+            } else {
+                Vec::new()
+            },
+            probe_position: 0,
+            build_position: 0,
+        });
+        Ok(None)
+    }
+
+    /// One bounded candidate page in original probe/group order. Residual
+    /// evaluation keeps the original full page boundary and never skips rows
+    /// after a semi/anti match, since their required errors still matter.
+    fn evaluate_page(
         &mut self,
         probe: &Chunk,
-        build: &Chunk,
-        selection: &JoinSelection,
-    ) -> ExecutionResult<(JoinSelection, Vec<TypedJoinBatch>)> {
-        let site = self
-            .plan
-            .residual
-            .ok_or("compiled hash join has no residual root")?;
-        let mut kept = JoinSelection::new();
-        let mut batches = Vec::new();
-        let mut offset = 0usize;
-        while offset < selection.len() {
-            let end = offset
-                .saturating_add(MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
-                .min(selection.len());
-            let schema = self.prepared_schemas()?.scope.clone();
-            let owner = self.control.construction_owner(&schema)?;
-            let scratch = self.control.construction_owner(&schema)?;
-            let gathered = gather_probe_build_batches_typed(
-                probe,
-                build,
-                &selection.probe[offset..end],
-                &selection.build[offset..end],
-                &schema,
-                true,
-                false,
-                owner.as_ref(),
-                scratch.as_ref(),
-                &self.control,
-            )
-            .map_err(JoinGatherError::into_execution)?;
-            let [candidates] = <[TypedJoinBatch; 1]>::try_from(gathered.batches)
-                .map_err(|_| "compiled hash join residual candidates are not one batch")?;
-            let instance = self
-                .instances
-                .as_mut()
-                .and_then(|roots| roots.last_mut())
-                .ok_or("compiled hash join residual instance is missing")?;
-            let truth = evaluate_all(instance, site, candidates.record_batch(), &self.control)?;
-            let mask = true_mask(&truth)?;
-            for (ordinal, keep) in mask.iter().enumerate() {
-                if keep == Some(true) {
-                    kept.push(
-                        selection.probe[offset + ordinal],
-                        selection.build[offset + ordinal],
-                    );
-                }
-            }
-            let filtered = candidates
-                .filter(&mask, owner.as_ref())
-                .map_err(JoinGatherError::into_execution)?;
-            if filtered.num_rows() > 0 {
-                batches.push(filtered);
-            }
-            offset = end;
+        selection: &mut JoinSelection,
+        publish: bool,
+    ) -> ExecutionResult<Option<TypedJoinBatch>> {
+        if selection.is_empty() {
+            return Ok(None);
         }
-        Ok((kept, batches))
-    }
-
-    /// The scope rows of every pair of `selection`.
-    fn gather_scope(
-        &self,
-        probe: &Chunk,
-        build: &Chunk,
-        selection: &JoinSelection,
-    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
+        let build = self.build_rows()?.ok_or_else(|| {
+            hash_join_contract("compiled hash join candidate build rows are absent")
+        })?;
         let schema = self.prepared_schemas()?.scope.clone();
         let owner = self.control.construction_owner(&schema)?;
         let scratch = self.control.construction_owner(&schema)?;
-        Ok(gather_probe_build_batches_typed(
+        let gathered = gather_probe_build_batches_typed(
             probe,
-            build,
+            &build,
             &selection.probe,
             &selection.build,
             &schema,
             true,
-            is_all_match_one(selection, probe.len()),
+            self.plan.residual.is_none() && is_all_match_one(selection, probe.len()),
             owner.as_ref(),
             scratch.as_ref(),
             &self.control,
         )
-        .map_err(JoinGatherError::into_execution)?
-        .batches)
+        .map_err(JoinGatherError::into_execution)?;
+        let [candidates] = <[TypedJoinBatch; 1]>::try_from(gathered.batches).map_err(|_| {
+            hash_join_contract("compiled hash join candidate page is not one batch")
+        })?;
+        let output = if let Some(site) = self.plan.residual {
+            let instance = self
+                .instances
+                .as_mut()
+                .and_then(|roots| roots.last_mut())
+                .ok_or_else(|| {
+                    hash_join_contract("compiled hash join residual instance is missing")
+                })?;
+            let truth = evaluate_all(instance, site, candidates.record_batch(), &self.control)?;
+            let mask = true_mask(&truth)?;
+            selection.compact_by_mask(&mask)?;
+            if publish {
+                Some(
+                    candidates
+                        .filter(&mask, owner.as_ref())
+                        .map_err(JoinGatherError::into_execution)?,
+                )
+            } else {
+                None
+            }
+        } else if publish {
+            Some(candidates)
+        } else {
+            None
+        };
+        Ok(output.filter(|batch| batch.num_rows() > 0))
     }
 
-    /// Scope rows republished in the canonical output layout: the same
-    /// arrays under the output's own fields.
+    fn advance_probe(&mut self, cursor: &mut HashProbeCursor) -> ExecutionResult<StepResult> {
+        let null_aware = self.plan.join_type == JoinType::NullAwareLeftAnti;
+        let publish = matches!(self.plan.join_type, JoinType::Inner | JoinType::LeftOuter);
+        match cursor.phase {
+            HashProbePhase::EqualPairs => {
+                let mut selection = match self.loaded()?.table.as_ref() {
+                    Some(table) => cursor
+                        .pairs
+                        .as_mut()
+                        .expect("pair cursor installed")
+                        .next_page(
+                            table,
+                            NonZeroUsize::new(MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
+                                .expect("positive output page size"),
+                        )
+                        .map_err(ExecutionFailure::from_domain)?,
+                    None => JoinSelection::new(),
+                };
+                let output = self.evaluate_page(&cursor.input, &mut selection, publish)?;
+                mark(&mut cursor.matched, &selection);
+                if self.loaded()?.table.is_none()
+                    || cursor
+                        .pairs
+                        .as_ref()
+                        .expect("pair cursor installed")
+                        .is_complete()
+                {
+                    cursor.pairs = None;
+                    cursor.phase = if null_aware {
+                        HashProbePhase::NullKeys
+                    } else {
+                        HashProbePhase::Tail
+                    };
+                }
+                let output = output.map(|batch| self.output_of(batch)).transpose()?;
+                let output = output.map(|batch| self.publish_typed(batch)).transpose()?;
+                Ok(StepResult::new(output, NextStep::Runnable, 0))
+            }
+            HashProbePhase::NullKeys | HashProbePhase::NullProbe => {
+                let null_keys = matches!(cursor.phase, HashProbePhase::NullKeys);
+                let null_rows = self.loaded()?.null_key_rows.clone().ok_or_else(|| {
+                    hash_join_contract("compiled null-aware anti join requires build null-key rows")
+                })?;
+                let build_rows = if null_keys {
+                    null_rows.len()
+                } else {
+                    self.loaded()?.row_count
+                };
+                let mut selection = JoinSelection::new();
+                while cursor.probe_position < cursor.input.len()
+                    && selection.len() < MAX_JOIN_OUTPUT_ROWS_PER_BATCH
+                {
+                    if build_rows == 0 || (!null_keys && !cursor.null_probe[cursor.probe_position])
+                    {
+                        cursor.probe_position += 1;
+                        cursor.build_position = 0;
+                        continue;
+                    }
+                    let probe = u32::try_from(cursor.probe_position).map_err(|_| {
+                        ExecutionFailure::from_domain(JoinCursorFailure::RowIdExtent)
+                    })?;
+                    let build = if null_keys {
+                        null_rows[cursor.build_position]
+                    } else {
+                        u32::try_from(cursor.build_position).map_err(|_| {
+                            ExecutionFailure::from_domain(JoinCursorFailure::RowIdExtent)
+                        })?
+                    };
+                    selection.push(probe, build);
+                    cursor.build_position += 1;
+                    if cursor.build_position == build_rows {
+                        cursor.probe_position += 1;
+                        cursor.build_position = 0;
+                    }
+                }
+                self.evaluate_page(&cursor.input, &mut selection, false)?;
+                mark(
+                    if null_keys {
+                        &mut cursor.matched_null
+                    } else {
+                        &mut cursor.matched_any
+                    },
+                    &selection,
+                );
+                if cursor.probe_position == cursor.input.len() {
+                    cursor.probe_position = 0;
+                    cursor.build_position = 0;
+                    cursor.phase = if null_keys {
+                        HashProbePhase::NullProbe
+                    } else {
+                        HashProbePhase::Tail
+                    };
+                }
+                Ok(StepResult::new(None, NextStep::Runnable, 0))
+            }
+            HashProbePhase::Tail => {
+                let output = match self.plan.join_type {
+                    JoinType::Inner => None,
+                    JoinType::LeftOuter => {
+                        let unmatched = cursor
+                            .matched
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, matched)| !**matched)
+                            .map(|(row, _)| {
+                                u32::try_from(row).map_err(|_| {
+                                    ExecutionFailure::from_domain(JoinCursorFailure::RowIdExtent)
+                                })
+                            })
+                            .collect::<ExecutionResult<Vec<_>>>()?;
+                        let schemas = self.prepared_schemas()?;
+                        let owner = self.control.construction_owner(&schemas.output)?;
+                        let scratch = self.control.construction_owner(&schemas.output)?;
+                        gather_left_with_null_right_typed(
+                            &cursor.input,
+                            &unmatched,
+                            &schemas.build,
+                            &schemas.output,
+                            owner.as_ref(),
+                            scratch.as_ref(),
+                            &self.control,
+                        )
+                        .map_err(JoinGatherError::into_execution)?
+                        .map(|batch| self.publish_typed(batch))
+                        .transpose()?
+                    }
+                    JoinType::LeftSemi => self.keep_probe(&cursor.input, &cursor.matched)?,
+                    JoinType::LeftAnti => self.keep_probe(
+                        &cursor.input,
+                        &cursor
+                            .matched
+                            .iter()
+                            .map(|value| !value)
+                            .collect::<Vec<_>>(),
+                    )?,
+                    JoinType::NullAwareLeftAnti => self.keep_probe(
+                        &cursor.input,
+                        &(0..cursor.input.len())
+                            .map(|row| {
+                                if cursor.null_probe[row] {
+                                    !cursor.matched_any[row]
+                                } else {
+                                    !(cursor.matched[row] || cursor.matched_null[row])
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )?,
+                    other => {
+                        return Err(program_binding_failure(
+                            PlanBindingKind::InvalidAssignment,
+                            format!("compiled hash join {other:?} is not executable yet"),
+                        ));
+                    }
+                };
+                Ok(StepResult::new(output, NextStep::NeedInput, 0))
+            }
+        }
+    }
+
     fn output_of(&self, batch: TypedJoinBatch) -> ExecutionResult<TypedJoinBatch> {
         let schema = self.prepared_schemas()?.output.clone();
         let owner = self.control.construction_owner(&schema)?;
@@ -1004,265 +1345,17 @@ impl CompiledHashJoinProbe {
             .republish(schema, owner.as_ref())
             .map_err(JoinGatherError::into_execution)
     }
-
-    fn matched_pairs(
-        &mut self,
-        probe: &Chunk,
-        keys: &[ArrayRef],
-    ) -> ExecutionResult<Option<(JoinSelection, Vec<TypedJoinBatch>)>> {
-        let table = match self.loaded()?.table.clone() {
-            Some(table) if !table.is_empty() => table,
-            _ => return Ok(None),
-        };
-        let Some(build) = self.build_rows()? else {
-            return Ok(None);
-        };
-        let (selection, _) = table
-            .search_pairs_arrays(keys, probe.len())
-            .map_err(ExecutionFailure::from)?;
-        if selection.is_empty() {
-            return Ok(Some((selection, Vec::new())));
-        }
-        if self.plan.residual.is_some() {
-            return self.residual(probe, &build, &selection).map(Some);
-        }
-        let batches = self.gather_scope(probe, &build, &selection)?;
-        Ok(Some((selection, batches)))
+    fn publish_typed(&self, batch: TypedJoinBatch) -> ExecutionResult<Chunk> {
+        let owner = self
+            .control
+            .construction_owner(&self.prepared_schemas()?.output)?;
+        batch
+            .into_chunk(owner.as_ref())
+            .map_err(JoinGatherError::into_execution)
     }
-
-    fn join_inner(
-        &mut self,
-        probe: &Chunk,
-        keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
-        let Some((_, batches)) = self.matched_pairs(probe, keys)? else {
-            return Ok(Vec::new());
-        };
-        batches
-            .into_iter()
-            .map(|batch| self.output_of(batch))
-            .collect()
-    }
-
-    fn join_left_outer(
-        &mut self,
-        probe: &Chunk,
-        keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
-        let (selection, matched) = self
-            .matched_pairs(probe, keys)?
-            .unwrap_or_else(|| (JoinSelection::new(), Vec::new()));
-        let mut output = matched
-            .into_iter()
-            .map(|batch| self.output_of(batch))
-            .collect::<ExecutionResult<Vec<_>>>()?;
-        let unmatched =
-            finalize_probe_rows(probe.len(), &selection, false, "compiled left outer join")
-                .map_err(ExecutionFailure::from)?
-                .selected;
-        let schemas = self.prepared_schemas()?;
-        let owner = self.control.construction_owner(&schemas.output)?;
-        let scratch = self.control.construction_owner(&schemas.output)?;
-        if let Some(batch) = gather_left_with_null_right_typed(
-            probe,
-            &unmatched,
-            &schemas.build,
-            &schemas.output,
-            owner.as_ref(),
-            scratch.as_ref(),
-            &self.control,
-        )
-        .map_err(JoinGatherError::into_execution)?
-        {
-            output.push(batch);
-        }
-        Ok(output)
-    }
-
-    fn join_semi_anti(
-        &mut self,
-        probe: &Chunk,
-        keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
-        let semi = self.plan.join_type == JoinType::LeftSemi;
-        let table = match self.loaded()?.table.clone() {
-            Some(table) if !table.is_empty() => table,
-            // No build key can match: semi keeps nothing, anti everything.
-            _ => return self.keep_probe(probe, &vec![!semi; probe.len()]),
-        };
-        let matched = if self.plan.residual.is_some() {
-            let (selection, _) = self
-                .matched_pairs(probe, keys)?
-                .unwrap_or_else(|| (JoinSelection::new(), Vec::new()));
-            finalize_probe_rows(probe.len(), &selection, true, "compiled semi/anti join")
-                .map_err(ExecutionFailure::from)?
-                .matched
-        } else {
-            table
-                .search_membership_arrays(keys, probe.len())
-                .map_err(ExecutionFailure::from)?
-                .0
-                .into_vec()
-        };
-        let keep = matched
-            .into_iter()
-            .map(|matched| matched == semi)
-            .collect::<Vec<_>>();
-        self.keep_probe(probe, &keep)
-    }
-
-    /// NOT IN semantics: a probe row is kept only when no build row can be
-    /// equal to it. A NULL probe key may equal any build row, and a build row
-    /// with a NULL key may equal any probe row; with a residual, only pairs
-    /// whose residual is TRUE count.
-    fn join_null_aware_anti(
-        &mut self,
-        probe: &Chunk,
-        keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
-        let rows = probe.len();
-        let (row_count, has_null_key, null_key_rows, table) = {
-            let build = self.loaded()?;
-            (
-                build.row_count,
-                build.has_null_key,
-                build.null_key_rows.clone(),
-                build.table.clone(),
-            )
-        };
-        if row_count == 0 {
-            return self.keep_probe(probe, &vec![true; rows]);
-        }
-        let probe_null = (0..rows)
-            .map(|row| keys.iter().any(|key| key.is_null(row)))
-            .collect::<Vec<_>>();
-        let group_ids = match table.as_ref() {
-            Some(table) => table
-                .lookup_group_ids_arrays(keys, rows)
-                .map_err(ExecutionFailure::from)?,
-            None => vec![None; rows],
-        };
-        if self.plan.residual.is_none() {
-            if has_null_key {
-                return Ok(Vec::new());
-            }
-            let keep = group_ids
-                .iter()
-                .zip(&probe_null)
-                .map(|(group, null)| !null && group.is_none())
-                .collect::<Vec<_>>();
-            return self.keep_probe(probe, &keep);
-        }
-        let null_key_rows = null_key_rows
-            .ok_or("compiled null-aware anti join with a residual requires build null-key rows")?;
-        let build = self
-            .build_rows()?
-            .ok_or("compiled null-aware anti join with a residual requires build rows")?;
-        let mut matched_equal = vec![false; rows];
-        if let Some(table) = table.as_ref() {
-            let (selection, _) = table
-                .search_pairs_arrays(keys, rows)
-                .map_err(ExecutionFailure::from)?;
-            if !selection.is_empty() {
-                let (kept, _) = self.residual(probe, &build, &selection)?;
-                mark(&mut matched_equal, &kept);
-            }
-        }
-        // Every probe row against every build row whose key is NULL.
-        let mut matched_null_key = vec![false; rows];
-        if !null_key_rows.is_empty() {
-            let probe_rows = (0..rows)
-                .map(|row| u32::try_from(row).map_err(|_| "join probe row id overflow"))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.cross_residual(
-                probe,
-                &build,
-                &probe_rows,
-                &null_key_rows,
-                &mut matched_null_key,
-            )?;
-        }
-        // Every probe row whose key is NULL against every build row.
-        let mut matched_any = vec![false; rows];
-        let null_probe_rows = probe_null
-            .iter()
-            .enumerate()
-            .filter(|(_, null)| **null)
-            .map(|(row, _)| u32::try_from(row))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "join probe row id overflow")?;
-        if !null_probe_rows.is_empty() {
-            let build_rows = (0..build.len())
-                .map(|row| u32::try_from(row).map_err(|_| "join build row id overflow"))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.cross_residual(
-                probe,
-                &build,
-                &null_probe_rows,
-                &build_rows,
-                &mut matched_any,
-            )?;
-        }
-        let keep = (0..rows)
-            .map(|row| {
-                if probe_null[row] {
-                    !matched_any[row]
-                } else {
-                    !(matched_equal[row] || matched_null_key[row])
-                }
-            })
-            .collect::<Vec<_>>();
-        self.keep_probe(probe, &keep)
-    }
-
-    /// The residual over every pair of `probe_rows` x `build_rows`, in
-    /// bounded blocks; marks the probe rows that have a TRUE pair.
-    fn cross_residual(
-        &mut self,
-        probe: &Chunk,
-        build: &Chunk,
-        probe_rows: &[u32],
-        build_rows: &[u32],
-        matched: &mut [bool],
-    ) -> ExecutionResult<()> {
-        if build_rows.is_empty() {
-            return Ok(());
-        }
-        let mut probe_position = 0usize;
-        let mut build_position = 0usize;
-        while probe_position < probe_rows.len() {
-            let mut selection = JoinSelection::new();
-            while probe_position < probe_rows.len()
-                && selection.len() < MAX_JOIN_OUTPUT_ROWS_PER_BATCH
-            {
-                let before = selection.len();
-                let stopped = append_cross_selection(
-                    &mut selection,
-                    &probe_rows[probe_position..=probe_position],
-                    &build_rows[build_position..],
-                    MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
-                );
-                build_position += selection.len() - before;
-                if build_position >= build_rows.len() {
-                    probe_position += 1;
-                    build_position = 0;
-                }
-                if stopped {
-                    break;
-                }
-            }
-            if !selection.is_empty() {
-                let (kept, _) = self.residual(probe, build, &selection)?;
-                mark(matched, &kept);
-            }
-        }
-        Ok(())
-    }
-
-    /// The probe rows `keep` selects, republished in the canonical output.
-    fn keep_probe(&self, probe: &Chunk, keep: &[bool]) -> ExecutionResult<Vec<TypedJoinBatch>> {
+    fn keep_probe(&self, probe: &Chunk, keep: &[bool]) -> ExecutionResult<Option<Chunk>> {
         if !keep.iter().any(|keep| *keep) {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let schema = self.prepared_schemas()?.output.clone();
         let owner = self.control.construction_owner(&schema)?;
@@ -1273,7 +1366,7 @@ impl CompiledHashJoinProbe {
             owner.as_ref(),
         )
         .map_err(JoinGatherError::into_execution)?;
-        Ok(vec![filtered])
+        self.publish_typed(filtered).map(Some)
     }
 }
 
@@ -1293,7 +1386,7 @@ pub(crate) fn validate_join_scope(
     left: &novarocks_local_program::StaticLayout,
     right: &novarocks_local_program::StaticLayout,
     scope: &novarocks_local_program::StaticLayout,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let slots = scope
         .slots()
         .iter()
@@ -1321,9 +1414,12 @@ pub(crate) fn validate_join_scope(
     if slots && fields && complete {
         Ok(())
     } else {
-        Err(format!(
-            "compiled join at local node {} has a scope other than its left then right layout",
-            node.index()
+        Err(crate::exec::fragment::error::program_binding_failure(
+            crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled join at local node {} has a scope other than its left then right layout",
+                node.index()
+            ),
         ))
     }
 }

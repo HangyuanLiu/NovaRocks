@@ -51,7 +51,7 @@ fn eval(
     columns: Vec<ArrayRef>,
     result: DataType,
     zone: Option<&str>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     arena.set_session_time_zone(zone.map(str::to_owned));
     let args = columns
@@ -338,13 +338,14 @@ fn original_from_unixtime_declared_datetime_date_carriers_errors_and_utf8_numeri
         Arc::new(BooleanArray::from(vec![true])),
     ] {
         assert_eq!(
-            eval(
+            (eval(
                 "from_unixtime",
                 vec![source, text(vec![Some("%Y")])],
                 DataType::Utf8,
                 Some("UTC")
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "from_unixtime expects int"
         );
     }
@@ -369,17 +370,18 @@ fn original_from_unixtime_declared_datetime_date_carriers_errors_and_utf8_numeri
         ]
     );
     assert_eq!(
-        eval(
+        (eval(
             "from_unixtime",
             vec![ints(vec![Some(0)]), ints(vec![Some(0)])],
             DataType::Utf8,
             Some("UTC")
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "from_unixtime expects string format"
     );
     assert_eq!(
-        eval(
+        (eval(
             "from_unixtime",
             vec![
                 ints(vec![Some(0)]),
@@ -389,18 +391,20 @@ fn original_from_unixtime_declared_datetime_date_carriers_errors_and_utf8_numeri
             DataType::Utf8,
             Some("UTC")
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "from_unixtime expects string timezone"
     );
     assert_eq!(
-        eval(
+        (eval(
             "from_unixtime",
             vec![ints(vec![Some(0)])],
             DataType::Int32,
             Some("UTC")
         )
-        .unwrap_err(),
-        "from_unixtime unsupported output type: Int32"
+        .unwrap_err())
+        .to_string(),
+        "from_unixtime has an unsupported frozen result type"
     );
 }
 #[test]
@@ -461,13 +465,14 @@ fn original_hour_from_unixtime_ignores_session_zone_and_retains_actual_int64_car
         assert_eq!(actual.to_data(), expected.to_data());
     }
     assert_eq!(
-        eval(
+        (eval(
             "hour_from_unixtime",
             vec![Arc::new(Date32Array::from(vec![0]))],
             DataType::Int32,
             Some("UTC")
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "hour_from_unixtime expects int"
     );
 }

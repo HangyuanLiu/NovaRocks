@@ -50,3 +50,6 @@ pub(crate) use join_hash_map::gather::{
     JoinGatherError, TypedJoinBatch, filter_probe_typed, gather_join_batch_typed,
     gather_left_with_null_right_typed,
 };
+
+#[cfg(test)]
+mod probe_step_test_support;

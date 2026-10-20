@@ -99,6 +99,12 @@ pub enum QueryLifecycleFaultKind {
     /// participant's failure must cause. It never fabricates a success and
     /// never skips the create it follows.
     TaskExecutionFailure,
+    /// Fails only a prepared Root Task after RUNNING and before data polling.
+    RootTaskExecutionFailureBeforeData,
+    /// Holds the second Root read until the exact runner activation after
+    /// a complete visible client prefix, then fails the original live Task.
+    /// Client observation grants no ACK or replacement Task authority.
+    TaskExecutionFailureAfterVisiblePrefix,
     /// Holds one applied `EstablishQueryContext` open so the harness can
     /// replace that exact backend process.
     ///
@@ -180,7 +186,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 28] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
         Self::RuntimeFilterContributionAckDrop,
@@ -195,6 +201,8 @@ impl QueryLifecycleFaultKind {
         Self::LeaseRenewalAckDrop,
         Self::LeaseRenewalStop,
         Self::TaskExecutionFailure,
+        Self::RootTaskExecutionFailureBeforeData,
+        Self::TaskExecutionFailureAfterVisiblePrefix,
         Self::RestartAfterEstablishContext,
         Self::CreateTaskRejectedAfterApply,
         Self::CreateTaskReceiptForeignTask,
@@ -229,6 +237,10 @@ impl QueryLifecycleFaultKind {
             Self::LeaseRenewalAckDrop => "lease-renewal-ack-drop",
             Self::LeaseRenewalStop => "lease-renewal-stop",
             Self::TaskExecutionFailure => "task-execution-failure",
+            Self::RootTaskExecutionFailureBeforeData => "root-task-execution-failure-before-data",
+            Self::TaskExecutionFailureAfterVisiblePrefix => {
+                "task-execution-failure-after-visible-prefix"
+            }
             Self::RestartAfterEstablishContext => "restart-after-establish-context",
             Self::CreateTaskRejectedAfterApply => "create-task-rejected-after-apply",
             Self::CreateTaskReceiptForeignTask => "create-task-receipt-foreign-task",
@@ -262,7 +274,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 24] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 26] = [
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
@@ -283,6 +295,8 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 24] = [
     // as an acknowledgement drop, because in both cases the answer arriving
     // is not what the case is about.
     QueryLifecycleFaultKind::TaskExecutionFailure,
+    QueryLifecycleFaultKind::RootTaskExecutionFailureBeforeData,
+    QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix,
     QueryLifecycleFaultKind::RestartAfterEstablishContext,
     // The exact ordinary Create remains outside Worker admission until the
     // runner releases it, proving unknown ownership during root completion.

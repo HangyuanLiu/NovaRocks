@@ -821,6 +821,15 @@ impl TaskStatusSource {
     /// drop this contract allows: it was not current and no observer had taken
     /// it. A queued terminal snapshot is never replaced.
     pub fn publish(&self, status: TaskStatus) {
+        if self.install_status(status) {
+            self.notify_status_publication();
+        }
+    }
+
+    /// Installs an immutable owner snapshot without invoking any waker. The
+    /// Task owner calls this before unlocking, so retirement cannot observe a
+    /// terminal owner whose source still contains only a nonterminal value.
+    pub(crate) fn install_status(&self, status: TaskStatus) -> bool {
         let identity = status.identity();
         let status_state = status.state();
         let mut state = self.state.lock().expect("task status source lock");
@@ -828,6 +837,28 @@ impl TaskStatusSource {
             !state.withheld.contains(&identity),
             "a task withheld from observers is never published"
         );
+        // The Task owner commits under its own lock and publishes after
+        // unlocking. A delayed older notification cannot roll back the source,
+        // reopen a terminal, or resurrect a retired observation.
+        if state.reclaimed.contains_key(&identity) || state.forgotten.contains(&identity) {
+            return false;
+        }
+        if let Some(current) = state.latest.get(&identity) {
+            if status.version() < current.version() {
+                return false;
+            }
+            if status.version() == current.version() {
+                assert_eq!(
+                    current, &status,
+                    "one Task status version binds one immutable snapshot"
+                );
+                return false;
+            }
+            assert!(
+                !current.is_terminal(),
+                "a terminal Task status cannot be revised"
+            );
+        }
         state.latest.insert(identity, status.clone());
         Self::publish_control_locked(
             &mut state,
@@ -853,7 +884,12 @@ impl TaskStatusSource {
         if status_state.is_failure() {
             state.failure_seen = true;
         }
-        drop(state);
+        true
+    }
+
+    /// Readiness only: the complete snapshot was already installed. Waking
+    /// after the Task lock is released permits synchronous reentrant observers.
+    pub(crate) fn notify_status_publication(&self) {
         self.wake.notify_waiters();
     }
 
@@ -1399,6 +1435,71 @@ mod covered_subscription_tests {
     }
 
     #[test]
+    fn delayed_publications_do_not_roll_back_version_cuts_or_resurrect_gone_tasks() {
+        let (context, identity, _) = identities();
+        let source = Arc::new(TaskStatusSource::new());
+        let subscriber = subscribe(&source, context, &[identity]);
+        drain_initial(&subscriber);
+        let old = TaskStatus::created(identity);
+        let current = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        source.publish(current.clone());
+        let cut = subscriber.bookmark().source_cut;
+        let revision = source.revision();
+        source.publish(old.clone());
+        source.publish(current.clone());
+        assert_eq!(source.latest(identity), Some(current));
+        assert_eq!(subscriber.bookmark().source_cut, cut);
+        assert_eq!(source.revision(), revision);
+        assert!(
+            matches!(take(&subscriber), CoveredObservationFrame::Live { fact: CoveredObservationFact::Status(status), .. } if status.version().get() == 2)
+        );
+        let terminal = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap();
+        source.publish(terminal.clone());
+        source.publish(old.clone());
+        assert_eq!(source.latest(identity), Some(terminal));
+        source.mark_gone(identity);
+        let cut = subscriber.bookmark().source_cut;
+        source.publish(old.clone());
+        assert_eq!(source.latest(identity), None);
+        assert_eq!(subscriber.bookmark().source_cut, cut);
+        source.forget_gone(identity);
+        source.publish(old);
+        assert_eq!(source.latest(identity), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "one Task status version binds one immutable snapshot")]
+    fn the_same_version_cannot_bind_another_snapshot() {
+        let (_, identity, _) = identities();
+        let source = TaskStatusSource::new();
+        source.publish(TaskStatus::created(identity));
+        source.publish(
+            TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::FIRST,
+                TaskState::Running,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
     fn covered_a1_atomic_cut_and_bounded_catch_up() {
         let (context, a, b) = identities();
         let source = Arc::new(TaskStatusSource::new());
@@ -1453,8 +1554,17 @@ mod covered_subscription_tests {
         drain_initial(&subscriber);
         source.publish(TaskStatus::created(hot));
         source.publish(TaskStatus::created(cold));
-        for _ in 0..10 {
-            source.publish(TaskStatus::created(hot));
+        for version in 2..=11 {
+            source.publish(
+                TaskStatus::try_new(
+                    hot,
+                    TaskStatusVersion::new(version).unwrap(),
+                    TaskState::Running,
+                    None,
+                    TaskOutputFacts::default(),
+                )
+                .unwrap(),
+            );
         }
         assert!(
             matches!(take(&subscriber), CoveredObservationFrame::Live { fact: CoveredObservationFact::Status(status), .. } if status.identity() == hot)
@@ -1477,7 +1587,16 @@ mod covered_subscription_tests {
         source.publish(TaskStatus::created(a));
         let selected = subscriber.select_next(1024, |_| 1).unwrap().unwrap();
         assert_eq!(subscriber.bookmark().covered_prefix, 0);
-        source.publish(TaskStatus::created(a));
+        source.publish(
+            TaskStatus::try_new(
+                a,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap(),
+        );
         assert_eq!(subscriber.bookmark().source_cut, 2);
         assert_eq!(subscriber.bookmark().covered_prefix, 0);
         assert_eq!(

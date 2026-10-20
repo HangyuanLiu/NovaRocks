@@ -549,7 +549,7 @@ mod tests {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.work.lock().unwrap().push(units);
             if units > 0
-                && let Some(failure) = self.failure
+                && let Some(failure) = self.failure.clone()
             {
                 Err(failure)
             } else {
@@ -571,7 +571,7 @@ mod tests {
             Some(CompileControlError::ResourceExhausted),
         ] {
             let control = Control {
-                failure,
+                failure: failure.clone(),
                 work: Mutex::default(),
             };
             let mut work =
@@ -689,7 +689,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 work: Mutex::default(),
             };
             let mut work =
@@ -716,7 +716,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 work: Mutex::default(),
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();

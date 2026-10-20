@@ -95,7 +95,7 @@ impl PureCompileControl for CompileControl {
         assert!(work <= 256);
         self.seen.lock().unwrap().push(work);
         if !self.quantum_only || work == 256 {
-            self.failure.map_or(Ok(()), Err)
+            self.failure.clone().map_or(Ok(()), Err)
         } else {
             Ok(())
         }
@@ -967,7 +967,7 @@ fn construction_raii_and_retained_overflow_precede_publication() {
 }
 
 #[test]
-fn lifetime_bound_checks_success_and_error_growth_and_cleanup() {
+fn lifetime_bound_checks_success_and_preserves_every_originating_error_and_cleanup() {
     let runtime = RuntimeControl::default();
     let values = value_array();
     let args = [EvaluatedArgument::Column(&values)];
@@ -975,6 +975,7 @@ fn lifetime_bound_checks_success_and_error_growth_and_cleanup() {
         for failure in [
             None,
             Some(operational()),
+            Some(actual_aggregate_scalar_source()),
             Some(internal("primary")),
             Some(KernelFailure::Cancelled),
             Some(KernelFailure::DeadlineExceeded),
@@ -1020,12 +1021,8 @@ fn lifetime_bound_checks_success_and_error_growth_and_cleanup() {
                 result
             };
             match failure {
-                Some(
-                    error @ (KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted),
-                ) => assert_eq!(result, Err(error)),
-                _ => assert!(matches!(result, Err(KernelFailure::Internal(_)))),
+                Some(error) => assert_eq!(result, Err(error)),
+                None => assert!(matches!(result, Err(KernelFailure::Internal(_)))),
             }
             assert!(kernel.retained_bytes(&state) > 0);
             drop(state);
@@ -1054,7 +1051,7 @@ fn emission_carrier_faults_are_internal_and_capacity_precedes_emitter() {
             );
             assert!(matches!(
                 emit_aggregate(kernel.as_ref(), [&state].into_iter(), 1, &runtime),
-                Err(KernelFailure::Internal(_))
+                Err(ref cause) if crate::kernel_control::test_contract::output(cause)
             ));
         }
         for failure in failures() {
@@ -1071,12 +1068,13 @@ fn emission_carrier_faults_are_internal_and_capacity_precedes_emitter() {
 }
 
 #[test]
-fn emission_checks_interior_growth_even_on_error_but_preserves_control_primary() {
+fn emission_checks_successful_growth_and_preserves_every_originating_error() {
     let runtime = RuntimeControl::default();
     for phase in [AggregateKernelPhase::Partial, AggregateKernelPhase::Final] {
         for failure in [
             None,
             Some(operational()),
+            Some(actual_aggregate_scalar_source()),
             Some(KernelFailure::Cancelled),
             Some(KernelFailure::DeadlineExceeded),
             Some(KernelFailure::ResourceExhausted),
@@ -1087,12 +1085,8 @@ fn emission_checks_interior_growth_even_on_error_but_preserves_control_primary()
             let state = create_aggregate_state(kernel.as_ref(), &runtime).unwrap();
             let result = emit_aggregate(kernel.as_ref(), [&state].into_iter(), 1, &runtime);
             match failure {
-                Some(
-                    error @ (KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted),
-                ) => assert_eq!(result.unwrap_err(), error),
-                _ => assert!(matches!(result, Err(KernelFailure::Internal(_)))),
+                Some(error) => assert_eq!(result.unwrap_err(), error),
+                None => assert!(matches!(result, Err(KernelFailure::Internal(_)))),
             }
             drop(state);
             assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
@@ -1111,7 +1105,7 @@ fn compile_entry_and_positive_quantum_controls_remain_typed_before_preparation()
             let owner = Owner::new(if positive { 300 } else { 1 }, false);
             let input = owner.input();
             let control = CompileControl {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 quantum_only: positive,
                 ..CompileControl::default()
             };
@@ -1468,4 +1462,21 @@ fn prepared_batches_read_compact_ordinals_and_explicit_scalar_broadcast() {
     merge.merge_next(&mut merged, &runtime).unwrap();
     assert_eq!(merged.sum, 600);
     assert_eq!(merged.last_row, Some(3));
+}
+
+fn actual_aggregate_scalar_source() -> KernelFailure {
+    let source = crate::aggregate_scalar::build_scalar_array(
+        &DataType::Boolean,
+        vec![Some(crate::aggregate_scalar::AggScalarValue::Int64(1))],
+        &mut crate::aggregate_scalar::ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&source);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 315);
+    assert!(matches!(&source, KernelFailure::Source(_)));
+    source
 }

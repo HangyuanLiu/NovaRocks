@@ -16,8 +16,10 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::function::compare_values_with_null;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, cast_with_special_rules};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -39,22 +41,22 @@ pub fn eval_in<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     values: &[ExprId],
     is_not_in: bool,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let array = arena.eval(child, chunk)?;
     let lhs_is_literal_like = !expr_contains_slot(arena, child);
     let single_candidate = values.len() == 1;
-    let mut state = novarocks_functions::native_inlist::InRows::legacy(&array);
+    let mut state = novarocks_functions::native_inlist::InRows::begin_required(&array)?;
     if state.is_empty() {
-        return Ok(Arc::new(state.finish_legacy(&array, is_not_in)));
+        return Ok(Arc::new(state.finish_required(&array, is_not_in)?));
     }
     for value_id in values {
         let candidate = arena.eval(*value_id, chunk)?;
-        state.candidate_nulls_legacy(&candidate)?;
+        state.candidate_nulls_required(&candidate)?;
         let equalities =
             eq_with_candidate(&array, &candidate, lhs_is_literal_like, single_candidate)?;
-        state.equalities_legacy(&equalities);
+        state.equalities_required(&equalities)?;
     }
-    Ok(Arc::new(state.finish_legacy(&array, is_not_in)))
+    Ok(Arc::new(state.finish_required(&array, is_not_in)?))
 }
 
 fn row_index(row: usize, len: usize) -> usize {
@@ -83,7 +85,7 @@ fn c1_dictionary_string_value_type(data_type: &DataType) -> Option<&DataType> {
 fn eq_dictionary_input_with_candidate(
     array: &ArrayRef,
     candidate: &ArrayRef,
-) -> Result<Option<BooleanArray>, String> {
+) -> ExecutionResult<Option<BooleanArray>> {
     let Some(value_type) = c1_dictionary_string_value_type(array.data_type()) else {
         return Ok(None);
     };
@@ -93,7 +95,7 @@ fn eq_dictionary_input_with_candidate(
     let candidate = if candidate.data_type() == value_type {
         candidate.clone()
     } else {
-        cast(candidate, value_type).map_err(|e| e.to_string())?
+        cast(candidate, value_type).map_err(crate::exec::expr::cast::cast_arrow_failure)?
     };
 
     if candidate.len() == 1 {
@@ -103,14 +105,18 @@ fn eq_dictionary_input_with_candidate(
             &scalar as &dyn arrow::array::Datum,
         )
         .map(Some)
-        .map_err(|e| e.to_string());
+        .map_err(|source| {
+            ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+        });
     }
     eq(
         &array.as_ref() as &dyn arrow::array::Datum,
         &candidate.as_ref() as &dyn arrow::array::Datum,
     )
     .map(Some)
-    .map_err(|e| e.to_string())
+    .map_err(|source| {
+        ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+    })
 }
 
 #[expect(
@@ -122,7 +128,7 @@ fn eq_with_candidate(
     candidate: &ArrayRef,
     lhs_is_literal_like: bool,
     single_candidate: bool,
-) -> Result<BooleanArray, String> {
+) -> ExecutionResult<BooleanArray> {
     if let Some(result) = eq_dictionary_input_with_candidate(array, candidate)? {
         return Ok(result);
     }
@@ -133,11 +139,11 @@ fn eq_with_candidate(
         let (array, candidate) =
             normalize_nested_candidate_types(array.clone(), candidate.clone())?;
         if array.data_type() != candidate.data_type() {
-            return Err(format!(
+            return Err(expression_contract(format_args!(
                 "IN nested type mismatch: {:?} vs {:?}",
                 array.data_type(),
                 candidate.data_type()
-            ));
+            )));
         }
         let mut builder = BooleanBuilder::with_capacity(array.len());
         for i in 0..array.len() {
@@ -162,7 +168,7 @@ fn eq_with_candidate(
         return Ok(builder.finish());
     }
     if let Some(result) =
-        novarocks_functions::native_inlist::signed_equality_legacy(array, candidate)?
+        novarocks_functions::native_inlist::signed_equality_required(array, candidate)?
     {
         return Ok(result);
     }
@@ -182,7 +188,9 @@ fn eq_with_candidate(
             &array.as_ref() as &dyn arrow::array::Datum,
             &candidate.as_ref() as &dyn arrow::array::Datum,
         )
-        .map_err(|e| e.to_string());
+        .map_err(|source| {
+            ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+        });
     }
     if matches!(array.data_type(), DataType::Utf8)
         && is_numeric_json_candidate(candidate.data_type())
@@ -194,54 +202,74 @@ fn eq_with_candidate(
         DataType::Int8 => {
             let arr = candidate.as_any().downcast_ref::<Int8Array>().unwrap();
             let scalar = Int8Array::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Int16 => {
             let arr = candidate.as_any().downcast_ref::<Int16Array>().unwrap();
             let scalar = Int16Array::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Int32 => {
             let arr = candidate.as_any().downcast_ref::<Int32Array>().unwrap();
             let scalar = Int32Array::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Int64 => {
             let arr = candidate.as_any().downcast_ref::<Int64Array>().unwrap();
             let scalar = Int64Array::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Float32 => {
             let arr = candidate.as_any().downcast_ref::<Float32Array>().unwrap();
             let scalar = Float32Array::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Float64 => {
             let arr = candidate.as_any().downcast_ref::<Float64Array>().unwrap();
             let scalar = Float64Array::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Boolean => {
             let arr = candidate.as_any().downcast_ref::<BooleanArray>().unwrap();
             let scalar = BooleanArray::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Utf8 => match utf8_equality_observed(&array, &candidate, &mut |_| {
             Ok::<_, std::convert::Infallible>(())
         }) {
             Ok(result) => Ok(result),
-            Err(novarocks_functions::native_inlist::InError::Data(message)) => Err(message),
+            Err(novarocks_functions::native_inlist::InError::Operation(cause)) => {
+                Err(ExecutionFailure::from(cause))
+            }
             Err(novarocks_functions::native_inlist::InError::Host(never)) => match never {},
         },
         DataType::LargeBinary => {
             let values = candidate
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast IN scalar to LargeBinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast IN scalar to LargeBinaryArray")
+                })?;
             let input = array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast IN input to LargeBinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast IN input to LargeBinaryArray")
+                })?;
             let mut builder = BooleanBuilder::with_capacity(input.len());
             for i in 0..input.len() {
                 let value_idx = row_index(i, values.len());
@@ -261,7 +289,9 @@ fn eq_with_candidate(
         DataType::Date32 => {
             let arr = candidate.as_any().downcast_ref::<Date32Array>().unwrap();
             let scalar = Date32Array::new_scalar(arr.value(row_index(0, arr.len())));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|source| {
+                ExecutionFailure::from(novarocks_functions::native_inlist::arrow_failure(source))
+            })
         }
         DataType::Timestamp(unit, _) => match unit {
             TimeUnit::Second => {
@@ -269,13 +299,13 @@ fn eq_with_candidate(
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN scalar to TimestampSecondArray".to_string()
+                        expression_contract("failed to downcast IN scalar to TimestampSecondArray")
                     })?;
                 let input = array
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN input to TimestampSecondArray".to_string()
+                        expression_contract("failed to downcast IN input to TimestampSecondArray")
                     })?;
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
@@ -293,13 +323,17 @@ fn eq_with_candidate(
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN scalar to TimestampMillisecondArray".to_string()
+                        expression_contract(
+                            "failed to downcast IN scalar to TimestampMillisecondArray",
+                        )
                     })?;
                 let input = array
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN input to TimestampMillisecondArray".to_string()
+                        expression_contract(
+                            "failed to downcast IN input to TimestampMillisecondArray",
+                        )
                     })?;
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
@@ -317,13 +351,17 @@ fn eq_with_candidate(
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN scalar to TimestampMicrosecondArray".to_string()
+                        expression_contract(
+                            "failed to downcast IN scalar to TimestampMicrosecondArray",
+                        )
                     })?;
                 let input = array
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN input to TimestampMicrosecondArray".to_string()
+                        expression_contract(
+                            "failed to downcast IN input to TimestampMicrosecondArray",
+                        )
                     })?;
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
@@ -341,13 +379,17 @@ fn eq_with_candidate(
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN scalar to TimestampNanosecondArray".to_string()
+                        expression_contract(
+                            "failed to downcast IN scalar to TimestampNanosecondArray",
+                        )
                     })?;
                 let input = array
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
-                        "failed to downcast IN input to TimestampNanosecondArray".to_string()
+                        expression_contract(
+                            "failed to downcast IN input to TimestampNanosecondArray",
+                        )
                     })?;
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
@@ -365,11 +407,15 @@ fn eq_with_candidate(
             let arr = candidate
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast IN scalar to Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast IN scalar to Decimal128Array")
+                })?;
             let input = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast IN input to Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast IN input to Decimal128Array")
+                })?;
             let mut builder = BooleanBuilder::with_capacity(input.len());
             for i in 0..input.len() {
                 let value_idx = row_index(i, arr.len());
@@ -385,11 +431,15 @@ fn eq_with_candidate(
             let arr = candidate
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| "failed to downcast IN scalar to Decimal256Array".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast IN scalar to Decimal256Array")
+                })?;
             let input = array
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| "failed to downcast IN input to Decimal256Array".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast IN input to Decimal256Array")
+                })?;
             let mut builder = BooleanBuilder::with_capacity(input.len());
             for i in 0..input.len() {
                 let value_idx = row_index(i, arr.len());
@@ -406,12 +456,14 @@ fn eq_with_candidate(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| {
-                    "failed to downcast IN scalar to FixedSizeBinaryArray".to_string()
+                    expression_contract("failed to downcast IN scalar to FixedSizeBinaryArray")
                 })?;
             let input = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast IN input to FixedSizeBinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast IN input to FixedSizeBinaryArray")
+                })?;
             let mut builder = BooleanBuilder::with_capacity(input.len());
             for i in 0..input.len() {
                 let value_idx = row_index(i, arr.len());
@@ -423,7 +475,10 @@ fn eq_with_candidate(
             }
             Ok(builder.finish())
         }
-        other => Err(format!("unsupported IN predicate type: {:?}", other)),
+        other => Err(expression_contract(format_args!(
+            "unsupported IN predicate type: {:?}",
+            other
+        ))),
     }
 }
 
@@ -438,19 +493,27 @@ pub(super) fn utf8_equality_observed<E>(
     let input = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| InError::Data("failed to downcast IN input to StringArray".to_string()))?;
+        .ok_or_else(|| {
+            InError::Operation(novarocks_functions::native_inlist::contract(
+                "failed to downcast IN input to StringArray",
+            ))
+        })?;
     let values = candidate
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
-            InError::Data("failed to downcast IN candidate to StringArray".to_string())
+            InError::Operation(novarocks_functions::native_inlist::contract(
+                "failed to downcast IN candidate to StringArray",
+            ))
         })?;
     if values.len() != 1 && values.len() != input.len() {
-        return Err(InError::Data(format!(
-            "IN predicate value length mismatch: input has {}, value has {}",
-            input.len(),
-            values.len()
-        )));
+        return Err(InError::Operation(
+            novarocks_functions::native_inlist::contract(format_args!(
+                "IN predicate value length mismatch: input has {}, value has {}",
+                input.len(),
+                values.len()
+            )),
+        ));
     }
     observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
     let mut builder = BooleanBuilder::with_capacity(input.len());
@@ -529,11 +592,11 @@ fn candidate_numeric_json_value(candidate: &ArrayRef, idx: usize) -> Option<Json
 fn eq_utf8_json_with_numeric_candidate(
     array: &ArrayRef,
     candidate: &ArrayRef,
-) -> Result<BooleanArray, String> {
+) -> ExecutionResult<BooleanArray> {
     let input = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "failed to downcast IN input to StringArray".to_string())?;
+        .ok_or_else(|| expression_contract("failed to downcast IN input to StringArray"))?;
     let mut builder = BooleanBuilder::with_capacity(input.len());
     for row in 0..input.len() {
         let candidate_idx = row_index(row, candidate.len());
@@ -572,18 +635,20 @@ fn same_nested_kind(left: &DataType, right: &DataType) -> bool {
 fn normalize_nested_candidate_types(
     left: ArrayRef,
     right: ArrayRef,
-) -> Result<(ArrayRef, ArrayRef), String> {
+) -> ExecutionResult<(ArrayRef, ArrayRef)> {
     if !is_nested_type(left.data_type()) || !is_nested_type(right.data_type()) {
         return Ok((left, right));
     }
     if check_exact(left.data_type(), right.data_type()).is_ok() {
-        let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
-        let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
+        let right =
+            retag_column(&right, left.data_type()).map_err(ExecutionFailure::from_domain)?;
+        let left = retag_column(&left, right.data_type()).map_err(ExecutionFailure::from_domain)?;
         return Ok((left, right));
     }
     if check_exact(right.data_type(), left.data_type()).is_ok() {
-        let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
-        let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
+        let left = retag_column(&left, right.data_type()).map_err(ExecutionFailure::from_domain)?;
+        let right =
+            retag_column(&right, left.data_type()).map_err(ExecutionFailure::from_domain)?;
         return Ok((left, right));
     }
     if same_nested_kind(left.data_type(), right.data_type())
@@ -597,7 +662,7 @@ fn normalize_nested_candidate_types(
 fn normalize_scalar_candidate_types(
     left: ArrayRef,
     right: ArrayRef,
-) -> Result<(ArrayRef, ArrayRef), String> {
+) -> ExecutionResult<(ArrayRef, ArrayRef)> {
     if left.data_type() == right.data_type()
         || is_nested_type(left.data_type())
         || is_nested_type(right.data_type())
@@ -605,20 +670,20 @@ fn normalize_scalar_candidate_types(
         return Ok((left, right));
     }
 
-    let Some(target) =
-        novarocks_types::comparison_common_type(left.data_type(), right.data_type())?
+    let Some(target) = novarocks_types::comparison_common_type(left.data_type(), right.data_type())
+        .map_err(ExecutionFailure::from_domain)?
     else {
         return Ok((left, right));
     };
     let left = if left.data_type() == &target {
         left
     } else {
-        cast(&left, &target).map_err(|e| e.to_string())?
+        cast(&left, &target).map_err(crate::exec::expr::cast::cast_arrow_failure)?
     };
     let right = if right.data_type() == &target {
         right
     } else {
-        cast(&right, &target).map_err(|e| e.to_string())?
+        cast(&right, &target).map_err(crate::exec::expr::cast::cast_arrow_failure)?
     };
     Ok((left, right))
 }
@@ -634,13 +699,13 @@ fn compare_values_for_in(
     right_idx: usize,
     lhs_is_literal_like: bool,
     single_candidate: bool,
-) -> Result<Option<bool>, String> {
+) -> ExecutionResult<Option<bool>> {
     if left.data_type() != right.data_type() {
-        return Err(format!(
+        return Err(expression_contract(format_args!(
             "IN nested type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     if left.is_null(left_idx) || right.is_null(right_idx) {
         return Ok(match left.data_type() {
@@ -710,15 +775,15 @@ fn compare_list_values_for_in(
     right_idx: usize,
     lhs_is_literal_like: bool,
     single_candidate: bool,
-) -> Result<Option<bool>, String> {
+) -> ExecutionResult<Option<bool>> {
     let l = left
         .as_any()
         .downcast_ref::<ListArray>()
-        .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+        .ok_or_else(|| expression_contract("failed to downcast left to ListArray"))?;
     let r = right
         .as_any()
         .downcast_ref::<ListArray>()
-        .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+        .ok_or_else(|| expression_contract("failed to downcast right to ListArray"))?;
 
     let l_offsets = l.value_offsets();
     let r_offsets = r.value_offsets();
@@ -759,15 +824,15 @@ fn compare_struct_values_for_in(
     right_idx: usize,
     lhs_is_literal_like: bool,
     single_candidate: bool,
-) -> Result<Option<bool>, String> {
+) -> ExecutionResult<Option<bool>> {
     let l = left
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+        .ok_or_else(|| expression_contract("failed to downcast left to StructArray"))?;
     let r = right
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+        .ok_or_else(|| expression_contract("failed to downcast right to StructArray"))?;
     if l.num_columns() != r.num_columns() {
         return Ok(Some(false));
     }
@@ -796,15 +861,15 @@ fn compare_map_values_for_in(
     right_idx: usize,
     lhs_is_literal_like: bool,
     single_candidate: bool,
-) -> Result<Option<bool>, String> {
+) -> ExecutionResult<Option<bool>> {
     let l = left
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+        .ok_or_else(|| expression_contract("failed to downcast left to MapArray"))?;
     let r = right
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+        .ok_or_else(|| expression_contract("failed to downcast right to MapArray"))?;
 
     let l_offsets = l.value_offsets();
     let r_offsets = r.value_offsets();
@@ -1368,10 +1433,10 @@ mod tests {
             .expect_err("numeric candidate should not match C1 path");
 
         assert!(
-            err.contains("Invalid comparison operation")
-                || err.contains("Dictionary")
-                || err.contains("not support")
-                || err.contains("unsupported"),
+            err.to_string().contains("Invalid comparison operation")
+                || err.to_string().contains("Dictionary")
+                || err.to_string().contains("not support")
+                || err.to_string().contains("unsupported"),
             "unexpected error: {err}"
         );
     }
@@ -1436,7 +1501,8 @@ mod tests {
             .expect_err("non-Int32 dictionary key should fall back");
 
         assert!(
-            err.contains("failed to downcast IN input to StringArray"),
+            err.to_string()
+                .contains("failed to downcast IN input to StringArray"),
             "unexpected error: {err}"
         );
     }
@@ -1464,7 +1530,8 @@ mod tests {
             .expect_err("non-string dictionary should fall back");
 
         assert!(
-            err.contains("failed to downcast IN input to StringArray"),
+            err.to_string()
+                .contains("failed to downcast IN input to StringArray"),
             "unexpected error: {err}"
         );
     }

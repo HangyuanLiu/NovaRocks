@@ -94,9 +94,9 @@ struct NativeFragmentResultSession {
 impl FragmentResultSession for NativeFragmentResultSession {
     fn reservation_bytes(
         &self,
-        chunk: &novarocks_execution::exec::chunk::Chunk,
+        input: novarocks_execution::runtime::fragment::io::ResultInputMetadata,
     ) -> Result<usize, FragmentIoError> {
-        if chunk.is_empty() {
+        if input.rows() == 0 {
             return Ok(0);
         }
         if self.spec.presentation() != ResultPresentation::MysqlText {
@@ -106,13 +106,13 @@ impl FragmentResultSession for NativeFragmentResultSession {
                 "typed result session only supports MYSQL text presentation",
             ));
         }
-        if chunk.logical_bytes() >= self.root_retained_byte_cap.get() {
+        if input.retained_bytes() >= self.root_retained_byte_cap.get() {
             return Err(FragmentIoError::new(
                 FragmentIoOperation::ResultWrite,
                 FragmentIoErrorKind::Unavailable,
                 format!(
                     "result chunk retains {} bytes and leaves no encoded capacity within joint cap {}",
-                    chunk.logical_bytes(),
+                    input.retained_bytes(),
                     self.root_retained_byte_cap
                 ),
             ));
@@ -122,7 +122,7 @@ impl FragmentResultSession for NativeFragmentResultSession {
 
     fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, FragmentIoError> {
         self.handle.try_acquire(bytes).map_err(|error| {
-            FragmentIoError::new(
+            FragmentIoError::from_domain(
                 FragmentIoOperation::ResultWrite,
                 FragmentIoErrorKind::Unavailable,
                 error,
@@ -159,17 +159,13 @@ impl FragmentResultSession for NativeFragmentResultSession {
                 )
             })?;
         let encoded = exchange::encode_chunks_bounded_with_creation(
-            &[chunk], true, encoded_byte_cap, factory, control,
-        ).map_err(|error| match error {
-            exchange::ExchangeEncodeFailure::Wire(error) => ResultWriteFailure::Io(FragmentIoError::new(
-                FragmentIoOperation::ResultWrite,
-                FragmentIoErrorKind::Unavailable,
-                format!(
-                    "typed result exceeds joint retained-byte cap: Arrow input retained {arrow_retained_bytes} bytes and encoded capacity is {encoded_byte_cap} bytes: {error}"
-                ),
-            )),
-            exchange::ExchangeEncodeFailure::Execution(error) => ResultWriteFailure::Execution(error),
-        })?;
+            &[chunk],
+            true,
+            encoded_byte_cap,
+            factory,
+            control,
+        )
+        .map_err(|cause| ResultWriteFailure::Execution(cause.into_execution()))?;
         self.handle
             .write_typed_with_credit(encoded, credit)
             .map(|_| ())
@@ -255,7 +251,10 @@ mod tests {
         )
         .unwrap();
         let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_observed::<
+            novarocks_execution::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             schema,
             vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
             1,
@@ -343,7 +342,7 @@ mod tests {
             )
             .expect("open bounded typed task result");
         let reservation = session
-            .reservation_bytes(&typed_chunk())
+            .reservation_bytes((&typed_chunk()).into())
             .expect("Arrow input fits the joint cap");
         let ResultWriteAdmission::Granted(credit) = session
             .try_acquire(reservation)
@@ -360,11 +359,31 @@ mod tests {
                 &ResultTestControl,
             )
             .expect_err("Arrow plus encoded backing must not exceed the joint cap");
-        let ResultWriteFailure::Io(error) = error else {
-            panic!("joint cap refusal must retain its original I/O cause");
+        let ResultWriteFailure::Execution(error) = error else {
+            panic!("joint cap refusal retains the actual bounded encoder cause");
         };
-        assert_eq!(error.kind(), FragmentIoErrorKind::Unavailable);
-        assert!(error.to_string().contains("joint retained-byte cap"));
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, FailureReason, RepresentationBoundary, domain,
+        };
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(
+            fact.reason(),
+            FailureReason::new(domain::EXCHANGE, std::num::NonZeroU16::new(112).unwrap())
+        );
+        let representation = fact.representation().expect("actual encoded packet extent");
+        assert_eq!(
+            representation.boundary,
+            RepresentationBoundary::SingleOutput
+        );
+        let encoded_cap = reservation.checked_sub(arrow_retained).unwrap() as u64;
+        assert_eq!(representation.extent_limit, Some(encoded_cap));
+        assert!(representation.required.unwrap() > encoded_cap);
+        assert_eq!(representation.representable_prefix, None);
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the original encoder source remains available locally"
+        );
         session.abort(ResultAbort::NeverStarted);
     }
 
@@ -516,7 +535,7 @@ mod tests {
             let baseline = tracker.current();
             let input = typed_chunk();
             let ResultWriteAdmission::Granted(credit) = session
-                .try_acquire(session.reservation_bytes(&input).unwrap())
+                .try_acquire(session.reservation_bytes((&input).into()).unwrap())
                 .unwrap()
             else {
                 panic!("fresh stream has its original credit");
@@ -579,7 +598,7 @@ mod tests {
             let control = CancelControl(AtomicUsize::new(0));
             let input = typed_chunk();
             let ResultWriteAdmission::Granted(credit) = session
-                .try_acquire(session.reservation_bytes(&input).unwrap())
+                .try_acquire(session.reservation_bytes((&input).into()).unwrap())
                 .unwrap()
             else {
                 panic!("fresh stream credit");
@@ -661,9 +680,12 @@ mod tests {
             let budget = ResultRetainedBudget::new(cap);
             let (identity, session) = open(1803, budget.clone(), cap);
             let original: novarocks_execution::runtime::fragment::ExecutionFailure =
-                "actual creator original pipeline refusal"
-                    .to_string()
-                    .into();
+                novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(
+                        "actual creator original pipeline refusal",
+                    ),
+                )
+                .into();
             let requests = Arc::new(AtomicUsize::new(0));
             let factory = OriginalCallerFactory {
                 inner: actual_result_factory(),
@@ -672,7 +694,7 @@ mod tests {
             };
             let input = typed_chunk();
             let ResultWriteAdmission::Granted(credit) = session
-                .try_acquire(session.reservation_bytes(&input).unwrap())
+                .try_acquire(session.reservation_bytes((&input).into()).unwrap())
                 .unwrap()
             else {
                 panic!("fresh result credit");

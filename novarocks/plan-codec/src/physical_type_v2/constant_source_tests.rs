@@ -27,7 +27,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         self.trace.lock().unwrap().push(units);
         if units != 0
-            && let Some(cause) = self.late
+            && let Some(cause) = self.late.clone()
         {
             return Err(cause);
         }

@@ -706,7 +706,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
 }
 
 fn runtime_state() -> Arc<RuntimeState> {
-    Arc::new(RuntimeState::new(
+    Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,
@@ -1009,18 +1009,21 @@ fn compiled_writer_bindings_cover_exactly_the_programs_writer_family() {
         CompiledWriterBindings::default()
             .validate(&insert.writer)
             .unwrap_err()
+            .to_string()
             .contains("table writers")
     );
     assert!(
         writer_bindings(&insert.writer, &recorded)
             .validate(&insert.finish)
             .unwrap_err()
+            .to_string()
             .contains("table writers")
     );
     assert!(
         CompiledWriterBindings::default()
             .validate(&insert.finish)
             .unwrap_err()
+            .to_string()
             .contains("table finishes")
     );
     writer_bindings(&insert.writer, &recorded)
@@ -1046,6 +1049,12 @@ pub(crate) fn compiled_statistics_writer_fixture()
 }
 
 mod statistics {
+    use crate::exec::pipeline::{
+        input::RawInput,
+        step::{AdmissionNext, InputResult, NextStep},
+        test_driver::TestDriver,
+    };
+
     use super::*;
 
     pub(super) fn writer_owner_fixture()
@@ -1217,7 +1226,7 @@ mod statistics {
             )
             .unwrap(),
         );
-        RuntimeState::new(None, None, None, None, None, None, Some(runtime))
+        RuntimeState::for_local_execution(None, None, None, None, None, None, Some(runtime))
     }
 
     /// The provider field types the frontend resolves each sketch over.
@@ -2431,24 +2440,77 @@ mod statistics {
 
     fn poll(operator: &mut Box<dyn Operator>, state: &RuntimeState) -> Result<Vec<Chunk>, String> {
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut calls = TestDriver::new(operator.as_mut(), state);
         let mut output = Vec::new();
-        while !operator.is_finished() {
+        loop {
             if let Some(error) = state.error() {
                 return Err(error.to_string());
             }
-            let processor = operator.as_processor_mut().unwrap();
-            if processor.has_output() {
-                if let Some(chunk) = processor.pull_chunk(state).map_err(|e| e.to_string())? {
-                    output.push(chunk);
-                }
-                continue;
+            assert!(
+                Instant::now() <= deadline,
+                "timed out waiting for operator output"
+            );
+            let step = calls.drive().map_err(|e| e.to_string())?;
+            if let Some(chunk) = step.output {
+                output.push(chunk);
             }
-            if Instant::now() > deadline {
-                return Err("timed out waiting for operator output".to_string());
+            match step.next {
+                NextStep::Finished => return Ok(output),
+                NextStep::Wait(_) => std::thread::sleep(Duration::from_millis(2)),
+                NextStep::Runnable | NextStep::Yield => {}
+                NextStep::NeedInput => panic!("fixture signaled EOS before finalization"),
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
-        Ok(output)
+    }
+
+    /// One actual writer admission and accepted continuation, preserving raw
+    /// custody across asynchronous queue capacity and the original deadline.
+    fn deliver_writer_input(
+        operator: &mut dyn Operator,
+        state: &RuntimeState,
+        chunk: Chunk,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut calls = TestDriver::new(operator, state);
+        let mut input = RawInput::for_test(chunk);
+        let mut step = loop {
+            assert!(Instant::now() < deadline, "the writer accepts its page");
+            match calls.try_push(input) {
+                InputResult::Accepted(result) => break result?,
+                InputResult::Rejected { failure, .. } => return Err(failure),
+                InputResult::Deferred {
+                    input: returned,
+                    next,
+                } => {
+                    input = returned;
+                    match next {
+                        AdmissionNext::Wait(_) => std::thread::sleep(Duration::from_millis(2)),
+                        AdmissionNext::Yield => {}
+                        AdmissionNext::ResumeExisting => {
+                            assert!(calls.drive()?.output.is_none(), "no prefix before EOS");
+                        }
+                    }
+                }
+            }
+        };
+        loop {
+            assert!(
+                step.output.is_none(),
+                "writer publishes only after input EOS"
+            );
+            if matches!(step.next, NextStep::NeedInput) {
+                return Ok(());
+            }
+            assert!(
+                !matches!(step.next, NextStep::Finished),
+                "accepted writer input remains open"
+            );
+            assert!(Instant::now() < deadline, "the accepted writer page drains");
+            if matches!(step.next, NextStep::Wait(_)) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            step = calls.drive()?;
+        }
     }
 
     /// Direct-operator fixtures use the same original runtime tracker/control
@@ -2510,22 +2572,9 @@ mod statistics {
                 operator.bind_runtime_state(state).unwrap();
                 operator.activate(state).unwrap();
                 for page in pages {
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    while !operator.as_processor_ref().unwrap().need_input() {
-                        assert!(Instant::now() < deadline, "the writer accepts its page");
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    operator
-                        .as_processor_mut()
-                        .unwrap()
-                        .push_chunk(state, page.clone())
-                        .unwrap();
+                    deliver_writer_input(operator.as_mut(), state, page.clone()).unwrap();
                 }
-                operator
-                    .as_processor_mut()
-                    .unwrap()
-                    .set_finishing(state)
-                    .unwrap();
+                operator.finish_for_test(state).unwrap();
                 poll(&mut operator, state).unwrap()
             })
             .collect()
@@ -2552,17 +2601,14 @@ mod statistics {
                 Arc::clone(relation),
             )
             .unwrap();
-            operator
-                .as_processor_mut()
-                .unwrap()
-                .push_chunk(state, delivered)
-                .map_err(|e| e.to_string())?;
+            crate::exec::operators::table_finish::complete_table_finish_input(
+                operator.as_mut(),
+                state,
+                delivered,
+            )
+            .map_err(|error| error.to_string())?;
         }
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(state)
-            .map_err(|e| e.to_string())?;
+        operator.finish_for_test(state).map_err(|e| e.to_string())?;
         poll(&mut operator, state)
     }
 
@@ -2677,11 +2723,12 @@ mod statistics {
             &kept(&compiled_writer),
             &state,
         );
+        let v1_state = statistics_state(Arc::clone(&function_set));
         let v1_root = run_finish(
             &v1_finish(&compiled, &function_set),
             v1_multiplex().chunk_schema(),
             &kept(&v1_writer),
-            &state,
+            &v1_state,
         );
         Differential {
             compiled_writer,
@@ -2918,20 +2965,13 @@ mod statistics {
         aggregate.bind_runtime_state(&state).unwrap();
         let relation = compiled_relation(&finish);
         for batch in arriving {
-            aggregate
-                .as_processor_mut()
-                .unwrap()
-                .push_chunk(
-                    &state,
+            TestDriver::new(aggregate.as_mut(), &state)
+                .input_without_output(
                     Chunk::try_new_with_chunk_schema(batch, Arc::clone(&relation)).unwrap(),
                 )
                 .unwrap();
         }
-        aggregate
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(&state)
-            .unwrap();
+        aggregate.finish_for_test(&state).unwrap();
         let output = poll(&mut aggregate, &state).unwrap();
         let [output] = output.as_slice() else {
             panic!("one final batch")
@@ -3004,10 +3044,7 @@ mod statistics {
         writer.prepare().unwrap();
         writer.bind_runtime_state(&state).unwrap();
         writer.activate(&state).unwrap();
-        let error = writer
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&state, page(&compiled.writer, &rows))
+        let error = deliver_writer_input(writer.as_mut(), &state, page(&compiled.writer, &rows))
             .expect_err("the guard rejects the partial update");
         assert!(error.to_string().contains("PartialUpdate"), "{error}");
         assert!(
@@ -3015,7 +3052,33 @@ mod statistics {
             "no page reaches the provider writer"
         );
 
+        // Retire the failed Task's real writer before starting an independent
+        // Task scope for the final-merge fault.
+        writer.on_driver_failure();
+        writer.begin_exit().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut pending = false;
+            writer.visit_exits(&mut |exit| match exit.report_to(&state.error_state()) {
+                crate::exec::pipeline::operator::ExitProgress::Pending(_)
+                | crate::exec::pipeline::operator::ExitProgress::Unresolved(_) => pending = true,
+                crate::exec::pipeline::operator::ExitProgress::Exited => {}
+            });
+            if !pending {
+                break;
+            }
+            assert!(Instant::now() < deadline, "failed writer actually exits");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if let Err(failure) = writer.close() {
+            state.error_state().report_cleanup(&failure);
+        }
+        assert!(state.error().unwrap().same_occurrence(&error));
+        drop(writer);
+        drop(factory);
+
         // A clean writer relation, then a finish whose guard rejects the merge.
+        let state = statistics_state(theta_function_set());
         let factory = compiled_table_writer_factory(
             &compiled.writer,
             compiled.writer.graph().root(),
@@ -3103,11 +3166,7 @@ mod statistics {
         let tracker = install_statistics_construction(operator.as_mut(), &state);
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(&state)
-            .unwrap();
+        operator.finish_for_test(&state).unwrap();
         let mut chunks = poll(&mut operator, &state).unwrap();
         assert_eq!(chunks.len(), 1, "empty partial emits actual initial states");
         let output = chunks.pop().unwrap();
@@ -3162,17 +3221,11 @@ mod statistics {
                 Arc::clone(&relation),
             )
             .unwrap();
-            operator
-                .as_processor_mut()
-                .unwrap()
-                .push_chunk(&state, input)
+            TestDriver::new(operator.as_mut(), &state)
+                .input_without_output(input)
                 .unwrap();
         }
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(&state)
-            .unwrap();
+        operator.finish_for_test(&state).unwrap();
         let mut outputs = poll(&mut operator, &state).unwrap();
         assert_eq!(outputs.len(), 1);
         let output = outputs.pop().unwrap();

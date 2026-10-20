@@ -1099,7 +1099,7 @@ impl PureCompileControl for Trace {
         events.push((phase, units));
         if self.at == Some(at) {
             self.refused.store(true, Ordering::SeqCst);
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -1141,7 +1141,7 @@ fn unpivot_full_compiler_preserves_each_original_control_prefix_and_ordinary_fai
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..expected.len() {
-                let control = Trace::new(Some(at), cause);
+                let control = Trace::new(Some(at), cause.clone());
                 assert!(
                     matches!(invoke(&control),Err(FragmentCompileError::Control(actual))if actual==cause)
                 );
@@ -1176,7 +1176,7 @@ fn unpivot_wide_actual_mapping_compilation_crosses_quantum_and_keeps_entry_tail_
         CompileControlError::ResourceExhausted,
     ] {
         for at in [0, quantum, expected.len() - 1] {
-            let control = Trace::new(Some(at), cause);
+            let control = Trace::new(Some(at), cause.clone());
             assert!(
                 matches!(compile(&source,&functions,&control),Err(FragmentCompileError::Control(actual))if actual==cause)
             );

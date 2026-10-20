@@ -17,6 +17,7 @@
 use super::*;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime::fragment::{ExecutionFailureCause, PipelineOperation};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeErrorState;
@@ -105,7 +106,7 @@ fn source_fixture(json_result: bool) -> Source {
             true,
         ),
     )]);
-    let state = RuntimeState::new(None, None, None, None, None, None, None);
+    let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
     let tracker = MemTracker::new_root("native-table-function-original-owner");
     let factory = try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
@@ -139,6 +140,7 @@ fn make_operator(source: &Source) -> Box<dyn Operator> {
     .unwrap();
     let mut operator = factory.create(1, 0);
     operator.set_construction_factory(source.factory.clone());
+    operator.bind_runtime_state(&source.state).unwrap();
     operator
 }
 fn input(source: &Source) -> Chunk {
@@ -175,17 +177,11 @@ fn native_table_function_complete_json_child_and_last_output_projection_keep_cre
     let mut operator = make_operator(&source);
     operator.prepare().unwrap();
     operator.bind_runtime_state(&source.state).unwrap();
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, input(&source))
+    let mut outputs = TestDriver::new(operator.as_mut(), &source.state)
+        .input_and_collect(input(&source))
         .unwrap();
-    let output = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&source.state)
-        .unwrap()
-        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    let output = outputs.pop().unwrap();
     assert_eq!(output.len(), 3, "original LEFT UNNEST padding algorithm");
     let values = output.columns()[0]
         .as_any()
@@ -264,8 +260,12 @@ fn native_table_function_preserves_first_memory_and_caller_refusal_without_tail(
     assert_eq!(tracker.current(), 0);
     let source = caller_source();
     let mut operator = make_operator(&source);
-    let original = ExecutionFailure::from("original native table function caller".to_owned())
-        .at_operator(3, PipelineOperation::Admission);
+    let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new(
+            &("original native table function caller".to_owned()),
+        ),
+    ))
+    .at_operator(3, PipelineOperation::Admission);
     source.state.error_state().set_error(original.clone());
     let before = source.tracker.allocated();
     let failure = operator.prepare().unwrap_err();
@@ -293,17 +293,11 @@ fn native_table_function_output_headers_outlive_temporary_operation_scratch() {
     let input = input(&source);
     let before_allocated = source.tracker.allocated();
     let before_live = source.tracker.current();
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, input.clone())
+    let mut outputs = TestDriver::new(operator.as_mut(), &source.state)
+        .input_and_collect(input.clone())
         .unwrap();
-    let output = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&source.state)
-        .unwrap()
-        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    let output = outputs.pop().unwrap();
     assert_eq!(output.len(), 3);
     let allocated = source.tracker.allocated() - before_allocated;
     let retained = source.tracker.current() - before_live;
@@ -332,10 +326,8 @@ fn native_table_function_materialization_first_memory_refusal_keeps_original_inp
     let input = original.clone().into_chunk();
     let baseline = source.tracker.current();
     source.tracker.install_limit_once(baseline).unwrap();
-    let failure = operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, input)
+    let failure = TestDriver::new(operator.as_mut(), &source.state)
+        .input_and_collect(input)
         .unwrap_err();
     assert!(matches!(
         failure.cause(),
@@ -361,17 +353,21 @@ fn native_table_function_materialization_preserves_original_caller_before_any_co
     operator.prepare().unwrap();
     let input = input(&source);
     let original_input = input.clone();
-    let failure = ExecutionFailure::from("original materialization caller".to_owned())
+    let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted)
         .at_operator(3, PipelineOperation::Admission);
     source.state.error_state().set_error(failure.clone());
     let before = source.tracker.allocated();
-    let actual = operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&source.state, input)
+    let actual = TestDriver::new(operator.as_mut(), &source.state)
+        .input_and_collect(input)
         .unwrap_err();
-    assert_eq!(actual.cause(), failure.cause());
+    assert!(actual.same_occurrence(&failure));
     assert_eq!(actual.context(), failure.context());
+    let accepted = source
+        .state
+        .error()
+        .expect("the originating local failure remains observed");
+    assert!(accepted.same_occurrence(&failure));
+    assert_eq!(accepted.context(), failure.context());
     assert_eq!(
         source.tracker.allocated(),
         before,

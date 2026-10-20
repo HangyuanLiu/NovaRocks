@@ -25,7 +25,6 @@ use novarocks_type_contract::{
     CallEffects, ExpressionEffectContext, FunctionIntrinsicRowError, PureCompileControl,
 };
 
-use crate::aggregate_kernel::finish_lifecycle;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, logical_is_null, validate_argument_observed};
 use crate::{
@@ -145,7 +144,7 @@ fn specialize_once<O: PureHigherOrderImplementation + ?Sized>(
         |contract, body| {
             owner
                 .prepare_higher_order(input, contract, body, control)
-                .map_err(FunctionSpecializationFailure::Kernel)
+                .map_err(FunctionSpecializationFailure::from)
         },
     )
 }
@@ -176,7 +175,7 @@ pub(crate) fn specialize_once_checked<O: PureHigherOrderImplementation + ?Sized>
                 .prepare_higher_order_checked(input, checked, contract, body, control)
                 .map_err(|error| match error {
                     crate::CheckedOwnerFailure::Original(error) => {
-                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::from(
                             error,
                         ))
                     }
@@ -225,7 +224,7 @@ fn specialize_once_core<
     let (receipt, effects) = refine(children)?;
     let contract = Arc::new(
         HigherOrderCallContract::from_refined(input, &receipt, selected, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let body = Arc::new(
         LambdaBodyContract::try_new(
@@ -235,7 +234,7 @@ fn specialize_once_core<
             options.capture_types,
             control,
         )
-        .map_err(FunctionSpecializationFailure::Kernel)?,
+        .map_err(FunctionSpecializationFailure::from)?,
     );
     let prepared = prepare(contract.clone(), body.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) || !Arc::ptr_eq(prepared.body_contract(), &body)
@@ -398,11 +397,8 @@ impl HigherOrderEvaluationInstance {
         size_of::<Self>()
             .checked_add(retained_bound)
             .ok_or(KernelFailure::ResourceExhausted)?;
-        let result = prepared.create_instance(control);
-        let instance = finish_lifecycle(
-            result,
-            validate_prepared_metadata(&prepared, &contract, &body, retained_bound),
-        )?;
+        let instance = prepared.create_instance(control)?;
+        validate_prepared_metadata(&prepared, &contract, &body, retained_bound)?;
         if instance.retained_bytes() > retained_bound {
             return Err(internal(
                 "new higher-order instance exceeded its retained bound",
@@ -517,18 +513,15 @@ impl HigherOrderEvaluationInstance {
         let result = self.instance.evaluate(input, &mut executor, control);
         // A caught body failure is an originating failure, not a housekeeping
         // post-check. It overrides a private success or unrelated outer error.
-        let result = executor.failure.map_or(result, Err);
-        let body_metadata = if Arc::ptr_eq(executor.evaluator.contract(), &self.body) {
-            Ok(())
-        } else {
-            Err(internal(
+        let output = executor.failure.map_or(result, Err)?;
+        if !Arc::ptr_eq(executor.evaluator.contract(), &self.body) {
+            return Err(internal(
                 "bound lambda evaluator changed its immutable contract",
-            ))
-        };
-        let result = finish_lifecycle(result, body_metadata);
-        let result = finish_lifecycle(result, self.validate_metadata());
-        let result = finish_lifecycle(result, self.retained_bytes().map(|_| ()));
-        let output = finish_lifecycle(result, control.checkpoint(0))?;
+            ));
+        }
+        self.validate_metadata()?;
+        self.retained_bytes()?;
+        control.checkpoint(0)?;
         validate_output(&self.contract, &self.body, selection, &output, control)?;
         Ok(output.values)
     }

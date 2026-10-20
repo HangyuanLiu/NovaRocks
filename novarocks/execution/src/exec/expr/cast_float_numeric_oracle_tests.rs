@@ -31,7 +31,7 @@ fn legacy(
     target: DataType,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     // Explicit Physical roots make this a numeric legacy oracle. Carrier-only
     // ExprArena metadata does not establish any nominal-domain authority.
     let source_type = FunctionValueType::new(source.data_type().clone(), true);
@@ -259,13 +259,14 @@ fn legacy_float_signed_allow_reports_the_first_original_batch_failure_including_
                     (vec![None, Some(f64::NEG_INFINITY), Some(overflow)], "-inf"),
                 ] {
                     assert_eq!(
-                        legacy(
+                        (legacy(
                             source_array(f32_source, &values),
                             target.clone(),
                             policy,
                             true
                         )
-                        .unwrap_err(),
+                        .unwrap_err())
+                        .to_string(),
                         range_error(&source_type, &target, first)
                     );
                     let output = legacy(
@@ -312,12 +313,12 @@ fn legacy_f32_error_expands_actual_native_bits_to_f64_without_changing_range_or_
             vec![None, Some(7), None, None]
         );
         assert_eq!(
-            legacy(selected, DataType::Int8, policy, true).unwrap_err(),
+            (legacy(selected, DataType::Int8, policy, true).unwrap_err()).to_string(),
             "Expr evaluate meet error: CAST failed: from Float32 to Int8: 128.00001525878906 conflict with range of TINYINT"
         );
         // Advancing the real array slice changes the first failing original row.
         assert_eq!(
-            legacy(pool.slice(4, 1), DataType::Int8, policy, true).unwrap_err(),
+            (legacy(pool.slice(4, 1), DataType::Int8, policy, true).unwrap_err()).to_string(),
             "Expr evaluate meet error: CAST failed: from Float32 to Int8: inf conflict with range of TINYINT"
         );
     }

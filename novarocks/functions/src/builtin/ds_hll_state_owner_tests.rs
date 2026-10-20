@@ -318,42 +318,151 @@ fn long_target() -> ArrayRef {
     Arc::new(b.finish())
 }
 #[test]
-fn ds_scalar_full_long_diagnostic_selected_remap_clone_last_drop() {
+fn ds_scalar_numeric_value_cause_keeps_reason_remap_clone_and_last_drop() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let arrays = vec![
+        Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![1024, 17])),
+    ];
+    let original =
+        super::super::ds_hll_state_core::evaluate(&arrays[0], Some(arrays[1].clone()), None)
+            .unwrap_err();
+    assert_eq!(original.failure_fact().class(), FailureClass::Data);
+    assert_eq!(
+        original.failure_fact(),
+        crate::DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    let mut source: &(dyn std::error::Error + 'static) = &original;
+    let mut actual_range_source = false;
+    while let Some(next) = source.source() {
+        actual_range_source |= next.is::<std::num::TryFromIntError>();
+        source = next;
+    }
+    assert!(
+        actual_range_source,
+        "raw required call retains the actual conversion cause"
+    );
+    let original = original.to_string();
+    let host = Arc::new(Host::default());
+    let mut kernel = instance(&arrays, &host);
+    let arguments = args(&arrays);
+    let rows = [0];
+    let output = kernel
+        .evaluate(
+            Selection::try_sparse(2, &rows).unwrap(),
+            &arguments,
+            &Control::default(),
+        )
+        .unwrap();
+    assert!(output.values().is_null(0));
+    assert_eq!(output.errors()[0].message(), original);
+    assert_eq!(
+        output.errors()[0].reason(),
+        crate::DataFailureReason::NumericOutOfRange
+    );
+    let remapped = output.errors()[0].with_selected_ordinal(9);
+    assert_eq!(remapped.selected_ordinal(), 9);
+    assert_eq!(remapped.message(), original);
+    assert_eq!(
+        remapped.reason(),
+        crate::DataFailureReason::NumericOutOfRange
+    );
+    assert!(host.ledger.lock().unwrap().bytes > original.len());
+    drop(output);
+    drop(kernel);
+    assert!(
+        host.ledger.lock().unwrap().bytes > 0,
+        "a real Data alias retains its diagnostic backing"
+    );
+    drop(remapped);
+    empty(&host);
+}
+#[test]
+fn ds_scalar_tuning_carrier_contract_is_bounded_latched_and_drops_actual_input() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
     let arrays = vec![
         Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
         Arc::new(Int64Array::from(vec![17, 17])),
         long_target(),
     ];
+    let weak = Arc::downgrade(&arrays[2]);
     let original = super::super::ds_hll_state_core::evaluate(
         &arrays[0],
         Some(arrays[1].clone()),
         Some(arrays[2].clone()),
     )
     .unwrap_err();
-    assert!(original.len() > 512);
+    assert_eq!(original.failure_fact().class(), FailureClass::Invariant);
+    assert!(original.to_string().len() <= 512);
     let host = Arc::new(Host::default());
     let mut kernel = instance(&arrays, &host);
+    let before_opaque = host.ledger.lock().unwrap().opaque_attempts;
     let arguments = args(&arrays);
     let rows = [0];
-    let selection = Selection::try_sparse(2, &rows).unwrap();
-    let output = kernel
-        .evaluate(selection, &arguments, &Control::default())
-        .unwrap();
-    assert!(output.values().is_null(0));
-    assert_eq!(output.errors()[0].message(), original);
-    let remapped = output.errors()[0].with_selected_ordinal(9);
-    assert_eq!(remapped.selected_ordinal(), 9);
-    assert_eq!(remapped.message(), original);
-    let outstanding = host.ledger.lock().unwrap().bytes;
-    assert!(outstanding > original.len());
-    drop(output);
-    drop(kernel);
-    assert!(
-        host.ledger.lock().unwrap().bytes > 0,
-        "true diagnostic clone retains backing after instance drop"
+    let failure = kernel
+        .evaluate(
+            Selection::try_sparse(2, &rows).unwrap(),
+            &arguments,
+            &Control::default(),
+        )
+        .unwrap_err();
+    assert_eq!(failure.failure_fact(), original.failure_fact());
+    assert_eq!(
+        host.ledger.lock().unwrap().opaque_attempts,
+        before_opaque,
+        "tuning type refusal must precede nested value copies and sketch preparation"
     );
-    drop(remapped);
+    assert_eq!(failure.to_string(), original.to_string());
+    assert_eq!(
+        kernel
+            .evaluate(
+                Selection::try_sparse(2, &rows).unwrap(),
+                &arguments,
+                &Control::default()
+            )
+            .unwrap_err(),
+        KernelFailure::InstanceFailed
+    );
+    drop(arguments);
+    drop(arrays);
+    drop(kernel);
+    assert!(weak.upgrade().is_none());
     empty(&host);
+}
+#[test]
+fn ds_scalar_target_hint_borrows_long_text_without_additional_opaque_work() {
+    fn run(target: &str) -> (Vec<u8>, usize) {
+        let arrays = vec![
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![17])),
+            Arc::new(StringArray::from(vec![target])),
+        ];
+        let host = Arc::new(Host::default());
+        let mut kernel = instance(&arrays, &host);
+        let before = host.ledger.lock().unwrap().opaque_attempts;
+        let arguments = args(&arrays);
+        let output = kernel
+            .evaluate(Selection::all(1), &arguments, &Control::default())
+            .unwrap();
+        assert!(output.errors().is_empty());
+        let values = output
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let bytes = values.value(0).to_vec();
+        let requests = host.ledger.lock().unwrap().opaque_attempts - before;
+        drop(output);
+        drop(kernel);
+        empty(&host);
+        (bytes, requests)
+    }
+    let expected = run("HLL_6");
+    let long = run(&"x".repeat(1_000_000));
+    assert_eq!(
+        long, expected,
+        "same HLL_6 hint result and actual opaque operation count"
+    );
 }
 #[test]
 fn ds_scalar_all_null_key_skips_entire_owned_tuning_reader_and_diagnostic() {
@@ -439,10 +548,12 @@ fn ds_scalar_every_callback_seven_causes_has_no_tail_and_failure_latch() {
 }
 #[test]
 fn ds_scalar_every_owned_allocation_and_opaque_reservation_seven_causes_rollback() {
+    // One successful sketch row exercises actual opaque copies/SDK work;
+    // the second row's genuine numeric Data exercises owned diagnostics.
     let arrays = vec![
-        Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-        Arc::new(Int64Array::from(vec![17])),
-        long_target().slice(0, 1),
+        Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![17, 1024])),
+        Arc::new(StringArray::from(vec!["HLL_4", "HLL_4"])) as ArrayRef,
     ];
     let good = Arc::new(Host::default());
     let mut kernel = instance(&arrays, &good);
@@ -451,7 +562,7 @@ fn ds_scalar_every_owned_allocation_and_opaque_reservation_seven_causes_rollback
     let initial_opaque = good.ledger.lock().unwrap().opaque_attempts;
     drop(
         kernel
-            .evaluate(Selection::all(1), &arguments, &Control::default())
+            .evaluate(Selection::all(2), &arguments, &Control::default())
             .unwrap(),
     );
     let owned = good.ledger.lock().unwrap().attempts - initial_owned;
@@ -467,7 +578,7 @@ fn ds_scalar_every_owned_allocation_and_opaque_reservation_seven_causes_rollback
             arm_refusal(&host, stop, cause.clone());
             assert_eq!(
                 kernel
-                    .evaluate(Selection::all(1), &arguments, &Control::default())
+                    .evaluate(Selection::all(2), &arguments, &Control::default())
                     .unwrap_err(),
                 cause
             );
@@ -481,7 +592,7 @@ fn ds_scalar_every_owned_allocation_and_opaque_reservation_seven_causes_rollback
             *host.opaque_refusal.lock().unwrap() = Some((base + stop, cause.clone()));
             assert_eq!(
                 kernel
-                    .evaluate(Selection::all(1), &arguments, &Control::default())
+                    .evaluate(Selection::all(2), &arguments, &Control::default())
                     .unwrap_err(),
                 cause
             );
@@ -520,13 +631,28 @@ fn ds_scalar_every_sketch_create_update_serialize_reservation_preserves_seven_ca
     let host = Arc::new(Host::default());
     let mut kernel = instance(&arrays, &host);
     let base = host.ledger.lock().unwrap().opaque_attempts;
-    drop(
-        kernel
-            .evaluate(Selection::all(1), &arguments, &Control::default())
-            .unwrap(),
+    let output = kernel
+        .evaluate(Selection::all(1), &arguments, &Control::default())
+        .unwrap();
+    assert!(output.errors().is_empty());
+    let values = output
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(
+        crate::datasketches_hll::hll_estimate(values.value(0)).unwrap(),
+        1
     );
+    drop(output);
     let count = host.ledger.lock().unwrap().opaque_attempts - base;
-    assert!(count >= 5);
+    // Capacity authorization is required for these real SDK phases. The old
+    // minimum also counted two tuning copies which borrowed reads eliminated.
+    let funded_sdk_phases = ["create", "update", "serialize"];
+    assert!(
+        count >= funded_sdk_phases.len(),
+        "only {count} actual grants for {funded_sdk_phases:?}"
+    );
     drop(kernel);
     empty(&host);
     for cause in causes() {

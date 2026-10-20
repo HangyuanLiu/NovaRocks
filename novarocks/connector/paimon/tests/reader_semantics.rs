@@ -506,7 +506,7 @@ async fn closing_a_stream_observes_the_exit_of_its_own_operations() {
     assert!(split.is_sealed());
     assert!(!task.is_sealed(), "the task source stays open");
     assert_eq!(closes.load(Ordering::Acquire), 0, "the stream never opened");
-    read.end(Ok(()));
+    read.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
     closed.await.expect("the split exited");
     assert_eq!(task.live_operations(), 0);
 
@@ -517,6 +517,9 @@ async fn closing_a_stream_observes_the_exit_of_its_own_operations() {
     let (stream, _) = stream_fixture(vec![Step::Eof], resources, &budget, Some(split.clone()));
     drop(stream.close());
     assert!(split.is_sealed());
-    read.end(Ok(()));
-    split.exited().await.expect("the split still exits");
+    read.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+    assert_eq!(
+        split.exited().await,
+        novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+    );
 }

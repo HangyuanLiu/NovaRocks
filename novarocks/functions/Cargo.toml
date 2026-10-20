@@ -30,6 +30,7 @@ doctest = false
 [features]
 
 [dependencies]
+novarocks-failure-contract.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
 openssl.workspace = true
 url.workspace = true

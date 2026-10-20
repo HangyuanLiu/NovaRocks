@@ -278,6 +278,7 @@ fn original_error(stage: AnalyticInputStage) -> String {
         .err()
         .expect("original split Data"),
     }
+    .to_string()
 }
 #[test]
 fn analytic_input_stage_original_data_full_text_and_scope_no_failure_footer() {
@@ -295,13 +296,16 @@ fn analytic_input_stage_original_data_full_text_and_scope_no_failure_footer() {
             .err()
             .expect("original stage Data");
         match &failure {
-            AnalyticStageFailure::OriginalData {
+            AnalyticStageFailure::Operation {
                 stage: actual,
-                message,
+                cause: message,
                 ..
             } => {
                 assert_eq!(*actual, stage);
-                assert_eq!(message, &expected);
+                assert_eq!(message.to_string(), expected);
+                use novarocks_failure_contract::{FailureClass, FailureProjection};
+                assert_eq!(message.failure_fact().class(), FailureClass::Invariant);
+                assert!(std::error::Error::source(message).is_some());
             }
             other => panic!("wrong channel {other:?}"),
         }
@@ -318,7 +322,7 @@ fn analytic_input_stage_original_data_full_text_and_scope_no_failure_footer() {
         let observed = KernelControlObservation::new(&control);
         let mut work = Work::new(&observed, Arc::new(AtomicUsize::new(0)));
         assert!(
-            matches!(run(stage,true,&mut work),Err(AnalyticStageFailure::OriginalData { message,.. }) if message==expected)
+            matches!(run(stage,true,&mut work),Err(AnalyticStageFailure::Operation { cause: message,.. }) if message.to_string()==expected)
         );
         assert_eq!(control.trace(), trace);
         for cause in causes() {

@@ -331,7 +331,7 @@ impl MvApplicationError {
         self
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+        self.compile_control.clone()
     }
 
     pub fn kind(&self) -> MvApplicationErrorKind {
@@ -388,10 +388,8 @@ impl MvCreateProviderError {
         result.compile_control = failure.compile_control_error();
         result
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 
     pub fn kind(&self) -> MvCreateProviderErrorKind {
@@ -548,16 +546,16 @@ mod compile_error_tests {
             CompileControlError::ResourceExhausted,
         ] {
             for compile in [
-                SqlCompileError::from(control),
-                SqlCompileError::Analyze(AnalyzeError::control(control)),
+                SqlCompileError::from(control.clone()),
+                SqlCompileError::Analyze(AnalyzeError::control(control.clone())),
             ] {
                 let expected = compile.to_string();
                 let application = MvApplicationError::from_compile(compile.clone());
                 let provider = MvCreateProviderError::from_compile(compile);
                 assert_eq!(application.message(), expected);
                 assert_eq!(provider.message(), expected);
-                assert_eq!(application.compile_control_error(), Some(control));
-                assert_eq!(provider.compile_control_error(), Some(control));
+                assert_eq!(application.compile_control_error(), Some(control.clone()));
+                assert_eq!(provider.compile_control_error(), Some(control.clone()));
                 assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
                 assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
             }

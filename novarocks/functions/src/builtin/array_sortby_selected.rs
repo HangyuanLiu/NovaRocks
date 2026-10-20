@@ -66,8 +66,11 @@ struct Port<'port, 'work, 'control, 'rows>(
 );
 impl SortByPort for Port<'_, '_, '_, '_> {
     type Failure = ScalarInvocationFailure;
-    fn diagnostic(&mut self, original: std::fmt::Arguments<'_>) -> Self::Failure {
-        ProjectionPort::diagnostic(self.0, original)
+    fn value_error(
+        &mut self,
+        original: super::array_sortby_core::SortByLengthMismatch,
+    ) -> Self::Failure {
+        ProjectionPort::value_error(self.0, format_args!("{original}"))
     }
     fn step(&mut self) -> Result<(), Self::Failure> {
         ProjectionPort::step(self.0)

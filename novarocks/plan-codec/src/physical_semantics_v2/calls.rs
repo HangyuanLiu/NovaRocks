@@ -925,7 +925,7 @@ mod tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut events = self.events.lock().unwrap();
             events.push((phase, units));
-            if let Some((at, error)) = self.failure
+            if let Some((at, error)) = self.failure.clone()
                 && at == events.len()
             {
                 return Err(error);
@@ -1785,20 +1785,23 @@ mod tests {
         ] {
             for at in 1..=encode_trace.len() {
                 let stop = TestControl {
-                    failure: Some((at, error)),
+                    failure: Some((at, error.clone())),
                     events: Mutex::default(),
                 };
-                assert_eq!(encode_checked(&checked, &stop), Err(E::Control(error)));
+                assert_eq!(
+                    encode_checked(&checked, &stop),
+                    Err(E::Control(error.clone()))
+                );
                 assert_eq!(stop.events.lock().unwrap().len(), at);
             }
             for at in 1..=decode_trace.len() {
                 let stop = TestControl {
-                    failure: Some((at, error)),
+                    failure: Some((at, error.clone())),
                     events: Mutex::default(),
                 };
                 assert_eq!(
                     decode_checked(&fixture, &dto, &stop),
-                    Err(E::Control(error))
+                    Err(E::Control(error.clone()))
                 );
                 assert_eq!(stop.events.lock().unwrap().len(), at);
             }

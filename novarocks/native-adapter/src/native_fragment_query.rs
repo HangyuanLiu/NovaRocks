@@ -233,19 +233,15 @@ impl NativeFragmentQueryRuntime {
         let execution = execution_key(execution_id);
         self.manager
             .ensure_native_context_execution(execution, false, delivery_expire, query_expire)
-            .map_err(NativeFragmentAdmissionError::Existing)?;
+            .map_err(NativeFragmentAdmissionError::Context)?;
         let query_mem_tracker = self
             .manager
             .query_mem_tracker_execution(execution)
-            .ok_or_else(|| {
-                NativeFragmentAdmissionError::Existing(
-                    "QueryContext missing mem_tracker".to_string(),
-                )
-            })?;
+            .ok_or_else(|| NativeFragmentAdmissionError::MissingTracker)?;
         let query_memory_account = if let Some(limit) = exec_mem_limit {
             query_mem_tracker
                 .install_limit_once(limit)
-                .map_err(NativeFragmentAdmissionError::Existing)?;
+                .map_err(NativeFragmentAdmissionError::Limit)?;
             // The same number, stated on both mechanisms. Charges still live
             // on the tracker, so the account's own `L` is near zero and this
             // policy refuses nothing yet; that is deliberate. As later slices
@@ -255,11 +251,8 @@ impl NativeFragmentQueryRuntime {
                 .manager
                 .ensure_query_memory_account(execution, &self.memory_authority)
                 .map_err(NativeFragmentAdmissionError::MemoryAccount)?;
-            let limit_bytes = u64::try_from(limit).map_err(|_| {
-                NativeFragmentAdmissionError::Existing(format!(
-                    "query memory limit must not be negative: {limit}"
-                ))
-            })?;
+            let limit_bytes = u64::try_from(limit)
+                .map_err(|_| NativeFragmentAdmissionError::InvalidLimit(limit))?;
             account
                 .account()
                 .install_policy(limit_bytes, LimitDimension::Work);
@@ -293,15 +286,11 @@ impl NativeFragmentQueryRuntime {
         let tracker = self
             .manager
             .query_mem_tracker_execution(execution_key(execution_id))
-            .ok_or_else(|| {
-                NativeFragmentAdmissionError::Existing(
-                    "native type construction requires an established query tracker".to_string(),
-                )
-            })?;
+            .ok_or_else(|| NativeFragmentAdmissionError::MissingTracker)?;
         if let Some(limit) = exec_mem_limit {
             tracker
                 .install_limit_once(limit)
-                .map_err(NativeFragmentAdmissionError::Existing)?;
+                .map_err(NativeFragmentAdmissionError::Limit)?;
         }
         Ok(tracker)
     }
@@ -321,11 +310,8 @@ impl NativeFragmentQueryRuntime {
             query_expire,
             exec_mem_limit,
         )?;
-        let query_memory = query_memory.ok_or_else(|| {
-            NativeFragmentAdmissionError::Existing(
-                "native preparation requires the established query memory binding".into(),
-            )
-        })?;
+        let query_memory =
+            query_memory.ok_or_else(|| NativeFragmentAdmissionError::MissingBinding)?;
         Ok(NativeQueryPreparationMemory {
             query_memory,
             query_mem_tracker,
@@ -358,22 +344,20 @@ impl NativeFragmentQueryRuntime {
         resources
     }
 
-    pub fn register_fragment_execution(
+    pub(crate) fn register_fragment_execution(
         &self,
         execution_id: QueryExecutionId,
         fragment_instance_id: UniqueId,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<NativeFragmentRegistrationLease, String> {
+    ) -> Result<NativeFragmentRegistrationLease, NativeFragmentAdmissionError> {
         let execution = execution_key(execution_id);
-        self.manager.get_or_register_native_execution(
-            execution,
-            false,
-            delivery_expire,
-            query_expire,
-        )?;
         self.manager
-            .register_native_finst_execution(fragment_instance_id, execution)?;
+            .get_or_register_native_execution(execution, false, delivery_expire, query_expire)
+            .map_err(NativeFragmentAdmissionError::Context)?;
+        self.manager
+            .register_native_finst_execution(fragment_instance_id, execution)
+            .map_err(NativeFragmentAdmissionError::Context)?;
         let lease = NativeFragmentRegistrationLease {
             runtime: self.clone(),
             execution,
@@ -446,20 +430,62 @@ fn execution_key(execution_id: QueryExecutionId) -> QueryExecutionKey {
 /// Exact host admission causes; memory refusals stay typed until task projection.
 #[derive(Debug)]
 pub(crate) enum NativeFragmentAdmissionError {
-    Existing(String),
+    Context(novarocks_worker::query_context::QueryContextRegistrationError),
+    Limit(novarocks_execution::runtime::mem_tracker::MemTrackerLimitInstallError),
+    MissingTracker,
+    MissingBinding,
+    InvalidLimit(i64),
     MemoryAccount(QueryMemoryAccountError),
     Binding(QueryMemoryBindingError),
 }
 impl std::fmt::Display for NativeFragmentAdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Existing(error) => f.write_str(error),
+            Self::Context(error) => error.fmt(f),
+            Self::Limit(error) => error.fmt(f),
+            Self::MissingTracker => {
+                f.write_str("native admission requires the established query tracker")
+            }
+            Self::MissingBinding => {
+                f.write_str("native preparation requires the established query memory binding")
+            }
+            Self::InvalidLimit(limit) => {
+                write!(f, "query memory limit must not be negative: {limit}")
+            }
             Self::MemoryAccount(error) => error.fmt(f),
             Self::Binding(error) => error.fmt(f),
         }
     }
 }
-impl std::error::Error for NativeFragmentAdmissionError {}
+impl std::error::Error for NativeFragmentAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Context(source) => Some(source),
+            Self::Limit(source) => Some(source),
+            Self::MemoryAccount(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::MissingTracker | Self::MissingBinding | Self::InvalidLimit(_) => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for NativeFragmentAdmissionError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let code = match self {
+            Self::Context(source) => return source.failure_fact(),
+            Self::Limit(source) => return source.failure_fact(),
+            Self::MemoryAccount(source) => return source.failure_fact(),
+            Self::Binding(source) => return source.failure_fact(),
+            Self::MissingTracker => 830,
+            Self::MissingBinding => 831,
+            Self::InvalidLimit(_) => 832,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
 /// Borrowed by metadata preparation, then consumed by the original admission.
 pub(crate) struct NativeQueryPreparationMemory {

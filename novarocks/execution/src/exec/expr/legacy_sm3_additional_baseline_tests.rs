@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Immutable original v1 SM3 bytes, grouped text, successful empty and error ordering.
+use super::legacy_array_append_baseline_tests::{
+    assert_frozen_target as assert_expression_contract, assert_original_arrow,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::{FunctionKind, encryption::eval_encryption_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
@@ -26,6 +29,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::SlotId;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -34,7 +38,10 @@ use std::{
 fn strings(v: Vec<Option<&str>>) -> ArrayRef {
     Arc::new(StringArray::from(v))
 }
-fn raw(input: ArrayRef, target: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    input: ArrayRef,
+    target: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slot = SlotId::new(1);
     let ty = input.data_type().clone();
     let batch = RecordBatch::try_new(
@@ -149,30 +156,22 @@ fn legacy_sm3_static_reader_error_full_text_precedes_sql_null_and_ignores_target
     ] {
         for target in [None, Some(DataType::Binary), Some(DataType::Int64)] {
             assert_eq!(
-                raw(input.clone(), target).unwrap_err(),
+                (raw(input.clone(), target).unwrap_err()).to_string(),
                 "sm3: arg0 must be VARCHAR or VARBINARY"
             );
         }
     }
 }
 #[test]
-fn legacy_sm3_original_empty_args_index_panic_and_long_utf8_byte_stream_golden() {
+fn legacy_sm3_original_empty_args_contract_and_long_utf8_byte_stream_golden() {
     let mut arena = ExprArena::default();
     let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
     let schema =
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[]).unwrap();
     let chunk = Chunk::new_with_chunk_schema(batch, schema);
     let expr = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Utf8);
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| eval_encryption_function(
-            "sm3",
-            &arena,
-            expr,
-            &[],
-            &chunk
-        )))
-        .is_err()
-    );
+    let error = eval_encryption_function("sm3", &arena, expr, &[], &chunk).unwrap_err();
+    assert_expression_contract(&error);
     let long = "é中\0".repeat(200);
     // Independent Python hashlib byte-stream oracles, not the production recipe.
     assert_eq!(

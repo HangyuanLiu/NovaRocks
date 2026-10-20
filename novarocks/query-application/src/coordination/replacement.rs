@@ -493,6 +493,51 @@ pub enum ReplacementQualificationFailure {
     Expired,
     OutcomeUnknown,
     EffectOwnerClosed,
+    MismatchedReceipt,
+    DomainRefused(novarocks_execution_contract::failure::FailureFact),
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for ReplacementQualificationFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let (class, code, observed_stop) = match self {
+            Self::Rejected => (FailureClass::Control, 94, false),
+            Self::InvalidReservation => (FailureClass::Invariant, 95, false),
+            Self::Expired => (FailureClass::Control, 96, false),
+            Self::OutcomeUnknown => (FailureClass::Dependency, 97, false),
+            Self::EffectOwnerClosed => (FailureClass::Control, 98, true),
+            Self::MismatchedReceipt => (FailureClass::Invariant, 100, false),
+            Self::DomainRefused(fact) => return *fact,
+        };
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        if observed_stop {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(class, reason)
+        }
+    }
+}
+
+impl ReplacementQualificationFailure {
+    /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
+    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        let message = match self {
+            Self::Rejected => "attempt replacement qualification was refused",
+            Self::InvalidReservation => {
+                "attempt replacement qualification returned an invalid reservation"
+            }
+            Self::Expired => "attempt replacement qualification expired",
+            Self::OutcomeUnknown => "attempt replacement qualification outcome is unknown",
+            Self::EffectOwnerClosed => "attempt replacement qualification effect owner is closed",
+            Self::MismatchedReceipt => {
+                "attempt replacement receipt does not match its exact operation and identity"
+            }
+            Self::DomainRefused(_) => "owning service refused replacement qualification",
+        };
+        novarocks_execution_contract::SafeDetail::truncating(message)
+    }
 }
 
 #[derive(Debug)]
@@ -575,10 +620,29 @@ impl ReplacementQualificationEffectSubmission {
         Ok(())
     }
 
-    pub fn rejected(mut self) {
-        let _ = self.publish(ReplacementQualificationSettlement::Failed(
-            ReplacementQualificationFailure::Rejected,
-        ));
+    pub fn rejected(self) {
+        self.refused(ReplacementQualificationFailure::Rejected);
+    }
+
+    /// Returns the original producer fact through this already-owned effect.
+    pub fn refused(mut self, reason: ReplacementQualificationFailure) {
+        let _ = self.publish(ReplacementQualificationSettlement::Failed(reason));
+        self.settled = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_with_header_for_test(
+        mut self,
+        operation_id: TaskOperationId,
+        identity: ReplacementQualificationIdentity,
+    ) {
+        let _ = self.receipts.send(ReplacementQualificationEffectReceipt {
+            operation_id,
+            identity,
+            settlement: ReplacementQualificationSettlement::Failed(
+                ReplacementQualificationFailure::Rejected,
+            ),
+        });
         self.settled = true;
     }
 
@@ -611,4 +675,44 @@ pub(crate) fn receipt_channel() -> (
     mpsc::UnboundedReceiver<ReplacementQualificationEffectReceipt>,
 ) {
     mpsc::unbounded_channel()
+}
+
+#[cfg(test)]
+mod failure_projection_tests {
+    #[test]
+    fn qualification_outcome_cannot_claim_backend_loss_or_accepted_cancellation() {
+        use super::ReplacementQualificationFailure;
+        use crate::{
+            api::NativeAttemptTopologyRequirement,
+            coordination::{AttemptFailureClass, LogicalExecutionActorError},
+            execution_error::{ExecutionFailureInput, ExecutionFailureSite},
+        };
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureEvidence, FailureProjection,
+        };
+        let source = ReplacementQualificationFailure::OutcomeUnknown;
+        let actor = LogicalExecutionActorError::ReplacementQualificationFailed(source);
+        let input = ExecutionFailureInput::new(
+            actor.failure_fact(),
+            actor.safe_detail(),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(input.fact(), source.failure_fact());
+        assert_eq!(input.detail(), &source.safe_detail());
+        assert_eq!(input.fact().class(), FailureClass::Dependency);
+        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
+        assert_eq!(
+            input.topology_requirement(),
+            NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        let source = ReplacementQualificationFailure::EffectOwnerClosed;
+        let actor = LogicalExecutionActorError::ReplacementQualificationFailed(source);
+        let input = ExecutionFailureInput::new(
+            actor.failure_fact(),
+            actor.safe_detail(),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
+        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
+    }
 }

@@ -101,7 +101,7 @@ pub(crate) fn create_prepared_grouped_in(
     root_schema: ChunkSchemaRef,
     tracker: Option<Arc<MemTracker>>,
     factory: Arc<dyn InputConstructionFactory>,
-    error: Arc<RuntimeErrorState>,
+    receiver: &RuntimeKernelControl,
 ) -> ExecutionResult<Box<dyn GroupedUnpivotSource>> {
     if !root_schema.is_typed() || !final_chunk.chunk_schema().is_typed() {
         return Err(ConstructionFailure::MissingOwner.into());
@@ -114,12 +114,12 @@ pub(crate) fn create_prepared_grouped_in(
     }
     if let Some(tracker) = &tracker {
         final_chunk
-            .try_transfer_to_typed(tracker)
+            .try_transfer_to(tracker)
             .map_err(ConstructionFailure::Memory)?;
     }
     let owner = factory.begin_typed_construction(&root_schema)?;
     let temporary = factory.begin_typed_construction(&root_schema)?;
-    let mut control = RuntimeKernelControl::new(error);
+    let mut control = receiver.for_receiver();
     control.bind_construction_factory(factory.clone());
     let grouping_values = final_chunk.column_by_slot_id(plan.grouping_output_slot_id)?;
     let groups = grouping_values
@@ -142,22 +142,28 @@ pub(crate) fn create_prepared_grouped_in(
     for row in 0..groups.len() {
         crate::exec::expr::ExprEvaluationControl::checkpoint(&control)?;
         if groups.is_null(row) {
-            return Err("table finish final aggregate produced a null grouping key".into());
+            return Err(ExecutionFailure::from(FragmentBindingError::new(
+                FragmentBindingTarget::Program,
+                FragmentBindingErrorKind::SchemaMismatch,
+                "table finish final aggregate produced a null grouping key",
+            )));
         }
         let target = target_ordinal_from_wire(groups.value(row))
-            .map_err(|cause| format!("table finish final aggregate grouping key: {cause}"))?
+            .map_err(|cause| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::DecodeWriteTarget, cause))?
             .get();
         if !seen.insert(target) {
-            return Err(
-                format!("table finish final aggregate produced duplicate target {target}").into(),
-            );
+            return Err(failure::contract(format_args!(
+                "table finish final aggregate produced duplicate target {target}"
+            )));
         }
         if !plan
             .mappings
             .iter()
             .any(|mapping| mapping.grouping_key == target)
         {
-            return Err(format!("table finish final aggregate produced target {target} with no grouped Unpivot mapping").into());
+            return Err(failure::contract(format_args!(
+                "table finish final aggregate produced target {target} with no grouped Unpivot mapping"
+            )));
         }
         rows.push((target, row));
     }
@@ -422,10 +428,8 @@ pub(crate) fn create_prepared_grouped_in(
             ),
         });
     }
-    grouped_arc::<Observable>(owner.as_ref())?;
-    let observable = Arc::new(Observable::new());
-    owner.request(Layout::new::<CompiledGroupedUnpivot>())?;
-    Ok(Box::new(CompiledGroupedUnpivot {
+    owner.request(Layout::new::<CompiledGroupedStep>())?;
+    Ok(Box::new(Source::new(CompiledGroupedUnpivot {
         final_chunk,
         constants: GroupedConstants {
             arrays: constants,
@@ -436,9 +440,8 @@ pub(crate) fn create_prepared_grouped_in(
         next: 0,
         started: false,
         tracker,
-        source_observable: observable,
         factory,
         control,
         _storage: owner.storage_lifetime(),
-    }))
+    })))
 }

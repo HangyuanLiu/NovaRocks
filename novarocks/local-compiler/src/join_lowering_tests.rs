@@ -1046,7 +1046,7 @@ impl PureCompileControl for Trace {
         events.push((phase, units));
         if self.at == Some(at) {
             self.refused.store(true, Ordering::SeqCst);
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -1088,7 +1088,7 @@ fn every_join_compiler_control_prefix_refuses_with_its_own_cause() {
             let control = Trace {
                 events: Mutex::new(vec![]),
                 at: Some(at),
-                cause,
+                cause: cause.clone(),
                 refused: AtomicBool::new(false),
             };
             assert!(matches!(

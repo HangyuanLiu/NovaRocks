@@ -17,7 +17,7 @@
 
 use crate::approx_percentile_failure::{
     ApproxPercentileDataRecipe as DataRecipe, ApproxPercentileFailureSink,
-    ApproxPercentileObservation as WorkObservation, LegacyApproxPercentileFailure,
+    ApproxPercentileObservation as WorkObservation, RequiredApproxPercentileFailure,
 };
 use allocator_api2::alloc::{Allocator, Global};
 use allocator_api2::vec::Vec as AllocVec;
@@ -132,8 +132,8 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.processed_weight + self.unprocessed_weight
     }
 
-    fn try_clone(&self) -> Result<Self, String> {
-        self.try_clone_with_sink(&mut LegacyApproxPercentileFailure)
+    fn try_clone(&self) -> Result<Self, crate::KernelFailure> {
+        self.try_clone_with_sink(&mut RequiredApproxPercentileFailure)
     }
 
     fn try_clone_with_sink<S: ApproxPercentileFailureSink>(
@@ -174,8 +174,8 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.total_weight()
     }
 
-    fn add(&mut self, value: f32, weight: f32) -> Result<(), String> {
-        self.add_with_sink(value, weight, &mut LegacyApproxPercentileFailure)
+    fn add(&mut self, value: f32, weight: f32) -> Result<(), crate::KernelFailure> {
+        self.add_with_sink(value, weight, &mut RequiredApproxPercentileFailure)
     }
     fn add_with_sink<S: ApproxPercentileFailureSink>(
         &mut self,
@@ -186,18 +186,19 @@ impl<A: Allocator + Clone> TDigest<A> {
         if value.is_nan() || weight <= 0.0 {
             return Ok(());
         }
-        self.unprocessed.try_reserve(1).map_err(|_| {
-            sink.allocation(DataRecipe::Static(
-                "ResourceExhausted: reserve TDigest centroid",
-            ))
+        self.unprocessed.try_reserve(1).map_err(|source| {
+            sink.allocation(
+                DataRecipe::Static("ResourceExhausted: reserve TDigest centroid"),
+                source,
+            )
         })?;
         self.unprocessed.push(Centroid::new(value, weight));
         self.unprocessed_weight += weight;
         self.process_if_necessary_with_sink(sink)
     }
 
-    fn merge(&mut self, other: &TDigest<A>) -> Result<(), String> {
-        self.merge_with_sink(other, &mut LegacyApproxPercentileFailure)
+    fn merge(&mut self, other: &TDigest<A>) -> Result<(), crate::KernelFailure> {
+        self.merge_with_sink(other, &mut RequiredApproxPercentileFailure)
     }
     fn merge_with_sink<S: ApproxPercentileFailureSink>(
         &mut self,
@@ -225,10 +226,11 @@ impl<A: Allocator + Clone> TDigest<A> {
         if !other.unprocessed.is_empty() {
             self.unprocessed
                 .try_reserve(other.unprocessed.len())
-                .map_err(|_| {
-                    sink.allocation(DataRecipe::Static(
-                        "ResourceExhausted: reserve merged TDigest centroids",
-                    ))
+                .map_err(|source| {
+                    sink.allocation(
+                        DataRecipe::Static("ResourceExhausted: reserve merged TDigest centroids"),
+                        source,
+                    )
                 })?;
             // The original complete reserve precedes the same ordered byte copies.
             // Split only the copies into bounded observed work quanta.
@@ -246,8 +248,8 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.update_cumulative_with_sink(sink)
     }
 
-    fn quantile(&mut self, q: f32) -> Result<Option<f32>, String> {
-        self.quantile_with_sink(q, &mut LegacyApproxPercentileFailure)
+    fn quantile(&mut self, q: f32) -> Result<Option<f32>, crate::KernelFailure> {
+        self.quantile_with_sink(q, &mut RequiredApproxPercentileFailure)
     }
 
     fn quantile_with_sink<S: ApproxPercentileFailureSink>(
@@ -264,25 +266,35 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.quantile_processed_with_sink(q, sink)
     }
 
-    fn serialize_binary(&self) -> Vec<u8> {
-        match self.serialize_binary_observed(&mut |_| Ok::<_, std::convert::Infallible>(())) {
-            Ok(bytes) => bytes,
-            Err(never) => match never {},
-        }
+    fn serialize_binary(&self) -> Result<Vec<u8>, crate::KernelFailure> {
+        self.serialize_binary_observed(&mut |_| Ok::<_, crate::KernelFailure>(()))
     }
-    fn serialize_binary_observed<E>(
+    fn encoded_digest_size(&self) -> Result<usize, crate::KernelFailure> {
+        use crate::approx_percentile_failure::{storage_count, wire_count};
+        wire_count(self.processed.len())?;
+        wire_count(self.unprocessed.len())?;
+        wire_count(self.cumulative.len())?;
+        storage_count::<u8>(
+            48 + 8 * (self.processed.len() as u128 + self.unprocessed.len() as u128)
+                + 4 * self.cumulative.len() as u128,
+        )
+    }
+    fn serialize_binary_observed<E: From<crate::KernelFailure>>(
         &self,
         observe: &mut dyn FnMut(PercentileEncodeObservation) -> Result<(), E>,
     ) -> Result<Vec<u8>, E> {
+        let bytes = self.encoded_digest_size()?;
+        let processed = crate::approx_percentile_failure::wire_count(self.processed.len())?;
+        let unprocessed = crate::approx_percentile_failure::wire_count(self.unprocessed.len())?;
+        let cumulative = crate::approx_percentile_failure::wire_count(self.cumulative.len())?;
         observe(PercentileEncodeObservation::OpaqueBegin)?;
-        let mut out = Vec::with_capacity(
-            4 * std::mem::size_of::<f32>()
-                + 2 * std::mem::size_of::<u64>()
-                + 3 * std::mem::size_of::<u32>()
-                + self.processed.len() * 2 * std::mem::size_of::<f32>()
-                + self.unprocessed.len() * 2 * std::mem::size_of::<f32>()
-                + self.cumulative.len() * std::mem::size_of::<f32>(),
-        );
+        let mut out = Vec::new();
+        out.try_reserve_exact(bytes).map_err(|source| {
+            crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                "reserve encoded TDigest state",
+                source,
+            ))
+        })?;
         observe(PercentileEncodeObservation::OpaqueEnd)?;
         out.extend_from_slice(&self.compression.to_le_bytes());
         out.extend_from_slice(&self.min.to_le_bytes());
@@ -291,19 +303,19 @@ impl<A: Allocator + Clone> TDigest<A> {
         out.extend_from_slice(&(self.max_unprocessed as u64).to_le_bytes());
         out.extend_from_slice(&self.processed_weight.to_le_bytes());
         out.extend_from_slice(&self.unprocessed_weight.to_le_bytes());
-        out.extend_from_slice(&(self.processed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&processed.to_le_bytes());
         for centroid in &self.processed {
             observe(PercentileEncodeObservation::Step)?;
             out.extend_from_slice(&centroid.mean.to_le_bytes());
             out.extend_from_slice(&centroid.weight.to_le_bytes());
         }
-        out.extend_from_slice(&(self.unprocessed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&unprocessed.to_le_bytes());
         for centroid in &self.unprocessed {
             observe(PercentileEncodeObservation::Step)?;
             out.extend_from_slice(&centroid.mean.to_le_bytes());
             out.extend_from_slice(&centroid.weight.to_le_bytes());
         }
-        out.extend_from_slice(&(self.cumulative.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cumulative.to_le_bytes());
         for value in &self.cumulative {
             observe(PercentileEncodeObservation::Step)?;
             out.extend_from_slice(&value.to_le_bytes());
@@ -311,8 +323,8 @@ impl<A: Allocator + Clone> TDigest<A> {
         Ok(out)
     }
 
-    fn deserialize_binary_in(payload: &[u8], allocator: A) -> Result<Self, String> {
-        Self::deserialize_binary_with_sink(payload, allocator, &mut LegacyApproxPercentileFailure)
+    fn deserialize_binary_in(payload: &[u8], allocator: A) -> Result<Self, crate::KernelFailure> {
+        Self::deserialize_binary_with_sink(payload, allocator, &mut RequiredApproxPercentileFailure)
     }
 
     fn deserialize_binary_with_sink<S: ApproxPercentileFailureSink>(
@@ -334,17 +346,17 @@ impl<A: Allocator + Clone> TDigest<A> {
             read_f32_with_sink(payload, &mut offset, "tdigest unprocessed_weight", sink)?;
 
         if !compression.is_finite() || compression <= 0.0 || compression > MAX_COMPRESSION as f32 {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "tdigest compression out of bounds: {compression}"
             ))));
         }
         if max_processed > MAX_DECODED_PROCESSED {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "tdigest max_processed {max_processed} exceeds {MAX_DECODED_PROCESSED}"
             ))));
         }
         if max_unprocessed > MAX_DECODED_UNPROCESSED {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "tdigest max_unprocessed {max_unprocessed} exceeds {MAX_DECODED_UNPROCESSED}"
             ))));
         }
@@ -352,16 +364,24 @@ impl<A: Allocator + Clone> TDigest<A> {
         let processed_len =
             read_u32_with_sink(payload, &mut offset, "tdigest processed len", sink)? as usize;
         if processed_len > MAX_DECODED_PROCESSED {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "tdigest processed length {processed_len} exceeds {MAX_DECODED_PROCESSED}"
             ))));
         }
+        if processed_len > payload.len().saturating_sub(offset) / std::mem::size_of::<Centroid>() {
+            return Err(sink.encoding(DataRecipe::Static("tdigest processed payload truncated")));
+        }
         let mut processed = AllocVec::new_in(allocator.clone());
-        processed.try_reserve_exact(processed_len).map_err(|_| {
-            sink.allocation(DataRecipe::Static(
-                "ResourceExhausted: reserve decoded TDigest processed centroids",
-            ))
-        })?;
+        processed
+            .try_reserve_exact(processed_len)
+            .map_err(|source| {
+                sink.allocation(
+                    DataRecipe::Static(
+                        "ResourceExhausted: reserve decoded TDigest processed centroids",
+                    ),
+                    source,
+                )
+            })?;
         for _ in 0..processed_len {
             sink.observe(WorkObservation::Step)?;
             processed.push(Centroid::new(
@@ -373,17 +393,24 @@ impl<A: Allocator + Clone> TDigest<A> {
         let unprocessed_len =
             read_u32_with_sink(payload, &mut offset, "tdigest unprocessed len", sink)? as usize;
         if unprocessed_len > MAX_DECODED_UNPROCESSED {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "tdigest unprocessed length {unprocessed_len} exceeds {MAX_DECODED_UNPROCESSED}"
             ))));
+        }
+        if unprocessed_len > payload.len().saturating_sub(offset) / std::mem::size_of::<Centroid>()
+        {
+            return Err(sink.encoding(DataRecipe::Static("tdigest unprocessed payload truncated")));
         }
         let mut unprocessed = AllocVec::new_in(allocator.clone());
         unprocessed
             .try_reserve_exact(unprocessed_len)
-            .map_err(|_| {
-                sink.allocation(DataRecipe::Static(
-                    "ResourceExhausted: reserve decoded TDigest unprocessed centroids",
-                ))
+            .map_err(|source| {
+                sink.allocation(
+                    DataRecipe::Static(
+                        "ResourceExhausted: reserve decoded TDigest unprocessed centroids",
+                    ),
+                    source,
+                )
             })?;
         for _ in 0..unprocessed_len {
             sink.observe(WorkObservation::Step)?;
@@ -396,16 +423,24 @@ impl<A: Allocator + Clone> TDigest<A> {
         let cumulative_len =
             read_u32_with_sink(payload, &mut offset, "tdigest cumulative len", sink)? as usize;
         if cumulative_len > MAX_DECODED_CUMULATIVE {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "tdigest cumulative length {cumulative_len} exceeds {MAX_DECODED_CUMULATIVE}"
             ))));
         }
+        if cumulative_len > payload.len().saturating_sub(offset) / std::mem::size_of::<f32>() {
+            return Err(sink.encoding(DataRecipe::Static("tdigest cumulative payload truncated")));
+        }
         let mut cumulative = AllocVec::new_in(allocator.clone());
-        cumulative.try_reserve_exact(cumulative_len).map_err(|_| {
-            sink.allocation(DataRecipe::Static(
-                "ResourceExhausted: reserve decoded TDigest cumulative weights",
-            ))
-        })?;
+        cumulative
+            .try_reserve_exact(cumulative_len)
+            .map_err(|source| {
+                sink.allocation(
+                    DataRecipe::Static(
+                        "ResourceExhausted: reserve decoded TDigest cumulative weights",
+                    ),
+                    source,
+                )
+            })?;
         for _ in 0..cumulative_len {
             sink.observe(WorkObservation::Step)?;
             cumulative.push(read_f32_with_sink(
@@ -416,7 +451,7 @@ impl<A: Allocator + Clone> TDigest<A> {
             )?);
         }
         if offset != payload.len() {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "tdigest payload has trailing bytes: consumed={} total={}",
                 offset,
                 payload.len()
@@ -452,8 +487,8 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.processed.len() > self.max_processed || self.unprocessed.len() > self.max_unprocessed
     }
 
-    fn process_if_necessary(&mut self) -> Result<(), String> {
-        self.process_if_necessary_with_sink(&mut LegacyApproxPercentileFailure)
+    fn process_if_necessary(&mut self) -> Result<(), crate::KernelFailure> {
+        self.process_if_necessary_with_sink(&mut RequiredApproxPercentileFailure)
     }
     fn process_if_necessary_with_sink<S: ApproxPercentileFailureSink>(
         &mut self,
@@ -465,8 +500,8 @@ impl<A: Allocator + Clone> TDigest<A> {
         Ok(())
     }
 
-    fn process(&mut self) -> Result<(), String> {
-        self.process_with_sink(&mut LegacyApproxPercentileFailure)
+    fn process(&mut self) -> Result<(), crate::KernelFailure> {
+        self.process_with_sink(&mut RequiredApproxPercentileFailure)
     }
 
     fn process_with_sink<S: ApproxPercentileFailureSink>(
@@ -499,11 +534,14 @@ impl<A: Allocator + Clone> TDigest<A> {
                     ))
                 })?;
             let mut merged = AllocVec::new_in(self.allocator.clone());
-            merged.try_reserve_exact(merged_capacity).map_err(|_| {
-                sink.allocation(DataRecipe::Static(
-                    "ResourceExhausted: reserve sorted TDigest merge",
-                ))
-            })?;
+            merged
+                .try_reserve_exact(merged_capacity)
+                .map_err(|source| {
+                    sink.allocation(
+                        DataRecipe::Static("ResourceExhausted: reserve sorted TDigest merge"),
+                        source,
+                    )
+                })?;
             let mut left_idx = 0usize;
             let mut right_idx = 0usize;
             while left_idx < self.unprocessed.len() && right_idx < processed.len() {
@@ -545,10 +583,11 @@ impl<A: Allocator + Clone> TDigest<A> {
         let mut processed = AllocVec::new_in(self.allocator.clone());
         processed
             .try_reserve_exact(self.max_processed.max(1))
-            .map_err(|_| {
-                sink.allocation(DataRecipe::Static(
-                    "ResourceExhausted: reserve processed TDigest centroids",
-                ))
+            .map_err(|source| {
+                sink.allocation(
+                    DataRecipe::Static("ResourceExhausted: reserve processed TDigest centroids"),
+                    source,
+                )
             })?;
         self.processed = processed;
         self.processed.push(first);
@@ -569,10 +608,11 @@ impl<A: Allocator + Clone> TDigest<A> {
                     self.integrated_location((w_so_far / f64::from(self.processed_weight)) as f32);
                 w_limit = f64::from(self.processed_weight) * f64::from(self.integrated_q(k1 + 1.0));
                 w_so_far += f64::from(centroid.weight);
-                self.processed.try_reserve(1).map_err(|_| {
-                    sink.allocation(DataRecipe::Static(
-                        "ResourceExhausted: grow processed TDigest centroids",
-                    ))
+                self.processed.try_reserve(1).map_err(|source| {
+                    sink.allocation(
+                        DataRecipe::Static("ResourceExhausted: grow processed TDigest centroids"),
+                        source,
+                    )
                 })?;
                 self.processed.push(centroid);
             }
@@ -589,7 +629,7 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn quantile_processed(&self, q: f32) -> Option<f32> {
-        self.quantile_processed_with_sink(q, &mut LegacyApproxPercentileFailure)
+        self.quantile_processed_with_sink(q, &mut RequiredApproxPercentileFailure)
             .expect("no fallible observation in original quantile search")
     }
 
@@ -648,8 +688,8 @@ impl<A: Allocator + Clone> TDigest<A> {
         )))
     }
 
-    fn update_cumulative(&mut self) -> Result<(), String> {
-        self.update_cumulative_with_sink(&mut LegacyApproxPercentileFailure)
+    fn update_cumulative(&mut self) -> Result<(), crate::KernelFailure> {
+        self.update_cumulative_with_sink(&mut RequiredApproxPercentileFailure)
     }
 
     fn update_cumulative_with_sink<S: ApproxPercentileFailureSink>(
@@ -659,10 +699,11 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.cumulative.clear();
         self.cumulative
             .try_reserve(self.processed.len() + 1)
-            .map_err(|_| {
-                sink.allocation(DataRecipe::Static(
-                    "ResourceExhausted: reserve TDigest cumulative weights",
-                ))
+            .map_err(|source| {
+                sink.allocation(
+                    DataRecipe::Static("ResourceExhausted: reserve TDigest cumulative weights"),
+                    source,
+                )
             })?;
         // The reference digest accumulates in double precision, then stores
         // each CDF center as a float. Repeated float accumulation loses small
@@ -781,8 +822,8 @@ impl<A: Allocator + Clone> PercentileState<A> {
     }
 }
 
-pub fn normalize_compression(compression: Option<f64>) -> Result<usize, String> {
-    normalize_compression_with_sink(compression, &mut LegacyApproxPercentileFailure)
+pub fn normalize_compression(compression: Option<f64>) -> Result<usize, crate::KernelFailure> {
+    normalize_compression_with_sink(compression, &mut RequiredApproxPercentileFailure)
 }
 pub fn normalize_compression_with_sink<S: ApproxPercentileFailureSink>(
     compression: Option<f64>,
@@ -809,8 +850,8 @@ pub fn normalize_compression_with_sink<S: ApproxPercentileFailureSink>(
 pub fn add_value<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     value: f64,
-) -> Result<(), String> {
-    add_value_with_sink(state, value, &mut LegacyApproxPercentileFailure)
+) -> Result<(), crate::KernelFailure> {
+    add_value_with_sink(state, value, &mut RequiredApproxPercentileFailure)
 }
 pub fn add_value_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     state: &mut PercentileState<A>,
@@ -825,8 +866,8 @@ pub fn add_weighted_value<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     value: f64,
     weight: i64,
-) -> Result<(), String> {
-    add_weighted_value_with_sink(state, value, weight, &mut LegacyApproxPercentileFailure)
+) -> Result<(), crate::KernelFailure> {
+    add_weighted_value_with_sink(state, value, weight, &mut RequiredApproxPercentileFailure)
 }
 pub fn add_weighted_value_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     state: &mut PercentileState<A>,
@@ -852,8 +893,8 @@ pub fn add_weighted_value_with_sink<A: Allocator + Clone, S: ApproxPercentileFai
 pub fn set_quantile<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     quantile: f64,
-) -> Result<(), String> {
-    set_quantile_with_sink(state, quantile, &mut LegacyApproxPercentileFailure)
+) -> Result<(), crate::KernelFailure> {
+    set_quantile_with_sink(state, quantile, &mut RequiredApproxPercentileFailure)
 }
 pub fn set_quantile_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     state: &mut PercentileState<A>,
@@ -885,8 +926,8 @@ pub fn set_quantile_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSi
 pub fn set_quantiles<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     quantiles: &[f64],
-) -> Result<(), String> {
-    set_quantiles_with_sink(state, quantiles, &mut LegacyApproxPercentileFailure)
+) -> Result<(), crate::KernelFailure> {
+    set_quantiles_with_sink(state, quantiles, &mut RequiredApproxPercentileFailure)
 }
 pub fn set_quantiles_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     state: &mut PercentileState<A>,
@@ -947,8 +988,8 @@ pub fn set_quantiles_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureS
 pub fn set_compression<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     compression: f64,
-) -> Result<(), String> {
-    set_compression_with_sink(state, compression, &mut LegacyApproxPercentileFailure)
+) -> Result<(), crate::KernelFailure> {
+    set_compression_with_sink(state, compression, &mut RequiredApproxPercentileFailure)
 }
 pub fn set_compression_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     state: &mut PercentileState<A>,
@@ -966,8 +1007,8 @@ pub fn set_compression_with_sink<A: Allocator + Clone, S: ApproxPercentileFailur
 pub fn merge_state<A: Allocator + Clone>(
     target: &mut PercentileState<A>,
     incoming: &PercentileState<A>,
-) -> Result<(), String> {
-    merge_state_with_sink(target, incoming, &mut LegacyApproxPercentileFailure)
+) -> Result<(), crate::KernelFailure> {
+    merge_state_with_sink(target, incoming, &mut RequiredApproxPercentileFailure)
 }
 pub fn merge_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     target: &mut PercentileState<A>,
@@ -993,7 +1034,7 @@ pub fn merge_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSin
 pub fn merge_serialized_state_into(
     target: &mut PercentileState,
     payload: &[u8],
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     let decoded = decode_state(payload)?;
     merge_state(target, &decoded)
 }
@@ -1005,11 +1046,11 @@ pub fn merge_serialized_state_into(
 pub fn merge_bounded_serialized_state_into(
     target: &mut PercentileState<impl Allocator + Clone>,
     payload: &[u8],
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     merge_bounded_serialized_state_into_with_sink(
         target,
         payload,
-        &mut LegacyApproxPercentileFailure,
+        &mut RequiredApproxPercentileFailure,
     )
 }
 pub fn merge_bounded_serialized_state_into_with_sink<
@@ -1030,33 +1071,26 @@ pub fn merge_bounded_serialized_state_into_with_sink<
     validate_state_with_sink(target, sink)
 }
 
-pub fn encode_empty_state() -> Vec<u8> {
+pub fn encode_empty_state() -> Result<Vec<u8>, crate::KernelFailure> {
     encode_state(&PercentileState::default())
 }
 
 /// The original singleton calculation with an explicit allocation policy.
-/// The legacy adapter retains its original Global allocation/expect behavior.
+/// Required and selected callers keep the original allocation refusal.
 pub fn single_value_state_in<A: Allocator + Clone>(
     value: f64,
     allocator: A,
-) -> Result<PercentileState<A>, String> {
+) -> Result<PercentileState<A>, crate::KernelFailure> {
     let mut state = PercentileState::new_in(DEFAULT_COMPRESSION_FACTOR, allocator);
     add_value(&mut state, value)?;
     Ok(state)
 }
-pub fn encode_single_value(value: f64) -> Vec<u8> {
-    let state = single_value_state_in(value, Global)
-        .expect("single percentile value must fit bounded TDigest");
+pub fn encode_single_value(value: f64) -> Result<Vec<u8>, crate::KernelFailure> {
+    let state = single_value_state_in(value, Global)?;
     encode_state(&state)
 }
-/// Original scalar hash codec footprint, before its std Vec allocations.
-/// Only the actual singleton producer may consume this receipt. The original
-/// serializer's four-byte capacity underestimate is intentionally unchanged.
-/// Rust 1.92 RawVec doubles the 52-byte digest backing when its final u32
-/// extends to 56 bytes. Account both old and replacement backing while resizing,
-/// plus the original outer 11-byte header + 56-byte digest backing.
-/// This is a host reservation for opaque logical allocations, not a physical
-/// allocator/RSS or formal MEM bound.
+/// Both actual exact-reserve byte buffers coexist until encoding returns.
+/// This is an opaque request extent, not an allocation or a memory grant.
 pub fn scalar_hash_codec_extent<A: Allocator + Clone>(state: &PercentileState<A>) -> Option<usize> {
     if state.quantiles.is_some() || state.compression != DEFAULT_COMPRESSION_FACTOR {
         return None;
@@ -1070,18 +1104,27 @@ pub fn scalar_hash_codec_extent<A: Allocator + Clone>(state: &PercentileState<A>
     {
         return None;
     }
-    let original_capacity = 4 * std::mem::size_of::<f32>()
-        + 2 * std::mem::size_of::<u64>()
-        + 3 * std::mem::size_of::<u32>()
-        + 2 * std::mem::size_of::<f32>();
-    let actual_length = 5 * std::mem::size_of::<f32>()
-        + 2 * std::mem::size_of::<u64>()
-        + 3 * std::mem::size_of::<u32>()
-        + 2 * std::mem::size_of::<f32>();
-    original_capacity
-        .checked_add(original_capacity.checked_mul(2)?.max(actual_length))?
-        .checked_add(HEADER_LEN)?
-        .checked_add(actual_length)
+    let digest = state.digest.encoded_digest_size().ok()?;
+    digest.checked_add(HEADER_LEN)?.checked_add(digest)
+}
+/// Exact byte geometry of this whole state, authored before codec allocation.
+pub fn encoded_size<A: Allocator + Clone>(
+    state: &PercentileState<A>,
+) -> Result<usize, crate::KernelFailure> {
+    use crate::approx_percentile_failure::{storage_count, wire_count};
+    wire_count(state.compression)?;
+    let count = match &state.quantiles {
+        Some(QuantileSpec::Scalar(_)) => 1,
+        Some(QuantileSpec::Array(values)) => values.len(),
+        None => 0,
+    };
+    wire_count(count)?;
+    let digest = if state.digest.is_empty() {
+        0
+    } else {
+        state.digest.encoded_digest_size()?
+    };
+    storage_count::<u8>(HEADER_LEN as u128 + 8 * count as u128 + digest as u128)
 }
 
 /// Work observation at the original serializer, never memory permission.
@@ -1091,16 +1134,17 @@ pub enum PercentileEncodeObservation {
     OpaqueBegin,
     OpaqueEnd,
 }
-pub fn encode_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Vec<u8> {
-    match encode_state_observed(state, &mut |_| Ok::<_, std::convert::Infallible>(())) {
-        Ok(bytes) => bytes,
-        Err(never) => match never {},
-    }
+pub fn encode_state<A: Allocator + Clone>(
+    state: &PercentileState<A>,
+) -> Result<Vec<u8>, crate::KernelFailure> {
+    encode_state_observed(state, &mut |_| Ok::<_, crate::KernelFailure>(()))
 }
-pub fn encode_state_observed<A: Allocator + Clone, E>(
+pub fn encode_state_observed<A: Allocator + Clone, E: From<crate::KernelFailure>>(
     state: &PercentileState<A>,
     observe: &mut dyn FnMut(PercentileEncodeObservation) -> Result<(), E>,
 ) -> Result<Vec<u8>, E> {
+    let bytes = encoded_size(state)?;
+    let compression = crate::approx_percentile_failure::wire_count(state.compression)?;
     let (quantile_kind, quantiles) = match &state.quantiles {
         Some(QuantileSpec::Scalar(q)) => (QUANTILE_KIND_SCALAR, std::slice::from_ref(q)),
         Some(QuantileSpec::Array(values)) => (QUANTILE_KIND_ARRAY, values.as_slice()),
@@ -1112,14 +1156,21 @@ pub fn encode_state_observed<A: Allocator + Clone, E>(
         state.digest.serialize_binary_observed(observe)?
     };
     observe(PercentileEncodeObservation::OpaqueBegin)?;
-    let mut out =
-        Vec::with_capacity(HEADER_LEN + std::mem::size_of_val(quantiles) + digest_payload.len());
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes).map_err(|source| {
+        crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+            "reserve encoded percentile state",
+            source,
+        ))
+    })?;
     observe(PercentileEncodeObservation::OpaqueEnd)?;
     out.push(PERCENTILE_STATE_MAGIC);
     out.push(PERCENTILE_STATE_VERSION);
     out.push(quantile_kind);
-    out.extend_from_slice(&(state.compression as u32).to_le_bytes());
-    out.extend_from_slice(&(quantiles.len() as u32).to_le_bytes());
+    out.extend_from_slice(&compression.to_le_bytes());
+    out.extend_from_slice(
+        &crate::approx_percentile_failure::wire_count(quantiles.len())?.to_le_bytes(),
+    );
     for quantile in quantiles {
         observe(PercentileEncodeObservation::Step)?;
         out.extend_from_slice(&quantile.to_le_bytes());
@@ -1134,8 +1185,8 @@ pub fn encode_state_observed<A: Allocator + Clone, E>(
     Ok(out)
 }
 
-pub fn decode_state(payload: &[u8]) -> Result<PercentileState, String> {
-    decode_state_with_sink(payload, Global, &mut LegacyApproxPercentileFailure)
+pub fn decode_state(payload: &[u8]) -> Result<PercentileState, crate::KernelFailure> {
+    decode_state_with_sink(payload, Global, &mut RequiredApproxPercentileFailure)
 }
 
 pub fn decode_state_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFailureSink>(
@@ -1150,14 +1201,14 @@ pub fn decode_state_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFai
         ));
     }
     if payload.len() < HEADER_LEN {
-        return Err(sink.data(DataRecipe::Arguments(format_args!(
+        return Err(sink.encoding(DataRecipe::Arguments(format_args!(
             "percentile state payload too short: expected>={} actual={}",
             HEADER_LEN,
             payload.len()
         ))));
     }
     if payload[0] != PERCENTILE_STATE_MAGIC {
-        return Err(sink.data(DataRecipe::Arguments(format_args!(
+        return Err(sink.encoding(DataRecipe::Arguments(format_args!(
             "unsupported percentile state payload magic: expected=0x{:02x} actual=0x{:02x}",
             PERCENTILE_STATE_MAGIC, payload[0]
         ))));
@@ -1165,7 +1216,7 @@ pub fn decode_state_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFai
     match payload[1] {
         PERCENTILE_STATE_VERSION => decode_state_v4_with_sink(payload, allocator, sink),
         3 => decode_state_v3_with_sink(payload, allocator, sink),
-        other => Err(sink.data(DataRecipe::Arguments(format_args!(
+        other => Err(sink.encoding(DataRecipe::Arguments(format_args!(
             "unsupported percentile state payload version: expected={} actual={}",
             PERCENTILE_STATE_VERSION, other
         )))),
@@ -1176,49 +1227,49 @@ pub fn decode_state_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFai
 /// Quantile processing/interpolation below is shared unchanged. The original
 /// public/v1 wrappers retain their derived, infallible clone semantics.
 pub trait TDigestClonePolicy<A: Allocator + Clone> {
-    fn clone_digest(&mut self, digest: &TDigest<A>) -> Result<TDigest<A>, String>;
+    fn clone_digest(&mut self, digest: &TDigest<A>) -> Result<TDigest<A>, crate::KernelFailure>;
 }
 pub struct OriginalDerivedClone;
 impl<A: Allocator + Clone> TDigestClonePolicy<A> for OriginalDerivedClone {
-    fn clone_digest(&mut self, digest: &TDigest<A>) -> Result<TDigest<A>, String> {
+    fn clone_digest(&mut self, digest: &TDigest<A>) -> Result<TDigest<A>, crate::KernelFailure> {
         Ok(digest.clone())
     }
 }
 pub struct FallibleClone;
 impl<A: Allocator + Clone> TDigestClonePolicy<A> for FallibleClone {
-    fn clone_digest(&mut self, digest: &TDigest<A>) -> Result<TDigest<A>, String> {
+    fn clone_digest(&mut self, digest: &TDigest<A>) -> Result<TDigest<A>, crate::KernelFailure> {
         digest.try_clone()
     }
 }
 pub fn quantile_value<A: Allocator + Clone>(
     state: &PercentileState<A>,
     quantile: f64,
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, crate::KernelFailure> {
     quantile_value_with_policy(state, quantile, &mut OriginalDerivedClone)
 }
 pub fn quantile_value_with_policy<A: Allocator + Clone, P: TDigestClonePolicy<A>>(
     state: &PercentileState<A>,
     quantile: f64,
     policy: &mut P,
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, crate::KernelFailure> {
     quantile_value_with_sink(
         state,
         quantile,
         &mut OriginalCloneLoan(policy),
-        &mut LegacyApproxPercentileFailure,
+        &mut RequiredApproxPercentileFailure,
     )
 }
 pub trait ObservedTDigestClone<A: Allocator + Clone, S: ApproxPercentileFailureSink> {
     fn clone_digest(&mut self, digest: &TDigest<A>, sink: &mut S) -> Result<TDigest<A>, S::Error>;
 }
-struct OriginalCloneLoan<'a, P>(&'a mut P);
+pub(crate) struct OriginalCloneLoan<'a, P>(pub(crate) &'a mut P);
 impl<A: Allocator + Clone, S: ApproxPercentileFailureSink, P: TDigestClonePolicy<A>>
     ObservedTDigestClone<A, S> for OriginalCloneLoan<'_, P>
 {
     fn clone_digest(&mut self, digest: &TDigest<A>, sink: &mut S) -> Result<TDigest<A>, S::Error> {
         self.0
             .clone_digest(digest)
-            .map_err(|error| sink.data(DataRecipe::Existing(&error)))
+            .map_err(|source| sink.kernel(source))
     }
 }
 pub struct TrackedTDigestClone;
@@ -1248,19 +1299,19 @@ pub fn quantile_value_with_sink<
 pub fn quantile_from_state<A: Allocator + Clone>(
     state: &PercentileState<A>,
     quantile: Option<f64>,
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, crate::KernelFailure> {
     quantile_from_state_with_policy(state, quantile, &mut OriginalDerivedClone)
 }
 pub fn quantile_from_state_with_policy<A: Allocator + Clone, P: TDigestClonePolicy<A>>(
     state: &PercentileState<A>,
     quantile: Option<f64>,
     policy: &mut P,
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, crate::KernelFailure> {
     quantile_from_state_with_sink(
         state,
         quantile,
         &mut OriginalCloneLoan(policy),
-        &mut LegacyApproxPercentileFailure,
+        &mut RequiredApproxPercentileFailure,
     )
 }
 
@@ -1287,32 +1338,62 @@ pub fn quantile_from_state_with_sink<
 
 pub fn quantiles_from_state<A: Allocator + Clone>(
     state: &PercentileState<A>,
-) -> Result<Option<Vec<f64>>, String> {
+) -> Result<Option<Vec<f64>>, crate::KernelFailure> {
     quantiles_from_state_with_policy(state, &mut OriginalDerivedClone)
 }
 pub fn quantiles_from_state_with_policy<A: Allocator + Clone, P: TDigestClonePolicy<A>>(
     state: &PercentileState<A>,
     policy: &mut P,
-) -> Result<Option<Vec<f64>>, String> {
-    let quantiles = match &state.quantiles {
-        Some(QuantileSpec::Scalar(q)) => vec![*q],
-        Some(QuantileSpec::Array(values)) => values.iter().copied().collect(),
+) -> Result<Option<Vec<f64>>, crate::KernelFailure> {
+    quantiles_from_state_with_sink(
+        state,
+        &mut OriginalCloneLoan(policy),
+        &mut RequiredApproxPercentileFailure,
+    )
+}
+pub fn quantiles_from_state_with_sink<
+    A: Allocator + Clone,
+    S: ApproxPercentileFailureSink,
+    P: ObservedTDigestClone<A, S>,
+>(
+    state: &PercentileState<A>,
+    policy: &mut P,
+    sink: &mut S,
+) -> Result<Option<Vec<f64>>, S::Error> {
+    let quantiles: &[f64] = match &state.quantiles {
+        Some(QuantileSpec::Scalar(q)) => std::slice::from_ref(q),
+        Some(QuantileSpec::Array(values)) => values,
         None => return Ok(None),
     };
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(quantiles.len())
+        .map_err(|source| {
+            sink.allocation(
+                DataRecipe::Static("reserve percentile quantile results"),
+                source,
+            )
+        })?;
     if state.digest.is_empty() {
-        return Ok(Some(vec![f64::NAN; quantiles.len()]));
+        output.resize(quantiles.len(), f64::NAN);
+        return Ok(Some(output));
     }
-    let mut digest = policy.clone_digest(&state.digest)?;
-    Ok(Some(
-        quantiles
-            .into_iter()
-            .map(|q| Ok(digest.quantile(q as f32)?.unwrap_or(f32::NAN) as f64))
-            .collect::<Result<Vec<_>, String>>()?,
-    ))
+    let mut digest = policy.clone_digest(&state.digest, sink)?;
+    for q in quantiles {
+        sink.observe(WorkObservation::Step)?;
+        output.push(
+            digest
+                .quantile_with_sink(*q as f32, sink)?
+                .unwrap_or(f32::NAN) as f64,
+        );
+    }
+    Ok(Some(output))
 }
 
-pub fn validate_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Result<(), String> {
-    validate_state_with_sink(state, &mut LegacyApproxPercentileFailure)
+pub fn validate_state<A: Allocator + Clone>(
+    state: &PercentileState<A>,
+) -> Result<(), crate::KernelFailure> {
+    validate_state_with_sink(state, &mut RequiredApproxPercentileFailure)
 }
 
 pub fn validate_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
@@ -1332,8 +1413,8 @@ pub fn validate_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailure
     Ok(())
 }
 
-fn validate_quantile(quantile: f64) -> Result<(), String> {
-    validate_quantile_with_sink(quantile, &mut LegacyApproxPercentileFailure)
+fn validate_quantile(quantile: f64) -> Result<(), crate::KernelFailure> {
+    validate_quantile_with_sink(quantile, &mut RequiredApproxPercentileFailure)
 }
 fn validate_quantile_with_sink<S: ApproxPercentileFailureSink>(
     quantile: f64,
@@ -1355,8 +1436,8 @@ fn merge_sorted_centroids<A: Allocator + Clone>(
     left: &[Centroid],
     right: &[Centroid],
     allocator: A,
-) -> Result<AllocVec<Centroid, A>, String> {
-    merge_sorted_centroids_with_sink(left, right, allocator, &mut LegacyApproxPercentileFailure)
+) -> Result<AllocVec<Centroid, A>, crate::KernelFailure> {
+    merge_sorted_centroids_with_sink(left, right, allocator, &mut RequiredApproxPercentileFailure)
 }
 fn merge_sorted_centroids_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     left: &[Centroid],
@@ -1375,10 +1456,11 @@ fn merge_sorted_centroids_with_sink<A: Allocator + Clone, S: ApproxPercentileFai
         .checked_add(right.len())
         .ok_or_else(|| sink.data(DataRecipe::Static("TDigest merge length overflow")))?;
     let mut merged = AllocVec::new_in(allocator);
-    merged.try_reserve_exact(capacity).map_err(|_| {
-        sink.allocation(DataRecipe::Static(
-            "ResourceExhausted: reserve TDigest merge",
-        ))
+    merged.try_reserve_exact(capacity).map_err(|source| {
+        sink.allocation(
+            DataRecipe::Static("ResourceExhausted: reserve TDigest merge"),
+            source,
+        )
     })?;
     let (mut li, mut ri) = (0usize, 0usize);
     while li < left.len() && ri < right.len() {
@@ -1402,15 +1484,15 @@ fn merge_sorted_centroids_with_sink<A: Allocator + Clone, S: ApproxPercentileFai
     Ok(merged)
 }
 
-fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, String> {
+fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, crate::KernelFailure> {
     decode_state_v4_in(payload, Global)
 }
 
 fn decode_state_v4_in<A: Allocator + Clone>(
     payload: &[u8],
     allocator: A,
-) -> Result<PercentileState<A>, String> {
-    decode_state_v4_with_sink(payload, allocator, &mut LegacyApproxPercentileFailure)
+) -> Result<PercentileState<A>, crate::KernelFailure> {
+    decode_state_v4_with_sink(payload, allocator, &mut RequiredApproxPercentileFailure)
 }
 
 fn decode_state_v4_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
@@ -1419,51 +1501,54 @@ fn decode_state_v4_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSin
     sink: &mut S,
 ) -> Result<PercentileState<A>, S::Error> {
     if payload.len() < HEADER_LEN {
-        return Err(sink.data(DataRecipe::Static("percentile state payload too short")));
+        return Err(sink.encoding(DataRecipe::Static("percentile state payload too short")));
     }
     let quantile_kind = payload[2];
     let compression = u32::from_le_bytes(payload[3..7].try_into().map_err(|_| {
-        sink.data(DataRecipe::Static(
+        sink.encoding(DataRecipe::Static(
             "percentile state compression decode failed",
         ))
     })?) as usize;
     let quantile_count = u32::from_le_bytes(payload[7..11].try_into().map_err(|_| {
-        sink.data(DataRecipe::Static(
+        sink.encoding(DataRecipe::Static(
             "percentile state quantile count decode failed",
         ))
     })?) as usize;
     if quantile_count > MAX_QUANTILE_COUNT {
-        return Err(sink.data(DataRecipe::Arguments(format_args!(
+        return Err(sink.encoding(DataRecipe::Arguments(format_args!(
             "percentile state quantile count {quantile_count} exceeds {MAX_QUANTILE_COUNT}"
         ))));
     }
     if compression == 0 || compression > MAX_COMPRESSION as usize {
-        return Err(sink.data(DataRecipe::Arguments(format_args!(
+        return Err(sink.encoding(DataRecipe::Arguments(format_args!(
             "percentile state compression {compression} exceeds bounded range"
         ))));
     }
     let quantile_bytes = quantile_count
         .checked_mul(std::mem::size_of::<f64>())
         .ok_or_else(|| {
-            sink.data(DataRecipe::Static(
+            sink.encoding(DataRecipe::Static(
                 "percentile state quantile bytes overflow",
             ))
         })?;
-    let quantile_end = HEADER_LEN
-        .checked_add(quantile_bytes)
-        .ok_or_else(|| sink.data(DataRecipe::Static("percentile state quantile end overflow")))?;
+    let quantile_end = HEADER_LEN.checked_add(quantile_bytes).ok_or_else(|| {
+        sink.encoding(DataRecipe::Static("percentile state quantile end overflow"))
+    })?;
     if payload.len() < quantile_end {
-        return Err(sink.data(DataRecipe::Static(
+        return Err(sink.encoding(DataRecipe::Static(
             "percentile state quantile payload truncated",
         )));
     }
 
     let mut quantiles = AllocVec::new_in(allocator.clone());
-    quantiles.try_reserve_exact(quantile_count).map_err(|_| {
-        sink.allocation(DataRecipe::Static(
-            "ResourceExhausted: reserve decoded percentile quantiles",
-        ))
-    })?;
+    quantiles
+        .try_reserve_exact(quantile_count)
+        .map_err(|source| {
+            sink.allocation(
+                DataRecipe::Static("ResourceExhausted: reserve decoded percentile quantiles"),
+                source,
+            )
+        })?;
     let mut offset = HEADER_LEN;
     for _ in 0..quantile_count {
         sink.observe(WorkObservation::Step)?;
@@ -1480,7 +1565,7 @@ fn decode_state_v4_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSin
         (QUANTILE_KIND_SCALAR, 1) => Some(QuantileSpec::Scalar(quantiles[0])),
         (QUANTILE_KIND_ARRAY, _) => Some(QuantileSpec::Array(quantiles)),
         _ => {
-            return Err(sink.data(DataRecipe::Arguments(format_args!(
+            return Err(sink.encoding(DataRecipe::Arguments(format_args!(
                 "invalid percentile state quantile metadata: kind={} count={}",
                 quantile_kind, quantile_count
             ))));
@@ -1506,8 +1591,13 @@ fn try_copy_slice_in<T: Copy, A: Allocator + Clone>(
     values: &[T],
     allocator: A,
     label: &str,
-) -> Result<AllocVec<T, A>, String> {
-    try_copy_slice_with_sink(values, allocator, label, &mut LegacyApproxPercentileFailure)
+) -> Result<AllocVec<T, A>, crate::KernelFailure> {
+    try_copy_slice_with_sink(
+        values,
+        allocator,
+        label,
+        &mut RequiredApproxPercentileFailure,
+    )
 }
 fn try_copy_slice_with_sink<T: Copy, A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     values: &[T],
@@ -1516,10 +1606,11 @@ fn try_copy_slice_with_sink<T: Copy, A: Allocator + Clone, S: ApproxPercentileFa
     sink: &mut S,
 ) -> Result<AllocVec<T, A>, S::Error> {
     let mut copied = AllocVec::new_in(allocator);
-    copied.try_reserve_exact(values.len()).map_err(|_| {
-        sink.allocation(DataRecipe::Arguments(format_args!(
-            "ResourceExhausted: reserve {label}"
-        )))
+    copied.try_reserve_exact(values.len()).map_err(|source| {
+        sink.allocation(
+            DataRecipe::Arguments(format_args!("ResourceExhausted: reserve {label}")),
+            source,
+        )
     })?;
     for value in values {
         sink.observe(WorkObservation::Step)?;
@@ -1549,8 +1640,8 @@ impl PercentileDecodeStorage for Global {
     }
 }
 
-fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
-    decode_state_v3_with_sink(payload, Global, &mut LegacyApproxPercentileFailure)
+fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, crate::KernelFailure> {
+    decode_state_v3_with_sink(payload, Global, &mut RequiredApproxPercentileFailure)
 }
 
 fn decode_state_v3_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFailureSink>(
@@ -1559,25 +1650,25 @@ fn decode_state_v3_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFail
     sink: &mut S,
 ) -> Result<PercentileState<A>, S::Error> {
     let meta_len = u32::from_le_bytes(payload[2..6].try_into().map_err(|_| {
-        sink.data(DataRecipe::Static(
+        sink.encoding(DataRecipe::Static(
             "percentile state meta length decode failed",
         ))
     })?) as usize;
     if payload.len() < 6 + meta_len {
-        return Err(sink.data(DataRecipe::Static(
+        return Err(sink.encoding(DataRecipe::Static(
             "percentile state meta payload truncated",
         )));
     }
     sink.observe(WorkObservation::JsonBegin(meta_len))?;
-    let meta: PercentileStateMeta = serde_json::from_slice(&payload[6..6 + meta_len])
-        .map_err(|e| sink.data(DataRecipe::Json(&e)))?;
+    let meta: PercentileStateMeta =
+        serde_json::from_slice(&payload[6..6 + meta_len]).map_err(|source| sink.json(source))?;
     sink.observe(WorkObservation::JsonEnd)?;
     let mut digest = if payload.len() == 6 + meta_len {
         TDigest::new_in(meta.compression as f32, allocator.clone())
     } else {
         sink.observe(WorkObservation::JsonBegin(payload.len() - 6 - meta_len))?;
-        let decoded: SerializableTDigest = serde_json::from_slice(&payload[6 + meta_len..])
-            .map_err(|e| sink.data(DataRecipe::Json(&e)))?;
+        let decoded: SerializableTDigest =
+            serde_json::from_slice(&payload[6 + meta_len..]).map_err(|source| sink.json(source))?;
         sink.observe(WorkObservation::JsonEnd)?;
         TDigest {
             allocator: allocator.clone(),
@@ -1612,8 +1703,8 @@ fn decode_state_v3_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFail
     })
 }
 
-fn read_u32(payload: &[u8], offset: &mut usize, label: &str) -> Result<u32, String> {
-    read_u32_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+fn read_u32(payload: &[u8], offset: &mut usize, label: &str) -> Result<u32, crate::KernelFailure> {
+    read_u32_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
 }
 
 fn read_u32_with_sink<S: ApproxPercentileFailureSink>(
@@ -1625,21 +1716,21 @@ fn read_u32_with_sink<S: ApproxPercentileFailureSink>(
     let end = offset
         .checked_add(std::mem::size_of::<u32>())
         .ok_or_else(|| {
-            sink.data(DataRecipe::Arguments(format_args!(
+            sink.encoding(DataRecipe::Arguments(format_args!(
                 "{label} offset overflow"
             )))
         })?;
     let bytes: [u8; 4] = payload
         .get(*offset..end)
-        .ok_or_else(|| sink.data(DataRecipe::Arguments(format_args!("{label} truncated"))))?
+        .ok_or_else(|| sink.encoding(DataRecipe::Arguments(format_args!("{label} truncated"))))?
         .try_into()
-        .map_err(|_| sink.data(DataRecipe::Arguments(format_args!("{label} decode failed"))))?;
+        .map_err(|_| sink.encoding(DataRecipe::Arguments(format_args!("{label} decode failed"))))?;
     *offset = end;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_u64(payload: &[u8], offset: &mut usize, label: &str) -> Result<u64, String> {
-    read_u64_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+fn read_u64(payload: &[u8], offset: &mut usize, label: &str) -> Result<u64, crate::KernelFailure> {
+    read_u64_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
 }
 
 fn read_u64_with_sink<S: ApproxPercentileFailureSink>(
@@ -1651,21 +1742,21 @@ fn read_u64_with_sink<S: ApproxPercentileFailureSink>(
     let end = offset
         .checked_add(std::mem::size_of::<u64>())
         .ok_or_else(|| {
-            sink.data(DataRecipe::Arguments(format_args!(
+            sink.encoding(DataRecipe::Arguments(format_args!(
                 "{label} offset overflow"
             )))
         })?;
     let bytes: [u8; 8] = payload
         .get(*offset..end)
-        .ok_or_else(|| sink.data(DataRecipe::Arguments(format_args!("{label} truncated"))))?
+        .ok_or_else(|| sink.encoding(DataRecipe::Arguments(format_args!("{label} truncated"))))?
         .try_into()
-        .map_err(|_| sink.data(DataRecipe::Arguments(format_args!("{label} decode failed"))))?;
+        .map_err(|_| sink.encoding(DataRecipe::Arguments(format_args!("{label} decode failed"))))?;
     *offset = end;
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_f32(payload: &[u8], offset: &mut usize, label: &str) -> Result<f32, String> {
-    read_f32_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+fn read_f32(payload: &[u8], offset: &mut usize, label: &str) -> Result<f32, crate::KernelFailure> {
+    read_f32_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
 }
 
 fn read_f32_with_sink<S: ApproxPercentileFailureSink>(
@@ -1678,8 +1769,8 @@ fn read_f32_with_sink<S: ApproxPercentileFailureSink>(
     Ok(f32::from_le_bytes(bits.to_le_bytes()))
 }
 
-fn read_f64(payload: &[u8], offset: &mut usize, label: &str) -> Result<f64, String> {
-    read_f64_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+fn read_f64(payload: &[u8], offset: &mut usize, label: &str) -> Result<f64, crate::KernelFailure> {
+    read_f64_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
 }
 
 fn read_f64_with_sink<S: ApproxPercentileFailureSink>(
@@ -1763,10 +1854,11 @@ mod tests {
                 // Force a real processed digest before the serialized merge.
                 assert_eq!(quantile_value(&part, 0.5).unwrap(), Some(value));
                 assert_eq!(part.digest.quantile(0.5).unwrap(), Some(value as f32));
-                merge_bounded_serialized_state_into(&mut merged, &encode_state(&part)).unwrap();
+                merge_bounded_serialized_state_into(&mut merged, &encode_state(&part).unwrap())
+                    .unwrap();
             }
             add_weighted_value(&mut merged, 1000000.0, 0).unwrap();
-            let decoded = decode_state(&encode_state(&merged)).unwrap();
+            let decoded = decode_state(&encode_state(&merged).unwrap()).unwrap();
             for state in [&merged, &decoded] {
                 assert_eq!(quantile_value(state, 0.0).unwrap(), Some(2.0));
                 assert_eq!(
@@ -1807,7 +1899,7 @@ mod tests {
     #[test]
     fn clean_v4_state_rebuilds_mass_on_decode_and_first_bounded_merge() {
         let source = historical_clean_state_with_stale_mass();
-        let payload = encode_state(&source);
+        let payload = encode_state(&source).unwrap();
         let decoded = decode_state(&payload).unwrap();
         assert!(decoded.digest.unprocessed.is_empty());
         assert!(!decoded.digest.is_dirty());
@@ -1895,7 +1987,7 @@ mod tests {
         add_value(&mut state, 1.0).unwrap();
         add_value(&mut state, 2.0).unwrap();
         add_value(&mut state, 3.0).unwrap();
-        let encoded = encode_state(&state);
+        let encoded = encode_state(&state).unwrap();
         let decoded = decode_state(&encoded).expect("decode");
         assert_eq!(decoded.digest.total_weight() as i64, 3);
     }
@@ -1909,7 +2001,7 @@ mod tests {
             add_value(&mut source, value as f64).unwrap();
         }
 
-        let payload = encode_state(&source);
+        let payload = encode_state(&source).unwrap();
         let expected = quantiles_from_state(&decode_state(&payload).expect("decode source"))
             .expect("source quantiles");
 
@@ -1965,5 +2057,85 @@ mod tests {
         let before = state.retained_bytes();
         assert!(add_weighted_value(&mut state, 1.0, -1).is_err());
         assert_eq!(state.retained_bytes(), before);
+    }
+    #[derive(Clone, Debug, Default)]
+    struct DecodeProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    // SAFETY: the probe delegates each exact block/layout unchanged to Global.
+    unsafe impl Allocator for DecodeProbe {
+        fn allocate(
+            &self,
+            layout: std::alloc::Layout,
+        ) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Global.allocate(layout)
+        }
+        unsafe fn deallocate(&self, p: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+            unsafe { Global.deallocate(p, layout) };
+        }
+    }
+    #[test]
+    fn percentile_codec_checks_each_declared_component_before_allocator_entry() {
+        use novarocks_failure_contract::FailureProjection;
+        let digest = TDigest::new_in(10_000.0, Global);
+        let empty = digest.serialize_binary().unwrap();
+        assert_eq!(empty.len(), 48);
+        for (offset, count) in [
+            (36, MAX_DECODED_PROCESSED),
+            (40, MAX_DECODED_UNPROCESSED),
+            (44, MAX_DECODED_CUMULATIVE),
+        ] {
+            let mut payload = empty[..offset + 4].to_vec();
+            payload[offset..offset + 4].copy_from_slice(&(count as u32).to_le_bytes());
+            let allocator = DecodeProbe::default();
+            let cause = TDigest::deserialize_binary_in(&payload, allocator.clone()).unwrap_err();
+            assert_eq!(
+                cause.failure_fact(),
+                crate::DataFailureReason::InvalidEncoding.failure_fact()
+            );
+            assert_eq!(allocator.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+    #[test]
+    fn percentile_codec_format_boundaries_keep_exact_extent_and_original_sources() {
+        use crate::approx_percentile_failure::{storage_count, wire_count};
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(wire_count(u32::MAX as usize).unwrap(), u32::MAX);
+        let required = u32::MAX as usize + 1;
+        let cause = wire_count(required).unwrap_err();
+        assert_eq!(cause.failure_fact().class(), FailureClass::Representation);
+        let facts = cause.failure_fact().representation().unwrap();
+        assert_eq!(facts.required, Some(required as u64));
+        assert_eq!(facts.extent_limit, Some(u32::MAX as u64));
+        let mut source: &(dyn std::error::Error + 'static) = &cause;
+        while !source.is::<std::num::TryFromIntError>() {
+            source = source
+                .source()
+                .expect("actual wire count conversion source");
+        }
+        let cause = storage_count::<f64>(usize::MAX as u128).unwrap_err();
+        assert_eq!(
+            cause.failure_fact().representation().unwrap().required,
+            None
+        );
+        let mut source: &(dyn std::error::Error + 'static) = &cause;
+        while !source.is::<std::alloc::LayoutError>() {
+            source = source.source().expect("actual storage layout source");
+        }
+    }
+    #[test]
+    fn percentile_codec_actual_exact_reserves_and_singleton_envelope_match_wire() {
+        let state = single_value_state_in(3.0, Global).unwrap();
+        let digest = state.digest.serialize_binary().unwrap();
+        let encoded = encode_state(&state).unwrap();
+        assert_eq!(digest.len(), 56);
+        assert_eq!(digest.capacity(), 56);
+        assert_eq!(encoded.len(), 67);
+        assert_eq!(encoded.capacity(), 67);
+        assert_eq!(encoded_size(&state).unwrap(), encoded.len());
+        assert_eq!(
+            scalar_hash_codec_extent(&state).unwrap(),
+            digest.capacity() + encoded.capacity()
+        );
+        assert_eq!(&encoded[11..], digest);
     }
 }

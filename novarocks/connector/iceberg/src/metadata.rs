@@ -2970,20 +2970,7 @@ pub(crate) fn metadata_creation_error(
     match cause {
         novarocks_connector_contract::PureProviderCompileError::Provider(cause) => cause,
         novarocks_connector_contract::PureProviderCompileError::Control(cause) => {
-            ConnectorError::new(
-                match cause {
-                    novarocks_type_contract::CompileControlError::Cancelled => {
-                        ConnectorErrorKind::Cancelled
-                    }
-                    novarocks_type_contract::CompileControlError::DeadlineExceeded => {
-                        ConnectorErrorKind::DeadlineExceeded
-                    }
-                    novarocks_type_contract::CompileControlError::ResourceExhausted => {
-                        ConnectorErrorKind::ResourceExhausted
-                    }
-                },
-                cause.to_string(),
-            )
+            ConnectorError::compile_interruption(cause)
         }
     }
 }

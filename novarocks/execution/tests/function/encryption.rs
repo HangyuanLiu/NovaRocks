@@ -305,5 +305,8 @@ fn fingerprint_alias_ignores_real_list_columns_without_ignoring_scalar_nulls() {
     }
     let err =
         eval_encryption_function("encode_sort_key", &arena, output, &args, &chunk).unwrap_err();
-    assert!(err.contains("unsupported argument type"), "{err}");
+    assert!(
+        err.to_string().contains("unsupported argument type"),
+        "{err}"
+    );
 }

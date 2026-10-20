@@ -27,12 +27,17 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{SinkKernel, SinkStep, Transform},
+    step::NextStep,
+    step_context::StepContext,
+};
 
 /// Factory for terminal sinks that consume input without producing downstream output.
 pub struct NoopSinkFactory {
@@ -59,10 +64,9 @@ impl OperatorFactory for NoopSinkFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(NoopSinkOperator {
+        Box::new(Transform::hydrating(NoopSinkOperator {
             name: self.name.clone(),
-            finishing: false,
-        })
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -72,46 +76,23 @@ impl OperatorFactory for NoopSinkFactory {
 
 struct NoopSinkOperator {
     name: String,
-    finishing: bool,
 }
 
-impl Operator for NoopSinkOperator {
+impl OperatorLifecycle for NoopSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn is_finished(&self) -> bool {
-        self.finishing
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
-
-impl ProcessorOperator for NoopSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.finishing
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finishing = true;
-        Ok(())
+impl InputEncodingPolicy for NoopSinkOperator {}
+impl SinkKernel for NoopSinkOperator {
+    fn consume(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        drop(chunk);
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
 }

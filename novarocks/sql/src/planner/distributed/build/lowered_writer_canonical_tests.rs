@@ -56,7 +56,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -424,7 +424,7 @@ fn writer_rejects_foreign_catalogue_and_returned_state_domain_without_retagging_
             for cause in causes() {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 assert!(matches!(
                     authored(&source, &auxiliary, rejected_catalogue.clone(), &control),
@@ -467,7 +467,7 @@ fn writer_checked_source_refuses_equal_foreign_owner_and_observes_every_prefix()
         for cause in causes() {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(run(&control), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
@@ -488,7 +488,7 @@ fn actual_writer_lowering_preserves_each_original_control_refusal() {
         for cause in causes() {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(authored(&source,&auxiliary,functions.clone(),&control),Err(ContractLoweringError::Control(actual)) if actual == cause),

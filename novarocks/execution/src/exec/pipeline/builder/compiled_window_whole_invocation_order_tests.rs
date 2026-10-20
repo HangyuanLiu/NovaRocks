@@ -20,6 +20,7 @@
 //! This permanent original-equivalence expectation must not be changed to #1.
 use super::super::window_fixture::package_typed;
 use super::*;
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
 use arrow::datatypes::DataType;
@@ -125,8 +126,8 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
         ),
     );
     operator.prepare().unwrap();
-    let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
     let mut earlier = None;
     for start in (0..4).step_by(step) {
         let input = Chunk::try_new_with_chunk_schema(
@@ -134,12 +135,15 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
             chunk_schema.clone(),
         )
         .unwrap();
-        if let Err(cause) = processor.push_chunk(&state, input) {
+        if let Err(cause) = processor.input_without_output(input) {
             earlier = Some(cause);
             break;
         }
     }
-    let first = earlier.unwrap_or_else(|| processor.set_finishing(&state).unwrap_err());
+    let first = earlier.unwrap_or_else(|| {
+        processor.signal_eos().unwrap();
+        processor.collect_until_finished().unwrap_err()
+    });
     match first.cause() {
         ExecutionFailureCause::WindowInvocationData(data) => {
             assert_eq!(
@@ -162,10 +166,23 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
         }
         other => panic!("actual original whole-call Data: {other:?}"),
     }
-    assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
-    assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
+    assert_eq!(
+        processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap_err(),
+        first
+    );
+    assert_eq!(processor.signal_eos().unwrap_err(), first);
+    assert_eq!(state.error(), Some(first.clone()));
+    drop(processor);
     drop(operator);
     drop(first);
+    assert!(
+        tracker.current() > 0,
+        "the early failure observer still owns original invocation data"
+    );
+    drop(state);
     assert_eq!(tracker.current(), 0);
 }
 

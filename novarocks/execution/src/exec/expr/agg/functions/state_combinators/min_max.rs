@@ -59,7 +59,7 @@ impl AggregateFunction for MinMaxStateAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_min_max_state_spec(func, input_type, input_is_intermediate, false)
     }
 
@@ -71,7 +71,7 @@ impl AggregateFunction for MinMaxStateAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_min_max_state_input_view(min_max_name_for_kind(&spec.kind), spec, array)
     }
 
@@ -79,7 +79,7 @@ impl AggregateFunction for MinMaxStateAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_min_max_state_merge_view(min_max_name_for_kind(&spec.kind), array)
     }
 
@@ -93,7 +93,7 @@ impl AggregateFunction for MinMaxStateAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         init_min_max_state(ptr, tracker)
     }
 
@@ -116,7 +116,7 @@ impl AggregateFunction for MinMaxStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_min_max_state(
             min_max_name_for_kind(&spec.kind),
             spec,
@@ -132,7 +132,7 @@ impl AggregateFunction for MinMaxStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_min_max_state(
             min_max_name_for_kind(&spec.kind),
             spec,
@@ -148,7 +148,7 @@ impl AggregateFunction for MinMaxStateAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_min_max_state_array(spec, offset, group_states)
     }
 }
@@ -159,7 +159,7 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_min_max_state_spec(func, input_type, input_is_intermediate, true)
     }
 
@@ -171,7 +171,7 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_min_max_state_input_view(min_max_name_for_kind(&spec.kind), spec, array)
     }
 
@@ -179,7 +179,7 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_min_max_state_merge_view(min_max_name_for_kind(&spec.kind), array)
     }
 
@@ -193,7 +193,7 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         init_min_max_state(ptr, tracker)
     }
 
@@ -216,7 +216,7 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_min_max_state(
             min_max_name_for_kind(&spec.kind),
             spec,
@@ -232,7 +232,7 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_min_max_state(
             min_max_name_for_kind(&spec.kind),
             spec,
@@ -248,7 +248,7 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_min_max_state_array(spec, offset, group_states)
     }
 }
@@ -258,7 +258,7 @@ fn build_min_max_state_spec(
     input_type: Option<&DataType>,
     input_is_intermediate: bool,
     signed: bool,
-) -> Result<AggSpec, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     let name = min_max_name(func, signed);
     let logical_input_type;
     if input_is_intermediate {
@@ -267,10 +267,18 @@ fn build_min_max_state_spec(
             .as_ref()
             .and_then(|t| t.input_arg_type.as_ref())
             .cloned()
-            .ok_or_else(|| format!("{name} merge requires original logical input type"))?;
+            .ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "{name} merge requires original logical input type"
+                ))
+            })?;
         validate_key_type(name, merge_key_type(&logical_input_type))?;
     } else {
-        let input_type = input_type.ok_or_else(|| format!("{name} input type missing"))?;
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "{name} input type missing"
+            ))
+        })?;
         if signed {
             validate_signed_input_type(name, input_type)?;
         } else {
@@ -321,30 +329,42 @@ fn min_max_name(func: &AggFunction, signed: bool) -> &str {
     }
 }
 
-fn validate_signed_input_type(name: &str, input_type: &DataType) -> Result<(), String> {
+fn validate_signed_input_type(
+    name: &str,
+    input_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let DataType::Struct(fields) = input_type else {
-        return Err(format!(
-            "{name} expects struct input (value, change_op), got {:?}",
-            input_type
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "{name} expects struct input (value, change_op), got {:?}",
+                input_type
+            ),
         ));
     };
     if fields.len() != 2 {
-        return Err(format!(
-            "{name} expects 2 arguments, got struct with {} fields",
-            fields.len()
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "{name} expects 2 arguments, got struct with {} fields",
+                fields.len()
+            ),
         ));
     }
     validate_key_type(name, fields[0].data_type())?;
     if fields[1].data_type() != &DataType::Int8 {
-        return Err(format!(
-            "{name} change_op must be Int8, got {:?}",
-            fields[1].data_type()
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "{name} change_op must be Int8, got {:?}",
+                fields[1].data_type()
+            ),
         ));
     }
     Ok(())
 }
 
-fn validate_key_type(name: &str, data_type: &DataType) -> Result<(), String> {
+fn validate_key_type(
+    name: &str,
+    data_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<()> {
     match data_type {
         DataType::Boolean
         | DataType::Int8
@@ -358,7 +378,9 @@ fn validate_key_type(name: &str, data_type: &DataType) -> Result<(), String> {
         | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _)
         | DataType::Utf8
         | DataType::LargeUtf8 => Ok(()),
-        other => Err(format!("{name} unsupported key type {other:?}")),
+        other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} unsupported key type {other:?}"),
+        )),
     }
 }
 
@@ -379,16 +401,22 @@ fn build_min_max_state_input_view<'a>(
     name: &str,
     spec: &AggSpec,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
-    let arr = array
-        .as_ref()
-        .ok_or_else(|| format!("{name} input missing"))?;
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+    let arr = array.as_ref().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+            "{name} input missing"
+        ))
+    })?;
     match spec.kind {
         AggKind::MinState | AggKind::MaxState => validate_key_type(name, arr.data_type())?,
         AggKind::MinStateSigned | AggKind::MaxStateSigned => {
             validate_signed_input_type(name, arr.data_type())?
         }
-        _ => return Err(format!("{name} input kind mismatch")),
+        _ => {
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{name} input kind mismatch"),
+            ));
+        }
     }
     Ok(AggInputView::Any(arr))
 }
@@ -396,20 +424,28 @@ fn build_min_max_state_input_view<'a>(
 fn build_min_max_state_merge_view<'a>(
     name: &str,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
-    let arr = array
-        .as_ref()
-        .ok_or_else(|| format!("{name} merge input missing"))?;
-    let binary = arr
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| format!("{name} merge input must be BinaryArray"))?;
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+    let arr = array.as_ref().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+            "{name} merge input missing"
+        ))
+    })?;
+    let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+            "{name} merge input must be BinaryArray"
+        ))
+    })?;
     Ok(AggInputView::Binary(binary))
 }
 
-fn init_min_max_state(ptr: *mut u8, tracker: Option<Arc<MemTracker>>) -> Result<(), String> {
+fn init_min_max_state(
+    ptr: *mut u8,
+    tracker: Option<Arc<MemTracker>>,
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let tracker = tracker.ok_or_else(|| {
-        "allocation-tracked min/max state requires an aggregate memory tracker".to_string()
+        crate::exec::expr::agg::functions::aggregate_binding_contract(
+            "allocation-tracked min/max state requires an aggregate memory tracker",
+        )
     })?;
     unsafe {
         std::ptr::write(ptr as *mut MinMaxState, MinMaxState::new(tracker));
@@ -433,7 +469,7 @@ fn update_min_max_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match spec.kind {
         AggKind::MinState | AggKind::MaxState => {
             update_min_max_state_unsigned(name, offset, state_ptrs, input)
@@ -441,7 +477,9 @@ fn update_min_max_state(
         AggKind::MinStateSigned | AggKind::MaxStateSigned => {
             update_min_max_state_signed(name, offset, state_ptrs, input)
         }
-        _ => Err(format!("{name} update kind mismatch")),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} update kind mismatch"),
+        )),
     }
 }
 
@@ -450,12 +488,14 @@ fn update_min_max_state_unsigned(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     if state_ptrs.is_empty() {
         return Ok(());
     }
     let AggInputView::Any(array) = input else {
-        return Err(format!("{name} batch input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} batch input type mismatch"),
+        ));
     };
     let mut staged = new_staging_map(state_ptrs, offset, name)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
@@ -475,7 +515,7 @@ fn update_min_max_state_signed(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     if state_ptrs.is_empty() {
         return Ok(());
     }
@@ -500,18 +540,29 @@ fn update_min_max_state_signed(
 fn signed_parts<'a>(
     name: &str,
     input: &'a AggInputView<'a>,
-) -> Result<(&'a StructArray, &'a ArrayRef, &'a Int8Array), String> {
+) -> Result<
+    (&'a StructArray, &'a ArrayRef, &'a Int8Array),
+    crate::runtime::fragment::ExecutionFailure,
+> {
     let AggInputView::Any(array) = input else {
-        return Err(format!("{name} batch input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} batch input type mismatch"),
+        ));
     };
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| format!("{name} expects struct input"))?;
+        .ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+                "{name} expects struct input"
+            ))
+        })?;
     if struct_arr.num_columns() != 2 {
-        return Err(format!(
-            "{name} expects 2 arguments, got {}",
-            struct_arr.num_columns()
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "{name} expects 2 arguments, got {}",
+                struct_arr.num_columns()
+            ),
         ));
     }
     let value_arr = struct_arr.column(0);
@@ -520,22 +571,28 @@ fn signed_parts<'a>(
         .as_any()
         .downcast_ref::<Int8Array>()
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "{name} change_op must be Int8, got {:?}",
                 op_arr_ref.data_type()
-            )
+            ))
         })?;
     Ok((struct_arr, value_arr, op_arr))
 }
 
-fn signed_delta(name: &str, op_arr: &Int8Array, row: usize) -> Result<Option<i64>, String> {
+fn signed_delta(
+    name: &str,
+    op_arr: &Int8Array,
+    row: usize,
+) -> Result<Option<i64>, crate::runtime::fragment::ExecutionFailure> {
     if op_arr.is_null(row) {
         return Ok(None);
     }
     match op_arr.value(row) {
         CHANGE_OP_INSERT => Ok(Some(1)),
         CHANGE_OP_DELETE => Ok(Some(-1)),
-        other => Err(format!("unknown {name} change_op: {other}")),
+        other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("unknown {name} change_op: {other}"),
+        )),
     }
 }
 
@@ -544,13 +601,13 @@ fn staged_state<'a>(
     base: AggStatePtr,
     offset: usize,
     _context: &str,
-) -> Result<&'a mut MinMaxState, String> {
+) -> Result<&'a mut MinMaxState, crate::runtime::fragment::ExecutionFailure> {
     let ptr = state_slot(base, offset);
     if !staged.contains_key(&(ptr as usize)) {
         let copy = clone_state(unsafe { &*ptr })?;
-        staged.try_reserve(1).map_err(|_| {
+        staged.try_reserve(1).map_err(|source| {
             copy.allocator
-                .allocation_error("reserve min/max staging state")
+                .allocation_error("reserve min/max staging state", source)
         })?;
         staged.insert(ptr as usize, copy);
     }
@@ -563,20 +620,24 @@ fn new_staging_map(
     state_ptrs: &[AggStatePtr],
     offset: usize,
     context: &str,
-) -> Result<AggregateHashMap<usize, MinMaxState>, String> {
-    let first = state_ptrs
-        .first()
-        .ok_or_else(|| format!("{context} staging requires at least one state"))?;
+) -> Result<AggregateHashMap<usize, MinMaxState>, crate::runtime::fragment::ExecutionFailure> {
+    let first = state_ptrs.first().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+            "{context} staging requires at least one state"
+        ))
+    })?;
     let state = unsafe { &*state_slot(*first, offset) };
     Ok(aggregate_hash_map(state.allocator.clone()))
 }
 
-fn clone_state(state: &MinMaxState) -> Result<MinMaxState, String> {
+fn clone_state(
+    state: &MinMaxState,
+) -> Result<MinMaxState, crate::runtime::fragment::ExecutionFailure> {
     let mut counts = aggregate_hash_map(state.allocator.clone());
-    counts.try_reserve(state.counts.len()).map_err(|_| {
+    counts.try_reserve(state.counts.len()).map_err(|source| {
         state
             .allocator
-            .allocation_error("reserve min/max state clone")
+            .allocation_error("reserve min/max state clone", source)
     })?;
     for (key, count) in &state.counts {
         counts.insert(aggregate_bytes(state.allocator.clone(), key)?, *count);
@@ -587,23 +648,54 @@ fn clone_state(state: &MinMaxState) -> Result<MinMaxState, String> {
     })
 }
 
+#[derive(Debug)]
+struct MinMaxKeyFailure {
+    aggregate: novarocks_failure_contract::BoundedDetail,
+    source: crate::exec::mv::state_codec::StateCodecFailure,
+}
+impl std::fmt::Display for MinMaxKeyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.aggregate, self.source)
+    }
+}
+impl std::error::Error for MinMaxKeyFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MinMaxKeyFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.source)
+    }
+}
 fn tracked_key_at(
     allocator: &AggregateAllocator,
     array: &ArrayRef,
     row: usize,
     context: &str,
-) -> Result<AggregateVec<u8>, String> {
-    let mut len = 0usize;
+) -> Result<AggregateVec<u8>, crate::runtime::fragment::ExecutionFailure> {
+    let codec_failure = |source| {
+        crate::runtime::fragment::ExecutionFailure::from_domain(MinMaxKeyFailure {
+            aggregate: novarocks_failure_contract::BoundedDetail::truncating(context),
+            source,
+        })
+    };
+    let mut len = Some(0usize);
     visit_key_bytes_at(array, row, |bytes| {
-        len = len.saturating_add(bytes.len());
+        len = len.and_then(|current| current.checked_add(bytes.len()));
     })
-    .map_err(|error| format!("{context}: {error}"))?;
+    .map_err(&codec_failure)?;
+    let len = len.ok_or_else(|| {
+        crate::runtime::fragment::ExecutionFailure::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )
+    })?;
     let mut output = AggregateVec::new_in(allocator.clone());
     output
         .try_reserve_exact(len)
-        .map_err(|_| allocator.allocation_error("reserve min/max canonical key"))?;
+        .map_err(|source| allocator.allocation_error("reserve min/max canonical key", source))?;
     visit_key_bytes_at(array, row, |bytes| output.extend_from_slice(bytes))
-        .map_err(|error| format!("{context}: {error}"))?;
+        .map_err(codec_failure)?;
     Ok(output)
 }
 
@@ -613,15 +705,13 @@ fn add_count_to_map(
     delta: i64,
     context: &str,
     allocator: &AggregateAllocator,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let current = *counts.get(&key_bytes).unwrap_or(&0);
-    let next = current
-        .checked_add(delta)
-        .ok_or_else(|| format!("{context} overflow while adding multiset count"))?;
+    let next = super::failure::add_count(current, delta, context)?;
     if !counts.contains_key(&key_bytes) {
-        counts
-            .try_reserve(1)
-            .map_err(|_| allocator.allocation_error("reserve min/max multiset entry"))?;
+        counts.try_reserve(1).map_err(|source| {
+            allocator.allocation_error("reserve min/max multiset entry", source)
+        })?;
     }
     counts.insert(key_bytes, next);
     Ok(())
@@ -641,18 +731,24 @@ fn merge_min_max_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     if state_ptrs.is_empty() {
         return Ok(());
     }
     let AggInputView::Binary(array) = input else {
-        return Err(format!("{name} merge input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} merge input type mismatch"),
+        ));
     };
     let key_type = spec
         .input_arg_type
         .as_ref()
         .map(merge_key_type)
-        .ok_or_else(|| format!("{name} merge requires original logical input type"))?;
+        .ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+                "{name} merge requires original logical input type"
+            ))
+        })?;
     validate_key_type(name, key_type)?;
 
     let mut staged = new_staging_map(state_ptrs, offset, name)?;
@@ -661,11 +757,7 @@ fn merge_min_max_state(
             continue;
         }
         let state = staged_state(&mut staged, base, offset, name)?;
-        visit_multiset_with_key_type(array.value(row), key_type, |key, count| {
-            let key = aggregate_bytes(state.allocator.clone(), key)?;
-            add_count_to_map(&mut state.counts, key, count, name, &state.allocator)
-                .map_err(|_| format!("{name} overflow while merging multiset count"))
-        })?;
+        merge_entries_into_state(state, array.value(row), key_type, name)?;
     }
 
     commit_staged(staged);
@@ -685,19 +777,20 @@ fn build_min_max_state_array(
     spec: &AggSpec,
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let key_type = spec
         .input_arg_type
         .as_ref()
         .map(merge_key_type)
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "{} build_array requires original logical input type",
                 min_max_name_for_kind(&spec.kind)
-            )
+            ))
         })?;
     validate_key_type(min_max_name_for_kind(&spec.kind), key_type)?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::BinaryOutput::default();
     for &base in group_states {
         let state = unsafe { &*state_slot(base, offset) };
         let mut entries: Vec<_> = state
@@ -711,9 +804,23 @@ fn build_min_max_state_array(
             })
             .collect();
         entries.sort_by(|left, right| left.key_bytes.cmp(&right.key_bytes));
-        builder.append_value(encode_multiset(&entries, key_type)?);
+        let bytes = encode_multiset(&entries, key_type)?;
+        extent.append(bytes.len())?;
+        builder.append_value(bytes);
     }
     Ok(Arc::new(builder.finish()))
+}
+
+fn merge_entries_into_state(
+    state: &mut MinMaxState,
+    bytes: &[u8],
+    key_type: &DataType,
+    name: &str,
+) -> crate::runtime::fragment::ExecutionResult<()> {
+    visit_multiset_with_key_type(bytes, key_type, |key, count| {
+        let key = aggregate_bytes(state.allocator.clone(), key)?;
+        add_count_to_map(&mut state.counts, key, count, name, &state.allocator)
+    })
 }
 
 #[cfg(test)]
@@ -826,7 +933,10 @@ mod tests {
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &view).unwrap();
         }
 
-        fn try_update(&mut self, input: ArrayRef) -> Result<(), String> {
+        fn try_update(
+            &mut self,
+            input: ArrayRef,
+        ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
             let rows = input.len();
             let input_slot = Some(input);
             let view = super::super::super::build_input_view(&self.spec, &input_slot)?;
@@ -839,7 +949,7 @@ mod tests {
             &mut self,
             input: super::super::super::AggInputView<'_>,
             rows: usize,
-        ) -> Result<(), String> {
+        ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
             let ptr = self.ptr();
             let state_ptrs = vec![ptr; rows];
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &input)
@@ -854,7 +964,10 @@ mod tests {
             super::super::super::merge_batch(&self.spec, 0, &state_ptrs, &view).unwrap();
         }
 
-        fn try_merge(&mut self, input: ArrayRef) -> Result<(), String> {
+        fn try_merge(
+            &mut self,
+            input: ArrayRef,
+        ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
             let rows = input.len();
             let input_slot = Some(input);
             let view = super::super::super::build_merge_view(&self.spec, &input_slot)?;
@@ -1042,7 +1155,10 @@ mod tests {
             .try_update(signed_i64_input(vec![Some(1)], vec![Some(7)], None))
             .unwrap_err();
 
-        assert!(err.contains("unknown min_state_signed change_op"));
+        assert!(
+            err.to_string()
+                .contains("unknown min_state_signed change_op")
+        );
     }
 
     #[test]
@@ -1054,8 +1170,23 @@ mod tests {
             .try_update_view(AggInputView::Any(&input), input.len())
             .unwrap_err();
 
-        assert!(err.contains("max_state"));
-        assert!(!err.contains("min_state"));
+        assert!(err.to_string().contains("max_state"));
+        assert!(!err.to_string().contains("min_state"));
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(err.failure_fact().class(), FailureClass::Invariant);
+        let mut source: &dyn std::error::Error = &err;
+        loop {
+            if let Some(original) =
+                source.downcast_ref::<crate::exec::mv::state_codec::StateCodecFailure>()
+            {
+                assert!(matches!(
+                    original,
+                    crate::exec::mv::state_codec::StateCodecFailure::CarrierContract(_)
+                ));
+                break;
+            }
+            source = source.source().expect("the original key codec author");
+        }
     }
 
     #[test]
@@ -1067,8 +1198,11 @@ mod tests {
             .try_update(signed_i64_input(vec![Some(1)], vec![Some(7)], None))
             .unwrap_err();
 
-        assert!(err.contains("unknown max_state_signed change_op"));
-        assert!(!err.contains("min_state_signed"));
+        assert!(
+            err.to_string()
+                .contains("unknown max_state_signed change_op")
+        );
+        assert!(!err.to_string().contains("min_state_signed"));
     }
 
     #[test]
@@ -1148,7 +1282,7 @@ mod tests {
             ])))
             .unwrap_err();
 
-        assert!(err.contains("overflow"));
+        assert!(err.to_string().contains("overflow"));
         assert!(cell.final_bytes().is_empty());
     }
 
@@ -1172,7 +1306,7 @@ mod tests {
             ])))
             .unwrap_err();
 
-        assert!(err.contains("unsupported version byte"));
+        assert!(err.to_string().contains("unsupported version byte"));
         assert!(cell.final_bytes().is_empty());
     }
 
@@ -1198,7 +1332,7 @@ mod tests {
         let ptr = cell.ptr();
         let err = super::super::super::update_batch(&cell.spec, 0, &[ptr, ptr], &view).unwrap_err();
 
-        assert!(err.contains("overflow"));
+        assert!(err.to_string().contains("overflow"));
         assert_eq!(cell.final_bytes(), before);
     }
 
@@ -1215,7 +1349,10 @@ mod tests {
             ))
             .unwrap_err();
 
-        assert!(err.contains("unknown min_state_signed change_op"));
+        assert!(
+            err.to_string()
+                .contains("unknown min_state_signed change_op")
+        );
         assert!(cell.final_bytes().is_empty());
     }
 
@@ -1311,7 +1448,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("state combinator output_type must be Binary"));
+        assert!(
+            err.to_string()
+                .contains("state combinator output_type must be Binary")
+        );
     }
 
     #[test]
@@ -1323,7 +1463,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("min_state unsupported key type Binary"));
+        assert!(
+            err.to_string()
+                .contains("min_state unsupported key type Binary")
+        );
     }
 
     #[test]
@@ -1341,5 +1484,53 @@ mod tests {
             decode_counts(&cell.final_bytes(), &DataType::Utf8),
             vec![1, 2]
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_merge_source_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn multiset_merge_map_refusal_is_resource_not_numeric_and_releases_the_temporary_key() {
+        let tracker = MemTracker::new_root("overflow invalid encoding cancelled");
+        tracker.install_limit_once(8).unwrap();
+        let mut state = MinMaxState::new(tracker.clone());
+        let bytes = encode_multiset(
+            &[MultisetEntry {
+                key_bytes: 7i64.to_le_bytes().to_vec(),
+                count: 1,
+            }],
+            &DataType::Int64,
+        )
+        .unwrap();
+        let error = merge_entries_into_state(&mut state, &bytes, &DataType::Int64, "min_state")
+            .unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        let resource = fact.resource().unwrap();
+        // The container exposes its attempted Layout, but its erased allocator
+        // refusal has no original tracker-limit fact. Do not reconstruct one.
+        assert_eq!(resource.limit, None);
+        assert_eq!(fact.reason().code(), 169);
+        let mut source = std::error::Error::source(&error);
+        let mut actual_map_refusal = false;
+        while let Some(cause) = source {
+            actual_map_refusal |= cause
+                .is::<novarocks_functions::allocation_failure::AllocationRefusal<
+                    hashbrown::TryReserveError,
+                >>();
+            source = cause.source();
+        }
+        assert!(actual_map_refusal);
+        assert!(resource.requested.unwrap() > 8);
+        assert!(state.counts.is_empty());
+        assert_eq!(tracker.current(), 0);
+        let weak = Arc::downgrade(&tracker);
+        drop(state);
+        assert_eq!(tracker.current(), 0);
+        drop(tracker);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(error.failure_fact(), fact);
     }
 }

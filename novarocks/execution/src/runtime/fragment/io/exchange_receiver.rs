@@ -44,12 +44,15 @@ pub struct ExchangeReceiverRegistration {
 /// Execution uses this port instead of a process-global exchange map. The
 /// role installs one shared implementation for native ingress and operators.
 pub trait ExchangeReceiverPort: Send + Sync + 'static {
-    fn register(&self, registration: ExchangeReceiverRegistration) -> Result<(), String>;
+    fn register(
+        &self,
+        registration: ExchangeReceiverRegistration,
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure>;
     fn push(
         &self,
         key: ExchangeReceiverKey,
         frame: ExchangeReceiverFrame,
-    ) -> Result<(), crate::runtime::exchange::ExchangeReceiveFailure>;
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure>;
     fn cancel(&self, key: ExchangeReceiverKey);
     fn remove(&self, key: ExchangeReceiverKey);
     fn cancel_fragment(&self, fragment_instance_id: UniqueId);
@@ -57,12 +60,12 @@ pub trait ExchangeReceiverPort: Send + Sync + 'static {
         &self,
         key: ExchangeReceiverKey,
         expected_senders: usize,
-    ) -> Result<ExchangeReceiverHandle, String>;
+    ) -> Result<ExchangeReceiverHandle, crate::runtime::exchange::ExchangeFailure>;
     fn ensure_mem_tracker(
         &self,
         key: ExchangeReceiverKey,
         root: &Arc<MemTracker>,
-    ) -> Result<Arc<MemTracker>, String>;
+    ) -> Result<Arc<MemTracker>, crate::runtime::exchange::ExchangeFailure>;
     fn push_local(
         &self,
         key: ExchangeReceiverKey,
@@ -118,7 +121,10 @@ impl ExecutionRuntimeExchangeReceiverPort {
 }
 
 impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
-    fn register(&self, registration: ExchangeReceiverRegistration) -> Result<(), String> {
+    fn register(
+        &self,
+        registration: ExchangeReceiverRegistration,
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
         let key = Self::key(registration.key);
         self.runtime
             .exchange_registry()
@@ -142,7 +148,7 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
         &self,
         key: ExchangeReceiverKey,
         frame: ExchangeReceiverFrame,
-    ) -> Result<(), crate::runtime::exchange::ExchangeReceiveFailure> {
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
         let exchange_key = Self::key(key);
         let decode_start = Instant::now();
         let registry = self.runtime.exchange_registry();
@@ -182,7 +188,7 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
         &self,
         key: ExchangeReceiverKey,
         expected_senders: usize,
-    ) -> Result<ExchangeReceiverHandle, String> {
+    ) -> Result<ExchangeReceiverHandle, crate::runtime::exchange::ExchangeFailure> {
         self.runtime
             .exchange_registry()
             .get_receiver_handle(Self::key(key), expected_senders)
@@ -192,7 +198,7 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
         &self,
         key: ExchangeReceiverKey,
         root: &Arc<MemTracker>,
-    ) -> Result<Arc<MemTracker>, String> {
+    ) -> Result<Arc<MemTracker>, crate::runtime::exchange::ExchangeFailure> {
         self.runtime
             .exchange_registry()
             .ensure_receiver_mem_tracker(Self::key(key), root)
@@ -228,16 +234,19 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
 pub struct UnavailableExchangeReceiverPort;
 
 impl ExchangeReceiverPort for UnavailableExchangeReceiverPort {
-    fn register(&self, _registration: ExchangeReceiverRegistration) -> Result<(), String> {
-        Err("exchange receiver port is unavailable".to_string())
+    fn register(
+        &self,
+        _registration: ExchangeReceiverRegistration,
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
     }
 
     fn push(
         &self,
         _key: ExchangeReceiverKey,
         _frame: ExchangeReceiverFrame,
-    ) -> Result<(), crate::runtime::exchange::ExchangeReceiveFailure> {
-        Err("exchange receiver port is unavailable".to_string().into())
+    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
     }
 
     fn cancel(&self, _key: ExchangeReceiverKey) {}
@@ -250,16 +259,16 @@ impl ExchangeReceiverPort for UnavailableExchangeReceiverPort {
         &self,
         _key: ExchangeReceiverKey,
         _expected_senders: usize,
-    ) -> Result<ExchangeReceiverHandle, String> {
-        Err("exchange receiver port is unavailable".to_string())
+    ) -> Result<ExchangeReceiverHandle, crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
     }
 
     fn ensure_mem_tracker(
         &self,
         _key: ExchangeReceiverKey,
         _root: &Arc<MemTracker>,
-    ) -> Result<Arc<MemTracker>, String> {
-        Err("exchange receiver port is unavailable".to_string())
+    ) -> Result<Arc<MemTracker>, crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
     }
 
     fn push_local(

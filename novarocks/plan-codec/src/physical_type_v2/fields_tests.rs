@@ -33,7 +33,7 @@ impl PureCompileControl for Scope {
         let index = trace.len();
         trace.push(units);
         if phase == CompilePhase::Encode
-            && let Some((at, error)) = self.fail
+            && let Some((at, error)) = self.fail.clone()
             && at == index
         {
             return Err(error);
@@ -285,7 +285,7 @@ fn authored_field_control_refusals_preserve_entry_quantum_tail_and_ordinary_erro
     ] {
         for at in 0..events.len() {
             let scope = Scope {
-                fail: Some((at, error)),
+                fail: Some((at, error.clone())),
                 ..Scope::default()
             };
             assert!(
@@ -300,7 +300,7 @@ fn authored_field_control_refusals_preserve_entry_quantum_tail_and_ordinary_erro
         assert!(encode_type_table_with_fields(&[], &duplicate, envelope(), &baseline).is_err());
         let count = baseline.events.into_inner().unwrap().len();
         let tail = Scope {
-            fail: Some((count - 1, error)),
+            fail: Some((count - 1, error.clone())),
             ..Scope::default()
         };
         assert!(

@@ -53,7 +53,7 @@ fn array_cast_raw_vec_growth_bound_covers_actual_capacity_and_initial_reservatio
     );
     assert!(matches!(
         CopyBufferPeak::vec::<u64>(0, usize::MAX),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
 }
 #[test]

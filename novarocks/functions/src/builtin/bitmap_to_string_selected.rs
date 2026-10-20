@@ -104,10 +104,25 @@ impl Port<'_, '_, '_> {
 }
 impl BitmapDecodePort for Port<'_, '_, '_> {
     type Error = Failure;
+    fn failure(&mut self, source: crate::bitmap_value::BitmapValueFailure) -> Failure {
+        match source.classify() {
+            crate::bitmap_value::ClassifiedBitmapFailure::Value(source) => {
+                self.data(format_args!("{source}"))
+            }
+            crate::bitmap_value::ClassifiedBitmapFailure::Outer(source) => {
+                self.refused = true;
+                Failure::Kernel(KernelFailure::from_domain(source))
+            }
+        }
+    }
     fn data(&mut self, message: fmt::Arguments<'_>) -> Failure {
-        match RowDataError::prepare_host(self.ordinal, self.allocator, self.work, |f| {
-            f.write_fmt(message)
-        }) {
+        match RowDataError::prepare_host_with_reason(
+            self.ordinal,
+            crate::DataFailureReason::InvalidEncoding,
+            self.allocator,
+            self.work,
+            |f| f.write_fmt(message),
+        ) {
             Ok(data) => Failure::Data(data),
             Err(cause) => {
                 self.refused = true;
@@ -207,6 +222,7 @@ pub(super) fn evaluate<'a>(
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         validity.resize(validity_bytes, 0u8);
         let mut payload = Vec::new();
+        let mut output_extent = crate::bitmap_value::BitmapOutputTally::for_text();
         let mut errors = Vec::new();
         for (ordinal, batch_row) in selection.iter().enumerate() {
             observed!(rows.step())?;
@@ -238,12 +254,16 @@ pub(super) fn evaluate<'a>(
                     offsets.push(*offsets.last().unwrap());
                 }
                 Ok(text) => {
+                    if let Err(cause) = output_extent.append(text.len()) {
+                        observed_failure = true;
+                        return Err(cause);
+                    }
                     let extent = payload
                         .len()
                         .checked_add(text.len())
                         .ok_or(KernelFailure::ResourceExhausted)?;
-                    let offset =
-                        i32::try_from(extent).map_err(|_| KernelFailure::ResourceExhausted)?;
+                    let offset = i32::try_from(extent)
+                        .expect("the output tally checked the exact UTF8 extent");
                     Layout::array::<u8>(extent).map_err(|_| KernelFailure::ResourceExhausted)?;
                     port.boundary().map_err(|f| {
                         observed_failure = true;
@@ -295,14 +315,7 @@ pub(super) fn evaluate<'a>(
         )
     })();
     // An observed refusal or Resource first cause has no optional footer.
-    if observed_failure
-        || matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        )
-    {
+    if observed_failure || matches!(&result, Err(cause) if cause.is_interruption()) {
         return result;
     }
     work.finish()?;

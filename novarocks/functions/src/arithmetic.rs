@@ -111,7 +111,9 @@ pub enum ArithmeticPrepareError {
 impl ArithmeticPrepareError {
     pub fn control_error(&self) -> Option<CompileControlError> {
         match self {
-            Self::Control(cause) => Some(*cause),
+            Self::Control(cause) | Self::Kernel(KernelFailure::CompileControl(cause)) => {
+                Some(cause.clone())
+            }
             Self::Kernel(KernelFailure::Cancelled) => Some(CompileControlError::Cancelled),
             Self::Kernel(KernelFailure::DeadlineExceeded) => {
                 Some(CompileControlError::DeadlineExceeded)

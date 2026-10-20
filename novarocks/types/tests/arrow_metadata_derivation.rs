@@ -270,8 +270,18 @@ fn unknown_child_and_structurally_equal_child_refuse_provenance() {
     ] {
         let root = field("root", DataType::List(unknown));
         let origins = FieldMetadataOrigins::try_new(vec![root.clone(), child.clone()], 2).unwrap();
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let error = origins.for_field_tree(root.field(), 2, 1).unwrap_err();
+        assert_eq!(error, MetadataOwnerError::MissingFieldOrigin);
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(error.failure_fact().reason().code(), 4);
+        assert!(error.failure_fact().resource().is_none());
         assert_eq!(
-            origins.for_field_tree(root.field(), 2, 1).unwrap_err(),
+            origins.for_field_tree(root.field(), 65536, 64).unwrap_err(),
+            MetadataOwnerError::MissingFieldOrigin
+        );
+        assert_eq!(
+            origins.for_field_tree(root.field(), 0, 1).unwrap_err(),
             MetadataOwnerError::CapacityExceeded
         );
     }

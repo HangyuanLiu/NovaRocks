@@ -26,7 +26,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use crate::exec::mv::state_codec::{
     KeyValue, MultisetEntry, decode_multiset_self_describing, decode_multiset_with_key_type,
     encode_multiset, key_type_tag_for_data_type, read_key, union_multisets,
@@ -34,25 +34,31 @@ use crate::exec::mv::state_codec::{
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
-pub fn min_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn min_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     min_max_state_union("min_state_union", a, b)
 }
 
-pub fn max_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn max_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     min_max_state_union("max_state_union", a, b)
 }
 
 pub fn min_state_visible_key_value(
     state: &[u8],
     output_type: &DataType,
-) -> Result<Option<KeyValue>, String> {
+) -> Result<Option<KeyValue>, crate::runtime::fragment::ExecutionFailure> {
     visible_key_value(state, output_type, false)
 }
 
 pub fn max_state_visible_key_value(
     state: &[u8],
     output_type: &DataType,
-) -> Result<Option<KeyValue>, String> {
+) -> Result<Option<KeyValue>, crate::runtime::fragment::ExecutionFailure> {
     visible_key_value(state, output_type, true)
 }
 
@@ -61,8 +67,8 @@ pub fn eval_min_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_min_max_state_union("min_state_union", min_state_union, arena, args, chunk))?)
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_min_max_state_union("min_state_union", min_state_union, arena, args, chunk)
 }
 
 pub fn eval_max_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -70,8 +76,8 @@ pub fn eval_max_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_min_max_state_union("max_state_union", max_state_union, arena, args, chunk))?)
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_min_max_state_union("max_state_union", max_state_union, arena, args, chunk)
 }
 
 pub fn eval_min_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -79,8 +85,8 @@ pub fn eval_min_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_min_max_state_visible("min_state_visible", false, arena, expr, args, chunk))?)
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_min_max_state_visible("min_state_visible", false, arena, expr, args, chunk)
 }
 
 pub fn eval_max_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -88,11 +94,15 @@ pub fn eval_max_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_min_max_state_visible("max_state_visible", true, arena, expr, args, chunk))?)
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    eval_min_max_state_visible("max_state_visible", true, arena, expr, args, chunk)
 }
 
-fn min_max_state_union(fn_name: &str, a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+fn min_max_state_union(
+    fn_name: &str,
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     let (left_type, left_entries) = decode_multiset_self_describing(a)?;
     let (right_type, right_entries) = decode_multiset_self_describing(b)?;
     let key_type = match (a.is_empty(), b.is_empty()) {
@@ -101,16 +111,19 @@ fn min_max_state_union(fn_name: &str, a: &[u8], b: &[u8]) -> Result<Vec<u8>, Str
         (true, false) => right_type,
         (false, false) => {
             if key_type_tag_for_data_type(&left_type)? != key_type_tag_for_data_type(&right_type)? {
-                return Err(format!("{fn_name} key type tag mismatch"));
+                return Err(super::failure::invalid_state(format_args!(
+                    "{fn_name} key type tag mismatch"
+                )));
             }
             left_type
         }
     };
     let entries = union_multisets(&left_entries, &right_entries)?;
-    encode_multiset(&entries, &key_type)
+    Ok(encode_multiset(&entries, &key_type)?)
 }
 
-type MinMaxStateOp = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+type MinMaxStateOp =
+    fn(&[u8], &[u8]) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure>;
 
 fn eval_min_max_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
@@ -118,13 +131,16 @@ fn eval_min_max_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("{fn_name} expects 2 arguments, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "{fn_name} expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_min_max_state_union_arrays(fn_name, op, &lhs, &rhs))?)
+    eval_min_max_state_union_arrays(fn_name, op, &lhs, &rhs)
 }
 
 fn eval_min_max_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -134,21 +150,22 @@ fn eval_min_max_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if !(1..=2).contains(&args.len()) {
-        return Err((format!("{fn_name} expects 1 or 2 arguments, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "{fn_name} expects 1 or 2 arguments, got {}",
+            args.len()
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
     // See sum_state_visible: a second typed NULL witness freezes the target
     // MV column type for first-refresh state decoding without exposing state
     // payloads outside the BE.
-    let output_type = args
-        .get(1)
-        .and_then(|witness| arena.data_type(*witness))
-        .cloned()
-        .or_else(|| arena.data_type(expr).cloned())
-        .unwrap_or(DataType::Int64);
-    Ok((eval_min_max_state_visible_array(fn_name, pick_max, &input, &output_type))?)
+    let output_expr = args.get(1).copied().unwrap_or(expr);
+    let output_type = arena.data_type(output_expr).cloned().ok_or_else(|| {
+        super::failure::contract(format_args!("{fn_name} is missing its frozen output type"))
+    })?;
+    eval_min_max_state_visible_array(fn_name, pick_max, &input, &output_type)
 }
 
 fn eval_min_max_state_union_arrays(
@@ -156,13 +173,16 @@ fn eval_min_max_state_union_arrays(
     op: MinMaxStateOp,
     lhs: &ArrayRef,
     rhs: &ArrayRef,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count(fn_name, lhs.len(), rhs.len())?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::StateOutputTally::default();
     for row in 0..rows {
         let left = binary_value_or_empty(lhs, row_index(row, lhs.len())?, fn_name, 0)?;
         let right = binary_value_or_empty(rhs, row_index(row, rhs.len())?, fn_name, 1)?;
-        builder.append_value(op(left, right)?);
+        let state = op(left, right)?;
+        extent.append(state.len())?;
+        builder.append_value(state);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -172,7 +192,7 @@ fn eval_min_max_state_visible_array(
     pick_max: bool,
     input: &ArrayRef,
     output_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     match output_type {
         DataType::Boolean => Ok(Arc::new(BooleanArray::from(visible_values(
             fn_name,
@@ -181,7 +201,9 @@ fn eval_min_max_state_visible_array(
             output_type,
             |value| match value {
                 KeyValue::Bool(v) => Ok(*v),
-                _ => Err(format!("{fn_name} Boolean output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Boolean output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
         DataType::Int8 => Ok(Arc::new(Int8Array::from(visible_values(
@@ -191,7 +213,9 @@ fn eval_min_max_state_visible_array(
             output_type,
             |value| match value {
                 KeyValue::Int8(v) => Ok(*v),
-                _ => Err(format!("{fn_name} Int8 output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Int8 output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
         DataType::Int16 => Ok(Arc::new(Int16Array::from(visible_values(
@@ -201,7 +225,9 @@ fn eval_min_max_state_visible_array(
             output_type,
             |value| match value {
                 KeyValue::Int16(v) => Ok(*v),
-                _ => Err(format!("{fn_name} Int16 output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Int16 output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
         DataType::Int32 => Ok(Arc::new(Int32Array::from(visible_values(
@@ -211,17 +237,21 @@ fn eval_min_max_state_visible_array(
             output_type,
             |value| match value {
                 KeyValue::Int32(v) => Ok(*v),
-                _ => Err(format!("{fn_name} Int32 output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Int32 output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
-        DataType::Int64 | DataType::Null => Ok(Arc::new(Int64Array::from(visible_values(
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(visible_values(
             fn_name,
             pick_max,
             input,
             &DataType::Int64,
             |value| match value {
                 KeyValue::Int64(v) => Ok(*v),
-                _ => Err(format!("{fn_name} Int64 output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Int64 output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
         DataType::Float32 => Ok(Arc::new(Float32Array::from(visible_values(
@@ -231,7 +261,9 @@ fn eval_min_max_state_visible_array(
             output_type,
             |value| match value {
                 KeyValue::Float32(bits) => Ok(f32::from_bits(*bits)),
-                _ => Err(format!("{fn_name} Float32 output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Float32 output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
         DataType::Float64 => Ok(Arc::new(Float64Array::from(visible_values(
@@ -241,18 +273,22 @@ fn eval_min_max_state_visible_array(
             output_type,
             |value| match value {
                 KeyValue::Float64(bits) => Ok(f64::from_bits(*bits)),
-                _ => Err(format!("{fn_name} Float64 output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Float64 output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
         DataType::Decimal128(precision, scale) => {
             let values =
                 visible_values(fn_name, pick_max, input, output_type, |value| match value {
                     KeyValue::Decimal128(v) => Ok(*v),
-                    _ => Err(format!("{fn_name} Decimal128 output type mismatch")),
+                    _ => Err(super::failure::contract(format_args!(
+                        "{fn_name} Decimal128 output type mismatch"
+                    ))),
                 })?;
             let array = Decimal128Array::from(values)
                 .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(super::failure::constructor)?;
             Ok(Arc::new(array) as ArrayRef)
         }
         DataType::Date32 => Ok(Arc::new(Date32Array::from(visible_values(
@@ -262,26 +298,27 @@ fn eval_min_max_state_visible_array(
             output_type,
             |value| match value {
                 KeyValue::Date32(v) => Ok(*v),
-                _ => Err(format!("{fn_name} Date32 output type mismatch")),
+                _ => Err(super::failure::contract(format_args!(
+                    "{fn_name} Date32 output type mismatch"
+                ))),
             },
         )?)) as ArrayRef),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            Ok(Arc::new(TimestampMicrosecondArray::from(visible_values(
-                fn_name,
-                pick_max,
-                input,
-                output_type,
-                |value| match value {
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+            let values =
+                visible_values(fn_name, pick_max, input, output_type, |value| match value {
                     KeyValue::Timestamp(v) => Ok(*v),
-                    _ => Err(format!("{fn_name} Timestamp output type mismatch")),
-                },
-            )?)) as ArrayRef)
+                    _ => Err(super::failure::contract(format_args!(
+                        "{fn_name} Timestamp output type mismatch"
+                    ))),
+                })?;
+            let array = TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone());
+            Ok(Arc::new(array) as ArrayRef)
         }
         DataType::Utf8 => build_visible_string(fn_name, pick_max, input, output_type, false),
         DataType::LargeUtf8 => build_visible_string(fn_name, pick_max, input, output_type, true),
-        other => Err(format!(
+        other => Err(super::failure::contract(format_args!(
             "{fn_name} unsupported visible output type {other:?}"
-        )),
+        ))),
     }
 }
 
@@ -291,9 +328,9 @@ fn visible_values<T, F>(
     input: &ArrayRef,
     output_type: &DataType,
     convert: F,
-) -> Result<Vec<Option<T>>, String>
+) -> Result<Vec<Option<T>>, crate::runtime::fragment::ExecutionFailure>
 where
-    F: Fn(&KeyValue) -> Result<T, String>,
+    F: Fn(&KeyValue) -> Result<T, crate::runtime::fragment::ExecutionFailure>,
 {
     let mut values = Vec::with_capacity(input.len());
     for row in 0..input.len() {
@@ -312,11 +349,28 @@ fn build_visible_string(
     input: &ArrayRef,
     output_type: &DataType,
     large: bool,
-) -> Result<ArrayRef, String> {
-    let values = visible_values(fn_name, pick_max, input, output_type, |value| match value {
-        KeyValue::Utf8(v) => Ok(v.clone()),
-        _ => Err(format!("{fn_name} Utf8 output type mismatch")),
-    })?;
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    let mut values = Vec::with_capacity(input.len());
+    let mut extent = super::failure::StateOutputTally::utf8(large);
+    for row in 0..input.len() {
+        let state = binary_value_or_empty(input, row, fn_name, 0)?;
+        let value = visible_key_value(state, output_type, pick_max)?;
+        match value {
+            Some(KeyValue::Utf8(text)) => {
+                extent.append(text.len())?;
+                values.push(Some(text));
+            }
+            None => {
+                extent.append(0)?;
+                values.push(None);
+            }
+            Some(_) => {
+                return Err(super::failure::contract(format_args!(
+                    "{fn_name} Utf8 output type mismatch"
+                )));
+            }
+        }
+    }
     if large {
         Ok(Arc::new(LargeStringArray::from(values)) as ArrayRef)
     } else {
@@ -328,7 +382,7 @@ fn visible_key_value(
     state: &[u8],
     output_type: &DataType,
     pick_max: bool,
-) -> Result<Option<KeyValue>, String> {
+) -> Result<Option<KeyValue>, crate::runtime::fragment::ExecutionFailure> {
     let entries = decode_multiset_with_key_type(state, output_type)?;
     let mut best = None;
     for entry in entries.into_iter().filter(|entry| entry.count > 0) {
@@ -350,16 +404,24 @@ fn visible_key_value(
     Ok(best)
 }
 
-fn decode_entry_key(entry: &MultisetEntry, output_type: &DataType) -> Result<KeyValue, String> {
+fn decode_entry_key(
+    entry: &MultisetEntry,
+    output_type: &DataType,
+) -> Result<KeyValue, crate::runtime::fragment::ExecutionFailure> {
     let mut cursor = entry.key_bytes.as_slice();
     let value = read_key(&mut cursor, output_type)?;
     if !cursor.is_empty() {
-        return Err("min/max state key has trailing bytes".to_string());
+        return Err(super::failure::invalid_state(
+            "min/max state key has trailing bytes",
+        ));
     }
     Ok(value)
 }
 
-fn compare_key_values(left: &KeyValue, right: &KeyValue) -> Result<Ordering, String> {
+fn compare_key_values(
+    left: &KeyValue,
+    right: &KeyValue,
+) -> Result<Ordering, crate::runtime::fragment::ExecutionFailure> {
     match (left, right) {
         (KeyValue::Bool(a), KeyValue::Bool(b)) => Ok(a.cmp(b)),
         (KeyValue::Int8(a), KeyValue::Int8(b)) => Ok(a.cmp(b)),
@@ -376,7 +438,7 @@ fn compare_key_values(left: &KeyValue, right: &KeyValue) -> Result<Ordering, Str
         (KeyValue::Date32(a), KeyValue::Date32(b)) => Ok(a.cmp(b)),
         (KeyValue::Timestamp(a), KeyValue::Timestamp(b)) => Ok(a.cmp(b)),
         (KeyValue::Utf8(a), KeyValue::Utf8(b)) => Ok(a.cmp(b)),
-        _ => Err("min/max state key type mismatch".to_string()),
+        _ => Err(super::failure::contract("min/max state key type mismatch")),
     }
 }
 
@@ -459,7 +521,7 @@ mod tests {
 
         let err = max_state_union(&left, &right).unwrap_err();
 
-        assert!(err.contains("key type tag mismatch"));
+        assert!(err.to_string().contains("key type tag mismatch"));
     }
 
     #[test]
@@ -524,5 +586,33 @@ mod tests {
 
         assert_eq!(min_arr.value(0), 5.0);
         assert!(max_arr.value(0).is_nan());
+    }
+    #[test]
+    fn min_max_visible_preserves_frozen_timestamp_timezone_and_nulls() {
+        let ty = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let entries = [-7i64, 12]
+            .into_iter()
+            .map(|value| MultisetEntry {
+                key_bytes: key_bytes(Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(value)]).with_timezone("UTC"),
+                )),
+                count: 1,
+            })
+            .collect::<Vec<_>>();
+        let state = encode_multiset(&entries, &ty).unwrap();
+        let input = binary_array(&[Some(state), Some(vec![]), None]);
+        for (pick_max, expected) in [(false, -7), (true, 12)] {
+            let output =
+                eval_min_max_state_visible_array("min/max_state_visible", pick_max, &input, &ty)
+                    .unwrap();
+            assert_eq!(output.data_type(), &ty);
+            let output = output
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(output.value(0), expected);
+            assert!(output.is_null(1));
+            assert!(output.is_null(2));
+        }
     }
 }

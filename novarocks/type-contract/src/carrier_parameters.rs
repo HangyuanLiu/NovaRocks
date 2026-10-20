@@ -379,14 +379,14 @@ mod tests {
         ] {
             let entry =
                 validate_arrow_carrier_parameters_observed(&DataType::Decimal32(0, 127), || {
-                    Err::<(), _>(ObservedError::Control(error))
+                    Err::<(), _>(ObservedError::Control(error.clone()))
                 });
             assert!(matches!(entry, Err(ObservedError::Control(actual)) if actual == error));
             let mut calls = 0;
             let result = validate_arrow_carrier_parameters_observed(&union([0, 1, 2]), || {
                 calls += 1;
                 if calls == 3 {
-                    Err(ObservedError::Control(error))
+                    Err(ObservedError::Control(error.clone()))
                 } else {
                     Ok(())
                 }

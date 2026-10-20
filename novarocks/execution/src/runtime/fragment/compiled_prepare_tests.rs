@@ -50,8 +50,11 @@ struct CollectingSession {
 }
 
 impl FragmentResultSession for CollectingSession {
-    fn reservation_bytes(&self, chunk: &Chunk) -> Result<usize, FragmentIoError> {
-        Ok(chunk.logical_bytes())
+    fn reservation_bytes(
+        &self,
+        input: crate::runtime::fragment::io::ResultInputMetadata,
+    ) -> Result<usize, FragmentIoError> {
+        Ok(input.retained_bytes())
     }
 
     fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, FragmentIoError> {
@@ -313,7 +316,11 @@ fn compiled_receiver_after_exchange_failure_preserves_primary_cleanup_and_contro
         "injected failure after exchange registration"
     );
     assert_eq!(
-        error.cleanup_diagnostics(),
+        error
+            .cleanup_diagnostics()
+            .iter()
+            .map(|cause| cause.detail())
+            .collect::<Vec<_>>(),
         &["injected exchange registration cleanup failure".to_owned()]
     );
     let registration = {
@@ -600,7 +607,18 @@ fn a_compiled_scan_submission_refuses_unbound_and_unaddressed_scans() {
         submission,
         FragmentPrepareContext::default(),
     ));
-    assert!(error.to_string().contains("bind failed"), "{error}");
+    assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
+    assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(error.cause()).class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert!(
+        error
+            .detail()
+            .contains("fixture scan expects no frozen range"),
+        "{error}"
+    );
     assert_eq!(op.claims(), 0, "no refused submission claims the stream");
 }
 
@@ -753,8 +771,10 @@ fn project_metadata_refusal_keeps_nominal_cause_through_the_original_prepare_cha
     };
     use novarocks_execution_contract::task_execution::status::AbortCause;
     let causes = [
-        PreparationMetadataFailure::Host(PreparationMemoryRefusal::Stopped(
-            PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
+        PreparationMetadataFailure::Host(PreparationMemoryRefusal::Interrupted(
+            crate::runtime::fragment::ExecutionFailure::from_domain(PreparationMemoryStop::Abort(
+                AbortCause::LeaseExpired,
+            )),
         )),
         PreparationMetadataFailure::Host(PreparationMemoryRefusal::Capacity(
             novarocks_memory::CapacityError::Invalid {

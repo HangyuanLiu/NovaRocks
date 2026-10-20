@@ -15,16 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::ArrayRef;
 
 pub fn eval_ifnull<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
+    expr: ExprId,
     expr1: ExprId,
     expr2: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
+    let target = arena
+        .data_type(expr)
+        .ok_or_else(|| crate::exec::expr::expression_contract("ifnull: missing output type"))?;
     let left = arena.eval(expr1, chunk)?;
     let right = arena.eval(expr2, chunk)?;
-    Ok((novarocks_functions::control_values::ifnull_legacy(left, right))?)
+    novarocks_functions::control_values::ifnull_legacy(left, right, target)
+        .map_err(ExecutionFailure::from)
 }

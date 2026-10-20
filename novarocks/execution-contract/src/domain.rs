@@ -74,6 +74,22 @@ impl fmt::Display for DomainConflict {
 }
 
 impl std::error::Error for DomainConflict {}
+impl crate::failure::FailureProjection for DomainConflict {
+    fn failure_fact(&self) -> crate::failure::FailureFact {
+        use crate::failure::*;
+        let code = match self {
+            Self::SameTokenDifferentContent => 1010,
+            Self::Gap => 1011,
+            Self::AfterSeal => 1012,
+            Self::UnknownMember => 1013,
+            Self::NotMonotonic => 1014,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::PROTOCOL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
 /// Task-scoped domains, advanced only by `UpdateTask`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]

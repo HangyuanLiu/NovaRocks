@@ -352,7 +352,7 @@ impl PureCompileControl for Recording {
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
         if self.stop == Some(trace.len() - 1) {
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -381,7 +381,7 @@ fn every_callback<T>(run: impl Fn(&Recording) -> Result<T, SqlCompileError>) {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refused = recording(Some(stop), cause);
+            let refused = recording(Some(stop), cause.clone());
             assert!(matches!(run(&refused),Err(error) if error==SqlCompileError::from(cause)));
             assert_eq!(*refused.trace.lock().unwrap(), trace[..=stop]);
         }

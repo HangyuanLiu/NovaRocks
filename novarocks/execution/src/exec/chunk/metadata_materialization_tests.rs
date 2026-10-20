@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
         let ordinal = self.calls.fetch_add(1, Ordering::Relaxed);
-        match self.reject {
+        match self.reject.clone() {
             Some((at, cause)) if at == ordinal => Err(cause),
             _ => Ok(()),
         }
@@ -231,7 +231,7 @@ fn by_schema_origin_compilation_preserves_first_typed_control_without_footer() {
         let (source, _) = source();
         let control = Control {
             calls: AtomicUsize::new(0),
-            reject: Some((0, cause)),
+            reject: Some((0, cause.clone())),
         };
         let error = StaticLayout::try_new_materialized_for_compile(
             source,

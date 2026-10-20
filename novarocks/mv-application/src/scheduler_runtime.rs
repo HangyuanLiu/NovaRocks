@@ -42,10 +42,8 @@ impl MvRefreshFailure {
     pub fn message(&self) -> &str {
         &self.message
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 }
 impl From<String> for MvRefreshFailure {
@@ -74,9 +72,7 @@ pub enum MvRefreshDisposition {
 }
 
 impl MvRefreshDisposition {
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         match self {
             Self::TransientUnavailable(failure)
             | Self::InvalidDefinition(failure)
@@ -85,7 +81,7 @@ impl MvRefreshDisposition {
             | Self::InvariantViolation(failure) => failure.compile_control_error(),
             Self::AlreadyActive(control)
             | Self::TargetGone(control)
-            | Self::ShutdownCancelled(control) => *control,
+            | Self::ShutdownCancelled(control) => control.clone(),
             Self::Completed | Self::NoOp => None,
         }
     }
@@ -126,14 +122,12 @@ pub enum MvRefreshRuntimeDecision {
 }
 
 impl MvRefreshRuntimeDecision {
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         match self {
             Self::TransientBackoff { error, .. } | Self::Blocked { error } => {
                 error.compile_control_error()
             }
-            Self::NoChange { compile_control } => *compile_control,
+            Self::NoChange { compile_control } => compile_control.clone(),
             Self::Success => None,
         }
     }
@@ -465,11 +459,11 @@ mod tests {
                     MvSchedulerConfig::new(true, 1, 1, 10, 40),
                 );
                 let error = MvBackgroundEngineError::new(kind, "actual failure")
-                    .with_compile_control(Some(control));
+                    .with_compile_control(Some(control.clone()));
                 let disposition = MvRefreshDisposition::from_background_error(error);
-                assert_eq!(disposition.compile_control_error(), Some(control));
+                assert_eq!(disposition.compile_control_error(), Some(control.clone()));
                 let decision = runtime.record(&7, disposition, 100);
-                assert_eq!(decision.compile_control_error(), Some(control));
+                assert_eq!(decision.compile_control_error(), Some(control.clone()));
                 match kind {
                     K::TransientUnavailable => {
                         assert!(matches!(
@@ -492,7 +486,7 @@ mod tests {
                     _ => {
                         assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
                         let retained = runtime.blocked.get(&7).expect("blocked terminal retained");
-                        assert_eq!(retained.compile_control_error(), Some(control));
+                        assert_eq!(retained.compile_control_error(), Some(control.clone()));
                         assert_eq!(retained.message(), "actual failure");
                         assert!(runtime.is_suppressed(&7, 100));
                     }

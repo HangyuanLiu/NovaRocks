@@ -319,7 +319,7 @@ impl InvocationScalarKernelInstance for ArrayProjectionDiagnosticInstance {
             // canonical FunctionKind metadata. No child/value exists here.
             return Err(
                 failure.with_original_message("array_struct_subfield", |args| {
-                    diagnostic.diagnostic(args)
+                    diagnostic.value_error(args)
                 }),
             );
         }
@@ -481,12 +481,7 @@ impl ArrayProjectionDiagnosticProbeOwner {
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish().map_err(compile_failure)?;

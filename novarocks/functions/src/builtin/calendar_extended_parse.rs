@@ -206,13 +206,14 @@ fn named_day(
     Ok(Ok(date))
 }
 
-pub(super) fn evaluate_calendar_parse<'a>(
+pub(super) fn evaluate_calendar_parse<'a, E>(
     op: CalendarParseOp,
-    input: super::calendar_extended_shared::CalendarInput<'_, 'a>,
+    input: super::calendar_extended_shared::CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
+) -> Result<SelectedValues<'a>, super::calendar_extended_shared::CalendarFailure<E>> {
     if op == CalendarParseOp::FromDays {
-        return evaluate_from_days(input, control);
+        return evaluate_from_days(input, control)
+            .map_err(super::calendar_extended_shared::CalendarFailure::Outer);
     }
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
@@ -227,16 +228,17 @@ pub(super) fn evaluate_calendar_parse<'a>(
         {
             return Err(invalid(
                 "calendar constructor requires its nullable Physical Date32 result",
-            ));
+            )
+            .into());
         }
         if arguments.len() != types.len()
             || arguments.is_empty()
             || arguments.len() > 2
             || (op != CalendarParseOp::LastDay && arguments.len() != 2)
         {
-            return Err(invalid(
-                "calendar constructor requires its exact declared argument count",
-            ));
+            return Err(
+                invalid("calendar constructor requires its exact declared argument count").into(),
+            );
         }
         let mut sources = Vec::new();
         sources
@@ -244,14 +246,14 @@ pub(super) fn evaluate_calendar_parse<'a>(
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         for (ty, argument) in types.iter().zip(arguments) {
             let FunctionArgumentType::Value(source) = ty else {
-                return Err(invalid("calendar constructor requires value arguments"));
+                return Err(invalid("calendar constructor requires value arguments").into());
             };
             if source.logical_type() != ValueLogicalType::Physical
                 || source.data_type() != argument.array().data_type()
             {
-                return Err(invalid(
-                    "calendar constructor argument differs from selected profile",
-                ));
+                return Err(
+                    invalid("calendar constructor argument differs from selected profile").into(),
+                );
             }
             sources.push(source);
             work.step()?;
@@ -310,13 +312,13 @@ pub(super) fn evaluate_calendar_parse<'a>(
                 rows[index] = argument.value_row(ordinal, batch_row);
                 work.step()?;
                 if rows[index] >= argument.array().len() {
-                    return Err(internal("calendar constructor selected row out of bounds"));
+                    return Err(internal("calendar constructor selected row out of bounds").into());
                 }
                 let is_null = argument.array().is_null(rows[index]);
                 if is_null && !sources[index].nullable() {
-                    return Err(internal(
-                        "calendar constructor non-null source contains SQL NULL",
-                    ));
+                    return Err(
+                        internal("calendar constructor non-null source contains SQL NULL").into(),
+                    );
                 }
                 null |= is_null;
                 work.step()?;
@@ -392,8 +394,11 @@ pub(super) fn evaluate_calendar_parse<'a>(
             work.flush()?;
             for value in values {
                 projected.push(value.and_then(|date| {
-                    super::calendar_extended::timestamp_value_for_type(date, target.data_type())
-                        .ok()
+                    super::calendar_timestamp::timestamp_value(
+                        date,
+                        arrow_schema::TimeUnit::Microsecond,
+                    )
+                    .ok()
                 }));
                 work.step()?;
             }
@@ -408,8 +413,9 @@ pub(super) fn evaluate_calendar_parse<'a>(
             errors.into_boxed_slice(),
             || work.step(),
         )
+        .map_err(super::calendar_extended_shared::CalendarFailure::Outer)
     })();
-    work.finish_result(result)
+    super::calendar_extended_shared::finish_calendar_result(work, result)
 }
 
 pub(super) fn date_from_julian(julian: i32) -> Option<NaiveDate> {
@@ -446,8 +452,8 @@ pub(super) fn zero_date_sentinel_date32() -> i32 {
         date.num_days_from_ce() - datetime_value::UNIX_EPOCH_DAY_OFFSET
     })
 }
-fn evaluate_from_days<'a>(
-    input: super::calendar_extended_shared::CalendarInput<'_, 'a>,
+fn evaluate_from_days<'a, E>(
+    input: super::calendar_extended_shared::CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;

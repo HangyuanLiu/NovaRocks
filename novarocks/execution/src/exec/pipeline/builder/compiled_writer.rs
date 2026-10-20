@@ -24,7 +24,9 @@
 //! writer-result input is gathered to one driver first: DOP 1 is the finish
 //! operator's own law.
 
+use super::super::program_failure;
 use super::*;
+use crate::exec::fragment::error::FragmentBindingErrorKind;
 use crate::exec::operators::compiled_writer::{
     compiled_table_finish_factory, compiled_table_writer_factory,
 };
@@ -41,9 +43,12 @@ pub(super) fn build_table_writer(
     // The factory copies the Task capability it needs, so a refused binding
     // builds no driver.
     let binding = ctx.compiled_writers.writer(id).ok_or_else(|| {
-        format!(
-            "missing Task write binding for compiled table writer at local node {}",
-            id.index()
+        program_failure(
+            FragmentBindingErrorKind::MissingAssignment,
+            format!(
+                "missing Task write binding for compiled table writer at local node {}",
+                id.index()
+            ),
         )
     })?;
     let factory = compiled_table_writer_factory(program, id, node_id, binding, error)?;
@@ -53,9 +58,12 @@ pub(super) fn build_table_writer(
         ProgramNodeKind::ExchangeSource { .. }
     ) {
         let receiver = program.exchange_inputs().get(&input).ok_or_else(|| {
-            format!(
-                "missing compiled exchange input for table writer at local node {}",
-                id.index()
+            program_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                format!(
+                    "missing compiled exchange input for table writer at local node {}",
+                    id.index()
+                ),
             )
         })?;
         if !receiver.hash_partition_slots.is_empty() {
@@ -84,18 +92,23 @@ pub(super) fn build_table_finish(
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
     let binding = ctx.compiled_writers.finisher(id).ok_or_else(|| {
-        format!(
-            "missing Task finish binding for compiled table finish at local node {}",
-            id.index()
+        program_failure(
+            FragmentBindingErrorKind::MissingAssignment,
+            format!(
+                "missing Task finish binding for compiled table finish at local node {}",
+                id.index()
+            ),
         )
     })?;
     let factory = compiled_table_finish_factory(program, id, node_id, binding, error)?;
     let [input] = inputs else {
-        return Err(format!(
-            "compiled table finish at local node {} reads more than one writer input",
-            id.index()
-        )
-        .into());
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "compiled table finish at local node {} reads more than one writer input",
+                id.index()
+            ),
+        ));
     };
     let build = build_node(program, *input, ctx, error, ordered)?;
     let mut build = gather_to_one(build, ctx, node_id);

@@ -297,15 +297,21 @@ const MEMBERSHIP_SCHEMA_VERSION: u8 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterMembershipSchemaError {
     UnsupportedType,
-    TimezoneLengthOverflow,
+    TimezoneLengthOverflow {
+        required: usize,
+        source: std::num::TryFromIntError,
+    },
     DigestMismatch,
     Truncated,
     UnknownPrefix,
     InvalidNullSemantics,
     TrailingBytes,
     InvalidTimeUnit,
-    TimezoneLengthDecodeOverflow,
-    TimezoneNotUtf8,
+    TimezoneLengthDecodeOverflow {
+        required: u32,
+        source: std::num::TryFromIntError,
+    },
+    TimezoneNotUtf8(std::str::Utf8Error),
     InvalidTimezoneMetadata,
     InvalidDecimal,
     UnsupportedTypeTag,
@@ -316,15 +322,17 @@ impl FilterMembershipSchemaError {
     pub const fn detail(self) -> &'static str {
         match self {
             Self::UnsupportedType => "unsupported membership schema type",
-            Self::TimezoneLengthOverflow => "membership schema timezone length overflows u32",
+            Self::TimezoneLengthOverflow { .. } => {
+                "membership schema timezone length overflows u32"
+            }
             Self::DigestMismatch => "membership schema digest does not match canonical bytes",
             Self::Truncated => "truncated membership schema",
             Self::UnknownPrefix => "unknown canonical membership schema prefix",
             Self::InvalidNullSemantics => "invalid membership null semantics",
             Self::TrailingBytes => "membership schema has trailing bytes",
             Self::InvalidTimeUnit => "invalid timestamp time unit",
-            Self::TimezoneLengthDecodeOverflow => "timestamp timezone length overflow",
-            Self::TimezoneNotUtf8 => "timestamp timezone is not UTF-8",
+            Self::TimezoneLengthDecodeOverflow { .. } => "timestamp timezone length overflow",
+            Self::TimezoneNotUtf8(_) => "timestamp timezone is not UTF-8",
             Self::InvalidTimezoneMetadata => "invalid timestamp timezone metadata",
             Self::InvalidDecimal => "invalid decimal schema metadata",
             Self::UnsupportedTypeTag => "unsupported membership schema type tag",
@@ -339,7 +347,67 @@ impl fmt::Display for FilterMembershipSchemaError {
     }
 }
 
-impl std::error::Error for FilterMembershipSchemaError {}
+impl std::error::Error for FilterMembershipSchemaError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TimezoneLengthOverflow { source, .. }
+            | Self::TimezoneLengthDecodeOverflow { source, .. } => Some(source),
+            Self::TimezoneNotUtf8(source) => Some(source),
+            Self::Resource(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for FilterMembershipSchemaError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, code) = match self {
+            Self::UnsupportedType => (FailureClass::Invariant, 100),
+            Self::TimezoneLengthOverflow { required, .. } => {
+                return FailureFact::new(
+                    FailureClass::Representation,
+                    FailureReason::new(
+                        domain::LOCAL_PROGRAM,
+                        std::num::NonZeroU16::new(101).unwrap(),
+                    ),
+                )
+                .with_representation(RepresentationFacts {
+                    boundary: RepresentationBoundary::SingleOutput,
+                    layout: RepresentationLayout {
+                        domain: domain::LOCAL_PROGRAM,
+                        code: std::num::NonZeroU16::new(101).unwrap(),
+                    },
+                    required: u64::try_from(*required).ok(),
+                    extent_limit: Some(u32::MAX as u64),
+                    representable_prefix: None,
+                });
+            }
+            Self::DigestMismatch => (FailureClass::Data, 102),
+            Self::Truncated => (FailureClass::Data, 103),
+            Self::UnknownPrefix => (FailureClass::Data, 104),
+            Self::InvalidNullSemantics => (FailureClass::Data, 105),
+            Self::TrailingBytes => (FailureClass::Data, 106),
+            Self::InvalidTimeUnit => (FailureClass::Data, 107),
+            Self::TimezoneLengthDecodeOverflow { .. } => (FailureClass::Data, 108),
+            Self::TimezoneNotUtf8(_) => (FailureClass::Data, 109),
+            Self::InvalidTimezoneMetadata => (FailureClass::Data, 110),
+            Self::InvalidDecimal => (FailureClass::Data, 111),
+            Self::UnsupportedTypeTag => (FailureClass::Data, 112),
+            Self::Resource(source) => return source.failure_fact(),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(
+                domain::LOCAL_PROGRAM,
+                std::num::NonZeroU16::new(code).unwrap(),
+            ),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for FilterMembershipSchemaError {}
 impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
     for FilterMembershipSchemaError
 {
@@ -581,8 +649,12 @@ pub fn visit_filter_key_type<E: From<FilterMembershipSchemaError>>(
             match timezone {
                 Some(timezone) => {
                     write(&[1])?;
-                    let length = u32::try_from(timezone.len())
-                        .map_err(|_| FilterMembershipSchemaError::TimezoneLengthOverflow)?;
+                    let length = u32::try_from(timezone.len()).map_err(|source| {
+                        FilterMembershipSchemaError::TimezoneLengthOverflow {
+                            required: timezone.len(),
+                            source,
+                        }
+                    })?;
                     write(&length.to_be_bytes())?;
                     write(timezone.as_bytes())?;
                 }
@@ -627,11 +699,16 @@ fn decode_filter_key_type(
             let timezone = match cursor.u8()? {
                 0 => None,
                 1 => {
-                    let length = usize::try_from(cursor.u32()?)
-                        .map_err(|_| FilterMembershipSchemaError::TimezoneLengthDecodeOverflow)?;
+                    let required = cursor.u32()?;
+                    let length = usize::try_from(required).map_err(|source| {
+                        FilterMembershipSchemaError::TimezoneLengthDecodeOverflow {
+                            required,
+                            source,
+                        }
+                    })?;
                     Some(
                         std::str::from_utf8(cursor.take(length)?)
-                            .map_err(|_| FilterMembershipSchemaError::TimezoneNotUtf8)?
+                            .map_err(FilterMembershipSchemaError::TimezoneNotUtf8)?
                             .into(),
                     )
                 }
@@ -1085,6 +1162,62 @@ mod typed_creation_tests {
         );
         assert_eq!(result.unwrap_err(), Refusal::Observer(7));
         assert_eq!(calls, 0);
+    }
+}
+
+#[cfg(test)]
+mod failure_fact_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    use std::error::Error;
+    #[test]
+    fn canonical_schema_authors_distinguish_construction_format_and_actual_invalid_bytes() {
+        let unsupported = FilterMembershipSchema::try_new(
+            &DataType::Decimal256(10, 2),
+            FilterNullSemantics::NeverMatches,
+        )
+        .unwrap_err();
+        assert_eq!(unsupported, FilterMembershipSchemaError::UnsupportedType);
+        assert_eq!(unsupported.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(unsupported.failure_fact().reason().code(), 100);
+        let original = FilterMembershipSchema::try_new(
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            FilterNullSemantics::NeverMatches,
+        )
+        .unwrap();
+        let mut bytes = original.canonical_bytes().to_vec();
+        let position = bytes.windows(3).position(|x| x == b"UTC").unwrap();
+        bytes[position] = 255;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let failure = FilterMembershipSchema::from_canonical(&bytes, digest).unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 109);
+        let cause = failure
+            .source()
+            .unwrap()
+            .downcast_ref::<std::str::Utf8Error>()
+            .unwrap();
+        assert_eq!(cause.valid_up_to(), 0);
+        assert_eq!(cause.error_len(), Some(1));
+        assert!(failure.failure_fact().resource().is_none());
+        assert!(failure.failure_fact().representation().is_none());
+        #[cfg(target_pointer_width = "64")]
+        {
+            let required = u32::MAX as usize + 1;
+            let source = u32::try_from(required).unwrap_err();
+            let failure = FilterMembershipSchemaError::TimezoneLengthOverflow { required, source };
+            assert_eq!(failure.failure_fact().class(), FailureClass::Representation);
+            assert!(failure.failure_fact().resource().is_none());
+            let representation = failure.failure_fact().representation().unwrap();
+            assert_eq!(
+                representation.boundary,
+                RepresentationBoundary::SingleOutput
+            );
+            assert_eq!(representation.required, Some(required as u64));
+            assert_eq!(representation.extent_limit, Some(u32::MAX as u64));
+            assert_eq!(representation.representable_prefix, None);
+            assert!(failure.source().unwrap().is::<std::num::TryFromIntError>());
+        }
     }
 }
 

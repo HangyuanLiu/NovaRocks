@@ -84,24 +84,24 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, UnionMode};
 use std::ops::Range;
 
+#[path = "selected_copy/extent_failure.rs"]
+mod extent_failure;
+pub use extent_failure::CopyExtentFailure;
+use extent_failure::CopyLayout;
+
 #[derive(Debug)]
 pub enum CopyError {
-    Extent,
+    Extent(CopyExtentFailure),
     Invalid(&'static str),
-    Unsupported(DataType),
+    Unsupported(novarocks_failure_contract::BoundedDetail),
     Control(KernelFailure),
 }
 impl std::fmt::Display for CopyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Extent => {
-                f.write_str("constant broadcast output extent exceeds its Arrow format")
-            }
+            Self::Extent(source) => source.fmt(f),
             Self::Invalid(message) => f.write_str(message),
-            Self::Unsupported(ty) => write!(
-                f,
-                "constant broadcast does not support Arrow carrier {ty:?}"
-            ),
+            Self::Unsupported(detail) => f.write_str(detail.as_str()),
             Self::Control(error) => write!(f, "{error:?}"),
         }
     }
@@ -110,6 +110,7 @@ impl std::error::Error for CopyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Control(error) => Some(error),
+            Self::Extent(source) => Some(source),
             _ => None,
         }
     }
@@ -215,21 +216,31 @@ impl<'a, E: From<CopyError>> CopyObservation<'a, E> {
 }
 
 fn add(a: usize, b: usize) -> Result<usize, CopyError> {
-    a.checked_add(b).ok_or(CopyError::Extent)
+    a.checked_add(b)
+        .ok_or_else(|| CopyError::arithmetic(Some(a as u128 + b as u128)))
 }
 fn mul(a: usize, b: usize) -> Result<usize, CopyError> {
-    a.checked_mul(b).ok_or(CopyError::Extent)
+    a.checked_mul(b)
+        .ok_or_else(|| CopyError::arithmetic(Some(a as u128 * b as u128)))
 }
-fn limit(value: usize, maximum: usize) -> Result<(), CopyError> {
+fn limit(value: usize, maximum: usize, layout: CopyLayout) -> Result<(), CopyError> {
     if value > maximum {
-        Err(CopyError::Extent)
+        Err(CopyError::format_extent(
+            layout,
+            Some(value as u128),
+            maximum,
+        ))
     } else {
         Ok(())
     }
 }
 fn buffer_extent(elements: usize, width: usize) -> Result<(), CopyError> {
-    // Rust allocations cannot be larger than isize::MAX even if usize fits.
-    limit(mul(elements, width)?, isize::MAX as usize)
+    let required = elements as u128 * width as u128;
+    if required > isize::MAX as u128 {
+        Err(CopyError::backing_bytes(required))
+    } else {
+        Ok(())
+    }
 }
 fn mutable_buffer_extent(elements: usize, width: usize) -> Result<(), CopyError> {
     zip::rounded_capacity(mul(elements, width)?)?;
@@ -415,7 +426,7 @@ pub fn preflight_broadcast(
             &mut work,
         )
     })();
-    if matches!(&result, Err(CopyError::Control(_))) {
+    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {
         return result;
     }
     work.boundary()?;
@@ -463,14 +474,16 @@ fn mutable_constructor_geometry<E: From<CopyError>>(
     match ty {
         DataType::FixedSizeBinary(width) => mutable_buffer_extent(
             capacity,
-            usize::try_from(*width).map_err(|_| CopyError::Extent)?,
+            usize::try_from(*width)
+                .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?,
         )
         .map_err(E::from),
         DataType::FixedSizeList(_, width) => mutable_constructor_geometry(
             &data_children(sources, 0, work)?,
             mul(
                 capacity,
-                usize::try_from(*width).map_err(|_| CopyError::Extent)?,
+                usize::try_from(*width)
+                    .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?,
             )
             .map_err(E::from)?,
             mode,
@@ -526,7 +539,7 @@ fn mutable_constructor_geometry<E: From<CopyError>>(
                     add(if concat { cumulative } else { 0 }, dictionary.len()).map_err(E::from)?;
                 // Arrow validates offset + len, including an unused dictionary.
                 if mode != CopyMode::OriginalConcat {
-                    limit(end, maximum).map_err(E::from)?;
+                    limit(end, maximum, CopyLayout::Dictionary).map_err(E::from)?;
                 }
                 if concat {
                     cumulative = end;
@@ -569,8 +582,13 @@ fn mutable_constructor_geometry<E: From<CopyError>>(
             }
             // Same backing retains the original domain; different backing was
             // checked above along the actual full-domain concatenation path.
-            mutable_buffer_extent(capacity, key.primitive_width().ok_or(CopyError::Extent)?)
-                .map_err(E::from)
+            mutable_buffer_extent(
+                capacity,
+                key.primitive_width().ok_or(CopyError::Invalid(
+                    "copy dictionary key has no primitive width",
+                ))?,
+            )
+            .map_err(E::from)
         }
         DataType::Utf8View | DataType::BinaryView => {
             // The actual constructor appends every source variadic buffer,
@@ -587,7 +605,8 @@ fn mutable_constructor_geometry<E: From<CopyError>>(
                 )
                 .map_err(E::from)?;
                 if mode != CopyMode::OriginalConcat {
-                    limit(buffers, u32::MAX as usize).map_err(E::from)?;
+                    limit(buffers, u32::MAX as usize, CopyLayout::ViewBufferTable)
+                        .map_err(E::from)?;
                 }
             }
             mutable_buffer_extent(buffers, std::mem::size_of::<arrow_buffer::Buffer>())
@@ -600,7 +619,7 @@ fn mutable_constructor_geometry<E: From<CopyError>>(
         | DataType::LargeBinary
         | DataType::Null
         | DataType::Boolean => Ok(()),
-        other => Err((CopyError::Unsupported(other.clone())).into()),
+        other => Err((CopyError::unsupported(other)).into()),
     }
 }
 
@@ -778,7 +797,8 @@ fn visit<E: From<CopyError>>(
         DataType::Null | DataType::Boolean => Ok(()),
         DataType::FixedSizeBinary(width) => mutable_buffer_extent(
             rows,
-            usize::try_from(*width).map_err(|_| CopyError::Extent)?,
+            usize::try_from(*width)
+                .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?,
         )
         .map_err(E::from),
         DataType::Utf8 => {
@@ -799,8 +819,13 @@ fn visit<E: From<CopyError>>(
         // take_dict and single-source MutableArrayData retain the dictionary
         // values unchanged; only keys expand, never its encoded value domain.
         DataType::Dictionary(key, _) => {
-            mutable_buffer_extent(rows, key.primitive_width().ok_or(CopyError::Extent)?)
-                .map_err(E::from)?;
+            mutable_buffer_extent(
+                rows,
+                key.primitive_width().ok_or(CopyError::Invalid(
+                    "copy dictionary key has no primitive width",
+                ))?,
+            )
+            .map_err(E::from)?;
             if mode == CopyMode::OriginalConcat {
                 let children = child_sources(sources, work, |source| {
                     source
@@ -846,7 +871,8 @@ fn visit<E: From<CopyError>>(
         }
         DataType::FixedSizeList(_, width) => {
             let _array: &FixedSizeListArray = downcast(array)?;
-            let width = usize::try_from(*width).map_err(|_| CopyError::Extent)?;
+            let width = usize::try_from(*width)
+                .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?;
             let mut child =
                 selection.map_ranges(work, |source, range, raw_null, mut output, work| {
                     let range = if mode.is_raw_take() && raw_null {
@@ -872,7 +898,8 @@ fn visit<E: From<CopyError>>(
                             ..mul(range.end, width).map_err(E::from)?
                     };
                     if mode.is_take() && !mode.is_raw_take() {
-                        limit(range.end, u32::MAX as usize).map_err(E::from)?;
+                        limit(range.end, u32::MAX as usize, CopyLayout::TakeIndex)
+                            .map_err(E::from)?;
                     }
                     work.push(&mut output, range)?;
                     Ok(())
@@ -1021,7 +1048,8 @@ fn visit<E: From<CopyError>>(
                     }
                     // Both take and MutableArrayData write signed i32 offsets.
                     if !mode.is_original_operation() {
-                        limit(child.len(work)?, i32::MAX as usize).map_err(E::from)?;
+                        limit(child.len(work)?, i32::MAX as usize, CopyLayout::DenseUnion)
+                            .map_err(E::from)?;
                     }
                     let child_mode = if mode.is_take() {
                         CopyMode::Take {
@@ -1052,7 +1080,7 @@ fn visit<E: From<CopyError>>(
             }
             _ => Err((CopyError::Invalid("constant run-end index carrier is invalid")).into()),
         },
-        other => Err((CopyError::Unsupported(other.clone())).into()),
+        other => Err((CopyError::unsupported(other)).into()),
     }
 }
 
@@ -1081,15 +1109,19 @@ fn bytes<T: ByteArrayType, E: From<CopyError>>(
                 {
                     let start = offset_value(array.value_offsets()[row])?;
                     let end = offset_value(array.value_offsets()[row + 1])?;
-                    one = add(one, end.checked_sub(start).ok_or(CopyError::Extent)?)
-                        .map_err(E::from)?;
+                    one = add(
+                        one,
+                        end.checked_sub(start)
+                            .ok_or(CopyError::Invalid("copy source offsets are not monotonic"))?,
+                    )
+                    .map_err(E::from)?;
                 }
             }
         }
         total = add(total, mul(one, block.repeats).map_err(E::from)?).map_err(E::from)?;
     }
     if !mode.is_original_operation() {
-        limit(total, offset_max(large)).map_err(E::from)?;
+        limit(total, offset_max(large), CopyLayout::bytes(large)).map_err(E::from)?;
     }
     if let Some(invoice) = work.3.as_deref_mut() {
         invoice.selected_payload(total, mode)?;
@@ -1102,7 +1134,9 @@ fn bytes<T: ByteArrayType, E: From<CopyError>>(
 }
 
 fn offset_value<O: OffsetSizeTrait>(value: O) -> Result<usize, CopyError> {
-    value.to_usize().ok_or(CopyError::Extent)
+    value.to_usize().ok_or(CopyError::Invalid(
+        "copy source offset is negative or outside its addressable carrier",
+    ))
 }
 fn offset_selection<O: OffsetSizeTrait, E: From<CopyError>>(
     sources: &[&dyn Array],
@@ -1145,7 +1179,7 @@ fn offset_selection<O: OffsetSizeTrait, E: From<CopyError>>(
         }
     }
     if !mode.is_original_operation() {
-        limit(child.len(work)?, offset_max(large)).map_err(E::from)?;
+        limit(child.len(work)?, offset_max(large), CopyLayout::list(large)).map_err(E::from)?;
     }
     Ok(child)
 }
@@ -1227,7 +1261,7 @@ fn list_view<O: OffsetSizeTrait, E: From<CopyError>>(
         Ok(())
     })?;
     if !mode.is_original_operation() {
-        limit(child.len(work)?, offset_max(large)).map_err(E::from)?;
+        limit(child.len(work)?, offset_max(large), CopyLayout::list(large)).map_err(E::from)?;
     }
     let children = child_sources(sources, work, |source| {
         let source: &GenericListViewArray<O> = downcast(source)?;
@@ -1252,7 +1286,7 @@ fn run<R: RunEndIndexType, E: From<CopyError>>(
     work: &mut CopyObservation<'_, E>,
 ) -> Result<(), E> {
     if !mode.is_original_operation() {
-        limit(selection.len(work)?, maximum).map_err(E::from)?;
+        limit(selection.len(work)?, maximum, CopyLayout::RunEnd).map_err(E::from)?;
     }
     let mut output = ChildScratchVec::new(work.selection_allocator());
     let mut previous = None;
@@ -1280,7 +1314,7 @@ fn run<R: RunEndIndexType, E: From<CopyError>>(
                 raw: false,
             } = mode
             {
-                limit(end - 1, index_maximum).map_err(E::from)?;
+                limit(end - 1, index_maximum, CopyLayout::TakeIndex).map_err(E::from)?;
             }
             let start = if mode.is_take() && ranges.last().is_some_and(|last| last.end - 1 == start)
             {
@@ -1470,6 +1504,26 @@ fn preflight_original_take_with_observation<E: From<CopyError>>(
     )
 }
 
+/// Observe the actual Arrow take geometry from its borrowed index carrier.
+/// This port grants no allocation capacity and retains no input or index owner.
+/// Every originating failure returns without an optional completion observation.
+pub fn preflight_original_take(
+    array: &dyn Array,
+    indices: CopyIndexView<'_>,
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+) -> Result<(), CopyError> {
+    let mut work = CopyObservation(
+        WorkObservation::Legacy(&mut observe),
+        None,
+        ScratchCoverage::ChildTables,
+        None,
+        None,
+    );
+    work.boundary()?;
+    preflight_original_take_with_observation(array, indices, &mut work)?;
+    work.boundary()
+}
+
 /// Observe the original take's source metadata, exact recursive scratch and
 /// locked copy invoice. The caller retains its original source/index lifetime;
 /// this borrowed port neither allocates the output nor authorizes memory.
@@ -1584,7 +1638,9 @@ fn take_construction_core<H>(
         .operation_peak_bytes()
         .checked_sub(facts.metadata_upper_bytes())
         .and_then(|n| n.checked_sub(facts.retained_new_backing_upper()))
-        .ok_or(CopyError::Extent)?;
+        .ok_or(CopyError::Invalid(
+            "copy invoice payload/metadata relation is inconsistent",
+        ))?;
     let result = add(facts.retained_new_backing_upper(), result_metadata)?;
     let diagnostic = copy_diagnostic::OriginalTakeDiagnosticFacts::try_new()?;
     facts.admit_original_take_diagnostic(&diagnostic)?;
@@ -1730,7 +1786,9 @@ fn preflight_take_with_invoice<S>(
     for index in indices {
         work.step()?;
         if let Some(index) = index {
-            let index = usize::try_from(*index).map_err(|_| CopyError::Extent)?;
+            let index = usize::try_from(*index).map_err(|_| {
+                CopyError::Invalid("copy index is outside the source address domain")
+            })?;
             ranges.push(index..add(index, 1)?);
         } else {
             nulls = add(nulls, 1)?;
@@ -1810,7 +1868,7 @@ pub fn preflight_extend(
         };
         preflight(source, &selection, CopyMode::Extend, &mut work)
     })();
-    if matches!(&result, Err(CopyError::Control(_))) {
+    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {
         return result;
     }
     work.boundary()?;
@@ -1847,7 +1905,7 @@ pub fn preflight_extend_multi(
     );
     let result =
         preflight_extend_multi_with_observation(sources, segments, constructor_capacity, &mut work);
-    if matches!(&result, Err(CopyError::Control(_))) {
+    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {
         return result;
     }
     work.boundary()?;
@@ -2060,10 +2118,11 @@ pub fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyErr
     } else if let DataType::FixedSizeBinary(width) = ty {
         buffer_extent(
             rows,
-            usize::try_from(*width).map_err(|_| CopyError::Extent)?,
+            usize::try_from(*width)
+                .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?,
         )?;
     } else if *ty != DataType::Boolean {
-        return Err(CopyError::Unsupported(ty.clone()));
+        return Err(CopyError::unsupported(ty));
     }
     interleave_bitmap_extent(rows)
 }
@@ -2090,7 +2149,7 @@ pub fn guarded_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyE
 }
 
 pub(crate) fn byte_interleave_payload_extent(total: usize, large: bool) -> Result<(), CopyError> {
-    limit(total, offset_max(large))?;
+    limit(total, offset_max(large), CopyLayout::bytes(large))?;
     buffer_extent(total, 1)
 }
 
@@ -2107,7 +2166,12 @@ fn interleave_byte_payload<T: ByteArrayType, E: From<CopyError>>(
         let end = offset_value(array.value_offsets()[row + 1])?;
         // Arrow interleave_bytes copies the offset span even for NULL values.
         // Single-source take's validity-sensitive payload count is insufficient.
-        total = add(total, end.checked_sub(start).ok_or(CopyError::Extent)?).map_err(E::from)?;
+        total = add(
+            total,
+            end.checked_sub(start)
+                .ok_or(CopyError::Invalid("copy source offsets are not monotonic"))?,
+        )
+        .map_err(E::from)?;
         work.step()?;
     }
     byte_interleave_payload_extent(total, large).map_err(E::from)?;
@@ -2194,7 +2258,7 @@ pub fn preflight_guarded_interleave(
             _ => unreachable!("checked offset byte carrier"),
         }
     })();
-    if matches!(&result, Err(CopyError::Control(_))) {
+    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {
         return result;
     }
     work.boundary()?;
@@ -2225,7 +2289,7 @@ pub fn preflight_fixed_interleave(
         validate_interleave_plan(ty, sources, choices, &mut work)
     })();
     // An observer refusal is primary and must not trigger another callback.
-    if matches!(&result, Err(CopyError::Control(_))) {
+    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {
         return result;
     }
     work.boundary()?;
@@ -2274,7 +2338,7 @@ mod broadcast_tests {
         let input = Int64Array::from(vec![Some(8)]);
         assert!(matches!(
             preflight_broadcast(&input, 0, usize::MAX, |_| Ok(())),
-            Err(CopyError::Extent)
+            Err(CopyError::Extent(_))
         ));
     }
 
@@ -2380,7 +2444,7 @@ mod extend_tests {
         preflight_extend(&source, 0, 1, maximum - 1, maximum, |_| Ok(())).unwrap();
         assert!(matches!(
             preflight_extend(&source, 0, 1, maximum, maximum + 1, |_| Ok(())),
-            Err(CopyError::Extent)
+            Err(CopyError::Extent(_))
         ));
         preflight_extend(&source, 1, 1, maximum, maximum + 1, |_| Ok(())).unwrap();
         let nested = FixedSizeListArray::try_new(
@@ -2394,7 +2458,7 @@ mod extend_tests {
         preflight_extend(&nested, 0, 1, exact, exact + 1, |_| Ok(())).unwrap();
         assert!(matches!(
             preflight_extend(&nested, 0, 1, exact + 1, exact + 2, |_| Ok(())),
-            Err(CopyError::Extent)
+            Err(CopyError::Extent(_))
         ));
         for cause in super::broadcast_tests::failures() {
             let mut calls = 0;

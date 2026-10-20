@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::ArrayRef;
+use arrow::datatypes::DataType;
 use novarocks_functions::builtin::calendar_sec_to_time::evaluate_legacy_sec_to_time;
 pub use novarocks_functions::builtin::calendar_sec_to_time::format_sec_to_time;
 pub fn eval_sec_to_time<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Utf8)?;
     let array = arena.eval(args[0], chunk)?;
-    Ok((evaluate_legacy_sec_to_time(&array))?)
+    evaluate_legacy_sec_to_time(&array).map_err(Into::into)
 }

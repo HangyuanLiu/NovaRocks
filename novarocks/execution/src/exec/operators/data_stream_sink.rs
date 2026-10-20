@@ -27,7 +27,164 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StreamStepContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for StreamStepContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for StreamStepContract {}
+impl novarocks_failure_contract::FailureProjection for StreamStepContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::ExchangeStreamContract.reason(),
+        )
+    }
+}
+fn stream_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(StreamStepContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+
+#[derive(Debug)]
+struct StreamPartitionArrowFailure(arrow::error::ArrowError);
+impl std::fmt::Display for StreamPartitionArrowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for StreamPartitionArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for StreamPartitionArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use arrow::error::ArrowError;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, reason) = match &self.0 {
+            ArrowError::MemoryError(_) | ArrowError::ArithmeticOverflow(_) => (
+                FailureClass::Resource,
+                ExecutionReason::ExchangePartitionAllocation,
+            ),
+            ArrowError::OffsetOverflowError(_) => (
+                FailureClass::Representation,
+                ExecutionReason::ExchangePartitionOffset,
+            ),
+            ArrowError::IoError(..) | ArrowError::ExternalError(_) => (
+                FailureClass::Unexpected,
+                ExecutionReason::ExchangePartitionUnexpected,
+            ),
+            _ => (
+                FailureClass::Invariant,
+                ExecutionReason::ExchangePartitionArrow,
+            ),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        if matches!(self.0, ArrowError::OffsetOverflowError(_)) {
+            // The selected Arrow take/cast boundary knows neither the complete
+            // required extent nor a safe independent output prefix.
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(15).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+fn partition_arrow(source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(StreamPartitionArrowFailure(source))
+}
+#[derive(Debug)]
+struct StreamDictionaryKeyFailure {
+    row: usize,
+    key: i32,
+    source: std::num::TryFromIntError,
+}
+impl std::fmt::Display for StreamDictionaryKeyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hash_partition: negative dictionary key {} at row {}",
+            self.key, self.row
+        )
+    }
+}
+impl std::error::Error for StreamDictionaryKeyFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for StreamDictionaryKeyFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::ExchangeDictionaryKey.reason(),
+        )
+    }
+}
+#[derive(Clone, Copy, Debug)]
+struct PartitionRowExtent {
+    last_index: u64,
+}
+impl std::fmt::Display for PartitionRowExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "exchange partition row index {} exceeds UInt32",
+            self.last_index
+        )
+    }
+}
+impl std::error::Error for PartitionRowExtent {}
+impl novarocks_failure_contract::FailureProjection for PartitionRowExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        FailureFact::new(
+            FailureClass::Representation,
+            crate::runtime::fragment::ExecutionReason::ExchangePartitionRowExtent.reason(),
+        )
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: domain::EXECUTION,
+                code: std::num::NonZeroU16::new(16).unwrap(),
+            },
+            required: Some(self.last_index),
+            extent_limit: Some(u64::from(u32::MAX)),
+            representable_prefix: None,
+        })
+    }
+}
+fn check_partition_row_extent(rows: usize) -> ExecutionResult<()> {
+    let last_index = rows.saturating_sub(1);
+    if last_index as u128 > u128::from(u32::MAX) {
+        return Err(ExecutionFailure::from_domain(PartitionRowExtent {
+            last_index: last_index as u64,
+        }));
+    }
+    Ok(())
+}
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
@@ -56,9 +213,15 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    operator::{ExitObservation, ExitProgress, FinishWatch, InputEncodingPolicy, Operator},
+    shape::{ControlStep, SinkKernel, SinkStep, Transform},
+    step::{AdmissionNext, NextStep, WaitFact, WaitReason},
+    step_context::StepContext,
+};
 use crate::runtime::profile::{ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
@@ -117,8 +280,12 @@ fn is_low_cardinality_exchange_dictionary(data_type: &DataType) -> bool {
 
 // Hash partition implementation (vectorized, no row conversion)
 mod data_stream_sink_hash_partition {
-    use super::{Chunk, ExprArena, ExprId, is_low_cardinality_exchange_dictionary};
+    use super::{
+        Chunk, ExprArena, ExprId, StreamDictionaryKeyFailure, check_partition_row_extent,
+        is_low_cardinality_exchange_dictionary, partition_arrow, stream_contract,
+    };
     use crate::exec::hash_table::hash::{canonical_f32_bits, canonical_f64_bits};
+    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
         DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
@@ -207,30 +374,31 @@ mod data_stream_sink_hash_partition {
         hash
     }
 
-    fn dictionary_int32_indices(array: &ArrayRef) -> Result<&DictionaryArray<Int32Type>, String> {
+    fn dictionary_int32_indices(array: &ArrayRef) -> ExecutionResult<&DictionaryArray<Int32Type>> {
         array
             .as_any()
             .downcast_ref::<DictionaryArray<Int32Type>>()
             .ok_or_else(|| {
-                format!(
+                stream_contract(format_args!(
                     "hash_partition: failed to downcast dictionary carrier {:?} to DictionaryArray<Int32Type>",
                     array.data_type()
-                )
+                ))
             })
     }
 
-    fn dictionary_key_index(key: i32, values_len: usize, row: usize) -> Result<usize, String> {
-        let idx = usize::try_from(key)
-            .map_err(|_| format!("hash_partition: negative dictionary key {key} at row {row}"))?;
+    fn dictionary_key_index(key: i32, values_len: usize, row: usize) -> ExecutionResult<usize> {
+        let idx = usize::try_from(key).map_err(|source| {
+            ExecutionFailure::from_domain(StreamDictionaryKeyFailure { row, key, source })
+        })?;
         if idx >= values_len {
-            return Err(format!(
+            return Err(stream_contract(format_args!(
                 "hash_partition: dictionary key {key} at row {row} exceeds values len {values_len}"
-            ));
+            )));
         }
         Ok(idx)
     }
 
-    fn compute_fnv_hash_dictionary_array(array: &ArrayRef) -> Result<Vec<u64>, String> {
+    fn compute_fnv_hash_dictionary_array(array: &ArrayRef) -> ExecutionResult<Vec<u64>> {
         let dict = dictionary_int32_indices(array)?;
         let values = dict.values();
         let value_hashes = compute_fnv_hash_array(values)?;
@@ -247,7 +415,7 @@ mod data_stream_sink_hash_partition {
         Ok(out)
     }
 
-    fn compute_crc32_hash_dictionary_array(array: &ArrayRef) -> Result<Vec<u32>, String> {
+    fn compute_crc32_hash_dictionary_array(array: &ArrayRef) -> ExecutionResult<Vec<u32>> {
         let dict = dictionary_int32_indices(array)?;
         let values = dict.values();
         let value_hashes = compute_crc32_hash_array(values)?;
@@ -265,7 +433,7 @@ mod data_stream_sink_hash_partition {
     }
 
     // Compute FNV hash for each row in an array
-    fn compute_fnv_hash_array(array: &ArrayRef) -> Result<Vec<u64>, String> {
+    fn compute_fnv_hash_array(array: &ArrayRef) -> ExecutionResult<Vec<u64>> {
         let len = array.len();
         let mut hash_values = vec![FNV_SEED; len];
 
@@ -274,7 +442,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to BooleanArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -289,7 +457,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Int64Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -305,7 +473,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Int32Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -321,7 +489,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Int16Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -337,7 +505,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Float64Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -353,7 +521,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Float32Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -369,7 +537,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to StringArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -384,7 +552,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to LargeStringArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -399,7 +567,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to BinaryArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -413,7 +581,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<LargeBinaryArray>()
-                    .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to LargeBinaryArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -427,7 +595,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Date32Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -450,7 +618,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampSecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampSecondArray".to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampSecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -459,8 +629,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampMillisecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampMillisecondArray"
-                                            .to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampMillisecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -469,8 +640,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampMicrosecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampMicrosecondArray"
-                                            .to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampMicrosecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -479,7 +651,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampNanosecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampNanosecondArray".to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampNanosecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -494,7 +668,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Decimal128Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -510,7 +684,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Decimal256Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -526,14 +700,22 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to FixedSizeBinaryArray"))?;
+                if arr.value_length() != 16 {
+                    return Err(stream_contract(
+                        "hash_partition LARGEINT physical width differs from 16",
+                    ));
+                }
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
-                        let value = largeint::i128_from_be_bytes(arr.value(i)).map_err(|e| {
-                            format!("hash_partition: decode LARGEINT failed at row {}: {}", i, e)
-                        })?;
+                        // FixedSizeBinaryArray owns this exact fixed-width slice.
+                        let fixed: [u8; 16] = arr
+                            .value(i)
+                            .try_into()
+                            .expect("checked LARGEINT physical width");
+                        let value = i128::from_be_bytes(fixed);
                         let bytes = value.to_le_bytes();
                         *hash_value ^= fnv_hash_value(&bytes);
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -544,12 +726,14 @@ mod data_stream_sink_hash_partition {
                 let list = array
                     .as_any()
                     .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to ListArray"))?;
                 let values = list
                     .values()
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast list values to StringArray".to_string())?;
+                    .ok_or_else(|| {
+                        stream_contract("failed to downcast list values to StringArray")
+                    })?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -564,12 +748,14 @@ mod data_stream_sink_hash_partition {
                 let list = array
                     .as_any()
                     .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to ListArray"))?;
                 let values = list
                     .values()
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "failed to downcast list values to Int32Array".to_string())?;
+                    .ok_or_else(|| {
+                        stream_contract("failed to downcast list values to Int32Array")
+                    })?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -597,10 +783,10 @@ mod data_stream_sink_hash_partition {
                 return compute_fnv_hash_dictionary_array(array);
             }
             _ => {
-                return Err(format!(
+                return Err(stream_contract(format_args!(
                     "hash_partition: unsupported array type for FNV hash: {:?}",
                     array.data_type()
-                ));
+                )));
             }
         }
 
@@ -608,7 +794,7 @@ mod data_stream_sink_hash_partition {
     }
 
     // Compute CRC32 hash for each row in an array (for BUCKET_SHUFFLE_HASH_PARTITIONED)
-    fn compute_crc32_hash_array(array: &ArrayRef) -> Result<Vec<u32>, String> {
+    fn compute_crc32_hash_array(array: &ArrayRef) -> ExecutionResult<Vec<u32>> {
         let len = array.len();
         let mut hash_values = vec![0u32; len];
 
@@ -617,7 +803,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to BooleanArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = if arr.value(i) { 1u8 } else { 0u8 };
@@ -629,7 +815,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Int64Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -642,7 +828,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Int32Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -655,7 +841,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Int16Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -668,7 +854,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Float64Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -681,7 +867,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Float32Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -694,7 +880,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to StringArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -706,7 +892,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to LargeStringArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -718,7 +904,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to BinaryArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         *hash_value = crc32_hash_value(arr.value(i));
@@ -729,7 +915,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<LargeBinaryArray>()
-                    .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to LargeBinaryArray"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         *hash_value = crc32_hash_value(arr.value(i));
@@ -740,7 +926,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Date32Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -758,7 +944,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampSecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampSecondArray".to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampSecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -767,8 +955,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampMillisecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampMillisecondArray"
-                                            .to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampMillisecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -777,8 +966,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampMicrosecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampMicrosecondArray"
-                                            .to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampMicrosecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -787,7 +977,9 @@ mod data_stream_sink_hash_partition {
                                     .as_any()
                                     .downcast_ref::<TimestampNanosecondArray>()
                                     .ok_or_else(|| {
-                                        "failed to downcast to TimestampNanosecondArray".to_string()
+                                        stream_contract(
+                                            "failed to downcast to TimestampNanosecondArray",
+                                        )
                                     })?;
                                 arr.value(i)
                             }
@@ -801,7 +993,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Decimal128Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -814,7 +1006,7 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to Decimal256Array"))?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -827,12 +1019,20 @@ mod data_stream_sink_hash_partition {
                 let arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to FixedSizeBinaryArray"))?;
+                if arr.value_length() != 16 {
+                    return Err(stream_contract(
+                        "hash_partition LARGEINT physical width differs from 16",
+                    ));
+                }
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
-                        let value = largeint::i128_from_be_bytes(arr.value(i)).map_err(|e| {
-                            format!("hash_partition: decode LARGEINT failed at row {}: {}", i, e)
-                        })?;
+                        // FixedSizeBinaryArray owns this exact fixed-width slice.
+                        let fixed: [u8; 16] = arr
+                            .value(i)
+                            .try_into()
+                            .expect("checked LARGEINT physical width");
+                        let value = i128::from_be_bytes(fixed);
                         let bytes = value.to_le_bytes();
                         *hash_value = crc32_hash_value(&bytes);
                     }
@@ -842,12 +1042,14 @@ mod data_stream_sink_hash_partition {
                 let list = array
                     .as_any()
                     .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to ListArray"))?;
                 let values = list
                     .values()
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast list values to StringArray".to_string())?;
+                    .ok_or_else(|| {
+                        stream_contract("failed to downcast list values to StringArray")
+                    })?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
                         continue;
@@ -874,12 +1076,14 @@ mod data_stream_sink_hash_partition {
                 let list = array
                     .as_any()
                     .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+                    .ok_or_else(|| stream_contract("failed to downcast to ListArray"))?;
                 let values = list
                     .values()
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "failed to downcast list values to Int32Array".to_string())?;
+                    .ok_or_else(|| {
+                        stream_contract("failed to downcast list values to Int32Array")
+                    })?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
                         continue;
@@ -913,28 +1117,28 @@ mod data_stream_sink_hash_partition {
                 return compute_crc32_hash_dictionary_array(array);
             }
             _ => {
-                return Err(format!(
+                return Err(stream_contract(format_args!(
                     "hash_partition: unsupported array type for CRC32 hash: {:?}",
                     array.data_type()
-                ));
+                )));
             }
         }
 
         Ok(hash_values)
     }
 
-    fn canonicalize_hash_array(array: &ArrayRef) -> Result<ArrayRef, String> {
+    fn canonicalize_hash_array(array: &ArrayRef) -> ExecutionResult<ArrayRef> {
         match array.data_type() {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 => cast(array, &DataType::Int64)
-                .map_err(|e| format!("hash_partition: cast to Int64 failed: {e}")),
-            DataType::Float32 => cast(array, &DataType::Float64)
-                .map_err(|e| format!("hash_partition: cast to Float64 failed: {e}")),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+                cast(array, &DataType::Int64).map_err(partition_arrow)
+            }
+            DataType::Float32 => cast(array, &DataType::Float64).map_err(partition_arrow),
             _ => Ok(array.clone()),
         }
     }
 
     // Partition a chunk based on hash values without converting to rows
-    fn take_partition_rows_with<E: From<String>>(
+    fn take_partition_rows_with<E: From<ExecutionFailure>>(
         source: &Chunk,
         rows: &[u32],
         publish: impl FnOnce(&Chunk, Vec<ArrayRef>, usize) -> Result<Chunk, E>,
@@ -945,7 +1149,8 @@ mod data_stream_sink_hash_partition {
         for column in source.record_batch().columns() {
             columns.push(
                 take(column.as_ref(), &indices_ref, None)
-                    .map_err(|error| format!("Arrow take failed: {error}"))?,
+                    .map_err(partition_arrow)
+                    .map_err(E::from)?,
             );
         }
         publish(source, columns, rows.len())
@@ -1005,21 +1210,21 @@ mod data_stream_sink_hash_partition {
         Ok(output)
     }
 
+    /// Geometry-only reference caller. Production partitions use the creator ports below.
     #[cfg(test)]
     pub fn partition_chunk_by_hash<E: crate::exec::expr::ExprEvaluation + ?Sized>(
         chunk: &Chunk,
         exprs: &[ExprId],
-        arena: &E,
+        evaluation: &E,
         partitions: usize,
         crc: bool,
-    ) -> Result<Vec<Chunk>, E::Error> {
-        partition_chunk_by_hash_with(chunk, exprs, arena, partitions, crc, |source, rows| {
+    ) -> ExecutionResult<Vec<Chunk>> {
+        partition_chunk_by_hash_with(chunk, exprs, evaluation, partitions, crc, |source, rows| {
             take_partition_rows_with(source, rows, |source, columns, _| {
                 Chunk::try_new_with_columns(source.chunk_schema_ref(), columns).map_err(Into::into)
             })
         })
     }
-
     pub(crate) fn partition_chunk_by_hash_created(
         chunk: &Chunk,
         exprs: &[ExprId],
@@ -1028,90 +1233,95 @@ mod data_stream_sink_hash_partition {
         crc: bool,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
         control: &dyn crate::exec::expr::ExprEvaluationControl,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
-        partition_chunk_by_hash_with(chunk, exprs, evaluation, partitions, crc, |source, rows| {
-            take_partition_rows_created(source, rows, factory, control)
-        })
-    }
-
-    fn partition_chunk_by_hash_with<
-        E: crate::exec::expr::ExprEvaluation + ?Sized,
-        F: From<E::Error> + From<String>,
-    >(
-        chunk: &Chunk,
-        partition_exprs: &[ExprId],
-        arena: &E,
-        num_partitions: usize,
-        use_crc32: bool,
-        take_rows: impl FnMut(&Chunk, &[u32]) -> Result<Chunk, F>,
-    ) -> Result<Vec<Chunk>, F> {
-        if chunk.is_empty() {
-            return Ok(vec![Chunk::default(); num_partitions]);
-        }
-
-        // Evaluate partition expressions to get arrays
-        let mut partition_arrays = Vec::with_capacity(partition_exprs.len());
-        for expr_id in partition_exprs {
-            let array = arena.eval(*expr_id, chunk).map_err(F::from)?;
-            partition_arrays.push(array);
-        }
-
-        partition_chunk_by_hash_arrays_with(
+    ) -> ExecutionResult<Vec<Chunk>> {
+        control.checkpoint()?;
+        let out = partition_chunk_by_hash_with(
             chunk,
-            &partition_arrays,
-            num_partitions,
-            use_crc32,
-            take_rows,
-        )
+            exprs,
+            evaluation,
+            partitions,
+            crc,
+            |source, rows| take_partition_rows_created(source, rows, factory, control),
+        )?;
+        control.checkpoint()?;
+        Ok(out)
     }
-
+    fn partition_chunk_by_hash_with<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+        chunk: &Chunk,
+        exprs: &[ExprId],
+        evaluation: &E,
+        partitions: usize,
+        crc: bool,
+        take_rows: impl FnMut(&Chunk, &[u32]) -> ExecutionResult<Chunk>,
+    ) -> ExecutionResult<Vec<Chunk>> {
+        if chunk.is_empty() {
+            return Ok(vec![Chunk::default(); partitions]);
+        }
+        let mut keys = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            keys.push(evaluation.eval(*expr, chunk)?);
+        }
+        partition_chunk_by_hash_arrays_with(chunk, &keys, partitions, crc, take_rows)
+    }
     #[cfg(test)]
     pub fn partition_chunk_by_hash_arrays(
         chunk: &Chunk,
-        partition_arrays: &[ArrayRef],
-        num_partitions: usize,
-        use_crc32: bool,
-    ) -> Result<Vec<Chunk>, String> {
-        partition_chunk_by_hash_arrays_with(
-            chunk,
-            partition_arrays,
-            num_partitions,
-            use_crc32,
-            |source, rows| {
-                take_partition_rows_with(source, rows, |source, columns, _| {
-                    Chunk::try_new_with_columns(source.chunk_schema_ref(), columns)
-                })
-            },
-        )
+        keys: &[ArrayRef],
+        partitions: usize,
+        crc: bool,
+    ) -> ExecutionResult<Vec<Chunk>> {
+        partition_chunk_by_hash_arrays_with(chunk, keys, partitions, crc, |source, rows| {
+            take_partition_rows_with(source, rows, |source, columns, _| {
+                Chunk::try_new_with_columns(source.chunk_schema_ref(), columns).map_err(Into::into)
+            })
+        })
     }
-
     pub(crate) fn partition_chunk_by_hash_arrays_created(
         chunk: &Chunk,
-        arrays: &[ArrayRef],
+        keys: &[ArrayRef],
         partitions: usize,
         crc: bool,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
         control: &dyn crate::exec::expr::ExprEvaluationControl,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
-        partition_chunk_by_hash_arrays_with(chunk, arrays, partitions, crc, |source, rows| {
-            take_partition_rows_created(source, rows, factory, control)
-        })
+    ) -> ExecutionResult<Vec<Chunk>> {
+        control.checkpoint()?;
+        let output =
+            partition_chunk_by_hash_arrays_with(chunk, keys, partitions, crc, |source, rows| {
+                take_partition_rows_created(source, rows, factory, control)
+            })?;
+        control.checkpoint()?;
+        Ok(output)
     }
-
-    fn partition_chunk_by_hash_arrays_with<E: From<String>>(
+    fn partition_chunk_by_hash_arrays_with(
         chunk: &Chunk,
         partition_arrays: &[ArrayRef],
         num_partitions: usize,
         use_crc32: bool,
-        mut take_rows: impl FnMut(&Chunk, &[u32]) -> Result<Chunk, E>,
-    ) -> Result<Vec<Chunk>, E> {
+        mut take_rows: impl FnMut(&Chunk, &[u32]) -> ExecutionResult<Chunk>,
+    ) -> ExecutionResult<Vec<Chunk>> {
         if chunk.is_empty() {
             return Ok(vec![Chunk::default(); num_partitions]);
         }
 
+        check_partition_row_extent(chunk.len())?;
+        if num_partitions == 0 {
+            return Err(stream_contract(
+                "nonempty hash partition requires a destination",
+            ));
+        }
+
         let partition_arrays = partition_arrays
             .iter()
-            .map(canonicalize_hash_array)
+            .map(|array| {
+                if array.len() != chunk.len() {
+                    return Err(stream_contract(format_args!(
+                        "hash partition key rows {} differ from input rows {}",
+                        array.len(),
+                        chunk.len()
+                    )));
+                }
+                canonicalize_hash_array(array)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let num_rows = chunk.len();
@@ -1152,15 +1362,12 @@ mod data_stream_sink_hash_partition {
             partition_row_indices[part_idx].push(row_idx as u32);
         }
 
-        // Create chunks for each partition using Arrow take
         let mut partition_chunks = Vec::with_capacity(num_partitions);
-        for rows in partition_row_indices.iter().take(num_partitions) {
+        for rows in &partition_row_indices {
             if rows.is_empty() {
                 partition_chunks.push(Chunk::default());
             } else {
-                let new_chunk = take_rows(chunk, rows)?;
-
-                partition_chunks.push(new_chunk);
+                partition_chunks.push(take_rows(chunk, rows)?);
             }
         }
 
@@ -1202,7 +1409,7 @@ struct CompiledPartitionState {
 /// Factory for distributed stream sinks that serialize and transmit chunks to remote fragment instances.
 pub struct DataStreamSinkFactory {
     name: String,
-    init_error: Option<String>,
+    init_error: Option<ExecutionFailure>,
     input: DataStreamSinkFactoryInput,
     fragment_instance_id: UniqueId,
     sender_id: Option<i32>,
@@ -1232,7 +1439,7 @@ impl DataStreamSinkFactory {
             "EXCHANGE_SINK".to_string()
         };
         let init_error = (!input.output_exprs.is_empty())
-            .then(|| "DATA_STREAM_SINK output_exprs are not supported".to_string());
+            .then(|| stream_contract("DATA_STREAM_SINK output_exprs are not supported"));
 
         Self {
             name,
@@ -1255,18 +1462,17 @@ impl DataStreamSinkFactory {
     pub(crate) fn with_compiled_partition_keys(
         mut self,
         keys: CompiledPartitionKeys,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if !self.input.output_partition_exprs.is_empty() {
-            return Err(
-                "compiled partition keys cannot coexist with legacy partition expressions"
-                    .to_string(),
-            );
+            return Err(stream_contract(
+                "compiled partition keys cannot coexist with legacy partition expressions",
+            ));
         }
         if !self.input.output_partition_type.requires_exprs() || keys.sites.is_empty() {
-            return Err(format!(
+            return Err(stream_contract(format_args!(
                 "compiled partition keys do not match {} partitioning",
                 self.input.output_partition_type.display_name()
-            ));
+            )));
         }
         self.compiled_partition = Some(keys);
         Ok(self)
@@ -1370,14 +1576,15 @@ impl OperatorFactory for DataStreamSinkFactory {
                     .is_some_and(|dt| matches!(dt, arrow::datatypes::DataType::LargeBinary))
             });
             if has_variant {
-                init_error =
-                    Some("VARIANT is not supported in HASH_PARTITIONED partition keys".to_string());
+                init_error = Some(stream_contract(
+                    "VARIANT is not supported in HASH_PARTITIONED partition keys",
+                ));
             }
         }
 
         let send_observable = Arc::new(Observable::new());
 
-        Box::new(DataStreamSinkOperator {
+        Box::new(Transform::hydrating(DataStreamSinkOperator {
             name: self.name.clone(),
             input: self.input.clone(),
             fragment_instance_id: self.fragment_instance_id,
@@ -1405,6 +1612,8 @@ impl OperatorFactory for DataStreamSinkFactory {
             send_observable,
             construction_factory: None,
             prepared: false,
+            exiting: false,
+            compiled_control: None,
             error_state: None,
             finish_state: Arc::clone(&self.finish_state),
             profile_initialized: false,
@@ -1420,7 +1629,7 @@ impl OperatorFactory for DataStreamSinkFactory {
                     instances: None,
                 }
             }),
-        })
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -1453,7 +1662,7 @@ struct DataStreamSinkOperator {
     transmitter: Arc<dyn ExchangeFrameTransmitter>,
     arena: ExprArena,
     expr_ids: Vec<ExprId>,
-    init_error: Option<String>,
+    init_error: Option<ExecutionFailure>,
     driver_id: i32,
     sender_id: i32,
     be_number: i32,
@@ -1506,9 +1715,11 @@ struct DataStreamSinkOperator {
     construction_factory:
         Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     prepared: bool,
+    exiting: bool,
+    compiled_control: Option<RuntimeKernelControl>,
 }
 
-impl Operator for DataStreamSinkOperator {
+impl OperatorLifecycle for DataStreamSinkOperator {
     fn set_construction_factory(
         &mut self,
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
@@ -1558,6 +1769,16 @@ impl Operator for DataStreamSinkOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.error_state = Some(state.error_state());
+        let mut control = RuntimeKernelControl::new(state.error_state());
+        control.bind_runtime_memory(state);
+        if let Some(tracker) = &self.pending_chunks_mem_tracker {
+            control.bind_mem_tracker(tracker.clone());
+        }
+        if let Some(factory) = &self.construction_factory {
+            control.bind_construction_factory(factory.clone());
+        }
+        self.compiled_control = Some(control);
         #[cfg(novarocks_dev_controls)]
         if let Some(observer) = state.exchange_test_observer() {
             self.send_tracker.install_test_observer(observer.clone())?;
@@ -1572,9 +1793,10 @@ impl Operator for DataStreamSinkOperator {
             #[cfg(test)]
             return Ok(());
             #[cfg(not(test))]
-            return Err("exchange sink requires an ExecutionRuntime"
-                .to_string()
-                .into());
+            return Err(
+                crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime
+                    .into(),
+            );
         };
         let queue = runtime.exchange_send_queue();
         queue.register_send_observer(&self.send_observable);
@@ -1616,24 +1838,31 @@ impl Operator for DataStreamSinkOperator {
         Ok(())
     }
 
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.maybe_mark_finished()
-    }
-
+    #[cfg(test)]
+    #[cfg(test)]
     fn pending_finish(&self) -> Option<crate::exec::pipeline::operator::FinishWatch> {
         (!self.send_tracker.is_idle()).then(|| {
             crate::exec::pipeline::operator::FinishWatch::Notify(Arc::clone(&self.send_observable))
         })
     }
 
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.exiting = true;
+        if !self.finishing.load(Ordering::Acquire) && !self.aborting.load(Ordering::Acquire) {
+            self.cancel();
+        }
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
+    }
+    fn observe_exit(&mut self) -> ExitObservation {
+        if (self.exiting || self.aborting.load(Ordering::Acquire)) && !self.send_tracker.is_idle() {
+            ExitObservation::pending(FinishWatch::Notify(self.send_observable.clone()))
+        } else {
+            ExitObservation::exited()
+        }
+    }
     fn cancel(&mut self) {
         if self.aborting.swap(true, Ordering::AcqRel) {
             return;
@@ -1661,12 +1890,6 @@ impl DataStreamSinkOperator {
             .expect("exchange sink must be bound to an ExecutionRuntime before use")
     }
 
-    fn sync_be_number(&mut self, state: &RuntimeState) {
-        if let Some(be_number) = state.backend_num() {
-            self.be_number = be_number;
-        }
-    }
-
     fn pending_chunk_bytes_total(&self) -> usize {
         self.pending_bytes_per_dest.iter().sum()
     }
@@ -1684,7 +1907,7 @@ impl DataStreamSinkOperator {
     fn destination_gate(
         &self,
         dest: &FragmentDestination,
-    ) -> Result<Option<Arc<EdgeSendGate>>, String> {
+    ) -> ExecutionResult<Option<Arc<EdgeSendGate>>> {
         let Some(gates) = self.edge_gates.as_ref() else {
             return Ok(None);
         };
@@ -1694,9 +1917,9 @@ impl DataStreamSinkOperator {
             .cloned()
             .map(Some)
             .ok_or_else(|| {
-                format!(
+                stream_contract(format_args!(
                     "exchange destination {key} is not attributed to any outbound edge of this producer"
-                )
+                ))
             })
     }
 
@@ -1865,12 +2088,6 @@ impl DataStreamSinkOperator {
         );
     }
 
-    fn ensure_error_state(&mut self, state: &RuntimeState) {
-        if self.error_state.is_none() {
-            self.error_state = Some(state.error_state());
-        }
-    }
-
     fn current_error(&self) -> Option<ExecutionFailure> {
         self.error_state.as_ref().and_then(|state| state.error())
     }
@@ -1973,23 +2190,15 @@ impl DataStreamSinkOperator {
     /// Evaluate a compiled branch's partition keys over the whole chunk.
     /// A legacy branch returns `None` and evaluates through its arena. Row
     /// data errors and kernel failures of a key root stay typed.
-    fn compiled_partition_keys(
-        &mut self,
-        runtime_state: &RuntimeState,
-        chunk: &Chunk,
-    ) -> ExecutionResult<Option<Vec<ArrayRef>>> {
+    fn compiled_partition_keys(&mut self, chunk: &Chunk) -> ExecutionResult<Option<Vec<ArrayRef>>> {
         let Some(state) = self.compiled_partition.as_mut() else {
             return Ok(None);
         };
-        let error = self
-            .error_state
-            .as_ref()
-            .ok_or("compiled partition keys require the fragment error state")?;
-        let mut control = RuntimeKernelControl::new(Arc::clone(error));
-        control.bind_runtime_memory(runtime_state);
-        if let Some(tracker) = &self.pending_chunks_mem_tracker {
-            control.bind_mem_tracker(Arc::clone(tracker));
-        }
+        let control = self.compiled_control.as_ref().ok_or_else(|| {
+            crate::runtime::fragment::ExecutionFailure::from(
+                crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+            )
+        })?;
         compiled_instances(
             &mut state.instances,
             &state.keys.program,
@@ -1999,17 +2208,15 @@ impl DataStreamSinkOperator {
         let instances = state
             .instances
             .as_mut()
-            .ok_or("compiled partition key instances are absent")?;
+            .ok_or_else(|| stream_contract("compiled partition key instances are absent"))?;
         let mut arrays = Vec::with_capacity(instances.len());
         for (instance, site) in instances.iter_mut().zip(&state.keys.sites) {
             let array = evaluate_all(instance, *site, &chunk.record_batch(), &control)?;
             // Same refusal as the legacy sink's partition-key type check.
             if matches!(array.data_type(), DataType::LargeBinary) {
-                return Err(
-                    "VARIANT is not supported in HASH_PARTITIONED partition keys"
-                        .to_string()
-                        .into(),
-                );
+                return Err(stream_contract(
+                    "VARIANT is not supported in HASH_PARTITIONED partition keys",
+                ));
             }
             arrays.push(array);
         }
@@ -2018,6 +2225,7 @@ impl DataStreamSinkOperator {
 
     fn partition_chunk(
         &mut self,
+        ctx: &StepContext<'_>,
         chunk: &Chunk,
         compiled_keys: Option<&[ArrayRef]>,
     ) -> ExecutionResult<Vec<Vec<Chunk>>> {
@@ -2045,6 +2253,7 @@ impl DataStreamSinkOperator {
             DataStreamPartitionType::Random => {
                 // Random partition: use row indices
                 let num_rows = chunk.len();
+                check_partition_row_extent(num_rows)?;
                 let mut partition_row_indices: Vec<Vec<u32>> = vec![Vec::new(); n];
 
                 for row_idx in 0..num_rows {
@@ -2062,10 +2271,8 @@ impl DataStreamSinkOperator {
                         let factory = self.construction_factory.as_deref().ok_or(
                             crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                         )?;
-                        let control = RuntimeKernelControl::new(self.error_state.as_ref().ok_or(
-                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?.clone());
                         let new_chunk =
-                            take_partition_rows_created(chunk, row_indices, factory, &control)?;
+                            take_partition_rows_created(chunk, row_indices, factory, ctx)?;
 
                         per_dest_chunks.push(vec![new_chunk]);
                     }
@@ -2087,27 +2294,24 @@ impl DataStreamSinkOperator {
                         let factory = self.construction_factory.as_deref().ok_or(
                             crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                         )?;
-                        let control = RuntimeKernelControl::new(self.error_state.as_ref().ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?.clone());
                         partition_chunk_by_hash_arrays_created(
-                            chunk, keys, n, use_crc32, factory, &control,
+                            chunk, keys, n, use_crc32, factory, ctx,
                         )?
                     }
                     None => {
                         if self.expr_ids.is_empty() {
-                            return Err("HASH_PARTITIONED missing partition_exprs".into());
+                            return Err(stream_contract(
+                                "HASH_PARTITIONED missing partition_exprs",
+                            ));
                         }
-                        let factory = self.construction_factory.as_ref().ok_or(
+                        let factory = self.construction_factory.as_deref().ok_or(
                             crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                         )?;
                         let owner = factory.begin_input_construction(chunk)?;
-                        let error = self.error_state.as_ref().ok_or(
-                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                        )?;
-                        let control = RuntimeKernelControl::new(error.clone());
                         let evaluation = crate::exec::expr::ExprEvaluationContext::new(
                             &self.arena,
                             owner.as_ref(),
-                            &control,
+                            ctx,
                         );
                         partition_chunk_by_hash_created(
                             chunk,
@@ -2115,8 +2319,8 @@ impl DataStreamSinkOperator {
                             &evaluation,
                             n,
                             use_crc32,
-                            factory.as_ref(),
-                            &control,
+                            factory,
+                            ctx,
                         )?
                     }
                 };
@@ -2140,15 +2344,15 @@ impl DataStreamSinkOperator {
         dest: &FragmentDestination,
         mut pending: PendingPayload,
         allow_overflow: bool,
-    ) -> Result<PayloadEnqueue, String> {
+    ) -> ExecutionResult<PayloadEnqueue> {
         if dest.source_finst_id() != self.fragment_instance_id {
-            return Err(format!(
+            return Err(stream_contract(format_args!(
                 "exchange destination source fragment instance {}:{} does not match sender {}:{}",
                 dest.source_finst_id().high(),
                 dest.source_finst_id().low(),
                 self.fragment_instance_id.high(),
                 self.fragment_instance_id.low(),
-            ));
+            )));
         }
         let edge_gate = self.destination_gate(dest)?;
         match edge_gate.as_ref().map(|gate| gate.state()) {
@@ -2174,7 +2378,7 @@ impl DataStreamSinkOperator {
         let error_state = self
             .error_state
             .as_ref()
-            .ok_or_else(|| "missing runtime error state".to_string())?;
+            .ok_or_else(|| stream_contract("missing runtime error state"))?;
         if !allow_overflow
             && !self.exchange_queue().reserve_bytes_for(
                 addr.host(),
@@ -2391,18 +2595,27 @@ impl DataStreamSinkOperator {
         self.pending_payloads_per_dest = (0..dest_count).map(|_| None).collect();
     }
 
+    #[cfg(test)]
     fn buffer_chunk(&mut self, chunk: Chunk) -> ExecutionResult<()> {
-        self.buffer_chunk_with_keys(chunk, None)
+        let control = self
+            .error_state
+            .clone()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let ctx = StepContext::new(&control, &mut work);
+        self.buffer_chunk_with_keys(&ctx, chunk, None)
     }
 
     fn buffer_chunk_with_keys(
         &mut self,
+        ctx: &StepContext<'_>,
         chunk: Chunk,
         compiled_keys: Option<Vec<ArrayRef>>,
     ) -> ExecutionResult<()> {
         self.ensure_pending_buffers_initialized();
         let dests = self.destinations().to_vec();
-        let per_dest_chunks = self.partition_chunk(&chunk, compiled_keys.as_deref())?;
+        let per_dest_chunks = self.partition_chunk(ctx, &chunk, compiled_keys.as_deref())?;
         for (i, chunks) in per_dest_chunks.into_iter().enumerate() {
             if chunks.is_empty() || Self::is_pseudo_destination(&dests[i]) {
                 continue;
@@ -2440,12 +2653,12 @@ impl DataStreamSinkOperator {
         Ok(())
     }
 
-    fn drain_pending_batch(&mut self, dest_idx: usize) -> Result<(Vec<Chunk>, usize), String> {
+    fn drain_pending_batch(&mut self, dest_idx: usize) -> ExecutionResult<(Vec<Chunk>, usize)> {
         let max_bytes = self.max_transmit_batched_bytes.max(1);
         let pending = self
             .pending_per_dest
             .get_mut(dest_idx)
-            .ok_or_else(|| "pending buffer index out of range".to_string())?;
+            .ok_or_else(|| stream_contract("pending buffer index out of range"))?;
         if pending.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -2469,7 +2682,7 @@ impl DataStreamSinkOperator {
             }
             let chunk = pending
                 .pop_front()
-                .ok_or_else(|| "pending buffer empty unexpectedly".to_string())?;
+                .ok_or_else(|| stream_contract("pending buffer empty unexpectedly"))?;
             batch_bytes = batch_bytes.saturating_add(chunk_bytes);
             if first_schema.is_none() {
                 first_schema = Some(chunk.chunk_schema_ref());
@@ -2512,7 +2725,7 @@ impl DataStreamSinkOperator {
             let pending_payload = self
                 .pending_payloads_per_dest
                 .get_mut(i)
-                .ok_or_else(|| "pending payload index out of range".to_string())?
+                .ok_or_else(|| stream_contract("pending payload index out of range"))?
                 .take();
             if let Some(payload) = pending_payload {
                 match self.try_enqueue_payload(dest, payload, allow_overflow)? {
@@ -2566,6 +2779,11 @@ impl DataStreamSinkOperator {
     /// pseudo destination, or it withdrew), never because it is not ready yet.
     /// That is what makes it sound to latch "the seal is sent" on return.
     fn send_eos(&mut self) -> ExecutionResult<()> {
+        // The latched last-driver verdict survives every continuation. Once
+        // every exact destination received its marker, no later poll resends it.
+        if self.end_of_stream_sent.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.ensure_pending_buffers_initialized();
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         let mut sealed = 0_usize;
@@ -2592,19 +2810,17 @@ impl DataStreamSinkOperator {
                 // some destinations and silently not others would latch "the
                 // seal is sent" over a sender the receiver keeps counting.
                 Some(EdgeSendState::AwaitingPermission) => {
-                    return Err(format!(
-                        "exchange send EOS reached destination {} whose edge is still awaiting \
-                         permission",
+                    return Err(stream_contract(format_args!(
+                        "exchange send EOS reached destination {} whose edge is still awaiting permission",
                         dest.finst_id()
-                    )
-                    .into());
+                    )));
                 }
                 None | Some(EdgeSendState::Open) => {}
             }
             match self.transmit_partition(i, dest, &[], true, true)? {
                 PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => sealed += 1,
                 PayloadEnqueue::NoCapacity(_) => {
-                    return Err("exchange send EOS unexpectedly blocked".to_string().into());
+                    return Err(stream_contract("exchange send EOS unexpectedly blocked"));
                 }
             }
         }
@@ -2629,32 +2845,8 @@ impl DataStreamSinkOperator {
     }
 }
 
-impl ProcessorOperator for DataStreamSinkOperator {
-    fn finishing_wait(&self) -> FinishingWait {
-        if self.aborting.load(Ordering::Acquire) {
-            return FinishingWait::Complete;
-        }
-        if !self.finishing.load(Ordering::Acquire) {
-            return FinishingWait::Complete;
-        }
-        // Permission outranks owed output, and the order is load-bearing in
-        // both directions. While an edge is closed a flush can only park the
-        // payload again, so reporting owed output would spin the driver over
-        // an obstacle only the frontend's edge-open decision can clear. Once
-        // the edge is open, a parked payload and an unsent end-of-stream are
-        // output only this operator's own next turn can push -- and reporting
-        // *that* as a wait for an external event is what parked the driver
-        // forever with the rows in hand.
-        if self.awaits_edge_permission() {
-            return FinishingWait::ExternalEvent;
-        }
-        if self.has_pending_data() || self.owes_end_of_stream() {
-            return FinishingWait::OwedOutput;
-        }
-        FinishingWait::Complete
-    }
-
-    fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
+impl InputEncodingPolicy for DataStreamSinkOperator {
+    fn retains_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
         is_low_cardinality_exchange_dictionary(data_type)
             && matches!(
                 self.input.output_partition_type,
@@ -2664,8 +2856,9 @@ impl ProcessorOperator for DataStreamSinkOperator {
                     | DataStreamPartitionType::BucketShuffleHashPartitioned
             )
     }
-
-    fn need_input(&self) -> bool {
+}
+impl DataStreamSinkOperator {
+    fn input_admissible(&self) -> bool {
         if self.aborting.load(Ordering::Acquire) {
             return false;
         }
@@ -2690,45 +2883,7 @@ impl ProcessorOperator for DataStreamSinkOperator {
         }
         true
     }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if !self.prepared {
-            return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
-        }
-        if self.aborting.load(Ordering::Acquire) {
-            return Err("exchange sink was cancelled".to_string().into());
-        }
-        if let Some(err) = self.init_error.as_ref() {
-            return Err(err.clone().into());
-        }
-        if self.finished.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.sync_be_number(_state);
-        self.ensure_error_state(_state);
-        if let Some(err) = self.current_error() {
-            return Err(err);
-        }
-        self.init_profile_if_needed();
-        self.flush_pending(false, false)?;
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        let compiled_keys = self.compiled_partition_keys(_state, &chunk)?;
-        self.buffer_chunk_with_keys(chunk, compiled_keys)?;
-        self.flush_pending(false, false)?;
-        Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+    fn advance_finish(&mut self) -> ExecutionResult<()> {
         use tracing::debug;
 
         if self.aborting.load(Ordering::Acquire) {
@@ -2736,13 +2891,11 @@ impl ProcessorOperator for DataStreamSinkOperator {
         }
 
         if let Some(err) = self.init_error.as_ref() {
-            return Err(err.clone().into());
+            return Err(err.clone());
         }
         if self.finished.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.sync_be_number(_state);
-        self.ensure_error_state(_state);
         if let Some(err) = self.current_error() {
             return Err(err);
         }
@@ -2851,9 +3004,135 @@ impl ProcessorOperator for DataStreamSinkOperator {
         self.maybe_mark_finished();
         Ok(())
     }
-
-    fn sink_observable(&self) -> Option<Arc<Observable>> {
-        Some(Arc::clone(&self.send_observable))
+    fn next_work(&self, observed_generation: u64) -> NextStep {
+        if self.aborting.load(Ordering::Acquire) {
+            return NextStep::Finished;
+        }
+        let finishing = self.finishing.load(Ordering::Acquire);
+        // A non-last drained driver owes no sender EOS. The last driver keeps
+        // the mandatory marker until its exact destinations permit it.
+        if finishing
+            && self.finish_counted.load(Ordering::Acquire)
+            && !self.has_pending_data()
+            && !self.owes_end_of_stream()
+        {
+            return NextStep::Finished;
+        }
+        let blocked = (finishing && self.awaits_edge_permission())
+            || (self.has_pending_payloads() && !self.pending_payloads_can_send());
+        if !blocked
+            && ((finishing && (self.has_pending_data() || self.owes_end_of_stream()))
+                || (!finishing && self.has_pending_payloads() && self.pending_payloads_can_send()))
+        {
+            return NextStep::Runnable;
+        }
+        if !finishing && self.input_admissible() {
+            return NextStep::NeedInput;
+        }
+        NextStep::Wait(WaitFact {
+            reason: if finishing {
+                WaitReason::Finish
+            } else {
+                WaitReason::Output
+            },
+            observable: self.send_observable.clone(),
+            observed_generation,
+            deadline: None,
+        })
+    }
+}
+impl SinkKernel for DataStreamSinkOperator {
+    fn control_observable(&self) -> Option<Arc<Observable>> {
+        Some(self.send_observable.clone())
+    }
+    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        if let Some(error) = self.current_error() {
+            return Err(error);
+        }
+        if !self.destinations().is_empty()
+            && self.destinations().iter().enumerate().all(|(index, dest)| {
+                Self::is_pseudo_destination(dest) || self.destination_withdrawn(index)
+            })
+        {
+            self.cancel();
+            return Ok(ControlStep::Withdrawn);
+        }
+        Ok(ControlStep::Active)
+    }
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        if !self.prepared {
+            return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
+        }
+        if let Some(error) = self.current_error() {
+            return Err(error);
+        }
+        let observed_generation = self.send_observable.generation();
+        if self.input_admissible() {
+            Ok(None)
+        } else {
+            Ok(Some(AdmissionNext::Wait(WaitFact {
+                reason: WaitReason::Output,
+                observable: self.send_observable.clone(),
+                observed_generation,
+                deadline: None,
+            })))
+        }
+    }
+    fn consume(
+        &mut self,
+        _ctx: &mut StepContext<'_>,
+        chunk: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let generation = self.send_observable.generation();
+        let rows = chunk.chunk().len() as u64;
+        let chunk = chunk.into_uncovered_chunk()?;
+        if !self.prepared {
+            return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
+        }
+        if self.aborting.load(Ordering::Acquire) {
+            return Err(novarocks_functions::KernelFailure::Cancelled.into());
+        }
+        if let Some(err) = self.init_error.as_ref() {
+            return Err(err.clone());
+        }
+        if self.finished.load(Ordering::Acquire) {
+            return Ok(SinkStep::new(self.next_work(generation), 0));
+        }
+        if let Some(err) = self.current_error() {
+            return Err(err);
+        }
+        self.init_profile_if_needed();
+        self.flush_pending(false, false)?;
+        if chunk.is_empty() {
+            return Ok(SinkStep::new(self.next_work(generation), 0));
+        }
+        let compiled_keys = self.compiled_partition_keys(&chunk)?;
+        self.buffer_chunk_with_keys(_ctx, chunk, compiled_keys)?;
+        self.flush_pending(false, false)?;
+        Ok(SinkStep::new(self.next_work(generation), rows))
+    }
+    fn poll(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        let generation = self.send_observable.generation();
+        if !ctx.work().try_consume(1) {
+            return Ok(SinkStep::new(NextStep::Yield, 0));
+        }
+        if let Some(error) = self.current_error() {
+            return Err(error);
+        }
+        if self.finishing.load(Ordering::Acquire) {
+            self.advance_finish()?;
+        } else {
+            self.flush_pending(false, false)?;
+        }
+        Ok(SinkStep::new(self.next_work(generation), 0))
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        self.finishing.store(true, Ordering::Release);
+        SinkKernel::poll(self, ctx)
     }
 }
 
@@ -2979,10 +3258,11 @@ fn project_chunk_by_slot_ids_with_creation(
             &[],
             ArrayNormalizationStep::InspectConstructionWork { units: 1 },
         )?;
-        let index = chunk
-            .chunk_schema()
-            .index_of(*slot_id)
-            .ok_or_else(|| format!("output_columns slot id {slot_id} missing from chunk schema"))?;
+        let index = chunk.chunk_schema().index_of(*slot_id).ok_or_else(|| {
+            stream_contract(format_args!(
+                "output_columns slot id {slot_id} missing from chunk schema"
+            ))
+        })?;
         slots.push(chunk.chunk_schema().slots()[index].clone());
         columns.push(chunk.columns()[index].clone());
     }
@@ -3097,59 +3377,6 @@ fn split_oversized_chunks_with_creation(
 }
 
 #[cfg(test)]
-fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk, String> {
-    if slot_ids.is_empty() || chunk.is_empty() {
-        return Ok(chunk.clone());
-    }
-
-    let schema = chunk.schema();
-    let slot_map = chunk.slot_id_to_index();
-
-    let mut fields = Vec::with_capacity(slot_ids.len());
-    let mut cols = Vec::with_capacity(slot_ids.len());
-
-    for slot_id in slot_ids {
-        let idx = slot_map.get(slot_id).copied().ok_or_else(|| {
-            format!(
-                "output_columns slot id {} not found in chunk schema (slot_ids={:?})",
-                slot_id,
-                slot_map.keys().collect::<Vec<_>>()
-            )
-        })?;
-        let field = schema
-            .fields()
-            .get(idx)
-            .ok_or_else(|| format!("slot id {} mapped to invalid index {}", slot_id, idx))?
-            .as_ref()
-            .clone();
-        let col =
-            chunk.columns().get(idx).cloned().ok_or_else(|| {
-                format!("slot id {} mapped to invalid column index {}", slot_id, idx)
-            })?;
-        fields.push(field);
-        cols.push(col);
-    }
-
-    let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
-    let projected_slots = slot_ids
-        .iter()
-        .map(|slot_id| {
-            chunk.chunk_schema().slot(*slot_id).cloned().ok_or_else(|| {
-                format!(
-                    "output_columns slot id {} missing from chunk schema",
-                    slot_id
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let _ = new_schema;
-    Chunk::try_new_with_columns(
-        Arc::new(crate::exec::chunk::ChunkSchema::try_new(projected_slots)?),
-        cols,
-    )
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
@@ -3213,6 +3440,8 @@ mod tests {
             compiled_partition: None,
             construction_factory: None,
             prepared: false,
+            exiting: false,
+            compiled_control: None,
         }
     }
 
@@ -3226,6 +3455,9 @@ mod tests {
             crate::runtime::mem_tracker::MemTracker::new_root("prepared exchange sink fixture"),
             error,
         ).expect("actual sink creator");
+        let mut control = RuntimeKernelControl::new(op.error_state.as_ref().unwrap().clone());
+        control.bind_runtime_memory(&RuntimeState::default());
+        op.compiled_control = Some(control);
         op.set_construction_factory(factory);
         op.prepare().expect("actual sink preparation");
     }
@@ -3253,7 +3485,7 @@ mod tests {
         let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
         // Explicit pure frozen source author; the runtime sender derives new
         // headers only through its genuinely installed creator above.
-        Chunk::try_new_typed_with_columns_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_observed::<ExecutionFailure, _>(
             schema,
             vec![Arc::new(arrow::array::Int64Array::from_iter_values(
                 0..rows as i64,
@@ -3262,6 +3494,26 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn hash_placement_refuses_missing_destination_and_misaligned_key_rows() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let chunk = typed_int64_chunk(2);
+        for crc32 in [false, true] {
+            let error = partition_chunk_by_hash_arrays(&chunk, &[], 0, crc32).unwrap_err();
+            assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(error.failure_fact().reason().code(), 358);
+            let key: arrow::array::ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1]));
+            let error = partition_chunk_by_hash_arrays(&chunk, &[key], 2, crc32).unwrap_err();
+            assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(error.failure_fact().reason().code(), 358);
+            assert!(
+                error
+                    .detail()
+                    .contains("key rows 1 differ from input rows 2")
+            );
+        }
     }
 
     struct BlockingEosTransmitter {
@@ -3307,42 +3559,62 @@ mod tests {
     #[test]
     fn normal_eos_does_not_finish_until_blocked_transmit_returns() {
         let (mut sink, transmitter, entered, release) = blocked_eos_sink();
-        ProcessorOperator::set_finishing(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        let data =
+            SinkKernel::finish_for_test(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        assert!(
+            matches!(data.next, NextStep::Finished),
+            "the marker is enqueued, not yet transmitted"
+        );
         entered
             .recv_timeout(Duration::from_secs(2))
             .expect("EOS transmit started");
-        assert!(!Operator::is_finished(&sink));
-        assert!(Operator::pending_finish(&sink).is_some());
-
+        sink.begin_exit().expect("observe the real send owner");
+        assert!(matches!(
+            sink.observe_exit().progress,
+            ExitProgress::Pending(_)
+        ));
         release.send(()).expect("release real EOS transmit");
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !Operator::is_finished(&sink) && Instant::now() < deadline {
-            std::thread::yield_now();
+        loop {
+            match sink.observe_exit().progress {
+                ExitProgress::Exited => break,
+                ExitProgress::Pending(_) | ExitProgress::Unresolved(_) => {
+                    assert!(Instant::now() < deadline, "EOS transmit exit deadline");
+                    std::thread::yield_now();
+                }
+            }
         }
-        assert!(Operator::is_finished(&sink));
-        assert!(Operator::pending_finish(&sink).is_none());
         assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
     fn cancellation_revokes_eos_debt_but_waits_for_blocked_transmit() {
         let (mut sink, transmitter, entered, release) = blocked_eos_sink();
-        ProcessorOperator::set_finishing(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        let data =
+            SinkKernel::finish_for_test(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        assert!(matches!(data.next, NextStep::Finished));
         entered
             .recv_timeout(Duration::from_secs(2))
             .expect("EOS transmit started");
-        Operator::cancel(&mut sink);
-        assert!(!Operator::is_finished(&sink));
-        assert!(Operator::pending_finish(&sink).is_some());
-        assert!(!ProcessorOperator::need_input(&sink));
-
+        sink.cancel();
+        sink.begin_exit()
+            .expect("retain the inflight send after cancellation");
+        assert!(matches!(
+            sink.observe_exit().progress,
+            ExitProgress::Pending(_)
+        ));
+        assert!(!sink.input_admissible());
         release.send(()).expect("release real EOS transmit");
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !Operator::is_finished(&sink) && Instant::now() < deadline {
-            std::thread::yield_now();
+        loop {
+            match sink.observe_exit().progress {
+                ExitProgress::Exited => break,
+                ExitProgress::Pending(_) | ExitProgress::Unresolved(_) => {
+                    assert!(Instant::now() < deadline, "cancelled send exit deadline");
+                    std::thread::yield_now();
+                }
+            }
         }
-        assert!(Operator::is_finished(&sink));
-        assert!(Operator::pending_finish(&sink).is_none());
         assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
     }
 
@@ -3353,7 +3625,7 @@ mod tests {
         use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
 
         let (mut sink, transmitter, entered, release) = blocked_eos_sink();
-        ProcessorOperator::set_finishing(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        SinkKernel::finish_for_test(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
         entered
             .recv_timeout(Duration::from_secs(2))
             .expect("EOS transmit started");
@@ -3361,14 +3633,18 @@ mod tests {
         let state = Arc::new(RuntimeState::default());
         let driver = PipelineDriver::new(
             1,
-            vec![Box::new(sink)],
+            vec![Box::new(
+                crate::exec::pipeline::shape::Transform::hydrating(sink),
+            )],
             None,
             Vec::new(),
             Arc::clone(&state),
             None,
         );
-        let completion = FragmentCompletion::new(1);
-        assert!(completion.fail("injected task shutdown".to_string()));
+        let completion = FragmentCompletion::new(1, state.error_state());
+        assert!(
+            completion.fail(crate::exec::pipeline::driver_failure::DriverFailure::ExecutorShutdown)
+        );
         let context = Arc::new(FragmentContext::new(None, state, None, None, None, None));
         let task = DriverTask::new(
             driver,
@@ -3376,7 +3652,7 @@ mod tests {
             context,
             Duration::from_millis(10),
         );
-        let task = task
+        let mut task = task
             .finish_due_to_abort()
             .expect("blocked transmit keeps task pending");
         assert!(completion.stopped_fact().is_none());
@@ -3502,7 +3778,7 @@ mod tests {
             )
             .unwrap(),
         );
-        Chunk::try_new_typed_with_columns_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
             schema,
             Vec::new(),
             row_count,
@@ -3518,8 +3794,8 @@ mod tests {
         let large_utf8_dict =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8));
 
-        assert!(op.accepts_encoded_column(SlotId::new(91), &utf8_dict));
-        assert!(op.accepts_encoded_column(SlotId::new(91), &large_utf8_dict));
+        assert!(op.retains_encoded_column(SlotId::new(91), &utf8_dict));
+        assert!(op.retains_encoded_column(SlotId::new(91), &large_utf8_dict));
     }
 
     #[test]
@@ -3529,9 +3805,9 @@ mod tests {
         let wrong_value =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32));
 
-        assert!(!op.accepts_encoded_column(SlotId::new(91), &wrong_key));
-        assert!(!op.accepts_encoded_column(SlotId::new(91), &wrong_value));
-        assert!(!op.accepts_encoded_column(SlotId::new(91), &DataType::Utf8));
+        assert!(!op.retains_encoded_column(SlotId::new(91), &wrong_key));
+        assert!(!op.retains_encoded_column(SlotId::new(91), &wrong_value));
+        assert!(!op.retains_encoded_column(SlotId::new(91), &DataType::Utf8));
     }
 
     #[test]
@@ -3540,15 +3816,15 @@ mod tests {
         op.input.output_partition_type = DataStreamPartitionType::HashPartitioned;
         let utf8_dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
 
-        assert!(op.accepts_encoded_column(SlotId::new(91), &utf8_dict));
+        assert!(op.retains_encoded_column(SlotId::new(91), &utf8_dict));
     }
 
     #[test]
     fn bind_runtime_state_uses_backend_num_as_be_number() {
         let mut op = make_test_operator();
-        let state = RuntimeState::new(None, None, None, None, Some(7), None, None);
+        let state = RuntimeState::for_local_execution(None, None, None, None, Some(7), None, None);
 
-        Operator::bind_runtime_state(&mut op, &state).expect("bind runtime state");
+        OperatorLifecycle::bind_runtime_state(&mut op, &state).expect("bind runtime state");
 
         assert_eq!(op.sender_id, 11);
         assert_eq!(op.be_number, 7);
@@ -3772,8 +4048,17 @@ mod tests {
             panic!("an unattributed destination must not send");
         };
         assert!(
-            error.contains("not attributed to any outbound edge"),
+            error
+                .detail()
+                .contains("not attributed to any outbound edge"),
             "{error}"
+        );
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(error.failure_fact().reason().code(), 358);
+        assert!(
+            matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Domain(cause)
+            if cause.downcast_ref::<StreamStepContract>().is_some())
         );
     }
 
@@ -3789,8 +4074,8 @@ mod tests {
 
         prepare_test_operator(&mut op);
         let mut pushed = 0;
-        while ProcessorOperator::need_input(&op) && pushed < 8 {
-            ProcessorOperator::push_chunk(&mut op, &state, typed_int64_chunk(8))
+        while op.input_admissible() && pushed < 8 {
+            SinkKernel::consume_for_test(&mut op, &state, typed_int64_chunk(8))
                 .expect("push chunk");
             pushed += 1;
         }
@@ -3821,7 +4106,7 @@ mod tests {
 
         open_edges(&op, &[edge_id(1)]);
         assert!(
-            ProcessorOperator::need_input(&op),
+            op.input_admissible(),
             "opening the edge releases the backpressure"
         );
     }
@@ -3832,80 +4117,76 @@ mod tests {
     /// So the finishing drain waits, and the driver is told to come back.
     #[test]
     fn finishing_before_an_edge_opens_waits_instead_of_failing() {
+        let runtime = RuntimeState::default();
         let mut op = make_test_operator();
-        let dest = make_test_destination();
-        gate_destinations(&mut op, vec![dest]);
+        gate_destinations(&mut op, vec![make_test_destination()]);
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
         prepare_test_operator(&mut op);
         op.buffer_chunk(typed_int64_chunk(8)).expect("buffer chunk");
-
-        op.flush_pending(true, true)
-            .expect("the finishing drain parks a closed edge rather than failing");
-        assert!(
-            op.current_error().is_none(),
-            "waiting for permission is not the producer's error"
-        );
-        assert!(
-            op.awaits_edge_permission(),
-            "the sink must still be waiting on its edge"
-        );
+        let parked =
+            SinkKernel::finish_for_test(&mut op, &runtime).expect("closed edge parks finalization");
+        let NextStep::Wait(wait) = parked.next else {
+            panic!("closed edge must name its work wait")
+        };
+        assert!(matches!(wait.reason, WaitReason::Finish));
+        assert!(op.current_error().is_none(), "permission is not a failure");
+        assert!(op.awaits_edge_permission());
         assert_eq!(
             op.exchange_queue().inflight_bytes(),
             0,
-            "a closed edge reserved nothing while it waited"
-        );
-
-        op.finishing.store(true, Ordering::Release);
-        assert_eq!(
-            ProcessorOperator::finishing_wait(&op),
-            FinishingWait::ExternalEvent,
-            "a closed edge is an obstacle this operator cannot clear, so the driver parks"
+            "closed edge reserved nothing"
         );
         assert!(
             !op.maybe_mark_finished(),
-            "the sink cannot be finished while it still owes output"
+            "buffered output still belongs to this driver"
         );
-
         open_edges(&op, &[edge_id(1)]);
-        assert!(!op.awaits_edge_permission());
-        assert_eq!(
-            ProcessorOperator::finishing_wait(&op),
-            FinishingWait::OwedOutput,
-            "with the edge open the parked payload is output only this operator can push, \
-             so the driver must give it a turn rather than park again"
+        assert!(
+            wait.is_ready(),
+            "edge publication invalidates the exact reported wait"
         );
-        op.flush_pending(true, true)
-            .expect("the drain now completes");
-        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
+        assert!(
+            matches!(
+                op.next_work(op.send_observable.generation()),
+                NextStep::Runnable
+            ),
+            "only the worker can drain the now-admitted payload"
+        );
+        let completed =
+            SinkKernel::poll_for_test(&mut op, &runtime).expect("resume the same finalization");
+        assert!(matches!(completed.next, NextStep::Finished));
+        assert!(!op.has_pending_data());
+        assert!(!op.owes_end_of_stream());
     }
 
     /// The same race with nothing buffered. Only an end-of-stream is owed, and
     /// forgetting it would leave the destination counting senders forever.
     #[test]
     fn a_closed_edge_owed_only_an_end_of_stream_still_blocks_finishing() {
+        let runtime = RuntimeState::default();
         let mut op = make_test_operator();
-        let dest = make_test_destination();
-        gate_destinations(&mut op, vec![dest]);
+        gate_destinations(&mut op, vec![make_test_destination()]);
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
         prepare_test_operator(&mut op);
-
-        assert!(
-            !op.has_pending_data(),
-            "nothing is buffered, so only the end-of-stream is outstanding"
-        );
-        op.finishing.store(true, Ordering::Release);
-        assert!(
-            !op.maybe_mark_finished(),
-            "an unsent end-of-stream is still output this sink owes"
-        );
-        assert_eq!(
-            ProcessorOperator::finishing_wait(&op),
-            FinishingWait::ExternalEvent
-        );
-
+        assert!(!op.has_pending_data(), "only EOS is owed");
+        let parked = SinkKernel::finish_for_test(&mut op, &runtime).expect("signal EOS once");
+        let NextStep::Wait(wait) = parked.next else {
+            panic!("closed edge must defer its marker")
+        };
+        assert!(matches!(wait.reason, WaitReason::Finish));
+        assert!(!op.maybe_mark_finished());
+        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 0);
         open_edges(&op, &[edge_id(1)]);
-        op.send_eos().expect("the end-of-stream now goes out");
-        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
+        assert!(wait.is_ready());
+        assert_eq!(
+            op.shared_sequence.load(Ordering::SeqCst),
+            0,
+            "notification cannot send EOS"
+        );
+        let completed = SinkKernel::poll_for_test(&mut op, &runtime).expect("resume EOS");
+        assert!(matches!(completed.next, NextStep::Finished));
+        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 1);
+        assert!(!op.owes_end_of_stream());
     }
 
     /// The defect this catches: a sink that deferred its end-of-stream while
@@ -3930,56 +4211,43 @@ mod tests {
         let runtime = RuntimeState::default();
         let mut op = make_test_operator();
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
-        // One driver, so this operator is the one that completes the set and
-        // therefore the one that owes the marker.
         gate_destinations(&mut op, vec![make_test_destination()]);
         prepare_test_operator(&mut op);
-
-        // Nothing buffered: this producer's input drained before the frontend
-        // decided the edge, which is the ordinary shape for a fragment
-        // instance that read no matching rows at all.
-        ProcessorOperator::set_finishing(&mut op, &runtime)
-            .expect("a closed edge parks the seal rather than failing");
+        let parked =
+            SinkKernel::finish_for_test(&mut op, &runtime).expect("closed edge parks the seal");
+        let NextStep::Wait(wait) = parked.next else {
+            panic!("seal is waiting for its destination")
+        };
         assert!(!op.has_pending_data());
+        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 0);
+        open_edges(&op, &[edge_id(1)]);
+        assert!(wait.is_ready());
+        assert!(matches!(
+            op.next_work(op.send_observable.generation()),
+            NextStep::Runnable
+        ));
         assert_eq!(
             op.shared_sequence.load(Ordering::SeqCst),
             0,
-            "no frame may leave a sink whose edge has not been opened"
+            "an opened gate alone cannot satisfy the mandatory marker"
         );
-
-        open_edges(&op, &[edge_id(1)]);
-
-        // Exactly what the scheduler asks between driver turns, and what the
-        // driver itself asks at the top of its next turn.
-        assert!(
-            !Operator::is_finished(&op),
-            "a sink that still owes its end-of-stream has not finished"
-        );
-        assert_eq!(
-            ProcessorOperator::finishing_wait(&op),
-            FinishingWait::OwedOutput,
-            "the driver must be told to come back and send it"
-        );
-        assert!(
-            ProcessorOperator::need_input(&op),
-            "the sink is not blocked; it is owed one more turn"
-        );
-
-        // The turn the driver is now still allowed to take.
-        ProcessorOperator::set_finishing(&mut op, &runtime).expect("the seal now goes out");
+        let completed =
+            SinkKernel::poll_for_test(&mut op, &runtime).expect("worker sends the seal");
+        assert!(matches!(completed.next, NextStep::Finished));
         assert_eq!(
             op.shared_sequence.load(Ordering::SeqCst),
             1,
-            "exactly one frame left this sink, and with nothing buffered it is the end-of-stream"
+            "one EOS frame"
         );
-        assert!(
-            !op.owes_end_of_stream(),
-            "the sink no longer owes the marker once it has been enqueued"
+        assert!(!op.owes_end_of_stream());
+        let repeated =
+            SinkKernel::poll_for_test(&mut op, &runtime).expect("completed continuation is stable");
+        assert!(matches!(repeated.next, NextStep::Finished));
+        assert_eq!(
+            op.shared_sequence.load(Ordering::SeqCst),
+            1,
+            "EOS is never replayed"
         );
-        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
-        // Whether the operator is *finished* additionally waits for the send
-        // queue to hand the frame off, which is asynchronous and not this
-        // test's subject.
     }
 
     /// A sink can enter finishing while it still has buffered rows. Once the
@@ -3994,20 +4262,15 @@ mod tests {
         gate_destinations(&mut op, vec![make_test_destination()]);
         prepare_test_operator(&mut op);
         open_edges(&op, &[edge_id(1)]);
-
-        // Model the instant after a previously parked buffer drains, before
-        // the driver retries `set_finishing` and reports itself to the set.
+        // The continuation after the last local payload drain must still count
+        // this driver and publish the one sender-wide marker.
         op.finishing.store(true, Ordering::Release);
         assert!(!op.finish_counted.load(Ordering::SeqCst));
         assert!(!op.has_pending_data());
-        assert!(
-            !Operator::is_finished(&op),
-            "a drained but uncounted driver still owes the shared EOS"
-        );
-        assert!(ProcessorOperator::need_input(&op));
-
-        ProcessorOperator::set_finishing(&mut op, &runtime)
-            .expect("the next turn counts the driver and sends EOS");
+        assert!(!op.end_of_stream_sent.load(Ordering::SeqCst));
+        let completed =
+            SinkKernel::poll_for_test(&mut op, &runtime).expect("count and seal in the work step");
+        assert!(matches!(completed.next, NextStep::Finished));
         assert!(op.finish_counted.load(Ordering::SeqCst));
         assert!(op.end_of_stream_sent.load(Ordering::SeqCst));
         assert_eq!(op.finish_state.remaining_drivers.load(Ordering::SeqCst), 0);
@@ -4025,54 +4288,51 @@ mod tests {
     #[test]
     fn retrying_set_finishing_while_an_edge_is_closed_does_not_consume_the_driver_set() {
         let state = Arc::new(DataStreamSinkFinishState::default());
-        // Two drivers on one sink, both sharing the frozen finish state.
         let runtime = RuntimeState::default();
-
         let mut first = make_test_operator();
-        first.finish_state = Arc::clone(&state);
+        first.finish_state = state.clone();
         first.error_state = Some(Arc::new(RuntimeErrorState::default()));
         gate_destinations(&mut first, vec![make_test_destination()]);
-
         let mut second = make_test_operator();
         second.driver_id = 1;
-        second.finish_state = Arc::clone(&state);
+        second.finish_state = state.clone();
         second.error_state = Some(Arc::new(RuntimeErrorState::default()));
         gate_destinations(&mut second, vec![make_test_destination()]);
         prepare_test_operator(&mut first);
         prepare_test_operator(&mut second);
-
-        // The first driver drains while the edge is still closed and is
-        // retried, exactly as the pipeline driver retries a pending finish.
-        for _ in 0..8 {
-            ProcessorOperator::set_finishing(&mut first, &runtime)
-                .expect("a closed edge parks the drain rather than failing");
-            assert!(
-                ProcessorOperator::finishing_wait(&first).is_pending(),
-                "the driver is told to come back while the edge is closed"
-            );
+        let completed =
+            SinkKernel::finish_for_test(&mut first, &runtime).expect("first driver drains");
+        assert!(
+            matches!(completed.next, NextStep::Finished),
+            "a drained non-last driver owes no sender EOS"
+        );
+        for _ in 0..7 {
+            let repeated =
+                SinkKernel::poll_for_test(&mut first, &runtime).expect("completed continuation");
+            assert!(matches!(repeated.next, NextStep::Finished));
         }
         assert_eq!(
             state.remaining_drivers.load(Ordering::SeqCst),
             1,
-            "eight retries by one driver must count once"
+            "eight observations count once"
         );
-
-        // The second driver finishes, which completes the set.
-        ProcessorOperator::set_finishing(&mut second, &runtime).expect("the second driver drains");
+        let parked = SinkKernel::finish_for_test(&mut second, &runtime)
+            .expect("last driver owes the marker");
+        let NextStep::Wait(wait) = parked.next else {
+            panic!("last driver must wait for the exact edge")
+        };
         assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 0);
-
-        // The edge opens. The driver that completed the set still owes the
-        // end-of-stream, and its next retry sends it.
+        assert_eq!(second.shared_sequence.load(Ordering::SeqCst), 0);
         open_edges(&second, &[edge_id(1)]);
-        ProcessorOperator::set_finishing(&mut second, &runtime)
-            .expect("the end-of-stream now goes out");
-        assert!(
-            !ProcessorOperator::finishing_wait(&second).is_pending(),
-            "the sink no longer owes output once the end-of-stream is enqueued"
-        );
+        assert!(wait.is_ready());
+        let completed = SinkKernel::poll_for_test(&mut second, &runtime)
+            .expect("resume the last driver's seal");
+        assert!(matches!(completed.next, NextStep::Finished));
+        assert!(!second.owes_end_of_stream());
+        assert_eq!(second.shared_sequence.load(Ordering::SeqCst), 1);
         assert!(
             !state.force_eos_sent.load(Ordering::SeqCst),
-            "the one-shot guard is for a genuine accounting error, not for retries"
+            "no false driver-set accounting failure"
         );
     }
 
@@ -4109,7 +4369,7 @@ mod tests {
             .buffer_chunk(typed_int64_chunk(8))
             .expect("buffer chunk");
         assert!(holder.has_pending_chunks());
-        ProcessorOperator::set_finishing(&mut holder, &runtime)
+        SinkKernel::finish_for_test(&mut holder, &runtime)
             .expect("a closed edge parks the drain rather than failing");
         assert!(
             holder.has_pending_data(),
@@ -4123,7 +4383,7 @@ mod tests {
 
         // Its sibling finishing must therefore not complete the set, and must
         // not seal the sender over rows the first driver still holds.
-        ProcessorOperator::set_finishing(&mut sibling, &runtime)
+        SinkKernel::finish_for_test(&mut sibling, &runtime)
             .expect("the sibling drains with nothing to hand over");
         assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 1);
         assert!(
@@ -4135,7 +4395,7 @@ mod tests {
         // counts, completes the set, and only then does the marker follow the
         // frames it seals.
         open_edges(&holder, &[edge_id(1)]);
-        ProcessorOperator::set_finishing(&mut holder, &runtime)
+        SinkKernel::finish_for_test(&mut holder, &runtime)
             .expect("the parked rows and then the seal go out");
         assert!(!holder.has_pending_data());
         assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 0);
@@ -4727,8 +4987,8 @@ mod tests {
                 ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
             ));
             assert!(!sink.prepared);
-            let state = RuntimeState::new(None, None, None, None, None, None, None);
-            let refusal = sink.push_chunk(&state, source.clone()).unwrap_err();
+            let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
+            let refusal = sink.consume_for_test(&state, source.clone()).unwrap_err();
             assert!(matches!(
                 refusal.cause(),
                 ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
@@ -4740,6 +5000,29 @@ mod tests {
             drop(source);
             drop(factory);
             assert_eq!(tracker.current(), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod partition_extent_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    #[test]
+    fn selection_address_extent_is_representation_not_sql_numeric_overflow() {
+        assert!(check_partition_row_extent(0).is_ok());
+        assert!(check_partition_row_extent(1).is_ok());
+        if usize::BITS > 32 {
+            let last_legal_rows = (u64::from(u32::MAX) + 1) as usize;
+            assert!(check_partition_row_extent(last_legal_rows).is_ok());
+            let failure = check_partition_row_extent(last_legal_rows + 1).unwrap_err();
+            let fact = failure.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Representation);
+            assert_eq!(fact.reason().code(), 364);
+            let extent = fact.representation().unwrap();
+            assert_eq!(extent.boundary, RepresentationBoundary::SingleOutput);
+            assert_eq!(extent.required, Some(u64::from(u32::MAX) + 1));
+            assert_eq!(extent.extent_limit, Some(u64::from(u32::MAX)));
         }
     }
 }
@@ -4820,17 +5103,15 @@ mod created_partition_regressions {
         let source = input();
         let factory = factory();
         let state = RuntimeState::default();
-        state
-            .error_state()
-            .set_error("partition fragment failed".to_string());
+        let original = crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::Operational(
+                novarocks_functions::KernelDiagnostic::new("partition fragment failed"),
+            ),
+        );
+        state.error_state().set_error(original.clone());
         let control = RuntimeKernelControl::new(state.error_state());
         let error =
             take_partition_rows_created(&source, &[1, 3], factory.as_ref(), &control).unwrap_err();
-        assert_eq!(
-            error,
-            crate::runtime::fragment::ExecutionFailure::from(
-                "partition fragment failed".to_string()
-            )
-        );
+        assert_eq!(error, original);
     }
 }

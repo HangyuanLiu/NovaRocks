@@ -115,7 +115,7 @@ impl PureCompileControl for Control {
             .fetch_max(self.resources.snapshot().data_used_bytes, Ordering::Relaxed);
         let mut c = self.calls.lock().unwrap();
         *c += 1;
-        if let Some((at, cause)) = self.refuse
+        if let Some((at, cause)) = self.refuse.clone()
             && *c == at
         {
             return Err(cause);
@@ -447,10 +447,13 @@ fn sql_dependency_original_binding_record_every_control_refusal_has_no_footer_or
                     &mut source_work,
                 )
                 .unwrap();
-                let control = Control::new(resources.clone(), cause.map(|cause| (at + 1, cause)));
+                let control = Control::new(
+                    resources.clone(),
+                    cause.clone().map(|cause| (at + 1, cause)),
+                );
                 let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
                 let result = writer.write_bindings(encoded, &mut stock, 2, 91, &mut work);
-                match cause {
+                match cause.clone() {
                     None => {
                         result.unwrap();
                         count = *control.calls.lock().unwrap() - 1;

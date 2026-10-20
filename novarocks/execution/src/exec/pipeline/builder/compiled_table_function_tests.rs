@@ -829,12 +829,12 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
 }
 
 /// Prepare and run the program with an explicit chunk size; a preparation
-/// or execution failure retains its original typed cause.
+/// or execution failure retains its typed source.
 fn try_run_single(
     program: &Arc<LocalProgram>,
     batch_size: i32,
 ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
-    let state = Arc::new(RuntimeState::new(
+    let state = Arc::new(RuntimeState::for_local_execution(
         Some(QueryOptions {
             batch_size: Some(batch_size),
             ..QueryOptions::default()
@@ -1316,15 +1316,64 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
     drop(factory);
     drop(program);
     assert!(weak.upgrade().is_none());
-    let state = RuntimeState::default();
-    let processor = operator.as_processor_mut().unwrap();
-    processor.push_chunk(&state, input).unwrap();
-    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    use crate::exec::pipeline::{
+        input::RawInput,
+        step::{InputResult, NextStep},
+        step_context::{StepContext, TurnWork},
+    };
+    let state = RuntimeState::for_local_execution(
+        Some(QueryOptions {
+            batch_size: Some(1),
+            ..QueryOptions::default()
+        }),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let control = state.error_state();
+    operator.bind_runtime_state(&state).unwrap();
+    let duplicate = input.clone();
+    let original = duplicate.columns()[0].clone();
+    let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut ctx = StepContext::new(&control, &mut work);
+    let step = operator.as_mut();
+    assert!(matches!(
+        step.try_push(&mut ctx, RawInput::for_test(input)),
+        InputResult::Accepted(Ok(_))
+    ));
+    let installed = step.drive(&mut ctx).unwrap();
+    assert!(installed.output.is_none());
+    assert_eq!(installed.committed_rows, 1);
+    let InputResult::Deferred {
+        input: returned, ..
+    } = step.try_push(&mut ctx, RawInput::for_test(duplicate))
+    else {
+        panic!("the current parent relation still owns the receiver");
+    };
+    assert!(Arc::ptr_eq(&original, &returned.original().columns()[0]));
+    step.finish(&mut ctx).unwrap();
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        let result = step.drive(&mut ctx).unwrap();
+        assert!(matches!(result.next, NextStep::Runnable));
+        let output = result.output.expect("one granted output page");
+        assert_eq!(output.len(), 1);
+        outputs.push(output);
+    }
+    let ended = step.drive(&mut ctx).unwrap();
+    assert!(ended.output.is_none());
+    assert!(matches!(ended.next, NextStep::Finished));
+    assert!(step.drive(&mut ctx).unwrap().output.is_none());
     assert_eq!(
-        int64_rows(std::slice::from_ref(&output)),
+        int64_rows(&outputs),
         vec![vec![Some(7), Some(10)], vec![Some(7), Some(20)]]
     );
-    let schema = output.chunk_schema_ref();
+    let schema = outputs[0].chunk_schema_ref();
+    drop(returned);
+    drop(original);
     assert!(schema.is_typed());
     assert!(
         schema
@@ -1333,7 +1382,7 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
             .all(|slot| slot.field_ref().metadata().capacity() == 0)
     );
     drop(operator);
-    drop(output);
+    drop(outputs);
     assert!(tracker.current() > 0);
     drop(schema);
     assert_eq!(tracker.current(), 0);
@@ -1363,15 +1412,18 @@ fn compiled_table_prepare_preserves_real_memory_refusal_before_input() {
     let baseline = tracker.current();
     assert!(baseline > 0);
     tracker.install_limit_once(baseline + 1).unwrap();
+    let first = operator.prepare().unwrap_err();
     assert!(matches!(
-        operator.prepare().unwrap_err().cause(),
+        first.cause(),
         ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
     ));
-    assert!(matches!(
-        operator.prepare().unwrap_err().cause(),
-        ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::InstanceFailed)
-    ));
-    assert!(operator.is_finished());
+    assert_eq!(operator.prepare().unwrap_err(), first);
+    assert!(
+        operator
+            .drive_for_test(&crate::runtime::runtime_state::RuntimeState::default())
+            .unwrap_err()
+            .same_occurrence(&first)
+    );
     assert_eq!(tracker.current(), baseline);
     drop(operator);
     assert_eq!(tracker.current(), 0);

@@ -18,13 +18,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, Int8Array, Int16Array, Int32Array, Int64Array, ListArray,
-    StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, ListArray, StringArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 
 fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
@@ -47,14 +47,18 @@ fn encode_bitmap_text(values: &BTreeSet<u64>) -> Vec<u8> {
         .into_bytes()
 }
 
-fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u64>, String> {
+fn collect_set(
+    values: &ArrayRef,
+    start: usize,
+    end: usize,
+) -> crate::runtime::fragment::ExecutionResult<BTreeSet<u64>> {
     let mut out = BTreeSet::new();
     match values.data_type() {
         DataType::Int8 => {
             let arr = values
                 .as_any()
                 .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast Int8Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast Int8Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -69,7 +73,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast Int16Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast Int16Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -84,7 +88,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast Int32Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast Int32Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -99,7 +103,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast Int64Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast Int64Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -114,7 +118,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| "failed to downcast UInt8Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast UInt8Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -126,7 +130,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| "failed to downcast UInt16Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast UInt16Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -138,7 +142,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| "failed to downcast UInt32Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast UInt32Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -150,7 +154,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| "failed to downcast UInt64Array".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast UInt64Array"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -162,7 +166,7 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             let arr = values
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast StringArray".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast StringArray"))?;
             for i in start..end {
                 if arr.is_null(i) {
                     continue;
@@ -173,10 +177,10 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
             }
         }
         other => {
-            return Err(format!(
+            return Err(expression_contract(format_args!(
                 "array_to_bitmap expects integer/string array elements, got {:?}",
                 other
-            ));
+            )));
         }
     }
     Ok(out)
@@ -187,28 +191,38 @@ pub fn eval_array_to_bitmap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "array_to_bitmap requires exactly one argument",
+        ));
+    }
     let input = arena.eval(args[0], chunk)?;
     let list = input.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-        format!(
+        expression_contract(format_args!(
             "array_to_bitmap expects ARRAY input, got {:?}",
             input.data_type()
-        )
+        ))
     })?;
+    crate::exec::expr::function::array::common::validate_rows(
+        list.len(),
+        chunk.len(),
+        "array_to_bitmap input",
+    )?;
     let values = list.values();
     let offsets = list.value_offsets();
 
-    let mut builder = BinaryBuilder::new();
+    let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
     for row in 0..chunk.len() {
         let idx = row_index(row, list.len());
         if list.is_null(idx) {
-            builder.append_null();
+            builder.append_null()?;
             continue;
         }
         let start = offsets[idx] as usize;
         let end = offsets[idx + 1] as usize;
         let set = collect_set(values, start, end)?;
-        builder.append_value(encode_bitmap_text(&set));
+        builder.append_value(encode_bitmap_text(&set))?;
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    Ok(Arc::new(builder.finish()?) as ArrayRef)
 }

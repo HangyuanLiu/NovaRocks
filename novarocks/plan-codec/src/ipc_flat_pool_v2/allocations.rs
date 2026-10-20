@@ -228,7 +228,7 @@ mod tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.calls.lock().unwrap().push((phase, units));
             if units != 0
-                && let Some(error) = self.refusal
+                && let Some(error) = self.refusal.clone()
             {
                 return Err(error);
             }
@@ -329,7 +329,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let control = OriginalControl {
-                refusal: Some(error),
+                refusal: Some(error.clone()),
                 ..Default::default()
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();

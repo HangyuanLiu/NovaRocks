@@ -31,7 +31,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Outcome {
     Allow,
     Unavailable,
@@ -98,7 +98,7 @@ impl SqlFunctionCatalog for TableParentCatalog {
             control
                 .checkpoint(CompilePhase::FunctionSpecialization, 0)
                 .map_err(novarocks_functions::FunctionSpecializationFailure::Control)?;
-            match self.outcome {
+            match self.outcome.clone() {
                 Outcome::Allow => {}
                 Outcome::Unavailable => {
                     return Err(
@@ -359,7 +359,7 @@ fn e08s1_table_fold_parent_three_control_causes_keep_origin_and_no_child_tail() 
         CompileControlError::ResourceExhausted,
     ] {
         reset();
-        let catalog = source(Outcome::Control(cause));
+        let catalog = source(Outcome::Control(cause.clone()));
         let expected: SqlCompileError = cause.into();
         assert_eq!(optimize(&catalog).unwrap_err(), expected);
         assert_eq!(catalog.calls.load(Ordering::Relaxed), 1);

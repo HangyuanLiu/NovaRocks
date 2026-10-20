@@ -41,7 +41,7 @@ impl PureCompileControl for DeclarationControl {
             assert!(at <= stop, "callback after the first declaration refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -133,15 +133,46 @@ fn prefixes(
     succeeds: bool,
 ) {
     let baseline = DeclarationControl::default();
-    assert_eq!(call(&baseline).is_ok(), succeeds);
+    let original = call(&baseline);
+    assert_eq!(original.is_ok(), succeeds);
     let trace = baseline.trace.lock().unwrap().clone();
     assert_eq!(trace.first(), Some(&0));
-    assert!(trace.len() >= 2);
+    if succeeds {
+        assert!(trace.len() >= 2);
+        assert!(trace.iter().any(|units| *units > 0));
+    } else {
+        // A semantic refusal can precede the first flush. Do not manufacture
+        // an outer footer; an armed later callback must not replace the cause.
+        for cause in CAUSES {
+            let control = DeclarationControl {
+                trace: Mutex::new(vec![]),
+                refusal: Some((trace.len(), cause)),
+            };
+            match (call(&control).unwrap_err(), original.as_ref().unwrap_err()) {
+                (
+                    FunctionSpecializationFailure::Binding(actual),
+                    FunctionSpecializationFailure::Binding(expected),
+                ) => assert_eq!(&actual, expected),
+                (
+                    FunctionSpecializationFailure::MissingPureImplementation(actual),
+                    FunctionSpecializationFailure::MissingPureImplementation(expected),
+                ) => assert_eq!(&actual, expected),
+                (
+                    FunctionSpecializationFailure::InvalidInput(actual),
+                    FunctionSpecializationFailure::InvalidInput(expected),
+                ) => assert_eq!(&actual, expected),
+                (actual, expected) => panic!(
+                    "different ordinary declaration cause: {actual:?}, expected {expected:?}"
+                ),
+            }
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
+    }
     for at in 0..trace.len() {
         for cause in CAUSES {
             let control = DeclarationControl {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(FunctionSpecializationFailure::Control(actual)) if actual == cause)
@@ -410,8 +441,6 @@ fn pure_declaration_each_actual_small_success_and_ordinary_callback_preserves_al
             )
             .is_err()
     );
-    assert!(
-        *ordinary.trace.lock().unwrap().last().unwrap() > 0,
-        "completed ordinary lookup must report its tail"
-    );
+    // This exact unknown overload is rejected before the bounded lookup flush.
+    assert_eq!(*ordinary.trace.lock().unwrap(), [0]);
 }

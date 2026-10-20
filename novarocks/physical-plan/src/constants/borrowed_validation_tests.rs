@@ -47,7 +47,7 @@ impl PureCompileControl for BorrowedControl {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push((phase, units));
-        if let Some((refusal, cause)) = self.refusal
+        if let Some((refusal, cause)) = self.refusal.clone()
             && at == refusal
         {
             Err(cause)
@@ -78,10 +78,10 @@ fn every_prefix(
     assert_eq!(trace.first(), Some(&(CompilePhase::Decode, 0)));
     for cause in CAUSES {
         for at in 0..trace.len() {
-            let control = BorrowedControl::new(Some((at, cause)));
+            let control = BorrowedControl::new(Some((at, cause.clone())));
             assert_eq!(
                 borrowed(&control, &action),
-                Err(ConstantReferenceError::Control(cause))
+                Err(ConstantReferenceError::Control(cause.clone()))
             );
             assert_eq!(control.trace(), trace[..=at]);
         }

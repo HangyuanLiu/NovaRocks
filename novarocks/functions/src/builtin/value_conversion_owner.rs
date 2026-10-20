@@ -384,11 +384,7 @@ impl ValueConversionOwner {
             })?;
             Ok(self.call_effects(input))
         })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        work.finish_result(result, FunctionEffectOwnerError::Control)
     }
     fn prepare_selected_core(
         &self,
@@ -431,15 +427,6 @@ impl ValueConversionOwner {
             });
             Ok(prepared)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        work.finish_result(result, compile_failure)
     }
 }

@@ -44,7 +44,7 @@ pub enum ProjectMetadataFailure<H, C = FragmentCompileError> {
     Host(H),
 }
 pub trait ProjectMetadataScope {
-    type HostError: Error + Send + Sync + 'static;
+    type HostError: Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static;
     fn materialize<C, B>(
         &mut self,
         facts: &ProjectOutputRequestFacts,
@@ -88,7 +88,7 @@ impl<H: ProjectMetadataScope> ProjectMetadataMode<'_, H> {
             Self::Funded(host) => host.materialize(facts, body).map_err(|error| match error {
                 ProjectMetadataFailure::Body(error) => error,
                 ProjectMetadataFailure::Host(error) => FragmentCompileError::ProjectMetadataHost {
-                    error: Box::new(error),
+                    error: novarocks_failure_contract::SharedFailureCause::new(error),
                 }
                 .into(),
             }),

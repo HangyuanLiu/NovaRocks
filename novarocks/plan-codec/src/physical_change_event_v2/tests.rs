@@ -57,7 +57,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -934,7 +934,8 @@ fn change_event_all_small_original_control_prefixes_and_wide_real_quantum_are_pr
             assert!(trace.last().is_some_and(|(_, units)| *units > 0));
             for stop in 0..trace.len() {
                 for cause in CAUSES {
-                    let (result, actual) = control_case(decode, ordinary, Some((stop, cause)));
+                    let (result, actual) =
+                        control_case(decode, ordinary, Some((stop, cause.clone())));
                     assert!(matches!(result, Err(Error::Control(actual)) if actual == cause));
                     assert_eq!(actual, trace[..=stop]);
                 }
@@ -947,10 +948,10 @@ fn change_event_all_small_original_control_prefixes_and_wide_real_quantum_are_pr
         let mut node = small_source(); events(&mut node)[0].assignments = vec![(p::ValueId::new(0), None); 320].into_boxed_slice();
         c.arm(None); let wire = encode_change_event_node(&node, values, expressions, SOURCE, limits()).unwrap().0;
         let trace = c.trace(); let at = trace.iter().position(|(_, units)| *units == 256).unwrap();
-        for cause in CAUSES { c.arm(Some((at, cause))); assert!(matches!(encode_change_event_node(&node, values, expressions, SOURCE, limits()), Err(Error::Control(actual)) if actual == cause)); assert_eq!(c.trace(), trace[..=at]); }
+        for cause in CAUSES { c.arm(Some((at, cause.clone()))); assert!(matches!(encode_change_event_node(&node, values, expressions, SOURCE, limits()), Err(Error::Control(actual)) if actual == cause)); assert_eq!(c.trace(), trace[..=at]); }
         c.arm(None); assert_eq!(decode_change_event_node(&wire, read, SOURCE, limits()).unwrap().0, node);
         let trace = c.trace(); let at = trace.iter().position(|(_, units)| *units == 256).unwrap();
-        for cause in CAUSES { c.arm(Some((at, cause))); assert!(matches!(decode_change_event_node(&wire, read, SOURCE, limits()), Err(Error::Control(actual)) if actual == cause)); assert_eq!(c.trace(), trace[..=at]); }
+        for cause in CAUSES { c.arm(Some((at, cause.clone()))); assert!(matches!(decode_change_event_node(&wire, read, SOURCE, limits()), Err(Error::Control(actual)) if actual == cause)); assert_eq!(c.trace(), trace[..=at]); }
     });
 }
 #[test]

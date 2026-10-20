@@ -436,7 +436,7 @@ fn approximate_percentile_owner_full_data_rate_first_sparse_domain_latch() {
     }
 }
 #[test]
-fn approximate_percentile_owner_long_type_diagnostic_retains_original_fulltext() {
+fn approximate_percentile_owner_unsupported_type_is_bounded_contract() {
     let ty = DataType::Struct(Fields::from(vec![Field::new(
         "long original nested field 中🙂".repeat(24),
         DataType::Utf8,
@@ -460,7 +460,11 @@ fn approximate_percentile_owner_long_type_diagnostic_retains_original_fulltext()
         crate::percentile_input::PercentileInputDiagnostic::LegacyLabel("percentile_approx"),
     )
     .unwrap_err();
-    assert!(expected.len() > 512);
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&expected).class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert!(format!("{ty:?}").len() > 512);
     let failure = update_selected(
         &kernel,
         &mut state,
@@ -471,16 +475,20 @@ fn approximate_percentile_owner_long_type_diagnostic_retains_original_fulltext()
         &Control::default(),
     )
     .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("full unbounded original type Data")
+    let EvaluationFailure::Kernel(cause) = failure else {
+        panic!("physical input contract refusal");
     };
     assert_eq!(
-        data.message(),
-        crate::aggregate_format::AggregateFailureStage::Update
-            .message(&expected)
-            .to_string()
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+        novarocks_failure_contract::FailureClass::Invariant
     );
-    drop(data);
+    assert!(
+        cause
+            .to_string()
+            .starts_with("percentile_approx: unsupported numeric input type Struct")
+    );
+    assert!(cause.to_string().len() <= 512);
+    drop(cause);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
@@ -545,7 +553,7 @@ fn approximate_percentile_owner_actual_v4_bug_merge_data_and_emission_domain() {
         &Control::default(),
     )
     .unwrap();
-    assert_eq!(payload, digest::encode_state(&state.core));
+    assert_eq!(payload, digest::encode_state(&state.core).unwrap());
     let mut wrong_magic = payload.to_vec();
     wrong_magic[0] = 0;
     let wrong_magic = Arc::new(BinaryArray::from(vec![wrong_magic.as_slice()])) as ArrayRef;
@@ -731,7 +739,7 @@ fn approximate_percentile_owner_compile_three_causes_preserved() {
     struct Refuse(CompileControlError);
     impl PureCompileControl for Refuse {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
@@ -758,7 +766,7 @@ fn approximate_percentile_owner_compile_three_causes_preserved() {
                 logical_argument_count: 2,
                 expected_result_type: None,
             },
-            &Refuse(cause),
+            &Refuse(cause.clone()),
         );
         assert!(matches!(result,Err(FunctionBindingError::Control(actual))if actual==cause));
     }

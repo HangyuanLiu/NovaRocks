@@ -33,7 +33,7 @@ impl PureCompileControl for PrefixControl {
         let mut trace = self.trace.lock().unwrap();
         let index = trace.len();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.fail_at
+        if let Some((at, cause)) = self.fail_at.clone()
             && index == at
         {
             *self.refused.lock().unwrap() = true;
@@ -57,7 +57,7 @@ fn assert_prefixes(
     for at in 0..trace.len() {
         for cause in causes() {
             let control = PrefixControl {
-                fail_at: Some((at, cause)),
+                fail_at: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
@@ -187,19 +187,19 @@ fn decode_success_and_quantum_boundary_errors_keep_every_original_callback_prefi
 fn root_error_projection_preserves_typed_control_causes_and_ordinary_root_category() {
     for cause in causes() {
         assert_eq!(
-            ControlCodecError::from(RootUseBindingError::Control(cause)),
-            ControlCodecError::Control(cause)
+            ControlCodecError::from(RootUseBindingError::Control(cause.clone())),
+            ControlCodecError::Control(cause.clone())
         );
         assert_eq!(
             ControlCodecError::from(RootUseBindingError::Roots(ExpressionRootError::Control(
-                cause
+                cause.clone()
             ))),
             ControlCodecError::Control(cause)
         );
     }
     let ordinary = RootUseBindingError::Roots(ExpressionRootError::InvalidExpressionOwner);
     assert_eq!(
-        ControlCodecError::from(ordinary),
+        ControlCodecError::from(ordinary.clone()),
         ControlCodecError::Roots(ordinary)
     );
     let (fragment, roots) = binary_fixture();

@@ -50,6 +50,23 @@ impl ResourceKind {
     }
 }
 
+#[derive(Debug)]
+struct InjectedCleanupFailure(ResourceKind);
+impl std::fmt::Display for InjectedCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.cleanup_failure_detail())
+    }
+}
+impl std::error::Error for InjectedCleanupFailure {}
+impl novarocks_failure_contract::FailureProjection for InjectedCleanupFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            super::ExecutionReason::InjectedCleanupFailure.reason(),
+        )
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ResourceCleanupFaults {
     failed: std::collections::BTreeSet<ResourceKind>,
@@ -74,6 +91,7 @@ impl ResourceCleanupFaults {
 pub(crate) struct SinkCommitLease {
     lease: Option<Box<dyn FragmentCommitLease>>,
     cleanup_should_fail: bool,
+    settled: bool,
 }
 
 impl SinkCommitLease {
@@ -86,27 +104,22 @@ impl SinkCommitLease {
         Ok(Self {
             lease: Some(lease),
             cleanup_should_fail,
+            settled: false,
         })
     }
 
-    fn rollback(&mut self) -> Result<(), String> {
-        if let Some(lease) = self.lease.take() {
+    fn rollback(&mut self) -> super::ExecutionResult<()> {
+        if !std::mem::replace(&mut self.settled, true)
+            && let Some(lease) = self.lease.as_mut()
+        {
             lease.rollback()?;
         }
         if self.cleanup_should_fail {
             self.cleanup_should_fail = false;
-            return Err(ResourceKind::SinkCommit
-                .cleanup_failure_detail()
-                .to_string());
+            return Err(super::ExecutionFailure::from_domain(
+                InjectedCleanupFailure(ResourceKind::SinkCommit),
+            ));
         }
-        Ok(())
-    }
-
-    fn handoff(&mut self) -> Result<(), String> {
-        if let Some(lease) = self.lease.take() {
-            lease.handoff()?;
-        }
-        self.cleanup_should_fail = false;
         Ok(())
     }
 }
@@ -129,9 +142,7 @@ impl ResultRegistration {
         spec: ResultWriteSpec,
         cleanup_should_fail: bool,
     ) -> Result<Self, FragmentLaunchError> {
-        let session = writer
-            .open(spec)
-            .map_err(|error| registration_error(error.to_string()))?;
+        let session = writer.open(spec).map_err(registration_error)?;
         Ok(Self {
             session,
             active: true,
@@ -139,14 +150,16 @@ impl ResultRegistration {
         })
     }
 
-    fn rollback(&mut self) -> Result<(), String> {
+    fn rollback(&mut self) -> super::ExecutionResult<()> {
         if self.active {
-            self.session.abort(ResultAbort::PrepareRollback);
             self.active = false;
+            self.session.abort(ResultAbort::PrepareRollback);
         }
         if self.cleanup_should_fail {
             self.cleanup_should_fail = false;
-            return Err(ResourceKind::Result.cleanup_failure_detail().to_string());
+            return Err(super::ExecutionFailure::from_domain(
+                InjectedCleanupFailure(ResourceKind::Result),
+            ));
         }
         Ok(())
     }
@@ -158,16 +171,16 @@ impl ResultRegistration {
 
     fn finish_failure(&mut self, error: String) {
         if self.active {
-            self.session.abort(ResultAbort::Failed(error));
             self.active = false;
+            self.session.abort(ResultAbort::Failed(error));
         }
         self.cleanup_should_fail = false;
     }
 
     fn finish_cancelled(&mut self, reason: String) {
         if self.active {
-            self.session.abort(ResultAbort::Cancelled(reason));
             self.active = false;
+            self.session.abort(ResultAbort::Cancelled(reason));
         }
         self.cleanup_should_fail = false;
     }
@@ -176,8 +189,8 @@ impl ResultRegistration {
     /// this registration until the fragment has actually stopped.
     fn abort_for_cancellation(&mut self, reason: String) {
         if self.active {
-            self.session.abort(ResultAbort::Cancelled(reason));
             self.active = false;
+            self.session.abort(ResultAbort::Cancelled(reason));
         }
     }
 }
@@ -200,10 +213,12 @@ impl RootResultRegistration {
             self.session.abort(reason);
         }
     }
-    fn rollback(&mut self) -> Result<(), String> {
+    fn rollback(&mut self) -> super::ExecutionResult<()> {
         self.abort(ResultAbort::PrepareRollback);
         if std::mem::take(&mut self.cleanup_should_fail) {
-            return Err(ResourceKind::Result.cleanup_failure_detail().to_string());
+            return Err(super::ExecutionFailure::from_domain(
+                InjectedCleanupFailure(ResourceKind::Result),
+            ));
         }
         Ok(())
     }
@@ -252,7 +267,7 @@ impl ExchangeRegistration {
         Ok(Some(registration))
     }
 
-    fn rollback(&mut self) -> Result<(), String> {
+    fn rollback(&mut self) -> super::ExecutionResult<()> {
         self.stop_construction(novarocks_functions::KernelFailure::Cancelled.into());
         if self.active {
             for key in self.keys.drain(..).rev() {
@@ -262,7 +277,9 @@ impl ExchangeRegistration {
         }
         if self.cleanup_should_fail {
             self.cleanup_should_fail = false;
-            return Err(ResourceKind::Exchange.cleanup_failure_detail().to_string());
+            return Err(super::ExecutionFailure::from_domain(
+                InjectedCleanupFailure(ResourceKind::Exchange),
+            ));
         }
         Ok(())
     }
@@ -353,8 +370,8 @@ impl Drop for ExchangeReceiverRetirement {
 }
 
 pub(crate) struct FragmentResources {
-    commit_port: Arc<dyn FragmentCommitPort>,
-    exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+    commit_port: Option<Arc<dyn FragmentCommitPort>>,
+    exchange_receiver_port: Option<Arc<dyn ExchangeReceiverPort>>,
     sink_commit: Option<SinkCommitLease>,
     result: Option<ResultRegistration>,
     root_result: Option<RootResultRegistration>,
@@ -369,8 +386,8 @@ impl FragmentResources {
         cleanup_faults: ResourceCleanupFaults,
     ) -> Self {
         Self {
-            commit_port,
-            exchange_receiver_port,
+            commit_port: Some(commit_port),
+            exchange_receiver_port: Some(exchange_receiver_port),
             sink_commit: None,
             result: None,
             root_result: None,
@@ -384,7 +401,7 @@ impl FragmentResources {
         finst_id: UniqueId,
     ) -> Result<(), FragmentLaunchError> {
         self.sink_commit = Some(SinkCommitLease::acquire(
-            &self.commit_port,
+            self.commit_port.as_ref().expect("preparing commit factory"),
             finst_id,
             self.cleanup_faults.should_fail(ResourceKind::SinkCommit),
         )?);
@@ -420,20 +437,20 @@ impl FragmentResources {
         let Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) = sink else {
             if let Some(session) = session {
                 session.abort(ResultAbort::PrepareRollback);
-                return Err(registration_error(
+                return Err(root_registration_contract(
                     "bounded root session supplied for a different sink",
                 ));
             }
             return Ok(());
         };
         let session = session.ok_or_else(|| {
-            registration_error("frozen bounded root requires its host-owned session")
+            root_registration_contract("frozen bounded root requires its host-owned session")
         })?;
         if Some(session.spec().task) != identity
             || session.spec().contract.as_ref() != contract.as_ref()
         {
             session.abort(ResultAbort::PrepareRollback);
-            return Err(registration_error(
+            return Err(root_registration_contract(
                 "bounded root session disagrees with exact task or frozen contract",
             ));
         }
@@ -458,26 +475,17 @@ impl FragmentResources {
             .map(|registration| Arc::clone(&registration.session))
     }
 
-    /// Wake a root result sink that is blocked on its client-facing session.
-    ///
-    /// This does not release the registration or establish a terminal fact;
-    /// those remain owned by the actual driver-stop path.
-    pub(crate) fn abort_result_for_cancellation(&mut self, reason: &str) {
-        if let Some(root) = self.root_result.as_mut() {
-            root.abort(ResultAbort::Cancelled(reason.to_string()));
-        }
-        if let Some(result) = self.result.as_mut() {
-            result.abort_for_cancellation(reason.to_string());
-        }
-    }
-
     pub(crate) fn acquire_compiled_exchange(
         &mut self,
         registrations: Vec<ExchangeReceiverRegistration>,
         construction_stop: Option<ReceiverInputConstructionStopOwner>,
     ) -> Result<(), FragmentLaunchError> {
         self.exchange = ExchangeRegistration::acquire_registrations(
-            Arc::clone(&self.exchange_receiver_port),
+            Arc::clone(
+                self.exchange_receiver_port
+                    .as_ref()
+                    .expect("preparing receiver factory"),
+            ),
             registrations,
             self.cleanup_faults.should_fail(ResourceKind::Exchange),
             construction_stop,
@@ -494,7 +502,7 @@ impl FragmentResources {
             })
     }
 
-    pub(crate) fn rollback(&mut self) -> Vec<String> {
+    pub(crate) fn rollback(&mut self) -> Vec<super::ExecutionFailure> {
         let mut diagnostics = Vec::new();
         if let Some(mut root) = self.root_result.take()
             && let Err(error) = root.rollback()
@@ -518,50 +526,323 @@ impl FragmentResources {
         }
         diagnostics
     }
+}
 
-    pub(crate) fn finish_success(&mut self) {
-        if let Some(mut root) = self.root_result.take() {
-            root.active = false;
-            root.cleanup_should_fail = false;
+impl FragmentResources {
+    pub(crate) fn into_runtime(mut self) -> RuntimeFragmentResources {
+        let exchange = self.exchange.take().map(|mut registration| {
+            // Each original key has one independent hook and one original port
+            // reference. A bad key cannot discard unvisited sibling keys.
+            registration.active = false;
+            registration.cleanup_should_fail = false;
+            let keys = std::mem::take(&mut registration.keys)
+                .into_iter()
+                .rev()
+                .map(|key| ResourceCell::new((Arc::clone(&registration.port), key)))
+                .collect();
+            RuntimeExchange {
+                stop: registration.construction_stop.take().map(ResourceCell::new),
+                keys,
+                registration: ResourceCell::new(registration),
+            }
+        });
+        RuntimeFragmentResources {
+            root: self.root_result.take().map(ResourceCell::new),
+            result: self.result.take().map(ResourceCell::new),
+            sink_commit: self.sink_commit.take().map(ResourceCell::new),
+            exchange,
+            commit_port: self.commit_port.take().map(ResourceCell::new),
+            exchange_port: self.exchange_receiver_port.take().map(ResourceCell::new),
         }
-        if let Some(mut exchange) = self.exchange.take() {
-            exchange.finish_success();
-        }
-        if let Some(mut result) = self.result.take() {
-            result.finish_success();
+    }
+}
+
+use crate::exec::pipeline::global_driver_executor::once_role::{
+    CompletionFailure, Payload, Phase, Role,
+};
+use crate::runtime::runtime_state::RuntimeErrorState;
+use std::mem::ManuallyDrop;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+// A failed diagnostic notification is metadata. Its fixed opaque custody
+// outlives the original cell independently and owns neither a registration,
+// RuntimeErrorState nor an execution control. It cannot revoke actual exit.
+struct NotificationCustody {
+    payloads: std::sync::Mutex<[Option<Payload>; 2]>,
+    quarantine: std::sync::Mutex<Option<Arc<Self>>>,
+}
+impl NotificationCustody {
+    fn capture(owner: &mut Option<Arc<Self>>, ordinal: usize, payload: Payload) {
+        let custody = owner.get_or_insert_with(|| {
+            Arc::new(Self {
+                payloads: std::sync::Mutex::new([None, None]),
+                quarantine: std::sync::Mutex::new(None),
+            })
+        });
+        custody.payloads.lock().unwrap_or_else(|e| e.into_inner())[ordinal] = Some(payload);
+        let mut pin = custody.quarantine.lock().unwrap_or_else(|e| e.into_inner());
+        if pin.is_none() {
+            *pin = Some(custody.clone());
         }
     }
 
-    pub(crate) fn handoff_sink_commit(&mut self) {
-        if let Some(mut sink_commit) = self.sink_commit.take() {
-            let _ = sink_commit.handoff();
+    fn both(
+        owner: &mut Option<Arc<Self>>,
+        control: &RuntimeErrorState,
+        cause: &super::ExecutionFailure,
+    ) {
+        for (ordinal, report) in [
+            RuntimeErrorState::report_cleanup as fn(&RuntimeErrorState, &super::ExecutionFailure),
+            RuntimeErrorState::report_unresolved_exit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| report(control, cause))) {
+                Self::capture(owner, ordinal, ManuallyDrop::new(payload));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResourcePhase {
+    started: bool,
+    completed: bool,
+    payload: Option<Payload>,
+    notification: Option<Arc<NotificationCustody>>,
+}
+impl ResourcePhase {
+    fn run<T>(
+        &mut self,
+        control: &RuntimeErrorState,
+        phase: Phase,
+        f: impl FnOnce() -> T,
+    ) -> Option<T> {
+        if self.started {
+            return None;
+        }
+        self.started = true;
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(value) => {
+                self.completed = true;
+                Some(value)
+            }
+            Err(payload) => {
+                self.payload = Some(ManuallyDrop::new(payload));
+                let cause = super::ExecutionFailure::from_domain(CompletionFailure {
+                    role: Role::PipelineFinisher,
+                    phase,
+                });
+                NotificationCustody::both(&mut self.notification, control, &cause);
+                None
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CleanupNotification {
+    started: bool,
+    custody: Option<Arc<NotificationCustody>>,
+}
+impl CleanupNotification {
+    fn report(&mut self, control: &RuntimeErrorState, original: &super::ExecutionFailure) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| control.report_cleanup(original))) {
+            NotificationCustody::capture(&mut self.custody, 0, ManuallyDrop::new(payload));
+            // The returned cleanup error keeps its own exact original fact.
+            // Only this failed metadata call supplies the independent health fact.
+            let notification = super::ExecutionFailure::from_domain(CompletionFailure {
+                role: Role::PipelineFinisher,
+                phase: Phase::CleanupNotification,
+            });
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                control.report_unresolved_exit(&notification)
+            })) {
+                NotificationCustody::capture(&mut self.custody, 1, ManuallyDrop::new(payload));
+            }
+        }
+    }
+}
+
+struct ResourceCell<T> {
+    holder: Option<ManuallyDrop<T>>,
+    hook: ResourcePhase,
+    dispose: ResourcePhase,
+    returned_error: Option<ManuallyDrop<super::ExecutionFailure>>,
+    error_report: CleanupNotification,
+    error_dispose: ResourcePhase,
+}
+impl<T> ResourceCell<T> {
+    fn new(holder: T) -> Self {
+        Self {
+            holder: Some(ManuallyDrop::new(holder)),
+            hook: ResourcePhase::default(),
+            dispose: ResourcePhase::default(),
+            returned_error: None,
+            error_report: CleanupNotification::default(),
+            error_dispose: ResourcePhase::default(),
+        }
+    }
+    fn hook(
+        &mut self,
+        control: &RuntimeErrorState,
+        f: impl FnOnce(&mut T) -> super::ExecutionResult<()>,
+    ) {
+        let Some(holder) = self.holder.as_mut() else {
+            return;
+        };
+        if let Some(Err(error)) = self.hook.run(control, Phase::ResourceHook, || f(holder)) {
+            self.returned_error = Some(ManuallyDrop::new(error));
+        }
+        if let Some(error) = self.returned_error.as_ref() {
+            self.error_report.report(control, error);
+        }
+    }
+    fn retire(&mut self, control: &RuntimeErrorState) {
+        if !self.hook.completed {
+            return;
+        }
+        if !self.dispose.started {
+            let holder = self.holder.take();
+            self.dispose.run(control, Phase::ResourceHolderDrop, || {
+                if let Some(holder) = holder {
+                    drop(ManuallyDrop::into_inner(holder));
+                }
+            });
+        }
+        if self.returned_error.is_some() && !self.error_dispose.started {
+            let error = self.returned_error.take().expect("retained cleanup error");
+            self.error_dispose
+                .run(control, Phase::ResourceHolderDrop, || {
+                    drop(ManuallyDrop::into_inner(error))
+                });
+        }
+    }
+    fn exited(&self) -> bool {
+        self.hook.completed
+            && self.dispose.completed
+            && (!self.error_dispose.started || self.error_dispose.completed)
+    }
+}
+
+struct RuntimeExchange {
+    stop: Option<ResourceCell<ReceiverInputConstructionStopOwner>>,
+    keys: Vec<ResourceCell<(Arc<dyn ExchangeReceiverPort>, ExchangeReceiverKey)>>,
+    registration: ResourceCell<ExchangeRegistration>,
+}
+
+/// Original registrations, split only at the dormant-to-running transfer.
+/// Every dynamically sized cell comes from the original registered key vector;
+/// no observer list, rejected-work queue, or process parking table is created.
+pub(crate) struct RuntimeFragmentResources {
+    root: Option<ResourceCell<RootResultRegistration>>,
+    result: Option<ResourceCell<ResultRegistration>>,
+    sink_commit: Option<ResourceCell<SinkCommitLease>>,
+    exchange: Option<RuntimeExchange>,
+    commit_port: Option<ResourceCell<Arc<dyn FragmentCommitPort>>>,
+    exchange_port: Option<ResourceCell<Arc<dyn ExchangeReceiverPort>>>,
+}
+impl RuntimeFragmentResources {
+    pub(crate) fn interrupt(&mut self, reason: &str, control: &RuntimeErrorState) {
+        if let Some(root) = &mut self.root {
+            root.hook(control, |root| {
+                root.cleanup_should_fail = false;
+                root.abort(ResultAbort::Cancelled(reason.to_owned()));
+                Ok(())
+            });
+        }
+        if let Some(result) = &mut self.result {
+            result.hook(control, |result| {
+                result.cleanup_should_fail = false;
+                result.abort_for_cancellation(reason.to_owned());
+                Ok(())
+            });
         }
     }
 
-    pub(crate) fn finish_failure(&mut self, error: String) {
-        if let Some(mut root) = self.root_result.take() {
-            root.abort(ResultAbort::Failed(error.clone()));
-            root.cleanup_should_fail = false;
+    pub(crate) fn retire(
+        &mut self,
+        outcome: &super::FragmentOutcome,
+        control: &RuntimeErrorState,
+    ) -> bool {
+        use super::FragmentOutcome;
+        if let Some(root) = &mut self.root {
+            root.hook(control, |root| {
+                root.cleanup_should_fail = false;
+                match outcome {
+                    FragmentOutcome::Succeeded => root.active = false,
+                    FragmentOutcome::Failed(error) => {
+                        root.abort(ResultAbort::Failed(error.to_string()))
+                    }
+                    FragmentOutcome::Cancelled { reason } => {
+                        root.abort(ResultAbort::Cancelled(reason.detail().to_owned()))
+                    }
+                }
+                Ok(())
+            });
+            root.retire(control);
         }
-        if let Some(mut exchange) = self.exchange.take() {
-            exchange.finish_cancelled();
+        if let Some(result) = &mut self.result {
+            result.hook(control, |result| {
+                match outcome {
+                    FragmentOutcome::Succeeded => result.finish_success(),
+                    FragmentOutcome::Failed(error) => result.finish_failure(error.to_string()),
+                    FragmentOutcome::Cancelled { reason } => {
+                        result.finish_cancelled(reason.detail().to_owned())
+                    }
+                }
+                Ok(())
+            });
+            result.retire(control);
         }
-        if let Some(mut result) = self.result.take() {
-            result.finish_failure(error);
+        if let Some(exchange) = &mut self.exchange {
+            if let Some(stop) = &mut exchange.stop {
+                stop.hook(control, |stop| {
+                    stop.stop(novarocks_functions::KernelFailure::Cancelled.into());
+                    Ok(())
+                });
+                stop.retire(control);
+            }
+            for key in &mut exchange.keys {
+                key.hook(control, |(port, key)| {
+                    match outcome {
+                        FragmentOutcome::Succeeded => port.remove(*key),
+                        _ => port.cancel(*key),
+                    }
+                    Ok(())
+                });
+                key.retire(control);
+            }
+            exchange.registration.hook(control, |_| Ok(()));
+            exchange.registration.retire(control);
         }
-    }
-
-    pub(crate) fn finish_cancelled(&mut self, reason: String) {
-        if let Some(mut root) = self.root_result.take() {
-            root.abort(ResultAbort::Cancelled(reason.clone()));
-            root.cleanup_should_fail = false;
+        if let Some(commit) = &mut self.sink_commit {
+            commit.hook(control, SinkCommitLease::rollback);
+            commit.retire(control);
         }
-        if let Some(mut exchange) = self.exchange.take() {
-            exchange.finish_cancelled();
+        if let Some(port) = &mut self.commit_port {
+            port.hook(control, |_| Ok(()));
+            port.retire(control);
         }
-        if let Some(mut result) = self.result.take() {
-            result.finish_cancelled(reason);
+        if let Some(port) = &mut self.exchange_port {
+            port.hook(control, |_| Ok(()));
+            port.retire(control);
         }
+        self.root.as_ref().is_none_or(ResourceCell::exited)
+            && self.result.as_ref().is_none_or(ResourceCell::exited)
+            && self.sink_commit.as_ref().is_none_or(ResourceCell::exited)
+            && self.commit_port.as_ref().is_none_or(ResourceCell::exited)
+            && self.exchange_port.as_ref().is_none_or(ResourceCell::exited)
+            && self.exchange.as_ref().is_none_or(|exchange| {
+                exchange.stop.as_ref().is_none_or(ResourceCell::exited)
+                    && exchange.keys.iter().all(ResourceCell::exited)
+                    && exchange.registration.exited()
+            })
     }
 }
 
@@ -571,11 +852,24 @@ impl Drop for FragmentResources {
     }
 }
 
-fn registration_error(detail: impl Into<String>) -> FragmentLaunchError {
-    FragmentLaunchError::new(
-        FragmentLaunchStage::Register,
-        FragmentLaunchErrorKind::DuplicateRegistration,
+fn root_registration_contract(detail: &'static str) -> FragmentLaunchError {
+    use crate::exec::fragment::error::{
+        FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+    };
+    registration_error(FragmentBindingError::new(
+        FragmentBindingTarget::Sink,
+        FragmentBindingErrorKind::InvalidAssignment,
         detail,
+    ))
+}
+
+fn registration_error(
+    cause: impl Into<crate::runtime::fragment::ExecutionFailure>,
+) -> FragmentLaunchError {
+    FragmentLaunchError::from_failure(
+        FragmentLaunchStage::Register,
+        FragmentLaunchErrorKind::ResourceUnavailable,
+        cause.into(),
     )
 }
 
@@ -680,7 +974,19 @@ mod receiver_construction_tests {
                 Ok(_) => panic!("the original registry must refuse its already registered key"),
             };
             assert_eq!(error.stage(), FragmentLaunchStage::Register);
-            assert_eq!(error.kind(), FragmentLaunchErrorKind::DuplicateRegistration);
+            // Launch kind records the acquisition phase; the actual registry
+            // author, not this coarse envelope, owns semantic classification.
+            assert_eq!(error.kind(), FragmentLaunchErrorKind::ResourceUnavailable);
+            let fact = novarocks_failure_contract::FailureProjection::failure_fact(error.cause());
+            assert_eq!(
+                fact.class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            assert_eq!(
+                fact.reason().domain(),
+                novarocks_failure_contract::domain::EXCHANGE.get()
+            );
+            assert_eq!(fact.reason().code(), 100);
             assert_eq!(
                 error.detail(),
                 format!(
@@ -690,7 +996,11 @@ mod receiver_construction_tests {
             );
             if has_prefix {
                 assert_eq!(
-                    error.cleanup_diagnostics(),
+                    error
+                        .cleanup_diagnostics()
+                        .iter()
+                        .map(|cause| cause.detail())
+                        .collect::<Vec<_>>(),
                     &["injected exchange registration cleanup failure"]
                 );
                 assert!(port.snapshot(prefix).is_none());
@@ -698,7 +1008,12 @@ mod receiver_construction_tests {
                     Err(error) => error,
                     Ok(_) => panic!("the cancelled prefix cannot acquire a receiver handle"),
                 };
-                assert_eq!(refused, "exchange canceled");
+                let fact = novarocks_failure_contract::FailureProjection::failure_fact(&refused);
+                assert_eq!(
+                    fact.class(),
+                    novarocks_failure_contract::FailureClass::Control
+                );
+                assert_eq!(fact.reason().code(), 102);
             } else {
                 assert!(error.cleanup_diagnostics().is_empty());
             }
@@ -814,5 +1129,148 @@ mod receiver_construction_tests {
             drop(factory);
             assert_eq!(tracker.current(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_notification_tests {
+    use super::*;
+    use crate::runtime::fragment::ExecutionFailure;
+    use crate::runtime::task_control::{
+        TaskExecutionControl, TaskExecutionPort, test_support::Owner,
+    };
+    use novarocks_execution_contract::{
+        AcceptedTaskConclusion, ConclusionAcceptance, TaskConclusionPort, TaskConclusionProposal,
+        TaskFailurePhase, TaskIdentity,
+    };
+    use novarocks_failure_contract::{FailureFact, FailureProjection};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct OpaqueMetadata(Arc<AtomicUsize>);
+    impl Drop for OpaqueMetadata {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("opaque notification payload must remain quarantined");
+        }
+    }
+    struct FailingNotification {
+        owner: Arc<Owner>,
+        payload_drops: Arc<AtomicUsize>,
+        observed: Mutex<Option<FailureFact>>,
+        health: Mutex<Option<FailureFact>>,
+    }
+    impl TaskConclusionPort<ExecutionFailure> for FailingNotification {
+        fn identity(&self) -> TaskIdentity {
+            self.owner.identity()
+        }
+        fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
+            self.owner.accepted()
+        }
+        fn submit(
+            &self,
+            proposal: TaskConclusionProposal<ExecutionFailure>,
+        ) -> ConclusionAcceptance<ExecutionFailure> {
+            self.owner.submit(proposal)
+        }
+    }
+    impl TaskExecutionPort for FailingNotification {
+        fn execution_health(&self) -> Arc<crate::runtime::execution_health::ExecutionHealth> {
+            self.owner.execution_health()
+        }
+        fn report_cleanup(&self, cause: &ExecutionFailure, phase: TaskFailurePhase) {
+            *self.observed.lock().unwrap() = Some(cause.failure_fact());
+            self.owner.report_cleanup(cause, phase);
+            std::panic::panic_any(OpaqueMetadata(self.payload_drops.clone()));
+        }
+        fn report_unresolved_exit(&self, fact: FailureFact, phase: TaskFailurePhase) {
+            *self.health.lock().unwrap() = Some(fact);
+            self.owner.report_unresolved_exit(fact, phase);
+        }
+        fn is_stopped(&self) -> bool {
+            self.owner.is_stopped()
+        }
+        fn stop_observable(&self) -> Arc<crate::runtime::observable::Observable> {
+            self.owner.stop_observable()
+        }
+        fn wait_until_stopped(&self, duration: std::time::Duration) -> bool {
+            self.owner.wait_until_stopped(duration)
+        }
+    }
+    #[derive(Debug)]
+    struct OriginalCleanupSource(Arc<AtomicUsize>);
+    impl std::fmt::Display for OriginalCleanupSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original resource cleanup failure")
+        }
+    }
+    impl std::error::Error for OriginalCleanupSource {}
+    impl FailureProjection for OriginalCleanupSource {
+        fn failure_fact(&self) -> FailureFact {
+            InjectedCleanupFailure(ResourceKind::SinkCommit).failure_fact()
+        }
+    }
+    impl Drop for OriginalCleanupSource {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn failed_cleanup_notification_does_not_retain_exited_resource_or_task_authority() {
+        let owner = Owner::new();
+        let accepted = owner
+            .submit(TaskConclusionProposal::Aborted(
+                novarocks_execution_contract::AbortCause::PeerTaskFailed,
+            ))
+            .accepted;
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let port = Arc::new(FailingNotification {
+            owner: owner.clone(),
+            payload_drops: payload_drops.clone(),
+            observed: Mutex::new(None),
+            health: Mutex::new(None),
+        });
+        let weak_port = Arc::downgrade(&port);
+        let control = Arc::new(
+            TaskExecutionControl::new(port.identity(), port.clone(), TaskFailurePhase::Execution)
+                .unwrap(),
+        );
+        let state = RuntimeErrorState::for_task(control.clone());
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("returned cleanup source holder");
+        let mut cell = ResourceCell::new(
+            crate::runtime::mem_tracker::TrackedBytes::try_new(128, tracker.clone()).unwrap(),
+        );
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let error = ExecutionFailure::from_domain(OriginalCleanupSource(source_drops.clone()));
+        let original_fact = error.failure_fact();
+        cell.hook(&state, |_| Err(error));
+        cell.retire(&state);
+        assert!(
+            cell.exited(),
+            "metadata delivery is independent from actual hook/holder/source exit"
+        );
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(*port.observed.lock().unwrap(), Some(original_fact));
+        assert_eq!(
+            port.health.lock().unwrap().unwrap().reason(),
+            super::super::ExecutionReason::PipelineFinisherCallPanicked.reason()
+        );
+        assert!(
+            Arc::ptr_eq(&owner.accepted().unwrap(), &accepted),
+            "cleanup cannot refine the actual Peer placeholder"
+        );
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+        drop(cell);
+        drop(state);
+        drop(control);
+        drop(port);
+        assert!(
+            weak_port.upgrade().is_none(),
+            "metadata custody contains no Task execution authority"
+        );
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
     }
 }

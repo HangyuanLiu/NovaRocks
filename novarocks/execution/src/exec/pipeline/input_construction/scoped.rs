@@ -90,9 +90,8 @@ fn exhausted() -> ConstructionFailure {
     CompileControlError::ResourceExhausted.into()
 }
 fn arc_layout<T>() -> Result<Layout, ConstructionFailure> {
-    novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>()).map_err(
-        |error| ConstructionFailure::InvalidSource(format!("input creator Arc request: {error:?}")),
-    )
+    novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>())
+        .map_err(|error| ConstructionFailure::from(error))
 }
 impl CreatorGuard {
     fn request(&self, layout: Layout) -> Result<(), ConstructionFailure> {
@@ -328,7 +327,10 @@ mod tests {
     }
     fn source() -> Chunk {
         let pure = ValueTypeStorageLifetime::pure();
-        Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             Arc::new(ChunkSchema::try_new_typed(vec![], pure.clone()).unwrap()),
             vec![],
             1,

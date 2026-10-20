@@ -46,7 +46,7 @@ impl PureCompileControl for DeriveControl {
             assert!(at <= stop, "property derivation callback after refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -399,7 +399,7 @@ fn prefixes(
         ] {
             let control = DeriveControl {
                 trace: Mutex::default(),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(derive(fixture, calls, node, source, &control), Err(FragmentPropertyError::Control(actual)) if actual == cause)

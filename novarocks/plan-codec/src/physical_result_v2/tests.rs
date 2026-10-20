@@ -47,7 +47,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -336,7 +336,7 @@ fn replay(c: &Control, invoke: impl Fn() -> Result<(), Error>) {
     assert!(!trace.is_empty());
     for at in 0..trace.len() {
         for cause in CAUSES {
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             control_error(invoke(), cause);
             assert_eq!(c.trace(), trace[..=at]);
         }
@@ -876,7 +876,7 @@ fn every_small_result_callback_preserves_three_primary_causes_and_ordinary_tails
             assert!(trace.iter().any(|(_, units)| *units > 0));
             for at in 0..trace.len() {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     control_error(ordinary(), cause);
                     assert_eq!(c.trace(), trace[..=at]);
                 }
@@ -936,7 +936,7 @@ fn wide_result_actual_byte_copy_and_occurrences_expose_bounded_quantum() {
             samples.dedup();
             for at in samples {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     control_error(invoke(), cause);
                     assert_eq!(c.trace(), trace[..=at]);
                 }

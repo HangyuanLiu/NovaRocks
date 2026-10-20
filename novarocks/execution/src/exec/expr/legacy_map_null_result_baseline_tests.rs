@@ -25,6 +25,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{NullBuffer, OffsetBuffer};
+use novarocks_failure_contract::{
+    FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+};
 use novarocks_types::SlotId;
 use std::{collections::HashMap, sync::Arc};
 fn setup(mut columns: Vec<ArrayRef>, rows: usize) -> (ExprArena, Vec<ExprId>, Chunk) {
@@ -54,7 +57,7 @@ fn array(
     columns: Vec<ArrayRef>,
     rows: usize,
     output: Option<DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let empty = columns.is_empty();
     let (mut arena, mut ids, chunk) = setup(columns, rows);
     if empty {
@@ -83,7 +86,10 @@ fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bo
         false,
     ))
 }
-fn lookup(columns: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn lookup(
+    columns: Vec<ArrayRef>,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = columns[0].len();
     let (mut arena, ids, chunk) = setup(columns, rows);
     let id = match output {
@@ -127,7 +133,14 @@ fn original_map_null_result_preserves_exact_nullarray_storage_and_lookup_semanti
                 }
                 let result = lookup(arguments, output.clone());
                 if strict && map_valid && !present {
-                    assert_eq!(result.unwrap_err(), "Key not present in map", "{case}");
+                    let failure = result.unwrap_err();
+                    assert_eq!(
+                        failure.failure_fact(),
+                        novarocks_functions::builtin::map_lookup_core::LookupRowFailure::MissingKey
+                            .failure_fact(),
+                        "{case}",
+                    );
+                    assert_eq!(failure.to_string(), "Key not present in map", "{case}");
                     continue;
                 }
                 let result = result.unwrap_or_else(|error| {
@@ -147,12 +160,17 @@ fn original_map_null_result_preserves_exact_nullarray_storage_and_lookup_semanti
         vec![0, 1],
         None,
     );
+    let failure = lookup(
+        vec![source, Arc::new(StringArray::from(vec!["1"]))],
+        Some(DataType::Null),
+    )
+    .unwrap_err();
     assert_eq!(
-        lookup(
-            vec![source, Arc::new(StringArray::from(vec!["1"]))],
-            Some(DataType::Null),
-        )
-        .unwrap_err(),
-        "map key type mismatch: Int32 vs Utf8"
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(374).unwrap()),
+        ),
     );
+    assert_eq!(failure.to_string(), "map key type mismatch: Int32 vs Utf8");
 }

@@ -44,7 +44,7 @@ fn debug_bytes(
     }
     work.flush().map_err(CopyError::Control)?;
     let mut count = Count(0);
-    fmt::write(&mut count, format_args!("{value:?}")).map_err(|_| CopyError::Extent)?;
+    fmt::write(&mut count, format_args!("{value:?}")).map_err(|_| CopyError::arithmetic(None))?;
     work.flush().map_err(CopyError::Control)?;
     Ok(count.0)
 }

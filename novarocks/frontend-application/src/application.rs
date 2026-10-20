@@ -1924,6 +1924,11 @@ impl FrontendApplicationHost {
             self.data_runtime.clone(),
             self.execution_runtime_owner.lifecycle_diagnostics(),
             self.execution_runtime_owner.internal_result_cpu(),
+            Arc::clone(self.topology())
+                as novarocks_query_application::api::BackendProcessObservationService,
+            self.execution_runtime_owner
+                .supervisor
+                .statement_native_residual_port(),
         )
         .map_err(FrontendApplicationError::server)?;
         #[cfg(novarocks_dev_controls)]

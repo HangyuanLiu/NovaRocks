@@ -45,7 +45,7 @@ fn dense_payload() -> Vec<u8> {
     for n in 0..1024 {
         digest::add_value(&mut state, n as f64 - 512.).unwrap();
     }
-    digest::encode_state(&state)
+    digest::encode_state(&state).unwrap()
 }
 fn run_update(
     k: &ApproxPercentileKernel,
@@ -183,8 +183,8 @@ fn percentile_union_core_control_legacy_quantile_scratch_and_host_scratch_same_b
         .update_addresses(&mut original, 0, 0, 0, Diagnostic::UnweightedUpdate)
         .unwrap();
     assert_eq!(
-        digest::encode_state(&state.core),
-        digest::encode_state(&original)
+        digest::encode_state(&state.core).unwrap(),
+        digest::encode_state(&original).unwrap()
     );
     assert!(host.ledger.lock().unwrap().attempts >= 4);
     drop(state);
@@ -199,7 +199,7 @@ fn percentile_union_core_control_serializer_original_bytes_every_callback_seven_
         &(0..512).map(|n| n as f64 / 511.).collect::<Vec<_>>(),
     )
     .unwrap();
-    let original = digest::encode_state(&state);
+    let original = digest::encode_state(&state).unwrap();
     let run = |control: &Control| {
         let mut work = EvaluationCheckpoints::new(control);
         let result = digest::encode_state_observed(&state, &mut |event| match event {
@@ -240,7 +240,20 @@ fn percentile_union_core_control_typed_core_errors_keep_original_full_text_and_n
         fn data(&mut self, recipe: ApproxPercentileDataRecipe<'_>) -> String {
             recipe.to_string()
         }
-        fn allocation(&mut self, recipe: ApproxPercentileDataRecipe<'_>) -> String {
+        fn encoding(&mut self, recipe: ApproxPercentileDataRecipe<'_>) -> String {
+            recipe.to_string()
+        }
+        fn kernel(&mut self, source: crate::KernelFailure) -> String {
+            source.to_string()
+        }
+        fn json(&mut self, source: serde_json::Error) -> String {
+            source.to_string()
+        }
+        fn allocation<E: crate::allocation_failure::AllocationRefusalSource>(
+            &mut self,
+            recipe: ApproxPercentileDataRecipe<'_>,
+            _: E,
+        ) -> String {
             recipe.to_string()
         }
         fn observe(&mut self, _: ApproxPercentileObservation) -> Result<(), String> {
@@ -255,7 +268,7 @@ fn percentile_union_core_control_typed_core_errors_keep_original_full_text_and_n
         let error =
             digest::set_quantile_with_sink(&mut digest::PercentileState::default(), q, &mut sink)
                 .unwrap_err();
-        assert_eq!(error, expected);
+        assert_eq!(error, expected.to_string());
         assert_eq!(sink.trace, 0);
     }
     let mut legacy = digest::PercentileState::default();
@@ -267,10 +280,13 @@ fn percentile_union_core_control_typed_core_errors_keep_original_full_text_and_n
         digest::add_value(&mut legacy, value).unwrap();
         digest::add_value_with_sink(&mut typed, value, &mut sink).unwrap();
     }
-    assert_eq!(digest::encode_state(&legacy), digest::encode_state(&typed));
+    assert_eq!(
+        digest::encode_state(&legacy).unwrap(),
+        digest::encode_state(&typed).unwrap()
+    );
     let expected = digest::set_quantiles(&mut legacy, &[0., 0.75, 1.]).unwrap_err();
     assert_eq!(
         digest::set_quantiles_with_sink(&mut typed, &[0., 0.75, 1.], &mut sink).unwrap_err(),
-        expected
+        expected.to_string()
     );
 }

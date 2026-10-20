@@ -39,7 +39,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after primary refusal");
         }
@@ -657,7 +657,7 @@ fn prefixes(control: &Control, mut invoke: impl FnMut() -> Result<(), Error>, su
     assert!(!trace.is_empty());
     for at in 0..trace.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(matches!(invoke(),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(control.trace(), trace[..=at]);
         }
@@ -799,7 +799,7 @@ fn wide_schema_copy_has_actual_quantum_without_claiming_hashmap_internal_samplin
         };
         for at in [0, middle, trace.len() - 1] {
             for cause in CAUSES {
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 let result = if receive {
                     run_decode(encoded.as_wire(), &read, &control).map(|_| ())
                 } else {

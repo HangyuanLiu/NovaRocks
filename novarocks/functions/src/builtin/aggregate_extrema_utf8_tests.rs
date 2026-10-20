@@ -38,7 +38,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -866,7 +866,7 @@ fn utf8_extrema_actual_compile_boundaries_keep_three_causes_without_after_callba
                 ] {
                     let control = CompileControl {
                         trace: Mutex::default(),
-                        refusal: Some((stop, cause)),
+                        refusal: Some((stop, cause.clone())),
                     };
                     let out = fixture.prepare(phase, &control);
                     assert!(

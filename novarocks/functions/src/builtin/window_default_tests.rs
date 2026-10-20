@@ -39,7 +39,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -474,7 +474,7 @@ fn every_actual_compile_boundary_keeps_all_three_original_causes_and_ordinary_ta
             ] {
                 let c = CompileControl {
                     trace: Mutex::default(),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 let error = DefaultValueRecipe::try_new(&source, &target, &c).unwrap_err();
                 assert_eq!(error, compile_failure(cause));

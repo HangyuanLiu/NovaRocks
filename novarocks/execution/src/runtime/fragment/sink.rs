@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::{ExecutionFailure, sink_failure};
 use crate::exec::expr::ExprArena;
 #[cfg(test)]
 use crate::exec::expr::ExprId;
@@ -111,10 +112,10 @@ fn materialize_fragment_sink_components_impl(
     match (program, assignment) {
         (StaticSinkProgram::RootResult(contract), FragmentSinkAssignment::None) => {
             let session = root_result_session.ok_or_else(|| {
-                materialization_error("frozen root requires its opened bounded session")
+                materialization_contract("frozen root requires its opened bounded session")
             })?;
             if session.spec().contract.as_ref() != contract.as_ref() {
-                return Err(materialization_error(
+                return Err(materialization_contract(
                     "bounded root session has a different frozen contract",
                 ));
             }
@@ -130,7 +131,7 @@ fn materialize_fragment_sink_components_impl(
         }
         (StaticSinkProgram::Result, FragmentSinkAssignment::None) => {
             let session = result_session.ok_or_else(|| {
-                materialization_error("RESULT_SINK requires an opened Fragment result session")
+                materialization_contract("RESULT_SINK requires an opened Fragment result session")
             })?;
             Ok(MaterializedFragmentSink {
                 factory: Box::new(ResultBufferSinkFactory::new(session, None)),
@@ -202,7 +203,7 @@ fn materialize_fragment_sink_components_impl(
             std::sync::Arc::clone(&runtime_error),
         )
         .map(|factory| MaterializedFragmentSink { factory }),
-        (static_program, dynamic_assignment) => Err(materialization_error(format!(
+        (static_program, dynamic_assignment) => Err(materialization_contract(format!(
             "sink {} cannot be materialized with assignment {}",
             sink_program_name(static_program),
             sink_assignment_name(dynamic_assignment)
@@ -229,13 +230,13 @@ pub(crate) fn materialize_compiled_sink(
     let graph = program.graph();
     let sink = graph
         .sink()
-        .ok_or_else(|| materialization_error("compiled local program has no static sink"))?;
+        .ok_or_else(|| materialization_contract("compiled local program has no static sink"))?;
     if !matches!(
         sink,
         StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)
     ) && result_sink.is_some()
     {
-        return Err(materialization_error(format!(
+        return Err(materialization_contract(format!(
             "compiled {} sink cannot take a result sink",
             sink_program_name(sink)
         )));
@@ -245,7 +246,7 @@ pub(crate) fn materialize_compiled_sink(
             StaticSinkProgram::Result | StaticSinkProgram::RootResult(_),
             FragmentSinkAssignment::None,
         ) => result_sink
-            .ok_or_else(|| materialization_error("compiled RESULT_SINK requires a result sink")),
+            .ok_or_else(|| materialization_contract("compiled RESULT_SINK requires a result sink")),
         (StaticSinkProgram::Noop, FragmentSinkAssignment::None) => {
             Ok(Box::new(NoopSinkFactory::new()))
         }
@@ -258,12 +259,12 @@ pub(crate) fn materialize_compiled_sink(
         ) => {
             let partition_keys = compiled_partition_keys(program, branch)?;
             if let Some(limit) = branch.limit() {
-                return Err(materialization_error(format!(
+                return Err(materialization_contract(format!(
                     "compiled stream sink limit {limit} is not executable yet"
                 )));
             }
-            let plan_node_id = i32::try_from(graph.root().index())
-                .map_err(|_| materialization_error("compiled program root index exceeds i32"))?;
+            let plan_node_id =
+                sink_failure::root_identity(graph.root().index()).map_err(materialization_error)?;
             // Keys are compiled roots over the sink's input port, so the
             // legacy partition expressions and arena stay empty; the compiled
             // sink arena is never thawed.
@@ -302,11 +303,11 @@ pub(crate) fn materialize_compiled_sink(
             StaticSinkProgram::MultiCastDataStream { .. }
             | StaticSinkProgram::SplitDataStream { .. },
             _,
-        ) => Err(materialization_error(format!(
+        ) => Err(materialization_contract(format!(
             "compiled {} sink not executable yet",
             sink_program_name(sink)
         ))),
-        (static_program, dynamic_assignment) => Err(materialization_error(format!(
+        (static_program, dynamic_assignment) => Err(materialization_contract(format!(
             "compiled sink {} cannot be materialized with assignment {}",
             sink_program_name(static_program),
             sink_assignment_name(dynamic_assignment)
@@ -323,7 +324,7 @@ fn compiled_partition_keys(
     let keys = branch.partition_exprs().len();
     if !branch.partition_type().requires_exprs() {
         if keys != 0 {
-            return Err(materialization_error(format!(
+            return Err(materialization_contract(format!(
                 "compiled {} stream sink cannot carry partition keys",
                 branch.partition_type().display_name()
             )));
@@ -331,15 +332,14 @@ fn compiled_partition_keys(
         return Ok(None);
     }
     if keys == 0 {
-        return Err(materialization_error(format!(
+        return Err(materialization_contract(format!(
             "compiled {} stream sink has no partition key",
             branch.partition_type().display_name()
         )));
     }
     let mut sites = Vec::with_capacity(keys);
     for key in 0..keys {
-        let key = u32::try_from(key)
-            .map_err(|_| materialization_error("compiled partition key count exceeds u32"))?;
+        let key = sink_failure::key_identity(key).map_err(materialization_error)?;
         sites.push(
             novarocks_local_program::ProgramExpressionRootSite::SinkPartition { branch: 0, key },
         );
@@ -459,19 +459,23 @@ fn branch_input(
 #[cfg(test)]
 fn ensure_group_count(expected: usize, actual: usize) -> Result<(), FragmentLaunchError> {
     if expected != actual {
-        return Err(materialization_error(format!(
+        return Err(materialization_contract(format!(
             "expected {expected} destination groups, got {actual}"
         )));
     }
     Ok(())
 }
 
-fn materialization_error(detail: impl Into<String>) -> FragmentLaunchError {
-    FragmentLaunchError::new(
+fn materialization_error(source: impl Into<ExecutionFailure>) -> FragmentLaunchError {
+    FragmentLaunchError::from_failure(
         FragmentLaunchStage::Materialize,
         FragmentLaunchErrorKind::Materialization,
-        detail,
+        source.into(),
     )
+}
+
+fn materialization_contract(detail: impl std::fmt::Display) -> FragmentLaunchError {
+    materialization_error(sink_failure::contract(detail))
 }
 
 fn sink_program_name(program: &StaticSinkProgram) -> &'static str {
@@ -519,11 +523,12 @@ mod runtime_arena_tests {
                 .wait_interruptibly(std::time::Duration::ZERO)
                 .is_ok()
         );
-        stopped.set_error("sink fragment cancelled".to_string());
-        assert_eq!(
-            runtime.wait_interruptibly(std::time::Duration::from_secs(60)),
-            Err("sink fragment cancelled".to_string())
-        );
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Cancelled);
+        stopped.set_error(original.clone());
+        let observed = runtime
+            .wait_interruptibly(std::time::Duration::from_secs(60))
+            .unwrap_err();
+        assert!(observed.same_occurrence(&original));
         assert!(
             sibling
                 .wait_interruptibly(std::time::Duration::ZERO)

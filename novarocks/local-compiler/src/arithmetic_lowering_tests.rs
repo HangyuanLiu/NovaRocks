@@ -869,7 +869,7 @@ impl PureCompileControl for RefusingArithmeticControl {
         trace.push((phase, units));
         if trace.len() == self.stop_at {
             *refused = true;
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -905,7 +905,7 @@ fn mandatory_arithmetic_compilation_preserves_every_control_prefix_and_ordinary_
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = RefusingArithmeticControl::new(cause, stop_at);
+                let control = RefusingArithmeticControl::new(cause.clone(), stop_at);
                 assert!(
                     matches!(compile(source.clone(), &functions, &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );

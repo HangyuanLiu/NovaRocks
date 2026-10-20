@@ -16,6 +16,29 @@
 // under the License.
 //! Pure finalize helpers for join selection vectors and match flags.
 
+use crate::runtime::fragment::ExecutionFailure;
+#[derive(Debug)]
+struct JoinFinalizeContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinFinalizeContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinFinalizeContract {}
+impl novarocks_failure_contract::FailureProjection for JoinFinalizeContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinFinalizeContract.reason(),
+        )
+    }
+}
+fn contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinFinalizeContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+
 use super::match_flags::BuildMatchFlags;
 use super::search::JoinSelection;
 
@@ -25,13 +48,13 @@ pub(crate) struct ProbeFinalize {
     pub(crate) selected: Vec<u32>,
 }
 
-fn validate_selection_pair_lengths(selection: &JoinSelection) -> Result<(), String> {
+fn validate_selection_pair_lengths(selection: &JoinSelection) -> Result<(), ExecutionFailure> {
     if selection.probe.len() != selection.build.len() {
-        return Err(format!(
+        return Err(contract(format_args!(
             "join selection length mismatch: probe={} build={}",
             selection.probe.len(),
             selection.build.len()
-        ));
+        )));
     }
     Ok(())
 }
@@ -40,15 +63,15 @@ pub(crate) fn probe_matched_flags(
     probe_len: usize,
     selection: &JoinSelection,
     context: &str,
-) -> Result<Vec<bool>, String> {
+) -> Result<Vec<bool>, ExecutionFailure> {
     validate_selection_pair_lengths(selection)?;
     let mut matched = vec![false; probe_len];
     for &probe_row in &selection.probe {
         let row = probe_row as usize;
         let Some(slot) = matched.get_mut(row) else {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "{context} probe row out of bounds: row={probe_row} rows={probe_len}"
-            ));
+            )));
         };
         *slot = true;
     }
@@ -69,7 +92,7 @@ pub(crate) fn finalize_probe_rows(
     selection: &JoinSelection,
     want_matched: bool,
     context: &str,
-) -> Result<ProbeFinalize, String> {
+) -> Result<ProbeFinalize, ExecutionFailure> {
     let matched = probe_matched_flags(probe_len, selection, context)?;
     let selected = select_probe_rows_from_flags(&matched, want_matched);
     Ok(ProbeFinalize { matched, selected })
@@ -78,7 +101,7 @@ pub(crate) fn finalize_probe_rows(
 pub(crate) fn mark_build_matches(
     flags: &mut BuildMatchFlags,
     selection: &JoinSelection,
-) -> Result<u64, String> {
+) -> Result<u64, ExecutionFailure> {
     validate_selection_pair_lengths(selection)?;
     let mut newly_marked = 0u64;
     for &build_row in &selection.build {
@@ -102,6 +125,7 @@ pub(crate) fn is_all_match_one(selection: &JoinSelection, probe_len: usize) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_failure_contract::FailureProjection;
 
     #[test]
     fn finalize_probe_rows_selects_matched_and_unmatched() {
@@ -130,7 +154,14 @@ mod tests {
 
         let err = finalize_probe_rows(3, &selection, true, "left semi").expect_err("oob probe");
 
-        assert_eq!(err, "left semi probe row out of bounds: row=3 rows=3");
+        assert_eq!(
+            err.detail(),
+            "left semi probe row out of bounds: row=3 rows=3"
+        );
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
     }
 
     #[test]
@@ -143,7 +174,14 @@ mod tests {
         let err =
             finalize_probe_rows(2, &selection, true, "left semi").expect_err("length mismatch");
 
-        assert_eq!(err, "join selection length mismatch: probe=1 build=2");
+        assert_eq!(
+            err.detail(),
+            "join selection length mismatch: probe=1 build=2"
+        );
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
     }
 
     #[test]
@@ -175,7 +213,14 @@ mod tests {
 
         let err = mark_build_matches(&mut flags, &selection).expect_err("length mismatch");
 
-        assert_eq!(err, "join selection length mismatch: probe=1 build=2");
+        assert_eq!(
+            err.detail(),
+            "join selection length mismatch: probe=1 build=2"
+        );
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
     }
 
     #[test]

@@ -96,7 +96,7 @@ pub(super) fn paid_input(
         .unwrap();
     let metadata = OutputColumnMetadata::try_new(
         source.num_columns(),
-        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone()),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
         &FixtureControl,
     )
     .unwrap();
@@ -374,7 +374,7 @@ fn try_run_in(
     tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
 ) -> Result<Vec<Chunk>, String> {
     let tracked = tracker.is_some();
-    let state = Arc::new(RuntimeState::new(
+    let state = Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,

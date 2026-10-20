@@ -20,8 +20,8 @@
 
 use super::*;
 use crate::exec::chunk::typed_fixture;
-use crate::exec::operators::compiled_aggregate::expression_allocation_host;
 use crate::exec::pipeline::operator::{InputConstructionFactory, InputConstructionOwner};
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use crate::runtime::{
     fragment::ExecutionFailureCause, mem_tracker::MemTracker, runtime_state::RuntimeErrorState,
 };
@@ -107,7 +107,7 @@ impl Fixture {
         );
         let tracker = MemTracker::new_root("ordered-slice-actual-creator");
         if attach {
-            input.try_transfer_to_typed(&tracker).unwrap();
+            input.try_transfer_to(&tracker).unwrap();
         }
         let source_stock = tracker.current();
         let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
@@ -423,14 +423,18 @@ fn ordered_slice_control_refusal_keeps_first_cause_and_releases_unpublished_owne
 fn ordered_slice_positive_host_limit_refusal_keeps_no_raw_or_source_owner() {
     let mut fixture = Fixture::new(true);
     let tracker = fixture.tracker.clone();
-    tracker
-        .install_limit_once(tracker.current().checked_add(1).unwrap())
-        .unwrap();
+    let limit = tracker.current().checked_add(1).unwrap();
+    tracker.install_limit_once(limit).unwrap();
     let error = fixture.apply(1, 3, &Control::running()).unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
     assert_eq!(
-        error.cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Resource
     );
+    let resource = fact.resource().expect("the original tracker refusal");
+    assert_eq!(resource.limit, Some(limit as u64));
+    assert!(resource.requested.unwrap() > 0);
+    assert!(resource.committed.unwrap() > limit as u64);
     drop(fixture);
     assert_eq!(tracker.current(), 0);
 }

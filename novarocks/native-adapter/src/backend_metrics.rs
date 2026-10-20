@@ -1543,7 +1543,7 @@ mod tests {
             &self,
             _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
             _: novarocks_execution_contract::task_execution::creation::TaskCreationInput,
-            _preparation_stop: novarocks_worker::TaskPreparationStopView,
+            _preparation_stop: novarocks_worker::TaskPreparationContext<'_>,
         ) -> Result<novarocks_worker::PreparedTaskInstallation, novarocks_worker::HostRejection>
         {
             panic!("metrics fixture must not install a task")
@@ -1593,6 +1593,9 @@ mod tests {
             Arc::new(UnusedPreparationHost),
             Arc::new(UnusedPreparationHost),
             crate::task_execution_observation::backend_task_execution_ports(
+                Arc::new(
+                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+                ),
                 #[cfg(novarocks_dev_controls)]
                 None,
             ),

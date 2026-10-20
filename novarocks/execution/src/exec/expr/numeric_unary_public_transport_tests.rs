@@ -315,7 +315,7 @@ impl PureCompileControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         calls.push((p, n));
         if self.fail == Some(calls.len() - 1) {
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -347,7 +347,7 @@ fn numeric_unary_public_transport_observed_receipt_preserves_first_control_cause
             let fail = Trace {
                 calls: Mutex::new(Vec::new()),
                 fail: Some(at),
-                cause,
+                cause: cause.clone(),
             };
             match source.checked_original_result_declaration_observed(&fail) {
                 Err(ResultDeclarationError::Control(got)) => assert_eq!(got, cause),

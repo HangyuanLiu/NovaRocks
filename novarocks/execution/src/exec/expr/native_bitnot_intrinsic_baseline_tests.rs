@@ -26,7 +26,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_types::{SlotId, largeint};
 use std::sync::Arc;
-fn original(input: ArrayRef, nullable: bool) -> Result<ArrayRef, String> {
+fn original(
+    input: ArrayRef,
+    nullable: bool,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let dtype = input.data_type().clone();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -139,10 +142,10 @@ fn native_bitnot_original_largeint_all128_bits_and_nulls() {
 fn native_bitnot_original_null_target_full_data_error_including_empty() {
     for rows in [0, 1, 3] {
         let input: ArrayRef = Arc::new(NullArray::new(rows));
-        assert_eq!(
-            original(input, true).unwrap_err(),
-            "bitnot: failed to cast output: Cast error: Casting from Int64 to Null not supported"
-        );
+        let expected =
+            arrow::compute::cast(&Int64Array::from(vec![None; rows]), &DataType::Null).unwrap_err();
+        let error = original(input, true).unwrap_err();
+        super::legacy_array_append_baseline_tests::assert_original_arrow(&error, &expected);
     }
 }
 

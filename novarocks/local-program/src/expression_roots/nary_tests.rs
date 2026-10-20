@@ -35,7 +35,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         self.trace.lock().unwrap().push((phase, units));
-        match self.refuse_units {
+        match self.refuse_units.clone() {
             Some((at, error)) if at == units => Err(error),
             _ => Ok(()),
         }
@@ -359,7 +359,7 @@ fn nary_definition_and_root_correspondence_keep_original_entry_and_256_control_f
     ] {
         for units in [0, 256] {
             let control = Control {
-                refuse_units: Some((units, failure)),
+                refuse_units: Some((units, failure.clone())),
                 ..Control::default()
             };
             assert_eq!(
@@ -371,14 +371,14 @@ fn nary_definition_and_root_correspondence_keep_original_entry_and_256_control_f
                     &control
                 )
                 .unwrap_err(),
-                ExpressionsCompileError::Control(failure)
+                ExpressionsCompileError::Control(failure.clone())
             );
             assert_eq!(
                 control.trace.lock().unwrap().last().copied(),
                 Some((CompilePhase::LowerProgram, units))
             );
             let control = Control {
-                refuse_units: Some((units, failure)),
+                refuse_units: Some((units, failure.clone())),
                 ..Control::default()
             };
             let error = snapshot(

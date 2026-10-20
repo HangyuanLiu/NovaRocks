@@ -171,6 +171,122 @@ impl RootResultReply {
     }
 }
 
+/// A read response with or without a consumption receipt. Application
+/// admission and read failures do not create another Task conclusion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RootReadResponse {
+    Reply(RootResultReply),
+    Deferred(RootReadDeferred),
+    Refused(RootReadRefusal),
+}
+
+/// Frozen request binding for a response that supplies no ACK receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootReadBinding {
+    root_task: TaskIdentity,
+    profile: RootProfileId,
+    kind: RootOutputKind,
+}
+impl RootReadBinding {
+    fn from_request(request: &RootResultRead) -> Self {
+        Self {
+            root_task: request.root_task(),
+            profile: request.profile(),
+            kind: request.kind(),
+        }
+    }
+}
+
+/// A normal observation that this read did not obtain its next capacity.
+/// Facts come from the admission author; no retry authority crosses the port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootReadDeferral {
+    Preparing,
+    ReadHoldersBusy(crate::failure::ResourceFacts),
+    SendMetadataBusy(crate::failure::ResourceFacts),
+    SendBackingBusy(crate::failure::ResourceFacts),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootReadDeferred {
+    binding: RootReadBinding,
+    reason: RootReadDeferral,
+}
+impl RootReadDeferred {
+    pub fn for_request(request: &RootResultRead, reason: RootReadDeferral) -> Self {
+        Self {
+            binding: RootReadBinding::from_request(request),
+            reason,
+        }
+    }
+    pub const fn reason(&self) -> RootReadDeferral {
+        self.reason
+    }
+}
+
+/// A domain-authored read failure, independent of the Task's accepted cause.
+/// No ACK receipt means its watermark is unknown: a cumulative ACK may have
+/// already been applied before a later send-capacity or read failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootReadRefusal {
+    binding: RootReadBinding,
+    fact: crate::failure::FailureFact,
+    detail: crate::SafeDetail,
+}
+impl RootReadRefusal {
+    pub fn for_request(
+        request: &RootResultRead,
+        fact: crate::failure::FailureFact,
+        detail: crate::SafeDetail,
+    ) -> Self {
+        Self {
+            binding: RootReadBinding::from_request(request),
+            fact,
+            detail,
+        }
+    }
+    pub const fn fact(&self) -> crate::failure::FailureFact {
+        self.fact
+    }
+    pub const fn detail(&self) -> &crate::SafeDetail {
+        &self.detail
+    }
+}
+impl crate::failure::FailureProjection for RootReadRefusal {
+    fn failure_fact(&self) -> crate::failure::FailureFact {
+        self.fact
+    }
+}
+impl RootReadResponse {
+    pub const fn root_task(&self) -> TaskIdentity {
+        match self {
+            Self::Reply(reply) => reply.root_task,
+            Self::Deferred(deferred) => deferred.binding.root_task,
+            Self::Refused(refused) => refused.binding.root_task,
+        }
+    }
+    pub const fn profile(&self) -> RootProfileId {
+        match self {
+            Self::Reply(reply) => reply.profile,
+            Self::Deferred(deferred) => deferred.binding.profile,
+            Self::Refused(refused) => refused.binding.profile,
+        }
+    }
+    pub const fn kind(&self) -> RootOutputKind {
+        match self {
+            Self::Reply(reply) => reply.kind,
+            Self::Deferred(deferred) => deferred.binding.kind,
+            Self::Refused(refused) => refused.binding.kind,
+        }
+    }
+    pub fn validate(&self) -> Result<(), RootResultError> {
+        match self {
+            Self::Reply(reply) => reply.validate(),
+            Self::Deferred(_) | Self::Refused(_) => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootResultError {
     Wait,
@@ -230,5 +346,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for RootResultError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let code = match self {
+            Self::Wait => 230,
+            Self::Payload => 231,
+            Self::EndSequence => 232,
+        };
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        )
     }
 }

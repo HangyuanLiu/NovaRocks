@@ -2024,7 +2024,7 @@ mod tests {
             novarocks_type_contract::CompileControlError::ResourceExhausted,
         ] {
             let mut layout = |_| Ok(());
-            let mut work = |_| Err(cause);
+            let mut work = |_| Err(cause.clone());
             let mut creation =
                 novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
                     novarocks_type_contract::ValueTypeStorageLifetime::pure(),

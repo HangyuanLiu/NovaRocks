@@ -754,14 +754,28 @@ pub struct OperatorProfiles {
 }
 
 impl OperatorProfiles {
+    pub(crate) fn input_encoding_counters(&self) -> [CounterRef; 7] {
+        [
+            "DictInputRows",
+            "DictInputColumns",
+            "DictKeptRows",
+            "DictKeptColumns",
+            "DictHydratedRows",
+            "DictHydratedColumns",
+            "DictUnsupportedColumns",
+        ]
+        .map(|name| self.unique.add_counter(name, ProfileUnit::Unit))
+    }
     pub fn new(operator: RuntimeProfile) -> Self {
         let common = operator.child("CommonMetrics");
         let unique = operator.child("UniqueMetrics");
-        Self {
+        let profiles = Self {
             operator,
             common,
             unique,
-        }
+        };
+        let _ = profiles.input_encoding_counters();
+        profiles
     }
 }
 

@@ -37,7 +37,7 @@ struct Compile(Option<CompileControlError>);
 impl PureCompileControl for Compile {
     fn checkpoint(&self, _: CompilePhase, work: u32) -> Result<(), CompileControlError> {
         assert!(work <= 256);
-        self.0.map_or(Ok(()), Err)
+        self.0.clone().map_or(Ok(()), Err)
     }
 }
 const COMPILE: Compile = Compile(None);
@@ -1321,7 +1321,7 @@ fn frozen_mismatch_unknown_identity_and_control_do_not_invoke_cpu_prepare() {
         CompileControlError::ResourceExhausted,
     ] {
         assert!(
-            matches!(catalog.prepare_frozen(call.input(), call.selected.clone(), &owner.frozen(&call.selected), aggregate_prepare(&call, AggregateKernelPhase::Single), &Compile(Some(category))), Err(FunctionSpecializationFailure::Control(error)) if error == category)
+            matches!(catalog.prepare_frozen(call.input(), call.selected.clone(), &owner.frozen(&call.selected), aggregate_prepare(&call, AggregateKernelPhase::Single), &Compile(Some(category.clone()))), Err(FunctionSpecializationFailure::Control(error)) if error == category)
         );
     }
     assert_eq!(owner.counts.aggregate.load(Ordering::Relaxed), 0);
@@ -1729,7 +1729,7 @@ fn c02_p1_preparation_controls_stop_before_and_after_override_without_adapter() 
     impl PureCompileControl for Stop<'_> {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
             if !self.after_hook || self.counts.window_prepare.load(Ordering::Relaxed) > 0 {
-                Err(self.failure)
+                Err(self.failure.clone())
             } else {
                 Ok(())
             }
@@ -1751,7 +1751,7 @@ fn c02_p1_preparation_controls_stop_before_and_after_override_without_adapter() 
                 let stop = Stop {
                     counts: &owner.counts,
                     after_hook,
-                    failure,
+                    failure: failure.clone(),
                 };
                 let result = if frozen {
                     catalog.prepare_frozen(

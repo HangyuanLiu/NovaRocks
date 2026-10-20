@@ -577,7 +577,7 @@ fn every_actual_boolean_callback_preserves_all_seven_causes_without_retry() {
 }
 
 #[test]
-fn non_boolean_operand_refusal_observes_ordinary_tail_and_keeps_primary_control() {
+fn non_boolean_operand_refusal_is_primary_and_has_no_optional_tail() {
     let input = SelectedValues::try_new(
         Selection::all(1),
         &DataType::Int64,
@@ -604,10 +604,13 @@ fn non_boolean_operand_refusal_observes_ordinary_tail_and_keeps_primary_control(
         evaluate(&recorder),
         Err(KernelFailure::InvalidProgram(_))
     ));
-    assert_eq!(*recorder.trace.lock().unwrap(), vec![0, 1]);
+    assert_eq!(*recorder.trace.lock().unwrap(), vec![0]);
     for cause in all_causes() {
         let control = Control::stopping(2, cause.clone());
-        assert!(matches!(evaluate(&control),Err(actual) if actual==cause));
-        assert_eq!(*control.trace.lock().unwrap(), vec![0, 1]);
+        assert!(matches!(
+            evaluate(&control),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        assert_eq!(*control.trace.lock().unwrap(), vec![0]);
     }
 }

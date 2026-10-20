@@ -27,12 +27,15 @@ use arrow_buffer::i256;
 use std::cmp::Ordering;
 
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, aggregate_bytes};
+use crate::runtime::fragment::ExecutionResult;
 use novarocks_types::largeint;
+#[path = "common_output_failure.rs"]
+mod output_failure;
 
 pub(in crate::exec::expr::agg) fn build_bool_array(
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut builder = BooleanBuilder::new();
     for &base in group_states {
         let state = unsafe { &*((base as *mut u8).add(offset) as *const BoolState) };
@@ -59,7 +62,10 @@ impl TrackedUtf8State {
         }
     }
 
-    pub(super) fn replace(&mut self, value: &str) -> Result<(), String> {
+    pub(super) fn replace(
+        &mut self,
+        value: &str,
+    ) -> Result<(), novarocks_functions::KernelFailure> {
         let replacement = aggregate_bytes(self.allocator.clone(), value.as_bytes())?;
         self.value = Some(replacement);
         Ok(())
@@ -69,13 +75,15 @@ impl TrackedUtf8State {
 pub(in crate::exec::expr::agg) fn build_utf8_array(
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut builder = StringBuilder::new();
+    let mut extent = output_failure::TextTally::default();
     for &base in group_states {
         let state = unsafe { &*((base as *mut u8).add(offset) as *const TrackedUtf8State) };
         match &state.value {
             Some(value) => {
-                builder.append_value(std::str::from_utf8(value).map_err(|error| error.to_string())?)
+                extent.append(value.len())?;
+                builder.append_value(std::str::from_utf8(value).map_err(output_failure::utf8)?)
             }
             None => builder.append_null(),
         }
@@ -86,7 +94,7 @@ pub(in crate::exec::expr::agg) fn build_utf8_array(
 pub(in crate::exec::expr::agg) fn build_date32_array(
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
         let state = unsafe { &*((base as *mut u8).add(offset) as *const I32State) };
@@ -99,10 +107,10 @@ pub(in crate::exec::expr::agg) fn build_timestamp_array(
     offset: usize,
     group_states: &[AggStatePtr],
     output_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let (unit, tz) = match output_type {
         DataType::Timestamp(unit, tz) => (*unit, tz.as_deref().map(|s| s.to_string())),
-        other => return Err(format!("timestamp output type mismatch: {:?}", other)),
+        other => return Err(output_failure::wrong_type("timestamp", other)),
     };
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
@@ -150,10 +158,10 @@ pub(in crate::exec::expr::agg) fn build_decimal128_array(
     offset: usize,
     group_states: &[AggStatePtr],
     output_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let (precision, scale) = match output_type {
         DataType::Decimal128(precision, scale) => (*precision, *scale),
-        other => return Err(format!("decimal output type mismatch: {:?}", other)),
+        other => return Err(output_failure::wrong_type("decimal128", other)),
     };
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
@@ -162,7 +170,7 @@ pub(in crate::exec::expr::agg) fn build_decimal128_array(
     }
     let array = Decimal128Array::from(values)
         .with_precision_and_scale(precision, scale)
-        .map_err(|e| e.to_string())?;
+        .map_err(output_failure::decimal)?;
     Ok(Arc::new(array))
 }
 
@@ -170,10 +178,10 @@ pub(in crate::exec::expr::agg) fn build_decimal256_array(
     offset: usize,
     group_states: &[AggStatePtr],
     output_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let (precision, scale) = match output_type {
         DataType::Decimal256(precision, scale) => (*precision, *scale),
-        other => return Err(format!("decimal256 output type mismatch: {:?}", other)),
+        other => return Err(output_failure::wrong_type("decimal256", other)),
     };
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
@@ -182,20 +190,20 @@ pub(in crate::exec::expr::agg) fn build_decimal256_array(
     }
     let array = Decimal256Array::from(values)
         .with_precision_and_scale(precision, scale)
-        .map_err(|e| e.to_string())?;
+        .map_err(output_failure::decimal)?;
     Ok(Arc::new(array))
 }
 
 pub(in crate::exec::expr::agg) fn build_largeint_array(
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
         let state = unsafe { &*((base as *mut u8).add(offset) as *const I128State) };
         values.push(state.has_value.then_some(state.value));
     }
-    largeint::array_from_i128(&values)
+    Ok(largeint::array_from_i128(&values)?)
 }
 
 pub use novarocks_functions::aggregate_scalar::AggScalarValue;
@@ -206,11 +214,11 @@ pub(super) fn aggregate_vec_with_capacity<T>(
     allocator: &AggregateAllocator,
     capacity: usize,
     operation: &str,
-) -> Result<AggregateVec<T>, String> {
+) -> Result<AggregateVec<T>, novarocks_functions::KernelFailure> {
     let mut values = AggregateVec::new_in(allocator.clone());
     values
         .try_reserve_exact(capacity)
-        .map_err(|_| allocator.allocation_error(operation))?;
+        .map_err(|source| allocator.allocation_error(operation, source))?;
     Ok(values)
 }
 
@@ -218,21 +226,21 @@ pub(super) fn tracked_scalar_from_array(
     array: &ArrayRef,
     row: usize,
     allocator: &AggregateAllocator,
-) -> Result<Option<TrackedAggScalarValue>, String> {
+) -> ExecutionResult<Option<TrackedAggScalarValue>> {
     novarocks_functions::aggregate_scalar::tracked_scalar_from_array(
         array,
         row,
         allocator,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
 pub(super) fn tracked_scalar_from_value(
     value: AggScalarValue,
     allocator: &AggregateAllocator,
-) -> Result<TrackedAggScalarValue, String> {
+) -> Result<TrackedAggScalarValue, novarocks_functions::KernelFailure> {
     Ok(match value {
         AggScalarValue::Bool(value) => TrackedAggScalarValue::Bool(value),
         AggScalarValue::Int64(value) => TrackedAggScalarValue::Int64(value),
@@ -278,7 +286,7 @@ fn tracked_optional_values_from_values(
     values: Vec<Option<AggScalarValue>>,
     allocator: &AggregateAllocator,
     kind: &str,
-) -> Result<AggregateVec<Option<TrackedAggScalarValue>>, String> {
+) -> Result<AggregateVec<Option<TrackedAggScalarValue>>, novarocks_functions::KernelFailure> {
     let operation = match kind {
         "struct" => "reserve aggregate struct scalar",
         "list" => "reserve aggregate list scalar",
@@ -297,47 +305,47 @@ fn tracked_optional_values_from_values(
 
 pub(super) fn tracked_scalar_to_output(
     value: &TrackedAggScalarValue,
-) -> Result<AggScalarValue, String> {
+) -> Result<AggScalarValue, crate::runtime::fragment::ExecutionFailure> {
     novarocks_functions::aggregate_scalar::tracked_scalar_to_output(
         value,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 pub(super) fn compare_tracked_scalar_values(
     left: &TrackedAggScalarValue,
     right: &TrackedAggScalarValue,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, crate::runtime::fragment::ExecutionFailure> {
     novarocks_functions::aggregate_scalar::compare_tracked_scalar_values(
         left,
         right,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 pub(super) fn tracked_key_fingerprint(
     key: &TrackedAggScalarValue,
     allocator: &AggregateAllocator,
-) -> Result<AggregateVec<u8>, String> {
+) -> Result<AggregateVec<u8>, crate::runtime::fragment::ExecutionFailure> {
     novarocks_functions::aggregate_scalar_fingerprint::tracked_key_fingerprint(
         key,
         allocator,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 pub(super) fn tracked_optional_key_fingerprint(
     value: &Option<TrackedAggScalarValue>,
     allocator: &AggregateAllocator,
-) -> Result<AggregateVec<u8>, String> {
+) -> Result<AggregateVec<u8>, crate::runtime::fragment::ExecutionFailure> {
     novarocks_functions::aggregate_scalar_fingerprint::tracked_optional_key_fingerprint(
         value,
         allocator,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 /// Heap bytes owned by a scalar value, excluding the inline enum body.
@@ -378,56 +386,61 @@ pub(super) fn scalar_heap_bytes(value: &AggScalarValue) -> usize {
     }
 }
 
-pub fn scalar_from_array(array: &ArrayRef, row: usize) -> Result<Option<AggScalarValue>, String> {
+pub fn scalar_from_array(
+    array: &ArrayRef,
+    row: usize,
+) -> Result<Option<AggScalarValue>, crate::runtime::fragment::ExecutionFailure> {
     novarocks_functions::aggregate_scalar::scalar_from_array(
         array,
         row,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 pub(in crate::exec::expr::agg) fn scalar_to_string(
     value: &AggScalarValue,
     data_type: &DataType,
-) -> Result<String, String> {
+) -> crate::runtime::fragment::ExecutionResult<String> {
     novarocks_functions::aggregate_format::scalar_to_string(
         value,
         data_type,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 pub fn compare_scalar_values(
     left: &AggScalarValue,
     right: &AggScalarValue,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, crate::runtime::fragment::ExecutionFailure> {
     novarocks_functions::aggregate_scalar_fingerprint::compare_scalar_values(
         left,
         right,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
-pub(in crate::exec::expr::agg) fn key_fingerprint(key: &AggScalarValue) -> Vec<u8> {
+pub(in crate::exec::expr::agg) fn key_fingerprint(
+    key: &AggScalarValue,
+) -> ExecutionResult<Vec<u8>> {
     novarocks_functions::aggregate_scalar_fingerprint::key_fingerprint(
         key,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .expect("legacy fingerprint observer cannot fail")
+    .map_err(Into::into)
 }
 
 pub fn build_scalar_array(
     output_type: &DataType,
     values: Vec<Option<AggScalarValue>>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     novarocks_functions::aggregate_scalar::build_scalar_array(
         output_type,
         values,
         &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
     )
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -530,7 +543,28 @@ mod retained_bytes_tests {
         let allocator = AggregateAllocator::new(Arc::clone(&tracker));
 
         let error = tracked_scalar_from_array(&array, 0, &allocator).unwrap_err();
-        assert!(error.contains("ResourceExhausted"));
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use std::error::Error;
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().code(), 169);
+        let resource = fact.resource().unwrap();
+        assert_eq!(
+            resource.requested,
+            Some(std::mem::size_of::<Option<TrackedAggScalarValue>>() as u64)
+        );
+        assert_eq!(resource.limit, None);
+        assert_eq!(resource.committed, None);
+        let mut source = error.source();
+        let mut actual_refusal = false;
+        while let Some(actual) = source {
+            actual_refusal |= actual
+                .is::<novarocks_functions::allocation_failure::AllocationRefusal<
+                    allocator_api2::collections::TryReserveError,
+                >>();
+            source = actual.source();
+        }
+        assert!(actual_refusal);
         assert_eq!(tracker.current(), 0);
     }
 
@@ -553,7 +587,7 @@ mod retained_bytes_tests {
         let state_bytes = tracker.current();
 
         let fingerprint = tracked_key_fingerprint(&tracked, &allocator).unwrap();
-        assert_eq!(fingerprint.as_slice(), key_fingerprint(&value));
+        assert_eq!(fingerprint.as_slice(), key_fingerprint(&value).unwrap());
         assert_eq!(fingerprint.len(), fingerprint.capacity());
         assert!(tracker.current() > state_bytes);
 
@@ -561,4 +595,100 @@ mod retained_bytes_tests {
         drop(tracked);
         assert_eq!(tracker.current(), 0);
     }
+}
+
+#[cfg(test)]
+pub(in crate::exec::expr::agg) fn assert_plan_contract(
+    failure: &crate::runtime::fragment::ExecutionFailure,
+    expected: &str,
+) {
+    use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+    let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = failure.cause() else {
+        panic!("the actual plan author must survive");
+    };
+    let original = source
+        .downcast_ref::<crate::exec::fragment::error::ExecPlanBuildError>()
+        .expect("the original expression plan guard");
+    assert_eq!(
+        original.invariant(),
+        crate::exec::fragment::error::ExecPlanInvariant::Expression
+    );
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        original.detail(),
+        BoundedDetail::truncating(expected).as_str()
+    );
+}
+#[cfg(test)]
+pub(in crate::exec::expr::agg) fn assert_collection_refusal<
+    E: novarocks_functions::allocation_failure::AllocationRefusalSource,
+>(
+    failure: &(impl std::error::Error + novarocks_failure_contract::FailureProjection + 'static),
+    operation: &str,
+) {
+    use novarocks_failure_contract::FailureClass;
+    use novarocks_functions::allocation_failure::AllocationRefusal;
+    let fact = failure.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Resource);
+    assert_eq!(fact.reason().code(), 169);
+    let resource = fact.resource().expect("the original collection request");
+    assert_eq!(resource.limit, None);
+    let mut source: &dyn std::error::Error = failure;
+    loop {
+        if let Some(original) = source.downcast_ref::<AllocationRefusal<E>>() {
+            assert_eq!(original.original().allocator_refusal(), Some(true));
+            assert_eq!(
+                resource.requested,
+                original
+                    .original()
+                    .requested_bytes()
+                    .and_then(|n| u64::try_from(n).ok())
+            );
+            assert!(resource.requested.unwrap() > 0);
+            assert!(original.to_string().starts_with(operation));
+            break;
+        }
+        source = source
+            .source()
+            .expect("the actual collection reserve source");
+    }
+}
+#[cfg(test)]
+pub(in crate::exec::expr::agg) fn assert_bounded_outer_contract(
+    failure: &crate::runtime::fragment::ExecutionFailure,
+    expected: &str,
+) {
+    use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        failure.detail(),
+        BoundedDetail::truncating(expected).as_str()
+    );
+}
+
+#[cfg(test)]
+pub(in crate::exec::expr::agg) fn assert_view_contract(
+    failure: &crate::runtime::fragment::ExecutionFailure,
+    expected: &str,
+) {
+    use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+    let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = failure.cause() else {
+        panic!("the view author must survive");
+    };
+    let original = source
+        .downcast_ref::<crate::exec::expr::agg::views::AggregateViewFailure>()
+        .expect("the actual aggregate input view");
+    let crate::exec::expr::agg::views::AggregateViewFailure::InputContract(detail) = original
+    else {
+        panic!("the actual missing view contract");
+    };
+    assert_eq!(
+        detail.as_str(),
+        BoundedDetail::truncating(expected).as_str()
+    );
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        failure.failure_fact().reason(),
+        crate::runtime::fragment::ExecutionReason::AggregateInputContract.reason()
+    );
 }

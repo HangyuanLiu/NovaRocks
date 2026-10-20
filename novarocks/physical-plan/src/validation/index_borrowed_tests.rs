@@ -49,7 +49,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original index refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -299,7 +299,7 @@ fn scan_provider_and_derived_occurrences_create_their_own_shared_port_and_real_q
     for at in [0, quantum, trace.len() - 1] {
         for cause in CAUSES {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert_eq!(run(&fragment, &control).err(), Some(cause.into()));
@@ -318,7 +318,7 @@ fn every_actual_small_index_callback_preserves_three_causes_and_original_caller_
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let control = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert_eq!(run(&fragment, &control).err(), Some(cause.into()));

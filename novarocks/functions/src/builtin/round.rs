@@ -244,7 +244,11 @@ fn row_overflow(
     message: &str,
 ) {
     if policy == DecimalOverflowPolicy::ReportError {
-        errors.push(RowDataError::new(ordinal, message));
+        errors.push(RowDataError::with_reason(
+            ordinal,
+            crate::DataFailureReason::NumericOutOfRange,
+            message,
+        ));
     }
 }
 fn capacity(rows: usize) -> Result<(), KernelFailure> {

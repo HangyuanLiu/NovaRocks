@@ -2529,7 +2529,7 @@ mod constant_resource_tests {
             let mut calls = self.calls.lock().unwrap();
             let position = calls.len();
             calls.push((phase, units));
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((at, cause)) if at == position => Err(cause),
                 _ => Ok(()),
             }
@@ -2703,7 +2703,7 @@ mod constant_resource_tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     calls: Mutex::new(Vec::new()),
                 };
                 assert!(matches!(measured(&pools, &control), Err(actual) if actual == cause));

@@ -153,6 +153,7 @@ pub enum DropPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorMutationFailureKind {
+    Interrupted,
     InvalidRequest,
     NotFound,
     AlreadyExists,
@@ -172,13 +173,43 @@ pub enum ConnectorMutationFailureKind {
 pub struct ConnectorMutationFailure {
     kind: ConnectorMutationFailureKind,
     message: Arc<str>,
+    source: Option<ConnectorError>,
 }
 
+impl From<ConnectorErrorKind> for ConnectorMutationFailureKind {
+    fn from(kind: ConnectorErrorKind) -> Self {
+        match kind {
+            ConnectorErrorKind::InvalidRequest => Self::InvalidRequest,
+            ConnectorErrorKind::NotFound => Self::NotFound,
+            ConnectorErrorKind::PermissionDenied => Self::PermissionDenied,
+            ConnectorErrorKind::Unsupported => Self::Unsupported,
+            ConnectorErrorKind::Cancelled => Self::Cancelled,
+            ConnectorErrorKind::DeadlineExceeded => Self::DeadlineExceeded,
+            ConnectorErrorKind::ResourceExhausted => Self::ResourceExhausted,
+            ConnectorErrorKind::Interrupted => Self::Interrupted,
+            ConnectorErrorKind::Unavailable => Self::Unavailable,
+            ConnectorErrorKind::CorruptData => Self::CorruptData,
+            ConnectorErrorKind::Internal => Self::Internal,
+        }
+    }
+}
 impl ConnectorMutationFailure {
+    pub fn from_connector(error: ConnectorError) -> Self {
+        Self {
+            kind: error.kind().into(),
+            message: error.to_string().into(),
+            source: Some(error),
+        }
+    }
+    pub fn connector_source(&self) -> Option<&ConnectorError> {
+        self.source.as_ref()
+    }
+
     pub fn new(kind: ConnectorMutationFailureKind, message: impl Into<Arc<str>>) -> Self {
         Self {
             kind,
             message: message.into(),
+            source: None,
         }
     }
 
@@ -188,6 +219,45 @@ impl ConnectorMutationFailure {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+}
+
+impl std::error::Error for ConnectorMutationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|cause| cause as &dyn std::error::Error)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ConnectorMutationFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
+        if let Some(source) = &self.source {
+            return source.failure_fact();
+        }
+        let (class, reason) = match self.kind {
+            ConnectorMutationFailureKind::InvalidRequest => (C::Data, 6000),
+            ConnectorMutationFailureKind::NotFound => (C::Dependency, 6001),
+            ConnectorMutationFailureKind::AlreadyExists => (C::Data, 6002),
+            ConnectorMutationFailureKind::Conflict => (C::Dependency, 6003),
+            ConnectorMutationFailureKind::Unauthenticated => (C::Dependency, 6004),
+            ConnectorMutationFailureKind::PermissionDenied => (C::Dependency, 6005),
+            ConnectorMutationFailureKind::Unsupported => (C::Data, 6006),
+            ConnectorMutationFailureKind::Cancelled => (C::Control, 6007),
+            ConnectorMutationFailureKind::DeadlineExceeded => (C::Control, 6008),
+            ConnectorMutationFailureKind::ResourceExhausted => (C::Resource, 6009),
+            ConnectorMutationFailureKind::Unavailable => (C::Dependency, 6010),
+            ConnectorMutationFailureKind::CorruptData => (C::Data, 6011),
+            ConnectorMutationFailureKind::Internal => (C::Unexpected, 6012),
+            ConnectorMutationFailureKind::Interrupted => (C::Invariant, 6013),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(
+                domain::CONNECTOR,
+                std::num::NonZeroU16::new(reason).unwrap(),
+            ),
+        )
     }
 }
 

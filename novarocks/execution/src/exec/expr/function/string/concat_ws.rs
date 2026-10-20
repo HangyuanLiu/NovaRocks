@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
@@ -29,13 +30,13 @@ pub fn eval_concat_ws<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let sep_arr = arena.eval(args[0], chunk)?;
     let sep = sep_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "concat_ws expects string separator".to_string())?;
+        .ok_or_else(|| expression_contract("concat_ws expects string separator"))?;
     let mut arrays = Vec::with_capacity(args.len() - 1);
     for arg in &args[1..] {
         arrays.push(
@@ -43,7 +44,7 @@ pub fn eval_concat_ws<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 .eval(*arg, chunk)?
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "concat_ws expects string".to_string())?
+                .ok_or_else(|| expression_contract("concat_ws expects string"))?
                 .clone(),
         );
     }

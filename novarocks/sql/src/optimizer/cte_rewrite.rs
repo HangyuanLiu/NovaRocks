@@ -973,7 +973,7 @@ mod tests {
         ) -> Result<(), novarocks_type_contract::CompileControlError> {
             let mut observations = self.units.lock().unwrap();
             observations.push(units);
-            if let Some((point, error)) = self.stop {
+            if let Some((point, error)) = self.stop.clone() {
                 let stop = match point {
                     StopPoint::Entry => units == 0,
                     StopPoint::Batch(ordinal) => {
@@ -1031,9 +1031,9 @@ mod tests {
             Error::ResourceExhausted,
         ] {
             for point in [StopPoint::Entry, StopPoint::Batch(1), StopPoint::Finish] {
-                let control = observed_control(Some((point, error)));
+                let control = observed_control(Some((point, error.clone())));
                 let failure = collect_cte_counts(&wide_multi_consume(), &control).unwrap_err();
-                assert_eq!(failure, SqlCompileError::from(error));
+                assert_eq!(failure, SqlCompileError::from(error.clone()));
                 assert!(
                     control
                         .units
@@ -1042,7 +1042,7 @@ mod tests {
                         .iter()
                         .all(|units| *units <= 256)
                 );
-                let control = observed_control(Some((point, error)));
+                let control = observed_control(Some((point, error.clone())));
                 let failure = inline_single_use_ctes(
                     wide_multi_consume(),
                     &ctx,
@@ -1050,7 +1050,7 @@ mod tests {
                     &control,
                 )
                 .unwrap_err();
-                assert_eq!(failure, SqlCompileError::from(error));
+                assert_eq!(failure, SqlCompileError::from(error.clone()));
                 let units = control.units.lock().unwrap();
                 assert!(units.iter().all(|units| *units <= 256));
                 if matches!(point, StopPoint::Entry) {
@@ -1082,7 +1082,7 @@ mod tests {
             let ctx = collect_cte_counts(&plan, test_control()).unwrap();
             // The first 256-work checkpoint is in normal inlining; the
             // second is in the actual replacement clone's child traversal.
-            let control = observed_control(Some((StopPoint::Batch(2), error)));
+            let control = observed_control(Some((StopPoint::Batch(2), error.clone())));
             let failure =
                 inline_single_use_ctes(plan, &ctx, &mut scalar_arena(), &control).unwrap_err();
             assert_eq!(failure, SqlCompileError::from(error));
@@ -1119,7 +1119,7 @@ mod tests {
                 rows: vec![],
                 columns: columns.clone(),
             }));
-            let control = observed_control(Some((StopPoint::Batch(1), error)));
+            let control = observed_control(Some((StopPoint::Batch(1), error.clone())));
             let mut work = CteWork::try_new(&control).unwrap();
             let failure = adapt_cte_replacement_output_with_qualifier(
                 input,
@@ -1180,7 +1180,7 @@ mod tests {
                 let mut observations = self.observations.lock().unwrap();
                 observations.push(units);
                 if units > 0 && observations.iter().filter(|units| **units > 0).count() == 2 {
-                    Err(self.error)
+                    Err(self.error.clone())
                 } else {
                     Ok(())
                 }
@@ -1197,7 +1197,7 @@ mod tests {
                 columns: columns.clone(),
             }));
             let control = RefuseSecondPositive {
-                error,
+                error: error.clone(),
                 observations: Default::default(),
             };
             let mut work = CteWork::try_new(&control).unwrap();

@@ -117,6 +117,9 @@ impl ExpressionOccurrenceError {
                 novarocks_functions::FunctionBindingError::Control(error),
             ) => Self::Control(error),
             FunctionSpecializationFailure::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(error),
+            ) => Self::Control(error),
+            FunctionSpecializationFailure::Kernel(
                 novarocks_functions::KernelFailure::Cancelled,
             ) => Self::Control(CompileControlError::Cancelled),
             FunctionSpecializationFailure::Kernel(

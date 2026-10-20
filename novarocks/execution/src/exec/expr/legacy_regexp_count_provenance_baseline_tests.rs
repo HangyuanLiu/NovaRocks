@@ -46,7 +46,10 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn eval(
+    name: &str,
+    columns: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -89,14 +92,15 @@ fn legacy_regexp_count_baseline_literal_pool_and_column_do_not_share_error_polic
     );
     let source_chunk = chunk(vec![column(vec![Some("a")])]);
     assert_eq!(
-        eval_string_function(
+        (eval_string_function(
             "regexp_count",
             &arena,
             source,
             &[source, literal],
             &source_chunk
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         expected
     );
     assert_rows(

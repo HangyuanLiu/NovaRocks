@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Independent pre-extraction MD5 family raw oracles; no pure owner required.
+use super::legacy_array_append_baseline_tests::{
+    assert_frozen_target as assert_expression_contract, assert_original_arrow,
+};
 use super::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::eval_encryption_function;
@@ -25,6 +28,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::{SlotId, largeint};
 use std::sync::Arc;
 fn chunk(columns: Vec<ArrayRef>) -> Chunk {
@@ -58,7 +62,11 @@ fn invocation(columns: &[ArrayRef], target: Option<DataType>) -> (ExprArena, Exp
         .unwrap_or(ExprId(usize::MAX));
     (arena, expr, args)
 }
-fn eval(name: &str, columns: Vec<ArrayRef>, target: Option<DataType>) -> Result<ArrayRef, String> {
+fn eval(
+    name: &str,
+    columns: Vec<ArrayRef>,
+    target: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, expr, args) = invocation(&columns, target);
     eval_encryption_function(name, &arena, expr, &args, &chunk(columns))
 }
@@ -110,7 +118,8 @@ fn legacy_md5_family_baseline_unary_four_byte_carriers_and_null() {
         vec![None; 3]
     );
     assert_eq!(
-        eval("md5", vec![Arc::new(Int64Array::from(vec![None; 2]))], None).unwrap_err(),
+        (eval("md5", vec![Arc::new(Int64Array::from(vec![None; 2]))], None).unwrap_err())
+            .to_string(),
         "md5: arg0 must be VARCHAR or VARBINARY"
     );
 }
@@ -217,7 +226,7 @@ fn legacy_md5_family_baseline_numeric_raw_output_cast_and_null_target_error() {
         let actual = eval("md5sum_numeric", vec![input.clone()], Some(ty));
         match (expected, actual) {
             (Ok(a), Ok(b)) => assert_eq!(a.to_data(), b.to_data()),
-            (Err(a), Err(b)) => assert_eq!(a, b),
+            (Err(a), Err(b)) => assert_eq!(a, (b).detail()),
             _ => panic!("raw cast outcome changed"),
         }
     }
@@ -233,10 +242,16 @@ fn legacy_md5_family_baseline_argument_admission_precedes_later_eval_and_full_ca
         let columns = vec![a.clone()];
         let (mut arena, expr, mut args) = invocation(&columns, None);
         args.push(arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Utf8));
-        assert_eq!(
-            eval_encryption_function(name, &arena, expr, &args, &chunk(columns)).unwrap_err(),
-            format!("{}: arg0 must be VARCHAR or VARBINARY", name)
+        let expected = arrow::compute::cast(&a, &DataType::Utf8).unwrap_err();
+        let actual =
+            eval_encryption_function(name, &arena, expr, &args, &chunk(columns)).unwrap_err();
+        assert_original_arrow(&actual, &expected);
+        assert!(
+            actual
+                .detail()
+                .starts_with(&format!("{name}: failed to cast arg0 to VARCHAR:"))
         );
+        assert!(actual.detail().len() <= 512);
     }
     let a = text(vec![Some("x")]);
     let columns = vec![a];
@@ -245,11 +260,10 @@ fn legacy_md5_family_baseline_argument_admission_precedes_later_eval_and_full_ca
     args.push(bad);
     let error = arena.eval(bad, &chunk(columns.clone())).unwrap_err();
     for name in ["md5sum", "md5sum_numeric"] {
-        assert_eq!(
-            eval_encryption_function(name, &arena, expr, &args, &chunk(columns.clone()))
-                .unwrap_err(),
-            error
-        );
+        let actual = eval_encryption_function(name, &arena, expr, &args, &chunk(columns.clone()))
+            .unwrap_err();
+        assert_eq!(actual.failure_fact(), error.failure_fact());
+        assert_eq!(actual.detail(), error.detail());
     }
     let target = DataType::Struct(
         vec![Arc::new(Field::new(
@@ -260,17 +274,14 @@ fn legacy_md5_family_baseline_argument_admission_precedes_later_eval_and_full_ca
         .into(),
     );
     let out = eval("md5sum_numeric", columns.clone(), None).unwrap();
-    let expected = arrow::compute::cast(&out, &target)
-        .map_err(|e| format!("md5sum_numeric: failed to cast output: {}", e))
-        .unwrap_err();
-    assert!(expected.len() > 512);
-    assert_eq!(
-        eval("md5sum_numeric", columns, Some(target)).unwrap_err(),
-        expected
-    );
+    let expected = arrow::compute::cast(&out, &target).unwrap_err();
+    assert!(expected.to_string().len() > 512);
+    let actual = eval("md5sum_numeric", columns, Some(target)).unwrap_err();
+    assert_original_arrow(&actual, &expected);
+    assert!(actual.detail().len() <= 512);
 }
 #[test]
-fn legacy_md5_family_baseline_zero_arity_tail_ignored_and_empty_batches() {
+fn legacy_md5_family_variadic_empty_hash_and_unary_arity_with_empty_batches() {
     let columns = vec![text(vec![Some("unused"), None])];
     let (mut arena, expr, _) = invocation(&columns, None);
     let c = chunk(columns.clone());
@@ -286,20 +297,14 @@ fn legacy_md5_family_baseline_zero_arity_tail_ignored_and_empty_batches() {
             );
         }
     }
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_encryption_function(
-            "md5",
-            &arena,
-            expr,
-            &[],
-            &c
-        )))
-        .is_err()
-    );
+    let error = eval_encryption_function("md5", &arena, expr, &[], &c).unwrap_err();
+    assert_expression_contract(&error);
     let first = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
     let bad = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Utf8);
+    let error = eval_encryption_function("md5", &arena, expr, &[first, bad], &c).unwrap_err();
+    assert_expression_contract(&error);
     assert_eq!(
-        strings(&eval_encryption_function("md5", &arena, expr, &[first, bad], &c).unwrap()),
+        strings(&eval_encryption_function("md5", &arena, expr, &[first], &c).unwrap()),
         vec![Some("fd94c6a26d6b6571e8d9398446227ae8".into()), None]
     );
     for name in ["md5", "md5sum", "md5sum_numeric"] {

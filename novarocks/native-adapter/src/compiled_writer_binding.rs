@@ -31,6 +31,8 @@
 //! diagnostics and failpoints are keyed by the compiled display identity, the
 //! writer's local node index.
 
+use novarocks_execution::runtime::fragment::ExecutionFailure;
+
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,44 +79,101 @@ pub(crate) struct CompiledWriteTask<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledWriterBindingError {
     node: Option<usize>,
-    detail: String,
+    source: ExecutionFailure,
 }
-
 impl CompiledWriterBindingError {
-    fn program(detail: impl Into<String>) -> Self {
-        Self {
-            node: None,
-            detail: detail.into(),
-        }
-    }
-
-    fn at(node: ProgramNodeId, detail: impl Into<String>) -> Self {
+    fn at_failure(node: ProgramNodeId, source: ExecutionFailure) -> Self {
         Self {
             node: Some(node.index()),
-            detail: detail.into(),
+            source,
         }
     }
-
-    /// The local program node that was refused, if one was.
+    fn at_domain<E>(node: ProgramNodeId, source: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_execution_contract::failure::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::at_failure(node, ExecutionFailure::from_domain(source))
+    }
+    fn program_failure(source: ExecutionFailure) -> Self {
+        Self { node: None, source }
+    }
     pub const fn node(&self) -> Option<usize> {
         self.node
     }
-
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.source.detail()
     }
 }
-
 impl fmt::Display for CompiledWriterBindingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node {
-            Some(node) => write!(f, "compiled writer at local node {node}: {}", self.detail),
-            None => f.write_str(&self.detail),
+            Some(node) => write!(f, "compiled writer at local node {node}: {}", self.source),
+            None => self.source.fmt(f),
         }
     }
 }
+impl std::error::Error for CompiledWriterBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for CompiledWriterBindingError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        self.source.failure_fact()
+    }
+}
 
-impl std::error::Error for CompiledWriterBindingError {}
+#[derive(Debug)]
+enum WriterBindingContractFailure {
+    MissingRecipe,
+    DisplayRange {
+        index: usize,
+        source: std::num::TryFromIntError,
+    },
+    WrongBinding,
+    Observation(novarocks_execution_contract::failure::BoundedDetail),
+}
+impl fmt::Display for WriterBindingContractFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRecipe => f.write_str("the writer carries no provider write recipe"),
+            Self::DisplayRange { index, .. } => {
+                write!(f, "local node index {index} exceeds the display identity")
+            }
+            Self::WrongBinding => {
+                f.write_str("the decoded writer handle does not name the recipe's write binding")
+            }
+            Self::Observation(detail) => write!(f, "compiled writer observation refused: {detail}"),
+        }
+    }
+}
+impl std::error::Error for WriterBindingContractFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DisplayRange { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for WriterBindingContractFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self {
+            Self::MissingRecipe => (FailureClass::Invariant, 9720),
+            Self::DisplayRange { .. } => (FailureClass::Invariant, 9721),
+            Self::WrongBinding => (FailureClass::Invariant, 9722),
+            Self::Observation(_) => (FailureClass::Unexpected, 9723),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
 /// Bind every compiled TableWriter and TableFinish of `program` to the Task.
 /// Every refusal precedes registration; nothing is opened here.
@@ -128,21 +187,21 @@ pub(crate) fn bind_compiled_writers(
         match node.kind() {
             ProgramNodeKind::TableWriter { .. } => {
                 let recipe = program.write_recipes().get(&id).ok_or_else(|| {
-                    CompiledWriterBindingError::at(
+                    CompiledWriterBindingError::at_domain(
                         id,
-                        "the writer carries no provider write recipe",
+                        WriterBindingContractFailure::MissingRecipe,
                     )
                 })?;
                 let writer = bind_compiled_writer(id, recipe, task)?;
                 bindings
                     .bind_writer(id, writer)
-                    .map_err(|detail| CompiledWriterBindingError::at(id, detail))?;
+                    .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;
             }
             ProgramNodeKind::TableFinish { .. } => {
                 let finish = bind_compiled_finish(id, task)?;
                 bindings
                     .bind_finish(id, finish)
-                    .map_err(|detail| CompiledWriterBindingError::at(id, detail))?;
+                    .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;
             }
             _ => {}
         }
@@ -151,13 +210,19 @@ pub(crate) fn bind_compiled_writers(
     // anything: exactly one capability per writer-family node.
     bindings
         .validate(program)
-        .map_err(CompiledWriterBindingError::program)?;
+        .map_err(CompiledWriterBindingError::program_failure)?;
     Ok(bindings)
 }
 
 fn display_id(id: ProgramNodeId) -> Result<i32, CompiledWriterBindingError> {
-    i32::try_from(id.index()).map_err(|_| {
-        CompiledWriterBindingError::at(id, "local node index exceeds the display identity")
+    i32::try_from(id.index()).map_err(|source| {
+        CompiledWriterBindingError::at_domain(
+            id,
+            WriterBindingContractFailure::DisplayRange {
+                index: id.index(),
+                source,
+            },
+        )
     })
 }
 
@@ -167,25 +232,25 @@ pub(crate) fn bind_compiled_writer(
     recipe: &ConnectorWriteRecipe,
     task: &CompiledWriteTask<'_>,
 ) -> Result<TableWriterRuntimeBinding, CompiledWriterBindingError> {
-    let refused = |detail: String| CompiledWriterBindingError::at(id, detail);
     let draft = recipe.draft();
     let node_id = display_id(id)?;
 
     // Only the single-handle cap: the query-wide unique-handle budget is the
     // frontend's, the only owner that sees the whole unique set.
     validate_writer_handle_bytes(draft.payload().payload().len())
-        .map_err(|error| refused(format!("writer handle: {error}")))?;
+        .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
     let binding = task
         .runtime
         .catalog_write_execution(draft.binding().catalog_handle())
-        .map_err(|error| refused(format!("no installed write execution: {error}")))?;
+        .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
     let handle = binding
         .handle_decoder()
         .decode_writer_handle_payload(draft.payload())
-        .map_err(|error| refused(format!("provider writer handle is not decodable: {error}")))?;
+        .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
     if handle.binding() != draft.binding() {
-        return Err(refused(
-            "the decoded writer handle does not name the recipe's write binding".to_string(),
+        return Err(CompiledWriterBindingError::at_domain(
+            id,
+            WriterBindingContractFailure::WrongBinding,
         ));
     }
 
@@ -213,7 +278,7 @@ pub(crate) fn bind_compiled_writer(
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
     .map(|context| context.with_storage_resolver(task.runtime.storage_resolver()))
-    .map_err(|error| refused(format!("writer request context: {error}")))?;
+    .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
     let execution = Arc::new(ObservedConnectorWriteExecution::new(
         binding.execution(),
         execution_id,
@@ -233,7 +298,14 @@ pub(crate) fn bind_compiled_writer(
             .as_ref()
             .map(|controls| controls.observation_for("writer-marker", execution_id))
             .transpose()
-            .map_err(refused)?
+            .map_err(|detail| {
+                CompiledWriterBindingError::at_domain(
+                    id,
+                    WriterBindingContractFailure::Observation(
+                        novarocks_execution_contract::failure::BoundedDetail::truncating(&detail),
+                    ),
+                )
+            })?
             .flatten(),
     ));
     let fragment_encoder =
@@ -252,7 +324,7 @@ pub(crate) fn bind_compiled_writer(
         request_context,
         fragment_encoder,
     )
-    .map_err(|error| refused(error.to_string()))?;
+    .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
     #[cfg(novarocks_dev_controls)]
     let writer = if let Some(controls) = task.test_controls.as_ref() {
         writer.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(

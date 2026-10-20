@@ -537,7 +537,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 for item in &list_typed {
                     self.check_control()?;
                     common_type = wider_comparison_value_type(&common_type, &item.value_type)
-                        .map_err(|error| AnalyzeError::type_mismatch(error, in_list.span))?;
+                        .map_err(|error| AnalyzeError::type_mismatch_source(error, in_list.span))?;
                 }
                 let nullable = expr_typed.value_type.nullable();
                 expr_typed = self.cast_to_value_type(
@@ -611,7 +611,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         .and_then(|common| {
                             wider_comparison_value_type(&common, &high_typed.value_type)
                         })
-                        .map_err(|error| AnalyzeError::type_mismatch(error, between.span))?;
+                        .map_err(|error| AnalyzeError::type_mismatch_source(error, between.span))?;
                 let cast = |operand: TypedExpr| {
                     let nullable = operand.value_type.nullable();
                     self.cast_to_value_type(
@@ -1417,7 +1417,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     .map_err(AuthorError::Wrapper)
             })();
             if let Err(AuthorError::Control(error)) = &result {
-                return Err(AnalyzeError::control(*error));
+                return Err(AnalyzeError::control(error.clone()));
             }
             work.finish().map_err(AnalyzeError::control)?;
             let expected = result.map_err(|error| match error {
@@ -1702,7 +1702,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     &left_coerced.value_type,
                     &right_coerced.value_type,
                 )
-                .map_err(|message| AnalyzeError::type_mismatch(message, left.span()))?
+                .map_err(|message| AnalyzeError::type_mismatch_source(message, left.span()))?
                 {
                     Some(common) => {
                         let left_nullable = left_coerced.value_type.nullable();
@@ -1988,7 +1988,7 @@ impl<'a> super::AnalyzerContext<'a> {
             for (label, _) in &when_then {
                 self.check_control()?;
                 common = wider_comparison_value_type(&common, &label.value_type)
-                    .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+                    .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
             }
             let nullable = value.value_type.nullable();
             operand_typed = Some(Box::new(self.cast_to_value_type(
@@ -2070,16 +2070,16 @@ impl<'a> super::AnalyzerContext<'a> {
         // direct function-call syntax bypasses it.
         let mut name = name;
         if name == "element_at" {
-            // Analyze the first argument lazily to learn its type.
-            let first_arg_ty = if let Some(argument) = func.arguments.first() {
-                match self.analyze_expr(argument, scope) {
-                    Ok(typed) => Some(typed.value_type),
-                    Err(error) if error.control_error().is_some() => return Err(error),
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
+            // Analyze the first argument to learn its type. Preserve any
+            // authored failure before analyzing another argument or retrying.
+            let first_arg_ty = func
+                .arguments
+                .first()
+                .map(|argument| {
+                    self.analyze_expr(argument, scope)
+                        .map(|typed| typed.value_type)
+                })
+                .transpose()?;
             match first_arg_ty.as_ref().map(|ty| ty.value_type().kind()) {
                 Some(novarocks_type_contract::ValueKind::Map { .. }) => {
                     name = "__map_element_at".to_string()
@@ -3245,7 +3245,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             return_type =
                                 novarocks_types::value::variant::variant_get_target_type(&t)
                                     .map_err(|message| {
-                                        AnalyzeError::invalid_literal(message, func.span)
+                                        AnalyzeError::invalid_literal_source(message, func.span)
                                     })?;
                         }
                         _ => {
@@ -5533,12 +5533,16 @@ fn bind_scalar_function_call(
 fn normalize_field_arguments(
     args: Vec<TypedExpr>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<Vec<TypedExpr>, String> {
+) -> Result<Vec<TypedExpr>, AnalyzeError> {
     if args.len() < 2 {
-        return Err("field requires a value and at least one candidate".to_string());
+        return Err(AnalyzeError::internal(
+            "field requires a value and at least one candidate",
+        ));
     }
     if args.len() - 1 > i32::MAX as usize {
-        return Err("field candidate count exceeds INT range".to_string());
+        return Err(AnalyzeError::internal(
+            "field candidate count exceeds INT range",
+        ));
     }
     let numeric = |ty: &DataType| {
         matches!(
@@ -5562,10 +5566,10 @@ fn normalize_field_arguments(
                 DataType::Null | DataType::Boolean | DataType::Date32 | DataType::Timestamp(_, _)
             )
         {
-            return Err(format!(
+            return Err(AnalyzeError::internal(format!(
                 "field does not support argument type {:?}",
                 arg.value_type.data_type()
-            ));
+            )));
         }
     }
     let mut non_null = args
@@ -5605,15 +5609,16 @@ fn normalize_field_arguments(
                         ty.clone()
                     }
                 };
-                novarocks_types::coercion::decimal_compare_type(&decimal(&common), &decimal(other))?
+                novarocks_types::coercion::decimal_compare_type(&decimal(&common), &decimal(other))
+                    .map_err(AnalyzeError::domain_source)?
             } else {
-                match comparison_common_type(&common, other)? {
+                match comparison_common_type(&common, other).map_err(AnalyzeError::domain_source)? {
                     Some(target) => target,
                     None if common == **other => common,
                     None => {
-                        return Err(format!(
+                        return Err(AnalyzeError::internal(format!(
                             "field has no exact numeric common type for {common:?} and {other:?}"
-                        ));
+                        )));
                     }
                 }
             }
@@ -5628,7 +5633,8 @@ fn normalize_field_arguments(
             let can_introduce_null = *arg.value_type.data_type() != common
                 && string(&arg.value_type.data_type())
                 && !string(&common);
-            let mut cast = coerce_function_argument(arg, &common, decimal_overflow_policy)?;
+            let mut cast = coerce_function_argument(arg, &common, decimal_overflow_policy)
+                .map_err(AnalyzeError::internal)?;
             // Ordinary string-to-numeric CAST may produce NULL for invalid input.
             cast.value_type = cast
                 .value_type
@@ -5845,8 +5851,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
 ) -> Result<BoundScalarCall, AnalyzeError> {
     apply_implicit_string_function_casts(name, &mut args);
     if name.eq_ignore_ascii_case("field") {
-        args = normalize_field_arguments(args, decimal_overflow_policy)
-            .map_err(AnalyzeError::internal)?;
+        args = normalize_field_arguments(args, decimal_overflow_policy)?;
     }
     let arg_types = args
         .iter()
@@ -5928,6 +5933,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
         }
         Err(error)
             if error.control_error().is_some()
+                || error.source_failure().is_some()
                 || error.kind()
                     == crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
         {
@@ -10898,7 +10904,7 @@ fn container_child_value_type_observed(
             .map_err(Error::Wrapper)
     })();
     if let Err(Error::Control(error)) = &result {
-        return Err(AnalyzeError::control(*error));
+        return Err(AnalyzeError::control(error.clone()));
     }
     work.finish().map_err(AnalyzeError::control)?;
     result.map_err(|error| match error {

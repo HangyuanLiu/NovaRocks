@@ -66,7 +66,32 @@ pub fn arrow_type_equals_ignoring_metadata(a: &DataType, b: &DataType) -> bool {
     }
 }
 
-pub fn variant_get_target_type(type_str: &str) -> Result<DataType, String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VariantTargetTypeError(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for VariantTargetTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "variant_get: unsupported type '{}' (supported: boolean, int, bigint, float, double, string, date, datetime)",
+            self.0.as_str()
+        )
+    }
+}
+impl std::error::Error for VariantTargetTypeError {}
+impl novarocks_failure_contract::FailureProjection for VariantTargetTypeError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Data,
+            novarocks_failure_contract::FailureReason::new(
+                novarocks_failure_contract::domain::TYPE_CONTRACT,
+                std::num::NonZeroU16::new(93).unwrap(),
+            ),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for VariantTargetTypeError {}
+
+pub fn variant_get_target_type(type_str: &str) -> Result<DataType, VariantTargetTypeError> {
     match type_str.trim().to_ascii_lowercase().as_str() {
         "boolean" | "bool" => Ok(DataType::Boolean),
         "int" | "integer" | "int32" => Ok(DataType::Int32),
@@ -76,9 +101,24 @@ pub fn variant_get_target_type(type_str: &str) -> Result<DataType, String> {
         "string" | "varchar" => Ok(DataType::Utf8),
         "date" => Ok(DataType::Date32),
         "datetime" | "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
-        other => Err(format!(
-            "variant_get: unsupported type '{other}' \\
-             (supported: boolean, int, bigint, float, double, string, date, datetime)"
+        other => Err(VariantTargetTypeError(
+            novarocks_failure_contract::BoundedDetail::truncating(other),
         )),
+    }
+}
+
+#[cfg(test)]
+mod variant_target_tests {
+    use super::*;
+    use novarocks_failure_contract::{DIAGNOSTIC_MAX_BYTES, FailureClass, FailureProjection};
+    #[test]
+    fn unsupported_variant_target_keeps_bounded_domain_owned_literal() {
+        let text = "ResourceExhausted".repeat(DIAGNOSTIC_MAX_BYTES);
+        let error = variant_get_target_type(&text).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_eq!(error.failure_fact().reason().code(), 93);
+        assert!(error.0.as_str().len() <= DIAGNOSTIC_MAX_BYTES);
+        assert!(error.failure_fact().resource().is_none());
+        assert_eq!(variant_get_target_type(" INT ").unwrap(), DataType::Int32);
     }
 }

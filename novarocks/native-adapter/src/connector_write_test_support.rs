@@ -305,15 +305,22 @@ pub fn test_write_scan_runtime(
     .expect("session");
     novarocks_worker::TypedScanRuntime::new(
         execution_id,
-        Arc::new(|_| Err("no query-leased test read runtime".to_owned())),
+        Arc::new(|handle| {
+            Err(
+                novarocks_worker::CatalogExecutionAccessError::ReadUnavailable {
+                    catalog: handle.clone(),
+                },
+            )
+        }),
         Arc::new(move |handle| {
             if handle == &expected {
                 Ok(binding.clone())
             } else {
-                Err(format!(
-                    "no query-leased catalog runtime exists for {}",
-                    handle.catalog_name().as_str()
-                ))
+                Err(
+                    novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
+                        catalog: handle.clone(),
+                    },
+                )
             }
         }),
         queues,

@@ -23,6 +23,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
+#[cfg(test)]
+use novarocks_failure_contract::FailureProjection;
 use std::sync::Arc;
 
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, FloatArrayView, IntArrayView};
@@ -33,6 +35,312 @@ use super::hash::{
     hash_i128_with_seed, hash_null_with_seed, hash_u64_with_seed,
 };
 use super::key_layout::{CompressedKeyContext, compressed_key_is_valid};
+
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupKeyEncodingContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for GroupKeyEncodingContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for GroupKeyEncodingContract {}
+impl novarocks_failure_contract::FailureProjection for GroupKeyEncodingContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::GroupKeyEncodingContract.reason(),
+        )
+    }
+}
+fn group_key_encoding_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(GroupKeyEncodingContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+#[derive(Debug)]
+struct GroupKeyComponentExtent {
+    component: &'static str,
+    required: usize,
+    source: std::num::TryFromIntError,
+}
+impl std::fmt::Display for GroupKeyComponentExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "canonical group-key {} length {} exceeds UInt32",
+            self.component, self.required
+        )
+    }
+}
+impl std::error::Error for GroupKeyComponentExtent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for GroupKeyComponentExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        FailureFact::new(
+            FailureClass::Representation,
+            crate::runtime::fragment::ExecutionReason::GroupKeyComponentExtent.reason(),
+        )
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::MinimumUnit,
+            layout: RepresentationLayout {
+                domain: domain::EXECUTION,
+                code: std::num::NonZeroU16::new(17).unwrap(),
+            },
+            required: u64::try_from(self.required).ok(),
+            extent_limit: Some(u64::from(u32::MAX)),
+            representable_prefix: None,
+        })
+    }
+}
+pub(super) fn group_key_component_len(
+    required: usize,
+    component: &'static str,
+) -> ExecutionResult<u32> {
+    u32::try_from(required).map_err(|source| {
+        ExecutionFailure::from_domain(GroupKeyComponentExtent {
+            component,
+            required,
+            source,
+        })
+    })
+}
+pub(super) fn group_key_request_arithmetic() -> ExecutionFailure {
+    ExecutionFailure::from_domain(
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+    )
+}
+
+#[derive(Debug)]
+struct GroupKeyDictionaryAddress {
+    row: usize,
+    code: i32,
+    source: std::num::TryFromIntError,
+}
+impl std::fmt::Display for GroupKeyDictionaryAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dictionary group key code must be non-negative, got {} at row {}",
+            self.code, self.row
+        )
+    }
+}
+impl std::error::Error for GroupKeyDictionaryAddress {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for GroupKeyDictionaryAddress {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::GroupKeyDictionaryAddress.reason(),
+        )
+    }
+}
+
+#[derive(Debug)]
+enum GroupKeyDecodeFailure {
+    Contract(novarocks_failure_contract::BoundedDetail),
+    Utf8(std::str::Utf8Error),
+    Arrow(arrow::error::ArrowError),
+}
+impl std::fmt::Display for GroupKeyDecodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contract(detail) => detail.fmt(f),
+            Self::Utf8(source) => write!(f, "invalid canonical utf8 key: {source}"),
+            Self::Arrow(source) => source.fmt(f),
+        }
+    }
+}
+impl std::error::Error for GroupKeyDecodeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Contract(_) => None,
+            Self::Utf8(source) => Some(source),
+            Self::Arrow(source) => Some(source),
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for GroupKeyDecodeFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use arrow::error::ArrowError;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, reason) = match self {
+            Self::Contract(_) => (
+                FailureClass::Invariant,
+                ExecutionReason::GroupKeyDecodeContract,
+            ),
+            Self::Utf8(_) => (FailureClass::Invariant, ExecutionReason::GroupKeyDecodeUtf8),
+            Self::Arrow(ArrowError::MemoryError(_) | ArrowError::ArithmeticOverflow(_)) => (
+                FailureClass::Resource,
+                ExecutionReason::GroupKeyDecodeAllocation,
+            ),
+            Self::Arrow(ArrowError::OffsetOverflowError(_)) => (
+                FailureClass::Representation,
+                ExecutionReason::GroupKeyDecodeOffset,
+            ),
+            Self::Arrow(ArrowError::IoError(..) | ArrowError::ExternalError(_)) => (
+                FailureClass::Unexpected,
+                ExecutionReason::GroupKeyDecodeUnexpected,
+            ),
+            Self::Arrow(_) => (
+                FailureClass::Invariant,
+                ExecutionReason::GroupKeyDecodeArrow,
+            ),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        if matches!(self, Self::Arrow(ArrowError::OffsetOverflowError(_))) {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(22).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+pub(super) fn group_key_decoding_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(GroupKeyDecodeFailure::Contract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+pub(super) fn group_key_decode_arrow(source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(GroupKeyDecodeFailure::Arrow(source))
+}
+pub(super) fn group_key_decode_utf8(source: std::str::Utf8Error) -> ExecutionFailure {
+    ExecutionFailure::from_domain(GroupKeyDecodeFailure::Utf8(source))
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GroupKeyOutputKind {
+    Utf8,
+    Binary,
+    List,
+    Map,
+}
+impl GroupKeyOutputKind {
+    fn layout(self) -> u16 {
+        match self {
+            Self::Utf8 => 18,
+            Self::Binary => 19,
+            Self::List => 20,
+            Self::Map => 21,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+struct GroupKeyOutputExtent {
+    kind: GroupKeyOutputKind,
+    total: u128,
+    largest: u128,
+}
+impl std::fmt::Display for GroupKeyOutputExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "canonical group-key {:?} output extent {} (largest value {}) exceeds Int32 offsets",
+            self.kind, self.total, self.largest
+        )
+    }
+}
+impl std::error::Error for GroupKeyOutputExtent {}
+impl novarocks_failure_contract::FailureProjection for GroupKeyOutputExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (boundary, required) = if self.largest > i32::MAX as u128 {
+            (RepresentationBoundary::MinimumUnit, self.largest)
+        } else {
+            (RepresentationBoundary::SingleOutput, self.total)
+        };
+        FailureFact::new(
+            FailureClass::Representation,
+            crate::runtime::fragment::ExecutionReason::GroupKeyOutputExtent.reason(),
+        )
+        .with_representation(RepresentationFacts {
+            boundary,
+            layout: RepresentationLayout {
+                domain: domain::EXECUTION,
+                code: std::num::NonZeroU16::new(self.kind.layout()).unwrap(),
+            },
+            required: u64::try_from(required).ok(),
+            extent_limit: Some(i32::MAX as u64),
+            representable_prefix: None,
+        })
+    }
+}
+#[derive(Default)]
+pub(super) struct GroupKeyOutputTally {
+    total: u128,
+    largest: u128,
+}
+impl GroupKeyOutputTally {
+    pub(super) fn add(&mut self, length: usize) -> ExecutionResult<()> {
+        self.total = self
+            .total
+            .checked_add(length as u128)
+            .ok_or_else(group_key_request_arithmetic)?;
+        self.largest = self.largest.max(length as u128);
+        Ok(())
+    }
+    pub(super) fn finish(self, kind: GroupKeyOutputKind) -> ExecutionResult<()> {
+        if self.total > i32::MAX as u128 {
+            Err(ExecutionFailure::from_domain(GroupKeyOutputExtent {
+                kind,
+                total: self.total,
+                largest: self.largest,
+            }))
+        } else {
+            Ok(())
+        }
+    }
+}
+fn check_group_key_byte_output(
+    values: &[Option<&[u8]>],
+    kind: GroupKeyOutputKind,
+) -> ExecutionResult<()> {
+    let mut tally = GroupKeyOutputTally::default();
+    for value in values.iter().flatten() {
+        tally.add(value.len())?;
+    }
+    tally.finish(kind)
+}
+/// Read only canonical headers before creating any child-reference/output
+/// vector. The selected output layout stays exact; it is never widened.
+fn check_group_key_nested_output(
+    rows: &[Option<&[u8]>],
+    marker: u8,
+    kind: GroupKeyOutputKind,
+) -> ExecutionResult<()> {
+    let mut tally = GroupKeyOutputTally::default();
+    for row in rows.iter().flatten() {
+        let mut cursor = EncodedCursor::new(row);
+        cursor.expect_marker(marker)?;
+        tally.add(cursor.read_u32()? as usize)?;
+    }
+    tally.finish(kind)
+}
 
 pub enum DictionaryStringValues<'a> {
     Utf8(&'a StringArray),
@@ -69,7 +377,7 @@ pub struct DictionaryGroupKeyView<'a> {
 }
 
 impl<'a> DictionaryGroupKeyView<'a> {
-    pub fn new(dict: &'a DictionaryArray<Int32Type>) -> Result<Self, String> {
+    pub fn new(dict: &'a DictionaryArray<Int32Type>) -> ExecutionResult<Self> {
         let values = dict.values();
         let values_ptr = Arc::as_ptr(values) as *const () as usize;
         let values = match values.data_type() {
@@ -78,10 +386,14 @@ impl<'a> DictionaryGroupKeyView<'a> {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
-                        "failed to downcast dictionary values to StringArray".to_string()
+                        group_key_encoding_contract(
+                            "failed to downcast dictionary values to StringArray",
+                        )
                     })?;
                 if values.null_count() != 0 {
-                    return Err("dictionary group key values must not contain nulls".to_string());
+                    return Err(group_key_encoding_contract(
+                        "dictionary group key values must not contain nulls",
+                    ));
                 }
                 DictionaryStringValues::Utf8(values)
             }
@@ -90,18 +402,22 @@ impl<'a> DictionaryGroupKeyView<'a> {
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
                     .ok_or_else(|| {
-                        "failed to downcast dictionary values to LargeStringArray".to_string()
+                        group_key_encoding_contract(
+                            "failed to downcast dictionary values to LargeStringArray",
+                        )
                     })?;
                 if values.null_count() != 0 {
-                    return Err("dictionary group key values must not contain nulls".to_string());
+                    return Err(group_key_encoding_contract(
+                        "dictionary group key values must not contain nulls",
+                    ));
                 }
                 DictionaryStringValues::LargeUtf8(values)
             }
             other => {
-                return Err(format!(
+                return Err(group_key_encoding_contract(format_args!(
                     "dictionary group key unsupported value type: {:?}",
                     other
-                ));
+                )));
             }
         };
         Ok(Self {
@@ -119,16 +435,13 @@ impl<'a> DictionaryGroupKeyView<'a> {
         self.values.len()
     }
 
-    pub fn code_at(&self, row: usize) -> Result<Option<usize>, String> {
+    pub fn code_at(&self, row: usize) -> ExecutionResult<Option<usize>> {
         if self.dict.is_null(row) {
             return Ok(None);
         }
         let code = self.dict.keys().value(row);
-        usize::try_from(code).map(Some).map_err(|_| {
-            format!(
-                "dictionary group key code must be non-negative, got {} at row {}",
-                code, row
-            )
+        usize::try_from(code).map(Some).map_err(|source| {
+            ExecutionFailure::from_domain(GroupKeyDictionaryAddress { row, code, source })
         })
     }
 
@@ -136,23 +449,27 @@ impl<'a> DictionaryGroupKeyView<'a> {
         self.dict.is_null(row)
     }
 
-    pub fn value_as_bytes(&self, row: usize) -> Result<Option<&'a [u8]>, String> {
+    pub fn value_as_bytes(&self, row: usize) -> ExecutionResult<Option<&'a [u8]>> {
         let Some(code) = self.code_at(row)? else {
             return Ok(None);
         };
         self.value_bytes_for_code(code).map(Some)
     }
 
-    pub fn value_bytes_for_code(&self, code: usize) -> Result<&'a [u8], String> {
+    pub fn value_bytes_for_code(&self, code: usize) -> ExecutionResult<&'a [u8]> {
         Ok(self.value_str_for_code(code)?.as_bytes())
     }
 
-    pub fn value_str_for_code(&self, code: usize) -> Result<&'a str, String> {
+    pub fn value_str_for_code(&self, code: usize) -> ExecutionResult<&'a str> {
         if code >= self.values_len() {
-            return Err("dictionary group key code out of bounds".to_string());
+            return Err(group_key_encoding_contract(
+                "dictionary group key code out of bounds",
+            ));
         }
         if self.values.is_null(code) {
-            return Err("dictionary group key value cannot be null when key is valid".to_string());
+            return Err(group_key_encoding_contract(
+                "dictionary group key value cannot be null when key is valid",
+            ));
         }
         Ok(self.values.value(code))
     }
@@ -185,7 +502,7 @@ pub enum GroupKeyArrayView<'a> {
 
 pub fn build_group_key_views<'a>(
     arrays: &'a [ArrayRef],
-) -> Result<Vec<GroupKeyArrayView<'a>>, String> {
+) -> ExecutionResult<Vec<GroupKeyArrayView<'a>>> {
     let mut views = Vec::with_capacity(arrays.len());
     for array in arrays {
         let view = match array.data_type() {
@@ -199,14 +516,18 @@ pub fn build_group_key_views<'a>(
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast to BooleanArray")
+                    })?;
                 GroupKeyArrayView::Boolean(arr)
             }
             DataType::Utf8 => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast to StringArray")
+                    })?;
                 GroupKeyArrayView::Utf8(arr)
             }
             DataType::Dictionary(key_type, value_type)
@@ -217,21 +538,25 @@ pub fn build_group_key_views<'a>(
                     .as_any()
                     .downcast_ref::<DictionaryArray<Int32Type>>()
                     .ok_or_else(|| {
-                        "failed to downcast to DictionaryArray<Int32Type>".to_string()
+                        group_key_encoding_contract(
+                            "failed to downcast to DictionaryArray<Int32Type>",
+                        )
                     })?;
                 GroupKeyArrayView::Dictionary(DictionaryGroupKeyView::new(dict)?)
             }
             DataType::Dictionary(key_type, value_type) => {
-                return Err(format!(
+                return Err(group_key_encoding_contract(format_args!(
                     "dictionary group key unsupported type: key={:?}, value={:?}",
                     key_type, value_type
-                ));
+                )));
             }
             DataType::Date32 => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast to Date32Array")
+                    })?;
                 GroupKeyArrayView::Date32(arr)
             }
             DataType::Timestamp(unit, _tz) => match unit {
@@ -239,7 +564,11 @@ pub fn build_group_key_views<'a>(
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampSecondArray>()
-                        .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
+                        .ok_or_else(|| {
+                            group_key_encoding_contract(
+                                "failed to downcast to TimestampSecondArray",
+                            )
+                        })?;
                     GroupKeyArrayView::TimestampSecond(arr)
                 }
                 TimeUnit::Millisecond => {
@@ -247,7 +576,9 @@ pub fn build_group_key_views<'a>(
                         .as_any()
                         .downcast_ref::<TimestampMillisecondArray>()
                         .ok_or_else(|| {
-                            "failed to downcast to TimestampMillisecondArray".to_string()
+                            group_key_encoding_contract(
+                                "failed to downcast to TimestampMillisecondArray",
+                            )
                         })?;
                     GroupKeyArrayView::TimestampMillisecond(arr)
                 }
@@ -256,7 +587,9 @@ pub fn build_group_key_views<'a>(
                         .as_any()
                         .downcast_ref::<TimestampMicrosecondArray>()
                         .ok_or_else(|| {
-                            "failed to downcast to TimestampMicrosecondArray".to_string()
+                            group_key_encoding_contract(
+                                "failed to downcast to TimestampMicrosecondArray",
+                            )
                         })?;
                     GroupKeyArrayView::TimestampMicrosecond(arr)
                 }
@@ -265,7 +598,9 @@ pub fn build_group_key_views<'a>(
                         .as_any()
                         .downcast_ref::<TimestampNanosecondArray>()
                         .ok_or_else(|| {
-                            "failed to downcast to TimestampNanosecondArray".to_string()
+                            group_key_encoding_contract(
+                                "failed to downcast to TimestampNanosecondArray",
+                            )
                         })?;
                     GroupKeyArrayView::TimestampNanosecond(arr)
                 }
@@ -274,56 +609,64 @@ pub fn build_group_key_views<'a>(
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast to Decimal128Array")
+                    })?;
                 GroupKeyArrayView::Decimal128(arr)
             }
             DataType::Decimal256(_precision, _scale) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast to Decimal256Array")
+                    })?;
                 GroupKeyArrayView::Decimal256(arr)
             }
             DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast to FixedSizeBinaryArray")
+                    })?;
                 if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
-                    return Err(format!(
+                    return Err(group_key_encoding_contract(format_args!(
                         "group by type mismatch: expected FixedSizeBinary({}), got FixedSizeBinary({})",
                         largeint::LARGEINT_BYTE_WIDTH,
                         arr.value_length()
-                    ));
+                    )));
                 }
                 GroupKeyArrayView::LargeIntBinary(arr)
             }
             DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
-                let list = array
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+                let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                    group_key_encoding_contract("failed to downcast to ListArray")
+                })?;
                 let values = list
                     .values()
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast list values to StringArray".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast list values to StringArray")
+                    })?;
                 GroupKeyArrayView::ListUtf8 { list, values }
             }
             DataType::List(field) if matches!(field.data_type(), DataType::Int32) => {
-                let list = array
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+                let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                    group_key_encoding_contract("failed to downcast to ListArray")
+                })?;
                 let values = list
                     .values()
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "failed to downcast list values to Int32Array".to_string())?;
+                    .ok_or_else(|| {
+                        group_key_encoding_contract("failed to downcast list values to Int32Array")
+                    })?;
                 GroupKeyArrayView::ListInt32 { list, values }
             }
             DataType::Null => {
-                return Err("group by type is null".to_string());
+                return Err(group_key_encoding_contract("group by type is null"));
             }
             other => {
                 let _ = other;
@@ -336,7 +679,7 @@ pub fn build_group_key_views<'a>(
 }
 
 #[cfg(test)]
-pub fn encode_group_key_row(array: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
+pub fn encode_group_key_row(array: &ArrayRef, row: usize) -> ExecutionResult<Option<Vec<u8>>> {
     if array.is_null(row) {
         return Ok(None);
     }
@@ -349,48 +692,53 @@ pub(crate) fn encode_group_key_row_tracked(
     array: &ArrayRef,
     row: usize,
     allocator: AggregateAllocator,
-) -> Result<Option<AggregateVec<u8>>, String> {
+) -> ExecutionResult<Option<AggregateVec<u8>>> {
     if array.is_null(row) {
         return Ok(None);
     }
     let encoded_len = encoded_group_key_non_null_len(array, row)?;
     let mut out = AggregateVec::new_in(allocator.clone());
-    out.try_reserve_exact(encoded_len)
-        .map_err(|_| allocator.allocation_error("reserve canonical group-key bytes"))?;
+    out.try_reserve_exact(encoded_len).map_err(|source| {
+        allocator.allocation_error("reserve canonical group-key bytes", source)
+    })?;
     encode_group_key_non_null_value(array, row, &mut out)?;
     debug_assert_eq!(out.len(), encoded_len);
     Ok(Some(out))
 }
 
 trait KeyByteSink {
-    fn push_byte(&mut self, value: u8) -> Result<(), String>;
-    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String>;
+    fn push_byte(&mut self, value: u8) -> ExecutionResult<()>;
+    fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()>;
 }
 
 impl KeyByteSink for Vec<u8> {
-    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+    fn push_byte(&mut self, value: u8) -> ExecutionResult<()> {
         self.push(value);
         Ok(())
     }
 
-    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+    fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()> {
         self.extend_from_slice(values);
         Ok(())
     }
 }
 
 impl KeyByteSink for AggregateVec<u8> {
-    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+    fn push_byte(&mut self, value: u8) -> ExecutionResult<()> {
         if self.len() == self.capacity() {
-            return Err("canonical group-key byte reservation was too small".to_string());
+            return Err(group_key_encoding_contract(
+                "canonical group-key byte reservation was too small",
+            ));
         }
         self.push(value);
         Ok(())
     }
 
-    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+    fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()> {
         if values.len() > self.capacity().saturating_sub(self.len()) {
-            return Err("canonical group-key byte reservation was too small".to_string());
+            return Err(group_key_encoding_contract(
+                "canonical group-key byte reservation was too small",
+            ));
         }
         self.extend_from_slice(values);
         Ok(())
@@ -404,11 +752,11 @@ struct ComparingKeyByteSink<'a> {
 }
 
 impl KeyByteSink for ComparingKeyByteSink<'_> {
-    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+    fn push_byte(&mut self, value: u8) -> ExecutionResult<()> {
         self.extend_bytes(&[value])
     }
 
-    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+    fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()> {
         let end = self.offset.saturating_add(values.len());
         if self.equal && self.expected.get(self.offset..end) != Some(values) {
             self.equal = false;
@@ -422,7 +770,7 @@ pub(crate) fn canonical_group_key_equals(
     array: &ArrayRef,
     row: usize,
     expected: &[u8],
-) -> Result<bool, String> {
+) -> ExecutionResult<bool> {
     if array.is_null(row) {
         return Ok(false);
     }
@@ -452,13 +800,13 @@ impl HashingKeyByteSink {
 }
 
 impl KeyByteSink for HashingKeyByteSink {
-    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+    fn push_byte(&mut self, value: u8) -> ExecutionResult<()> {
         self.hash ^= value as u64;
         self.hash = self.hash.wrapping_mul(0x100000001b3);
         Ok(())
     }
 
-    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+    fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()> {
         for value in values {
             self.push_byte(*value)?;
         }
@@ -470,7 +818,7 @@ fn canonical_group_key_hash_with_seed(
     array: &ArrayRef,
     row: usize,
     seed: u64,
-) -> Result<Option<u64>, String> {
+) -> ExecutionResult<Option<u64>> {
     if array.is_null(row) {
         return Ok(None);
     }
@@ -482,7 +830,7 @@ fn canonical_group_key_hash_with_seed(
 pub(crate) fn canonical_group_key_fnv_hash(
     array: &ArrayRef,
     row: usize,
-) -> Result<Option<u64>, String> {
+) -> ExecutionResult<Option<u64>> {
     canonical_group_key_hash_with_seed(array, row, 0)
 }
 
@@ -501,7 +849,7 @@ impl Crc32KeyByteSink {
 }
 
 impl KeyByteSink for Crc32KeyByteSink {
-    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+    fn push_byte(&mut self, value: u8) -> ExecutionResult<()> {
         self.crc ^= value as u32;
         for _ in 0..8 {
             self.crc = if self.crc & 1 != 0 {
@@ -513,7 +861,7 @@ impl KeyByteSink for Crc32KeyByteSink {
         Ok(())
     }
 
-    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+    fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()> {
         for value in values {
             self.push_byte(*value)?;
         }
@@ -524,7 +872,7 @@ impl KeyByteSink for Crc32KeyByteSink {
 pub(crate) fn canonical_group_key_crc32_hash(
     array: &ArrayRef,
     row: usize,
-) -> Result<Option<u32>, String> {
+) -> ExecutionResult<Option<u32>> {
     if array.is_null(row) {
         return Ok(None);
     }
@@ -537,14 +885,16 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
     array: &ArrayRef,
     row: usize,
     out: &mut S,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     match array.data_type() {
         DataType::Boolean => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| {
-                    "failed to downcast BooleanArray while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast BooleanArray while encoding group key",
+                    )
                 })?;
             out.push_byte(1)?;
             out.push_byte(arr.value(row) as u8)?;
@@ -555,7 +905,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Int8Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Int8Array while encoding group key",
+                    )
                 })?;
             out.push_byte(2)?;
             out.extend_bytes(&arr.value(row).to_le_bytes())?;
@@ -566,7 +918,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Int16Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Int16Array while encoding group key",
+                    )
                 })?;
             out.push_byte(3)?;
             out.extend_bytes(&arr.value(row).to_le_bytes())?;
@@ -577,7 +931,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Int32Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Int32Array while encoding group key",
+                    )
                 })?;
             out.push_byte(4)?;
             out.extend_bytes(&arr.value(row).to_le_bytes())?;
@@ -588,7 +944,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Int64Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Int64Array while encoding group key",
+                    )
                 })?;
             out.push_byte(5)?;
             out.extend_bytes(&arr.value(row).to_le_bytes())?;
@@ -599,7 +957,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Float32Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Float32Array while encoding group key",
+                    )
                 })?;
             out.push_byte(6)?;
             out.extend_bytes(&canonical_f32_bits(arr.value(row)).to_le_bytes())?;
@@ -610,7 +970,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Float64Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Float64Array while encoding group key",
+                    )
                 })?;
             out.push_byte(7)?;
             out.extend_bytes(&canonical_f64_bits(arr.value(row)).to_le_bytes())?;
@@ -621,7 +983,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| {
-                    "failed to downcast StringArray while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast StringArray while encoding group key",
+                    )
                 })?;
             out.push_byte(8)?;
             let value = arr.value(row).as_bytes();
@@ -635,12 +999,13 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| {
-                    "failed to downcast BinaryArray while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast BinaryArray while encoding group key",
+                    )
                 })?;
             out.push_byte(20)?;
             let value = arr.value(row);
-            let len = u32::try_from(value.len())
-                .map_err(|_| "group key Binary length overflow".to_string())?;
+            let len = group_key_component_len(value.len(), "Binary")?;
             out.extend_bytes(&len.to_le_bytes())?;
             out.extend_bytes(value)?;
             Ok(())
@@ -650,12 +1015,13 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| {
-                    "failed to downcast LargeBinaryArray while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast LargeBinaryArray while encoding group key",
+                    )
                 })?;
             out.push_byte(21)?;
             let value = arr.value(row);
-            let len = u32::try_from(value.len())
-                .map_err(|_| "group key LargeBinary length overflow".to_string())?;
+            let len = group_key_component_len(value.len(), "LargeBinary")?;
             out.extend_bytes(&len.to_le_bytes())?;
             out.extend_bytes(value)?;
             Ok(())
@@ -665,7 +1031,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Date32Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Date32Array while encoding group key",
+                    )
                 })?;
             out.push_byte(9)?;
             out.extend_bytes(&arr.value(row).to_le_bytes())?;
@@ -684,8 +1052,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         .as_any()
                         .downcast_ref::<TimestampSecondArray>()
                         .ok_or_else(|| {
-                            "failed to downcast TimestampSecondArray while encoding group key"
-                                .to_string()
+                            group_key_encoding_contract(
+                                "failed to downcast TimestampSecondArray while encoding group key",
+                            )
                         })?;
                     arr.value(row)
                 }
@@ -694,8 +1063,7 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         .as_any()
                         .downcast_ref::<TimestampMillisecondArray>()
                         .ok_or_else(|| {
-                            "failed to downcast TimestampMillisecondArray while encoding group key"
-                                .to_string()
+                            group_key_encoding_contract("failed to downcast TimestampMillisecondArray while encoding group key")
                         })?;
                     arr.value(row)
                 }
@@ -704,8 +1072,7 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         .as_any()
                         .downcast_ref::<TimestampMicrosecondArray>()
                         .ok_or_else(|| {
-                            "failed to downcast TimestampMicrosecondArray while encoding group key"
-                                .to_string()
+                            group_key_encoding_contract("failed to downcast TimestampMicrosecondArray while encoding group key")
                         })?;
                     arr.value(row)
                 }
@@ -714,8 +1081,7 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         .as_any()
                         .downcast_ref::<TimestampNanosecondArray>()
                         .ok_or_else(|| {
-                            "failed to downcast TimestampNanosecondArray while encoding group key"
-                                .to_string()
+                            group_key_encoding_contract("failed to downcast TimestampNanosecondArray while encoding group key")
                         })?;
                     arr.value(row)
                 }
@@ -729,7 +1095,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Decimal128Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Decimal128Array while encoding group key",
+                    )
                 })?;
             out.push_byte(14)?;
             out.extend_bytes(&arr.value(row).to_le_bytes())?;
@@ -740,7 +1108,9 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
                 .ok_or_else(|| {
-                    "failed to downcast Decimal256Array while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast Decimal256Array while encoding group key",
+                    )
                 })?;
             out.push_byte(19)?;
             out.extend_bytes(&arr.value(row).to_le_bytes())?;
@@ -751,25 +1121,34 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| {
-                    "failed to downcast FixedSizeBinaryArray while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast FixedSizeBinaryArray while encoding group key",
+                    )
                 })?;
-            let value = largeint::i128_from_be_bytes(arr.value(row))
-                .map_err(|e| format!("encode LARGEINT group key failed: {}", e))?;
+            if arr.value_length() != 16 {
+                return Err(group_key_encoding_contract(
+                    "canonical LARGEINT key has a foreign physical width",
+                ));
+            }
+            let fixed: [u8; 16] = arr
+                .value(row)
+                .try_into()
+                .expect("checked canonical LARGEINT physical width");
+            let value = i128::from_be_bytes(fixed);
             out.push_byte(15)?;
             out.extend_bytes(&value.to_le_bytes())?;
             Ok(())
         }
         DataType::List(_) => {
             let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                "failed to downcast ListArray while encoding group key".to_string()
+                group_key_encoding_contract("failed to downcast ListArray while encoding group key")
             })?;
             let offsets = list.value_offsets();
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = list.values();
             out.push_byte(16)?;
-            let len = u32::try_from(end.saturating_sub(start))
-                .map_err(|_| "group key list length overflow".to_string())?;
+            let len = group_key_component_len(end.saturating_sub(start), "List")?;
             out.extend_bytes(&len.to_le_bytes())?;
             for idx in start..end {
                 encode_nullable_nested(values, idx, out, "group key list item")?;
@@ -781,11 +1160,12 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| {
-                    "failed to downcast StructArray while encoding group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast StructArray while encoding group key",
+                    )
                 })?;
             out.push_byte(17)?;
-            let field_count = u32::try_from(struct_arr.num_columns())
-                .map_err(|_| "group key struct field count overflow".to_string())?;
+            let field_count = group_key_component_len(struct_arr.num_columns(), "Struct")?;
             out.extend_bytes(&field_count.to_le_bytes())?;
             for column in struct_arr.columns() {
                 encode_nullable_nested(column, row, out, "group key struct field")?;
@@ -794,7 +1174,7 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
         }
         DataType::Map(_, _) => {
             let map = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
-                "failed to downcast MapArray while encoding group key".to_string()
+                group_key_encoding_contract("failed to downcast MapArray while encoding group key")
             })?;
             let offsets = map.value_offsets();
             let start = offsets[row] as usize;
@@ -803,8 +1183,7 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
             let keys = entries.column(0).clone();
             let values = entries.column(1).clone();
             out.push_byte(18)?;
-            let len = u32::try_from(end.saturating_sub(start))
-                .map_err(|_| "group key map length overflow".to_string())?;
+            let len = group_key_component_len(end.saturating_sub(start), "Map")?;
             out.extend_bytes(&len.to_le_bytes())?;
             for idx in start..end {
                 encode_nullable_nested(&keys, idx, out, "group key map key")?;
@@ -812,10 +1191,10 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
             }
             Ok(())
         }
-        other => Err(format!(
+        other => Err(group_key_encoding_contract(format_args!(
             "group key encode unsupported input type: {:?}",
             other
-        )),
+        ))),
     }
 }
 
@@ -823,20 +1202,20 @@ fn encode_nullable_nested<S: KeyByteSink>(
     array: &ArrayRef,
     row: usize,
     out: &mut S,
-    context: &str,
-) -> Result<(), String> {
+    context: &'static str,
+) -> ExecutionResult<()> {
     if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
         out.push_byte(0)?;
         return Ok(());
     }
     out.push_byte(1)?;
     let len = encoded_group_key_non_null_len(array, row)?;
-    let len = u32::try_from(len).map_err(|_| format!("{context} length overflow"))?;
+    let len = group_key_component_len(len, context)?;
     out.extend_bytes(&len.to_le_bytes())?;
     encode_group_key_non_null_value(array, row, out)
 }
 
-fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize, String> {
+fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> ExecutionResult<usize> {
     let fixed = match array.data_type() {
         DataType::Boolean | DataType::Int8 => Some(2),
         DataType::Int16 => Some(3),
@@ -856,7 +1235,9 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize,
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| {
-                    "failed to downcast StringArray while sizing group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast StringArray while sizing group key",
+                    )
                 })?;
             Ok(5usize.saturating_add(array.value(row).len()))
         }
@@ -865,7 +1246,9 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize,
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| {
-                    "failed to downcast BinaryArray while sizing group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast BinaryArray while sizing group key",
+                    )
                 })?;
             Ok(5usize.saturating_add(array.value(row).len()))
         }
@@ -874,15 +1257,16 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize,
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| {
-                    "failed to downcast LargeBinaryArray while sizing group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast LargeBinaryArray while sizing group key",
+                    )
                 })?;
             Ok(5usize.saturating_add(array.value(row).len()))
         }
         DataType::List(_) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| "failed to downcast ListArray while sizing group key".to_string())?;
+            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                group_key_encoding_contract("failed to downcast ListArray while sizing group key")
+            })?;
             let offsets = list.value_offsets();
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
@@ -894,7 +1278,9 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize,
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| {
-                    "failed to downcast StructArray while sizing group key".to_string()
+                    group_key_encoding_contract(
+                        "failed to downcast StructArray while sizing group key",
+                    )
                 })?;
             values.columns().iter().try_fold(5usize, |total, column| {
                 nested_value_encoded_len(column, row)
@@ -902,10 +1288,9 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize,
             })
         }
         DataType::Map(_, _) => {
-            let map = array
-                .as_any()
-                .downcast_ref::<MapArray>()
-                .ok_or_else(|| "failed to downcast MapArray while sizing group key".to_string())?;
+            let map = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                group_key_encoding_contract("failed to downcast MapArray while sizing group key")
+            })?;
             let offsets = map.value_offsets();
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
@@ -919,10 +1304,10 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize,
                     .and_then(|total| checked_encoded_len_add(total, value_len))
             })
         }
-        other => Err(format!(
+        other => Err(group_key_encoding_contract(format_args!(
             "group key encode unsupported input type: {:?}",
             other
-        )),
+        ))),
     }
 }
 
@@ -930,31 +1315,31 @@ fn nested_sequence_encoded_len(
     values: &ArrayRef,
     mut rows: std::ops::Range<usize>,
     initial: usize,
-) -> Result<usize, String> {
+) -> ExecutionResult<usize> {
     rows.try_fold(initial, |total, row| {
         nested_value_encoded_len(values, row).and_then(|len| checked_encoded_len_add(total, len))
     })
 }
 
-fn nested_value_encoded_len(array: &ArrayRef, row: usize) -> Result<usize, String> {
+fn nested_value_encoded_len(array: &ArrayRef, row: usize) -> ExecutionResult<usize> {
     if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
         Ok(1)
     } else {
         encoded_group_key_non_null_len(array, row)?
             .checked_add(5)
-            .ok_or_else(|| "canonical group-key length overflow".to_string())
+            .ok_or_else(|| group_key_request_arithmetic())
     }
 }
 
-fn checked_encoded_len_add(left: usize, right: usize) -> Result<usize, String> {
+fn checked_encoded_len_add(left: usize, right: usize) -> ExecutionResult<usize> {
     left.checked_add(right)
-        .ok_or_else(|| "canonical group-key length overflow".to_string())
+        .ok_or_else(|| group_key_request_arithmetic())
 }
 
 pub(crate) fn decode_group_key_rows(
     data_type: &DataType,
     rows: &[Option<&[u8]>],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     macro_rules! fixed_array {
         ($marker:expr, $size:expr, $array:ty, $decode:expr) => {{
             let values = rows
@@ -964,7 +1349,7 @@ pub(crate) fn decode_group_key_rows(
                         .map(|row| decode_fixed_value(row, $marker, $size, $decode))
                         .transpose()
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<ExecutionResult<Vec<_>>>()?;
             Ok(Arc::new(<$array>::from(values)) as ArrayRef)
         }};
     }
@@ -972,7 +1357,9 @@ pub(crate) fn decode_group_key_rows(
     match data_type {
         DataType::Null => {
             if rows.iter().any(Option::is_some) {
-                return Err("canonical Null group-key contains a non-null value".to_string());
+                return Err(group_key_decoding_contract(
+                    "canonical Null group-key contains a non-null value",
+                ));
             }
             Ok(Arc::new(NullArray::new(rows.len())))
         }
@@ -999,20 +1386,26 @@ pub(crate) fn decode_group_key_rows(
         }),
         DataType::Utf8 => {
             let values = decode_variable_rows(rows, 8)?;
+            check_group_key_byte_output(&values, GroupKeyOutputKind::Utf8)?;
             let values = values
                 .iter()
                 .map(|value| {
                     value
                         .map(|value| {
-                            std::str::from_utf8(value)
-                                .map_err(|error| format!("invalid canonical utf8 key: {error}"))
+                            std::str::from_utf8(value).map_err(|source| {
+                                ExecutionFailure::from_domain(GroupKeyDecodeFailure::Utf8(source))
+                            })
                         })
                         .transpose()
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<ExecutionResult<Vec<_>>>()?;
             Ok(Arc::new(StringArray::from(values)))
         }
-        DataType::Binary => Ok(Arc::new(BinaryArray::from(decode_variable_rows(rows, 20)?))),
+        DataType::Binary => {
+            let values = decode_variable_rows(rows, 20)?;
+            check_group_key_byte_output(&values, GroupKeyOutputKind::Binary)?;
+            Ok(Arc::new(BinaryArray::from(values)))
+        }
         DataType::LargeBinary => Ok(Arc::new(LargeBinaryArray::from(decode_variable_rows(
             rows, 21,
         )?))),
@@ -1039,7 +1432,7 @@ pub(crate) fn decode_group_key_rows(
                         })
                         .transpose()
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<ExecutionResult<Vec<_>>>()?;
             let array: ArrayRef = match unit {
                 TimeUnit::Second => {
                     Arc::new(TimestampSecondArray::from(values).with_timezone_opt(timezone.clone()))
@@ -1070,11 +1463,11 @@ pub(crate) fn decode_group_key_rows(
                         })
                         .transpose()
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<ExecutionResult<Vec<_>>>()?;
             Ok(Arc::new(
                 Decimal128Array::from(values)
                     .with_precision_and_scale(*precision, *scale)
-                    .map_err(|error| error.to_string())?,
+                    .map_err(group_key_decode_arrow)?,
             ))
         }
         DataType::Decimal256(precision, scale) => {
@@ -1091,11 +1484,11 @@ pub(crate) fn decode_group_key_rows(
                         })
                         .transpose()
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<ExecutionResult<Vec<_>>>()?;
             Ok(Arc::new(
                 Decimal256Array::from(values)
                     .with_precision_and_scale(*precision, *scale)
-                    .map_err(|error| error.to_string())?,
+                    .map_err(group_key_decode_arrow)?,
             ))
         }
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
@@ -1112,15 +1505,18 @@ pub(crate) fn decode_group_key_rows(
                         })
                         .transpose()
                 })
-                .collect::<Result<Vec<_>, String>>()?;
-            largeint::array_from_i128(&values)
+                .collect::<ExecutionResult<Vec<_>>>()?;
+            let output = largeint::array_from_i128_observed(&values, &mut |_| {
+                Ok::<_, std::convert::Infallible>(())
+            });
+            Ok(output.unwrap_or_else(|never| match never {}))
         }
         DataType::List(field) => decode_list_rows(field, rows),
         DataType::Struct(fields) => decode_struct_rows(fields, rows),
         DataType::Map(field, ordered) => decode_map_rows(field, *ordered, rows),
-        other => Err(format!(
+        other => Err(group_key_decoding_contract(format_args!(
             "canonical group-key decode unsupported type: {other:?}"
-        )),
+        ))),
     }
 }
 
@@ -1128,10 +1524,12 @@ fn decode_fixed_value<T>(
     bytes: &[u8],
     marker: u8,
     payload_len: usize,
-    decode: impl FnOnce(&[u8]) -> Result<T, String>,
-) -> Result<T, String> {
+    decode: impl FnOnce(&[u8]) -> ExecutionResult<T>,
+) -> ExecutionResult<T> {
     if bytes.first().copied() != Some(marker) || bytes.len() != payload_len.saturating_add(1) {
-        return Err("invalid canonical fixed-width group key".to_string());
+        return Err(group_key_decoding_contract(
+            "invalid canonical fixed-width group key",
+        ));
     }
     decode(&bytes[1..])
 }
@@ -1139,7 +1537,7 @@ fn decode_fixed_value<T>(
 fn decode_variable_rows<'a>(
     rows: &'a [Option<&'a [u8]>],
     marker: u8,
-) -> Result<Vec<Option<&'a [u8]>>, String> {
+) -> ExecutionResult<Vec<Option<&'a [u8]>>> {
     rows.iter()
         .map(|row| {
             row.as_ref()
@@ -1149,7 +1547,7 @@ fn decode_variable_rows<'a>(
         .collect()
 }
 
-fn decode_variable_value(bytes: &[u8], marker: u8) -> Result<&[u8], String> {
+fn decode_variable_value(bytes: &[u8], marker: u8) -> ExecutionResult<&[u8]> {
     let mut cursor = EncodedCursor::new(bytes);
     cursor.expect_marker(marker)?;
     let len = cursor.read_u32()? as usize;
@@ -1161,7 +1559,8 @@ fn decode_variable_value(bytes: &[u8], marker: u8) -> Result<&[u8], String> {
 fn decode_list_rows(
     field: &Arc<arrow::datatypes::Field>,
     rows: &[Option<&[u8]>],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
+    check_group_key_nested_output(rows, 16, GroupKeyOutputKind::List)?;
     let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
     offsets.push(0_i32);
     let mut nulls = NullBufferBuilder::new(rows.len());
@@ -1180,23 +1579,25 @@ fn decode_list_rows(
                 cursor.finish()?;
             }
         }
-        offsets.push(
-            i32::try_from(children.len()).map_err(|_| "list key offset overflow".to_string())?,
-        );
+        offsets
+            .push(i32::try_from(children.len()).expect("preflighted canonical list output extent"));
     }
     let child_array = decode_group_key_rows(field.data_type(), &children)?;
-    Ok(Arc::new(ListArray::new(
-        Arc::clone(field),
-        OffsetBuffer::new(offsets.into()),
-        child_array,
-        nulls.finish(),
-    )))
+    Ok(Arc::new(
+        ListArray::try_new(
+            Arc::clone(field),
+            OffsetBuffer::new(offsets.into()),
+            child_array,
+            nulls.finish(),
+        )
+        .map_err(group_key_decode_arrow)?,
+    ))
 }
 
 fn decode_struct_rows(
     fields: &arrow::datatypes::Fields,
     rows: &[Option<&[u8]>],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let mut columns: Vec<Vec<Option<&[u8]>>> = (0..fields.len())
         .map(|_| Vec::with_capacity(rows.len()))
         .collect();
@@ -1215,7 +1616,9 @@ fn decode_struct_rows(
                 cursor.expect_marker(17)?;
                 let count = cursor.read_u32()? as usize;
                 if count != fields.len() {
-                    return Err("canonical struct group-key field count mismatch".to_string());
+                    return Err(group_key_decoding_contract(
+                        "canonical struct group-key field count mismatch",
+                    ));
                 }
                 for column in &mut columns {
                     column.push(cursor.read_nested()?);
@@ -1229,24 +1632,28 @@ fn decode_struct_rows(
         .zip(columns)
         .map(|(field, rows)| decode_group_key_rows(field.data_type(), &rows))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Arc::new(StructArray::new(
-        fields.clone(),
-        arrays,
-        nulls.finish(),
-    )))
+    Ok(Arc::new(
+        StructArray::try_new(fields.clone(), arrays, nulls.finish())
+            .map_err(group_key_decode_arrow)?,
+    ))
 }
 
 fn decode_map_rows(
     field: &Arc<arrow::datatypes::Field>,
     ordered: bool,
     rows: &[Option<&[u8]>],
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let DataType::Struct(entry_fields) = field.data_type() else {
-        return Err("map group key requires struct entry type".to_string());
+        return Err(group_key_decoding_contract(
+            "map group key requires struct entry type",
+        ));
     };
     if entry_fields.len() != 2 {
-        return Err("map group key requires key/value entry fields".to_string());
+        return Err(group_key_decoding_contract(
+            "map group key requires key/value entry fields",
+        ));
     }
+    check_group_key_nested_output(rows, 18, GroupKeyOutputKind::Map)?;
     let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
     offsets.push(0_i32);
     let mut nulls = NullBufferBuilder::new(rows.len());
@@ -1267,18 +1674,22 @@ fn decode_map_rows(
                 cursor.finish()?;
             }
         }
-        offsets.push(i32::try_from(keys.len()).map_err(|_| "map key offset overflow".to_string())?);
+        offsets.push(i32::try_from(keys.len()).expect("preflighted canonical map output extent"));
     }
     let key_array = decode_group_key_rows(entry_fields[0].data_type(), &keys)?;
     let value_array = decode_group_key_rows(entry_fields[1].data_type(), &values)?;
-    let entries = StructArray::new(entry_fields.clone(), vec![key_array, value_array], None);
-    Ok(Arc::new(MapArray::new(
-        Arc::clone(field),
-        OffsetBuffer::new(offsets.into()),
-        entries,
-        nulls.finish(),
-        ordered,
-    )))
+    let entries = StructArray::try_new(entry_fields.clone(), vec![key_array, value_array], None)
+        .map_err(group_key_decode_arrow)?;
+    Ok(Arc::new(
+        MapArray::try_new(
+            Arc::clone(field),
+            OffsetBuffer::new(offsets.into()),
+            entries,
+            nulls.finish(),
+            ordered,
+        )
+        .map_err(group_key_decode_arrow)?,
+    ))
 }
 
 struct EncodedCursor<'a> {
@@ -1291,59 +1702,63 @@ impl<'a> EncodedCursor<'a> {
         Self { bytes, offset: 0 }
     }
 
-    fn expect_marker(&mut self, expected: u8) -> Result<(), String> {
+    fn expect_marker(&mut self, expected: u8) -> ExecutionResult<()> {
         let actual = self.read_u8()?;
         if actual != expected {
-            return Err(format!(
+            return Err(group_key_decoding_contract(format_args!(
                 "canonical group-key marker mismatch: expected {expected}, got {actual}"
-            ));
+            )));
         }
         Ok(())
     }
 
-    fn read_u8(&mut self) -> Result<u8, String> {
+    fn read_u8(&mut self) -> ExecutionResult<u8> {
         let value = *self
             .bytes
             .get(self.offset)
-            .ok_or_else(|| "truncated canonical group key".to_string())?;
+            .ok_or_else(|| group_key_decoding_contract("truncated canonical group key"))?;
         self.offset += 1;
         Ok(value)
     }
 
-    fn read_u32(&mut self) -> Result<u32, String> {
+    fn read_u32(&mut self) -> ExecutionResult<u32> {
         let bytes = self.read_slice(4)?;
         Ok(u32::from_le_bytes(bytes.try_into().expect("u32 bytes")))
     }
 
-    fn read_slice(&mut self, len: usize) -> Result<&'a [u8], String> {
+    fn read_slice(&mut self, len: usize) -> ExecutionResult<&'a [u8]> {
         let end = self
             .offset
             .checked_add(len)
-            .ok_or_else(|| "canonical group-key cursor overflow".to_string())?;
+            .ok_or_else(|| group_key_decoding_contract("canonical group-key cursor overflow"))?;
         let value = self
             .bytes
             .get(self.offset..end)
-            .ok_or_else(|| "truncated canonical group key".to_string())?;
+            .ok_or_else(|| group_key_decoding_contract("truncated canonical group key"))?;
         self.offset = end;
         Ok(value)
     }
 
-    fn read_nested(&mut self) -> Result<Option<&'a [u8]>, String> {
+    fn read_nested(&mut self) -> ExecutionResult<Option<&'a [u8]>> {
         match self.read_u8()? {
             0 => Ok(None),
             1 => {
                 let len = self.read_u32()? as usize;
                 self.read_slice(len).map(Some)
             }
-            marker => Err(format!("invalid canonical nested marker: {marker}")),
+            marker => Err(group_key_decoding_contract(format_args!(
+                "invalid canonical nested marker: {marker}"
+            ))),
         }
     }
 
-    fn finish(&self) -> Result<(), String> {
+    fn finish(&self) -> ExecutionResult<()> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
-            Err("trailing bytes in canonical group key".to_string())
+            Err(group_key_decoding_contract(
+                "trailing bytes in canonical group key",
+            ))
         }
     }
 }
@@ -1430,20 +1845,27 @@ fn hash_list_int32_row(list: &ListArray, values: &Int32Array, row: usize, seed: 
     hash
 }
 
-fn largeint_row_value(arr: &FixedSizeBinaryArray, row: usize) -> Result<Option<i128>, String> {
+fn largeint_row_value(arr: &FixedSizeBinaryArray, row: usize) -> ExecutionResult<Option<i128>> {
     if arr.is_null(row) {
         return Ok(None);
     }
-    largeint::i128_from_be_bytes(arr.value(row))
-        .map(Some)
-        .map_err(|e| format!("group key LARGEINT decode failed at row {}: {}", row, e))
+    if arr.value_length() != 16 {
+        return Err(group_key_encoding_contract(
+            "LARGEINT group key has a foreign physical width",
+        ));
+    }
+    let fixed: [u8; 16] = arr
+        .value(row)
+        .try_into()
+        .expect("checked LARGEINT group-key physical width");
+    Ok(Some(i128::from_be_bytes(fixed)))
 }
 
 pub fn build_one_number_hashes(
     view: &GroupKeyArrayView<'_>,
     num_rows: usize,
     seed: u64,
-) -> Result<Vec<u64>, String> {
+) -> ExecutionResult<Vec<u64>> {
     let mut hashes = Vec::with_capacity(num_rows);
     let null_hash = hash_null_with_seed(seed);
     match view {
@@ -1710,8 +2132,9 @@ pub fn build_one_number_hashes(
         GroupKeyArrayView::LargeIntBinary(arr) => {
             if arr.null_count() == 0 {
                 for row in 0..num_rows {
-                    let value = largeint_row_value(arr, row)?
-                        .ok_or_else(|| "group key LARGEINT unexpected null".to_string())?;
+                    let value = largeint_row_value(arr, row)?.ok_or_else(|| {
+                        group_key_encoding_contract("group key LARGEINT unexpected null")
+                    })?;
                     let value_hash = hash_i128_with_seed(seed, value);
                     hashes.push(combine_hash(seed, value_hash));
                 }
@@ -1731,7 +2154,9 @@ pub fn build_one_number_hashes(
         | GroupKeyArrayView::ListUtf8 { .. }
         | GroupKeyArrayView::ListInt32 { .. }
         | GroupKeyArrayView::Complex(_) => {
-            return Err("one number key does not support variable-length types".to_string());
+            return Err(group_key_encoding_contract(
+                "one number key does not support variable-length types",
+            ));
         }
     }
     Ok(hashes)
@@ -1741,7 +2166,7 @@ pub fn build_group_key_hashes(
     views: &[GroupKeyArrayView<'_>],
     num_rows: usize,
     seed: u64,
-) -> Result<Vec<u64>, String> {
+) -> ExecutionResult<Vec<u64>> {
     let mut hashes = vec![seed; num_rows];
     for view in views {
         hash_column(view, num_rows, seed, &mut hashes)?;
@@ -1759,7 +2184,7 @@ fn hash_column(
     num_rows: usize,
     seed: u64,
     hashes: &mut [u64],
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let null_hash = hash_null_with_seed(seed);
     match view {
         GroupKeyArrayView::Int(view) => match view {
@@ -1919,9 +2344,9 @@ fn hash_column(
                     Some(hash) => hash,
                     None => {
                         let hash = hash_bytes_with_seed(seed, dict.value_bytes_for_code(code)?);
-                        let slot = value_hashes
-                            .get_mut(code)
-                            .ok_or_else(|| "dictionary group key code out of bounds".to_string())?;
+                        let slot = value_hashes.get_mut(code).ok_or_else(|| {
+                            group_key_encoding_contract("dictionary group key code out of bounds")
+                        })?;
                         *slot = Some(hash);
                         hash
                     }
@@ -2051,8 +2476,9 @@ fn hash_column(
         GroupKeyArrayView::LargeIntBinary(arr) => {
             if arr.null_count() == 0 {
                 for row in 0..num_rows {
-                    let value = largeint_row_value(arr, row)?
-                        .ok_or_else(|| "group key LARGEINT unexpected null".to_string())?;
+                    let value = largeint_row_value(arr, row)?.ok_or_else(|| {
+                        group_key_encoding_contract("group key LARGEINT unexpected null")
+                    })?;
                     let value_hash = hash_i128_with_seed(seed, value);
                     combine_hash_at(hashes, row, value_hash);
                 }
@@ -2119,7 +2545,7 @@ pub(crate) fn build_compressed_flags(
     ctx: &CompressedKeyContext,
     views: &[GroupKeyArrayView<'_>],
     num_rows: usize,
-) -> Result<Vec<bool>, String> {
+) -> ExecutionResult<Vec<bool>> {
     let mut flags = Vec::with_capacity(num_rows);
     for row in 0..num_rows {
         flags.push(compressed_key_is_valid(ctx, views, row)?);
@@ -2199,7 +2625,14 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err, "dictionary group key values must not contain nulls");
+        assert_eq!(
+            err.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
+        assert_eq!(
+            err.failure_fact().reason(),
+            crate::runtime::fragment::ExecutionReason::GroupKeyEncodingContract.reason()
+        );
     }
 
     #[test]
@@ -2320,7 +2753,150 @@ mod tests {
             encode_group_key_row_tracked(&array, 0, AggregateAllocator::new(Arc::clone(&tracker)))
                 .expect_err("canonical bytes must be rejected before allocation");
 
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(
+            error.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
         assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[cfg(test)]
+mod encoding_extent_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, RepresentationBoundary};
+    #[test]
+    fn one_key_component_extent_is_distinct_from_a_row_batch_prefix() {
+        assert_eq!(group_key_component_len(0, "empty").unwrap(), 0);
+        assert_eq!(
+            group_key_component_len(u32::MAX as usize, "largest").unwrap(),
+            u32::MAX
+        );
+        if usize::BITS > 32 {
+            let required = (u64::from(u32::MAX) + 1) as usize;
+            let failure = group_key_component_len(required, "ResourceExhausted numeric overflow")
+                .unwrap_err();
+            let fact = failure.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Representation);
+            assert_eq!(fact.reason().code(), 366);
+            let extent = fact.representation().unwrap();
+            assert_eq!(extent.boundary, RepresentationBoundary::MinimumUnit);
+            assert_eq!(extent.required, Some(u64::from(u32::MAX) + 1));
+            assert_eq!(extent.extent_limit, Some(u64::from(u32::MAX)));
+            let crate::runtime::fragment::ExecutionFailureCause::Domain(cause) = failure.cause()
+            else {
+                panic!("expected original encoding source")
+            };
+            let cause = cause.downcast_ref::<GroupKeyComponentExtent>().unwrap();
+            assert!(
+                std::error::Error::source(cause)
+                    .unwrap()
+                    .is::<std::num::TryFromIntError>()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod decoding_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, RepresentationBoundary};
+    #[test]
+    fn malformed_utf8_keeps_its_error_without_retaining_the_input_owner() {
+        let bytes = Arc::new(vec![8, 1, 0, 0, 0, 0xff]);
+        let weak = Arc::downgrade(&bytes);
+        let failure =
+            decode_group_key_rows(&DataType::Utf8, &[Some(bytes.as_slice())]).unwrap_err();
+        drop(bytes);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 374);
+        let crate::runtime::fragment::ExecutionFailureCause::Domain(cause) = failure.cause() else {
+            panic!("expected canonical decoder source")
+        };
+        let source = cause.downcast_ref::<GroupKeyDecodeFailure>().unwrap();
+        assert_eq!(
+            std::error::Error::source(source)
+                .unwrap()
+                .downcast_ref::<std::str::Utf8Error>()
+                .unwrap()
+                .valid_up_to(),
+            0
+        );
+    }
+    #[test]
+    fn malformed_nonnullable_canonical_children_return_arrow_causes() {
+        use arrow::datatypes::Field;
+        let item = Arc::new(Field::new("item", DataType::Int64, false));
+        let fields: arrow::datatypes::Fields = vec![item.clone()].into();
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int64, false),
+                    Field::new("value", DataType::Int64, true),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        for (ty, bytes) in [
+            (DataType::List(item), vec![16, 1, 0, 0, 0, 0]),
+            (DataType::Struct(fields), vec![17, 1, 0, 0, 0, 0]),
+            (DataType::Map(entries, false), vec![18, 1, 0, 0, 0, 0, 0]),
+        ] {
+            let failure = decode_group_key_rows(&ty, &[Some(bytes.as_slice())]).unwrap_err();
+            assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(failure.failure_fact().reason().code(), 373);
+            let crate::runtime::fragment::ExecutionFailureCause::Domain(cause) = failure.cause()
+            else {
+                panic!("expected exact Arrow construction source")
+            };
+            let source = cause.downcast_ref::<GroupKeyDecodeFailure>().unwrap();
+            assert!(
+                std::error::Error::source(source)
+                    .unwrap()
+                    .is::<arrow::error::ArrowError>()
+            );
+        }
+    }
+    #[test]
+    fn output_offset_extent_distinguishes_one_value_from_an_output_batch() {
+        if usize::BITS <= 32 {
+            return;
+        }
+        let limit = i32::MAX as usize;
+        for (lengths, boundary, required) in [
+            (
+                vec![limit + 1],
+                RepresentationBoundary::MinimumUnit,
+                (limit + 1) as u64,
+            ),
+            (
+                vec![limit / 2 + 1, limit / 2 + 1],
+                RepresentationBoundary::SingleOutput,
+                (limit + 1) as u64,
+            ),
+        ] {
+            for kind in [
+                GroupKeyOutputKind::Utf8,
+                GroupKeyOutputKind::Binary,
+                GroupKeyOutputKind::List,
+                GroupKeyOutputKind::Map,
+            ] {
+                let mut tally = GroupKeyOutputTally::default();
+                for length in &lengths {
+                    tally.add(*length).unwrap();
+                }
+                let failure = tally.finish(kind).unwrap_err();
+                let fact = failure.failure_fact();
+                assert_eq!(fact.class(), FailureClass::Representation);
+                assert_eq!(fact.reason().code(), 375);
+                let extent = fact.representation().unwrap();
+                assert_eq!(extent.boundary, boundary);
+                assert_eq!(extent.required, Some(required));
+                assert_eq!(extent.extent_limit, Some(i32::MAX as u64));
+            }
+        }
     }
 }

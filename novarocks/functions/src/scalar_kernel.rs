@@ -276,7 +276,7 @@ fn specialize_scalar_once<O: PureScalarImplementation + ?Sized>(
     finish_scalar_specialization(input, selected, receipt, effects, control, |contract| {
         owner
             .prepare_scalar(input, contract, control)
-            .map_err(FunctionSpecializationFailure::Kernel)
+            .map_err(FunctionSpecializationFailure::from)
     })
 }
 
@@ -290,7 +290,7 @@ fn finish_scalar_specialization<E: From<FunctionSpecializationFailure>>(
 ) -> Result<ScalarSpecialization, E> {
     let contract = Arc::new(
         ScalarCallContract::from_refined(input, &receipt, selected, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
@@ -340,9 +340,7 @@ pub(crate) fn specialize_scalar_checked<O: PureScalarImplementation + ?Sized>(
             .prepare_scalar_checked(input, checked, contract, control)
             .map_err(|error| match error {
                 crate::CheckedOwnerFailure::Original(error) => {
-                    crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
-                        error,
-                    ))
+                    crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::from(error))
                 }
                 crate::CheckedOwnerFailure::UnconvertedOwner => {
                     crate::CheckedOwnerFailure::UnconvertedOwner
@@ -488,20 +486,8 @@ impl ScalarEvaluationInstance {
 }
 
 /// ONE original scalar argument/output validation and lifecycle traversal.
-/// Existing ScalarV1 retains its original empty-skip and three-cause footer
-/// policy. The whole-invocation ABI invokes actual activated empty calls and
-/// terminates ALL failures before reconciliation/output checks or callbacks.
-pub(crate) trait ScalarInvocationError: From<KernelFailure> {
-    fn omit_failure_footer(&self) -> bool;
-}
-impl ScalarInvocationError for KernelFailure {
-    fn omit_failure_footer(&self) -> bool {
-        matches!(
-            self,
-            Self::Cancelled | Self::DeadlineExceeded | Self::ResourceExhausted
-        )
-    }
-}
+/// Every originating outer failure ends fallible validation. The owning
+/// runtime still settles its resource scope after this call returns.
 pub(crate) trait ScalarInvocationRuntime<E> {
     fn invoke<'a>(
         &mut self,
@@ -522,7 +508,7 @@ impl ScalarInvocationRuntime<KernelFailure> for dyn ScalarKernelInstance {
         ScalarKernelInstance::retained_bytes(self)
     }
 }
-pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
+pub(crate) fn evaluate_scalar_once<'a, E: From<KernelFailure>>(
     instance: &mut (impl ScalarInvocationRuntime<E> + ?Sized),
     contract: &ScalarCallContract,
     retained_upper_bound: usize,
@@ -550,29 +536,19 @@ pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
         )
         .map_err(|_| E::from(internal("empty scalar result violates its contract")));
     }
-    let result = instance.invoke(
+    let output = instance.invoke(
         ScalarCallInput {
             contract,
             selection,
             arguments,
         },
         control,
-    );
-    if result
-        .as_ref()
-        .err()
-        .is_some_and(ScalarInvocationError::omit_failure_footer)
-    {
-        // A private owner can refuse without latching this wrapper's
-        // control. Its originating control cause wins over reconciliation.
-        return result;
-    }
+    )?;
     if instance.retained_bytes() > retained_upper_bound {
         return Err(E::from(internal(
             "scalar instance exceeded its lifetime retained bound",
         )));
     }
-    let output = result?;
     validate_scalar_output_observed(&output, selection, contract, control)?;
     control.checkpoint(0)?;
     Ok(output)

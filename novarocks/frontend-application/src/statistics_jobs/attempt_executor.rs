@@ -887,7 +887,7 @@ mod tests {
         ] {
             for class in 0..3 {
                 let failure = StatisticsFailure {
-                    compile_control: Some(control),
+                    compile_control: Some(control.clone()),
                     message: Arc::from("compile failed"),
                 };
                 let original = match class {
@@ -905,7 +905,7 @@ mod tests {
                     | (2, CoreStatisticsAttemptError::Cancelled(failure)) => failure,
                     _ => panic!("cleanup must preserve the original attempt class"),
                 };
-                assert_eq!(failure.compile_control, Some(control));
+                assert_eq!(failure.compile_control, Some(control.clone()));
                 assert_eq!(&*failure.message, "compile failed; abort failed");
             }
         }

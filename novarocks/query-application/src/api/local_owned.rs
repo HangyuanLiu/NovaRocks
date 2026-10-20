@@ -316,6 +316,7 @@ impl LocalRenderCursor {
             self.terminal_error = Some(RenderError {
                 kind: novarocks_result_render::RenderErrorKind::Cancelled,
                 output_ordinal: None,
+                required: None,
             });
         }
         if let Some(encoder) = &mut self.encoder {

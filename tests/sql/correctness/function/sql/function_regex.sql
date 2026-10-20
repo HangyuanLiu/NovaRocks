@@ -313,7 +313,10 @@ USE ${case_db};
 SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp;
 
 -- query 65
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position(column_0, '(unclosed') FROM (VALUES ('oops')) AS tmp;
 
@@ -398,32 +401,50 @@ SELECT regexp_position('test', '[0-9]', 1, NULL);
 
 -- query 80
 -- Invalid regex patterns for regexp_position
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '[0-9');
 
 -- query 81
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '(unclosed');
 
 -- query 82
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '?invalid');
 
 -- query 83
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '*invalid');
 
 -- query 84
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '+invalid');
 
 -- query 85
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '\\');
 
@@ -517,17 +538,26 @@ select str, regex, regexp_count(str, regex) from tsc_invalid order by str, regex
 
 -- query 102
 -- Invalid regex constant tests for regexp_count
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('test string', '[0-9');
 
 -- query 103
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('test string', '(unclosed');
 
 -- query 104
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('test string', '?invalid');
 
@@ -540,7 +570,10 @@ USE ${case_db};
 select regexp_count(NULL, '[0-9');
 
 -- query 107
--- @expect_error=Invalid regex expression
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('', '[0-9');
 

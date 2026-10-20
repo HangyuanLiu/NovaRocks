@@ -93,8 +93,7 @@ pub struct PreparedMutation {
 pub enum MutationStageOutcome {
     NoOp,
     AbortRequired {
-        reason: String,
-        engine_error_code: Option<novarocks_types::EngineErrorCode>,
+        reason: crate::dml::error::DmlExecutionError,
         handle: Arc<dyn MutationAbort>,
     },
     CommitRequired(Arc<dyn MutationCommit>),
@@ -183,11 +182,6 @@ struct CoreMutationAbort {
     kind: MutationStatementKind,
     attempt_id: String,
     execution: Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>,
-    #[allow(
-        dead_code,
-        reason = "Preserves the typed abort payload for the staged core mutation adapter."
-    )]
-    reason: String,
 }
 
 impl MutationPrepared for CoreMutationPrepared {
@@ -567,15 +561,12 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     }
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::AbortRequired {
                         reason,
-                        engine_error_code,
                         execution,
                     } => Ok(MutationStageOutcome::AbortRequired {
-                        engine_error_code,
                         handle: Arc::new(CoreMutationAbort {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
-                            reason: reason.clone(),
                         }),
                         reason,
                     }),
@@ -601,15 +592,12 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     }
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::AbortRequired {
                         reason,
-                        engine_error_code,
                         execution,
                     } => Ok(MutationStageOutcome::AbortRequired {
-                        engine_error_code,
                         handle: Arc::new(CoreMutationAbort {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
-                            reason: reason.clone(),
                         }),
                         reason,
                     }),
@@ -776,8 +764,10 @@ mod tests {
     }
 
     impl MutationExecution for TestExecution {
-        fn stage(&self) -> Result<QueryExecutionResult, String> {
-            Err("test execution must not stage".to_string())
+        fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+            Err(crate::dml::error::DmlExecutionError::Engine(
+                "test execution must not stage".to_string(),
+            ))
         }
 
         fn abort_terminal(&self) -> Result<ConnectorWriteAbortOutcome, String> {
@@ -831,7 +821,6 @@ mod tests {
             kind,
             attempt_id: attempt_id.to_string(),
             execution,
-            reason: "test staging failure".to_string(),
         }
     }
 

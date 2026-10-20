@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +57,7 @@ pub struct FragmentPrepareContext {
     event_sink: Arc<dyn FragmentEventSink>,
     result_spec: Option<ResultWriteSpec>,
     result_identity: Option<novarocks_execution_contract::TaskIdentity>,
+    task_control: Option<Arc<crate::runtime::task_control::TaskExecutionControl>>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
     execution_runtime: Option<Arc<ExecutionRuntime>>,
@@ -94,6 +94,7 @@ type ReceiverConstruction = (
 
 #[cfg(test)]
 mod owner_tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -141,7 +142,10 @@ mod owner_tests {
     }
 
     impl ExchangeReceiverPort for ReceiverConstructionPort {
-        fn register(&self, registration: ExchangeReceiverRegistration) -> Result<(), String> {
+        fn register(
+            &self,
+            registration: ExchangeReceiverRegistration,
+        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
             self.delegate.register(registration.clone())?;
             self.registrations.lock().unwrap().push(registration);
             Ok(())
@@ -150,7 +154,7 @@ mod owner_tests {
             &self,
             key: ExchangeReceiverKey,
             frame: ExchangeReceiverFrame,
-        ) -> Result<(), crate::runtime::exchange::ExchangeReceiveFailure> {
+        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
             self.delegate.push(key, frame)
         }
         fn cancel(&self, key: ExchangeReceiverKey) {
@@ -166,14 +170,20 @@ mod owner_tests {
             &self,
             key: ExchangeReceiverKey,
             expected_senders: usize,
-        ) -> Result<crate::runtime::exchange::ExchangeReceiverHandle, String> {
+        ) -> Result<
+            crate::runtime::exchange::ExchangeReceiverHandle,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
             self.delegate.receiver_handle(key, expected_senders)
         }
         fn ensure_mem_tracker(
             &self,
             key: ExchangeReceiverKey,
             root: &Arc<crate::runtime::mem_tracker::MemTracker>,
-        ) -> Result<Arc<crate::runtime::mem_tracker::MemTracker>, String> {
+        ) -> Result<
+            Arc<crate::runtime::mem_tracker::MemTracker>,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
             self.delegate.ensure_mem_tracker(key, root)
         }
         fn push_local(
@@ -284,9 +294,11 @@ mod owner_tests {
     pub(super) struct BoundedRootSession {
         spec: crate::runtime::fragment::io::RootResultWriteSpec,
         authority: crate::runtime::fragment::io::RootInputAuthority,
-        input: Mutex<Option<(Chunk, crate::runtime::fragment::io::RootInputPermit)>>,
+        input: Mutex<Option<crate::runtime::fragment::io::RootResultInput>>,
         finishing: AtomicBool,
         exited: AtomicBool,
+        exit_observable: Arc<crate::runtime::observable::Observable>,
+        exit_waker: Mutex<Option<std::task::Waker>>,
         aborts: Mutex<Vec<ResultAbort>>,
     }
     impl BoundedRootSession {
@@ -306,25 +318,51 @@ mod owner_tests {
                 )),
             };
             Arc::new(Self {
-                authority: crate::runtime::fragment::io::RootInputAuthority::new(&spec),
+                authority: crate::runtime::fragment::io::RootInputAuthority::new(
+                    &spec,
+                    Arc::new(crate::runtime::execution_health::ExecutionHealth::new()),
+                ),
                 spec,
                 input: Mutex::new(None),
                 finishing: AtomicBool::new(false),
                 exited: AtomicBool::new(false),
+                exit_observable: Arc::new(crate::runtime::observable::Observable::new()),
+                exit_waker: Mutex::new(None),
                 aborts: Mutex::new(Vec::new()),
             })
         }
         fn actual_exit(&self) {
             let input = self.input.lock().unwrap().take();
-            drop(input);
+            if let Some(input) = input {
+                let (chunk, mut permit) = input.into_cleanup_parts();
+                drop(chunk);
+                assert_eq!(
+                    permit.retire(),
+                    crate::runtime::fragment::io::RootWorkExitProgress::Exited
+                );
+            }
             self.exited.store(true, Ordering::Release);
+            let exit_waker = self.exit_waker.lock().unwrap().clone();
+            self.exit_observable.notify_observers();
+            if let Some(waker) = exit_waker {
+                waker.wake();
+            }
             self.authority.observable().notify_observers();
         }
         pub(super) fn context(self: &Arc<Self>) -> FragmentPrepareContext {
+            self.context_with_control(crate::runtime::task_control::test_support::control_for(
+                self.spec.task,
+            ))
+        }
+        fn context_with_control(
+            self: &Arc<Self>,
+            control: Arc<crate::runtime::task_control::TaskExecutionControl>,
+        ) -> FragmentPrepareContext {
             FragmentPrepareContext {
                 result_writer: Arc::new(RejectLegacyRootWriter),
                 ..Default::default()
             }
+            .with_task_control(control)
             .with_result_identity(self.spec.task)
             .with_root_result_session(
                 Arc::clone(self) as Arc<dyn crate::runtime::fragment::io::RootResultSession>
@@ -347,28 +385,50 @@ mod owner_tests {
         fn try_acquire_input(
             &self,
         ) -> Result<crate::runtime::fragment::io::RootInputAdmission, FragmentIoError> {
-            self.authority
-                .try_acquire(crate::runtime::fragment::io::ResultWriteCredit::new(
-                    self.authority.required_bytes(),
-                    |_| {},
-                ))
+            let crate::runtime::fragment::io::RootInputReservationAdmission::Granted(
+                mut reservation,
+            ) = self.authority.try_reserve()?
+            else {
+                return Ok(crate::runtime::fragment::io::RootInputAdmission::Blocked);
+            };
+            let mut credit = Some(crate::runtime::fragment::io::ResultWriteCredit::new(
+                reservation.required_bytes(),
+                |_| {},
+            ));
+            let admission = reservation.try_bind(&mut credit);
+            if !matches!(
+                admission,
+                Ok(crate::runtime::fragment::io::RootInputAdmission::Granted(_))
+            ) {
+                reservation.retire_credit(&mut credit);
+            }
+            admission
         }
         fn writable_observable(&self) -> Arc<crate::runtime::observable::Observable> {
             self.authority.observable()
         }
         fn submit_input(
             &self,
-            chunk: Chunk,
-            permit: crate::runtime::fragment::io::RootInputPermit,
+            offered: &mut Option<crate::runtime::fragment::io::RootResultInput>,
         ) -> Result<(), FragmentIoError> {
-            assert!(self.authority.owns(&permit));
-            assert!(
-                self.input
-                    .lock()
-                    .unwrap()
-                    .replace((chunk, permit))
-                    .is_none()
-            );
+            let input = offered
+                .as_ref()
+                .expect("root submission owns its offered slot");
+            assert!(self.authority.owns_original(input.permit()));
+            if self.finishing.load(Ordering::Acquire)
+                || self.exited.load(Ordering::Acquire)
+                || !self.aborts.lock().unwrap().is_empty()
+            {
+                return Err(FragmentIoError::new(
+                    crate::runtime::fragment::io::FragmentIoOperation::ResultWrite,
+                    crate::runtime::fragment::io::FragmentIoErrorKind::Cancelled,
+                    "fixture root input is closed",
+                ));
+            }
+            let mut accepted = self.input.lock().unwrap();
+            assert!(accepted.is_none());
+            // All validation and locking precede this pure ownership transfer.
+            *accepted = offered.take();
             Ok(())
         }
         fn finish_input(&self) -> Result<(), FragmentIoError> {
@@ -385,8 +445,31 @@ mod owner_tests {
                 RootProducerState::Accepting
             }
         }
-        fn producer_exited(&self) -> bool {
-            self.exited.load(Ordering::Acquire)
+        fn producer_exit_observable(&self) -> Arc<crate::runtime::observable::Observable> {
+            self.exit_observable.clone()
+        }
+        fn poll_producer_exit(
+            &self,
+            waker: &std::task::Waker,
+        ) -> crate::runtime::fragment::io::RootWorkExitProgress {
+            use crate::runtime::fragment::io::RootWorkExitProgress;
+            let mut registered = self.exit_waker.lock().unwrap();
+            if let Some(previous) = registered.as_ref() {
+                if !previous.will_wake(waker) {
+                    return RootWorkExitProgress::Unresolved;
+                }
+            } else {
+                *registered = Some(waker.clone());
+            }
+            let issuer = self.authority.input_exit_progress();
+            if issuer == RootWorkExitProgress::Unresolved {
+                RootWorkExitProgress::Unresolved
+            } else if self.exited.load(Ordering::Acquire) && issuer == RootWorkExitProgress::Exited
+            {
+                RootWorkExitProgress::Exited
+            } else {
+                RootWorkExitProgress::Pending
+            }
         }
         fn abort(&self, reason: ResultAbort) {
             let mut aborts = self.aborts.lock().unwrap();
@@ -466,14 +549,24 @@ mod owner_tests {
     #[test]
     fn bounded_root_cancellation_retains_host_input_until_actual_exit() {
         let root = BoundedRootSession::new();
-        let running = prepare_compiled_fragment(root.submission(), root.context())
-            .unwrap()
-            .start();
+        let task = crate::runtime::task_control::test_support::owner_for(root.spec.task);
+        let control =
+            Arc::new(task.view(novarocks_execution_contract::TaskFailurePhase::Execution));
+        let running =
+            prepare_compiled_fragment(root.submission(), root.context_with_control(control))
+                .unwrap()
+                .start();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !root.finishing.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::yield_now();
         }
         assert!(root.finishing.load(Ordering::Acquire));
+        let _ = novarocks_execution_contract::TaskConclusionPort::submit(
+            task.as_ref(),
+            novarocks_execution_contract::TaskConclusionProposal::Canceled(
+                novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+            ),
+        );
         running.cancel(FragmentCancelReason::new("root cancellation probe"));
         assert!(running.stopped_fact().is_none());
         assert!(
@@ -516,8 +609,11 @@ mod owner_tests {
     }
 
     impl FragmentResultSession for BlockingResultSession {
-        fn reservation_bytes(&self, chunk: &Chunk) -> Result<usize, FragmentIoError> {
-            Ok(chunk.logical_bytes())
+        fn reservation_bytes(
+            &self,
+            input: crate::runtime::fragment::io::ResultInputMetadata,
+        ) -> Result<usize, FragmentIoError> {
+            Ok(input.retained_bytes())
         }
 
         fn try_acquire(
@@ -644,7 +740,9 @@ mod owner_tests {
                 empty_result_with_receiver(UniqueId::new(84_100, ordinal as i64));
             assert!(port.snapshot(key).is_some());
             let running = if failed {
-                dormant.start_failed("original execution failure")
+                dormant.start_failed(novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(&("original execution failure")),
+                ))
             } else {
                 dormant.start()
             };
@@ -652,6 +750,123 @@ mod owner_tests {
             assert_eq!(matches!(fact.outcome(), FragmentOutcome::Failed(_)), failed);
             assert!(port.snapshot(key).is_none());
         }
+    }
+
+    #[test]
+    fn plan_tree_receiver_prepare_rollback_preserves_primary_and_cleanup_diagnostics() {
+        use crate::exec::fragment::program::FragmentNodeId;
+        use crate::runtime::fragment::instance::ExchangeInputAssignment;
+        use crate::runtime::fragment::resources::ResourceKind;
+
+        let id = UniqueId::new(84_500, 1);
+        // The existing fixture publishes a real distributed SQL gather package
+        // and compiles its ExchangeSource through the production local compiler.
+        // Its exchange wait remains the original one-second bound.
+        let program = super::compiled_prepare::tests::sql_gather_receiver_program();
+        assert_eq!(program.exchange_inputs().len(), 1);
+        let (&compiled_node, input) = program.exchange_inputs().iter().next().unwrap();
+        assert!(matches!(
+            program.graph().nodes()[compiled_node.index()].kind(),
+            novarocks_local_program::ProgramNodeKind::ExchangeSource { .. }
+        ));
+        let node = FragmentNodeId::new(i32::try_from(input.receiver_node).unwrap());
+        let instance = FragmentInstanceSpec::new_native(
+            FragmentContractVersion::CURRENT,
+            QueryId::new(84_498, 1),
+            FragmentInstanceId::new(id),
+            ScanAssignments::default(),
+            ExchangeInputAssignments::new(BTreeMap::from([(
+                node,
+                ExchangeInputAssignment::new(NonZeroUsize::MIN),
+            )])),
+            FragmentSinkAssignment::None,
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
+            NonZeroUsize::MIN,
+            BackendNum::try_new(1).unwrap(),
+        );
+        let submission = CompiledFragmentSubmission::try_new(
+            program,
+            super::super::scan::CompiledScanSources::new(),
+            instance,
+        )
+        .unwrap();
+        let runtime = crate::runtime::execution_runtime::test_execution_runtime();
+        let port = ReceiverConstructionPort::new(runtime.clone());
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("receiver rollback");
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let mut context = FragmentPrepareContext::default()
+            .with_execution_runtime(runtime)
+            .with_exchange_receiver_port(port.clone())
+            .with_registration_owned_exchange_receivers()
+            .with_prepare_failure(super::PrepareFailurePoint::AfterExchange)
+            .with_cleanup_failure(ResourceKind::Exchange);
+        context.mem_tracker = Some(tracker.clone());
+        let error = match prepare_compiled_fragment(submission, context) {
+            Err(error) => error,
+            Ok(_) => panic!("the original AfterExchange failure must refuse preparation"),
+        };
+        assert_eq!(error.stage(), super::FragmentLaunchStage::Register);
+        assert_eq!(
+            error.kind(),
+            super::FragmentLaunchErrorKind::ResourceUnavailable
+        );
+        assert_eq!(
+            error.detail(),
+            super::PrepareFailurePoint::AfterExchange.detail()
+        );
+        let primary = novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(
+                super::PrepareFailurePoint::AfterExchange.detail(),
+            ),
+        );
+        assert_eq!(
+            error.cause().cause(),
+            &crate::runtime::fragment::ExecutionFailureCause::Kernel(primary.clone()),
+        );
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .source()
+                .unwrap()
+                .downcast_ref::<novarocks_functions::KernelFailure>(),
+            Some(&primary),
+        );
+        assert_eq!(
+            error
+                .cleanup_diagnostics()
+                .iter()
+                .map(|cause| cause.detail())
+                .collect::<Vec<_>>(),
+            &["injected exchange registration cleanup failure"]
+        );
+        let loans = port.registrations.lock().unwrap();
+        assert_eq!(
+            loans.len(),
+            1,
+            "the actual receiver was installed before failure"
+        );
+        let loan = &loans[0];
+        assert_eq!(
+            loan.key,
+            ExchangeReceiverKey {
+                fragment_instance_id: id,
+                node_id: node.get()
+            }
+        );
+        assert!(port.snapshot(loan.key).is_none());
+        assert_eq!(
+            loan.creation_factory.observe_input_work(1).unwrap_err(),
+            crate::exec::pipeline::operator::ConstructionFailure::Caller(Box::new(
+                novarocks_functions::KernelFailure::Cancelled.into(),
+            )),
+        );
+        assert!(
+            tracker.current() > 0,
+            "the independent factory loan is still live"
+        );
+        drop(loans);
+        port.registrations.lock().unwrap().clear();
+        assert_eq!(tracker.current(), 0);
     }
 
     #[test]
@@ -664,7 +879,9 @@ mod owner_tests {
                 .expect("unique original receiver owner");
             assert!(dormant.take_exchange_retirement().is_none());
             let running = if failed {
-                dormant.start_failed("original execution failure")
+                dormant.start_failed(novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(&("original execution failure")),
+                ))
             } else {
                 dormant.start()
             };
@@ -695,6 +912,51 @@ mod owner_tests {
     }
 
     #[test]
+    fn stopped_preparation_drain_preserves_refused_owner_and_original_failure() {
+        use novarocks_failure_contract::FailureProjection;
+        let dormant = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(891, 892)),
+            FragmentPrepareContext::default(),
+        )
+        .unwrap();
+        let control = dormant.prepared.failure_control();
+        let mut slot = Some(dormant);
+        let original_address = slot.as_ref().unwrap() as *const super::DormantFragmentHandle;
+        let refused = match super::DormantFragmentHandle::try_drain_stopped(&mut slot) {
+            Err(error) => error,
+            Ok(_) => panic!("healthy prepared work cannot enter stopped drain"),
+        };
+        assert_eq!(
+            refused.failure_fact(),
+            super::super::ExecutionFailure::from_domain(
+                super::PreparedDrainRefusal::BeforeConclusion
+            )
+            .failure_fact()
+        );
+        assert_eq!(slot.as_ref().unwrap() as *const _, original_address);
+        assert_eq!(slot.as_ref().unwrap().submitted_driver_count(), 0);
+        let original: super::super::ExecutionFailure =
+            novarocks_functions::KernelFailure::DeadlineExceeded.into();
+        control.set_error(original.clone());
+        let running = super::DormantFragmentHandle::try_drain_stopped(&mut slot).unwrap();
+        assert!(slot.is_none());
+        let fact = running.join();
+        let FragmentOutcome::Failed(failure) = fact.outcome() else {
+            panic!("the original stop remains the execution conclusion")
+        };
+        assert!(failure.cause().same_occurrence(&original));
+        let missing = match super::DormantFragmentHandle::try_drain_stopped(&mut slot) {
+            Err(error) => error,
+            Ok(_) => panic!("the original owner transfers only once"),
+        };
+        assert_eq!(
+            missing.failure_fact(),
+            super::super::ExecutionFailure::from_domain(super::PreparedDrainRefusal::MissingOwner)
+                .failure_fact()
+        );
+    }
+
+    #[test]
     fn execution_owner_prepares_starts_and_freezes_an_empty_result_fragment() {
         let handle = prepare_compiled_fragment(
             empty_result_submission(UniqueId::new(91, 92)),
@@ -722,9 +984,9 @@ mod owner_tests {
         );
 
         let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
-        running.subscribe_stopped(move |fact| {
+        running.bind_test_publisher(move |fact| {
             stopped_tx
-                .send(fact)
+                .send(fact.clone())
                 .expect("stopped fact receiver remains available");
         });
         let (drop_tx, drop_rx) = mpsc::sync_channel(1);
@@ -770,9 +1032,9 @@ mod owner_tests {
         );
 
         let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
-        running.subscribe_stopped(move |fact| {
+        running.bind_test_publisher(move |fact| {
             stopped_tx
-                .send(fact)
+                .send(fact.clone())
                 .expect("stopped fact receiver remains available");
         });
         running.cancel(FragmentCancelReason::new("test cancellation"));
@@ -817,18 +1079,30 @@ mod owner_tests {
             "test sink must hold the driver before terminal freeze"
         );
 
+        let first_owner = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(98_601, 1)),
+            FragmentPrepareContext::default(),
+        )
+        .unwrap()
+        .start();
+        let last_owner = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(98_601, 2)),
+            FragmentPrepareContext::default(),
+        )
+        .unwrap()
+        .start();
         let first = Arc::new(AtomicUsize::new(0));
         let first_callback = Arc::clone(&first);
-        running.subscribe_stopped(move |_| {
+        first_owner.bind_test_publisher(move |_| {
             first_callback.fetch_add(1, Ordering::SeqCst);
         });
-        running.subscribe_stopped(|_| {
+        running.bind_test_publisher(|_| {
             panic!("injected fragment terminal observer panic");
         });
         let last = Arc::new(AtomicUsize::new(0));
         let last_callback = Arc::clone(&last);
         let (last_tx, last_rx) = mpsc::sync_channel(1);
-        running.subscribe_stopped(move |_| {
+        last_owner.bind_test_publisher(move |_| {
             last_callback.fetch_add(1, Ordering::SeqCst);
             last_tx
                 .send(())
@@ -842,8 +1116,369 @@ mod owner_tests {
             .expect("observer delivery completes after terminal freeze");
         assert!(matches!(terminal.outcome(), FragmentOutcome::Succeeded));
         assert_eq!(running.stopped_fact(), Some(terminal));
+        first_owner.join();
+        last_owner.join();
         assert_eq!(first.load(Ordering::SeqCst), 1);
         assert_eq!(last.load(Ordering::SeqCst), 1);
+    }
+
+    struct OpaqueCompletionPanic(Arc<AtomicUsize>);
+    impl Drop for OpaqueCompletionPanic {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("opaque payload must remain in original custody");
+        }
+    }
+    struct UnknownResultHolder {
+        drops: Arc<AtomicUsize>,
+        payload_drops: Arc<AtomicUsize>,
+        charge: std::mem::ManuallyDrop<crate::runtime::mem_tracker::TrackedBytes>,
+    }
+    impl Drop for UnknownResultHolder {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(OpaqueCompletionPanic(self.payload_drops.clone()));
+        }
+    }
+    impl FragmentResultSession for UnknownResultHolder {
+        fn reservation_bytes(
+            &self,
+            input: crate::runtime::fragment::io::ResultInputMetadata,
+        ) -> Result<usize, FragmentIoError> {
+            Ok(input.retained_bytes())
+        }
+        fn try_acquire(
+            &self,
+            _: usize,
+        ) -> Result<crate::runtime::fragment::io::ResultWriteAdmission, FragmentIoError> {
+            unreachable!("registration-only result fixture")
+        }
+        fn writable_observable(&self) -> Option<Arc<crate::runtime::observable::Observable>> {
+            None
+        }
+        fn write_with_credit(
+            &self,
+            _: Chunk,
+            _: crate::runtime::fragment::io::ResultWriteCredit,
+            _: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+            _: &dyn novarocks_functions::KernelEvaluationControl,
+        ) -> Result<(), crate::runtime::fragment::io::ResultWriteFailure> {
+            unreachable!("registration-only result fixture")
+        }
+        fn finish(&self) -> Result<(), FragmentIoError> {
+            Ok(())
+        }
+        fn abort(&self, _: ResultAbort) {}
+    }
+    struct SingleResultHolderWriter(Mutex<Option<Arc<dyn FragmentResultSession>>>);
+    impl FragmentResultWriter for SingleResultHolderWriter {
+        fn open(
+            &self,
+            _: ResultWriteSpec,
+        ) -> Result<Arc<dyn FragmentResultSession>, FragmentIoError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one original registration"))
+        }
+    }
+    struct CommitHolderGate {
+        registered: AtomicBool,
+        rollback_count: AtomicUsize,
+        drops: AtomicUsize,
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        cv: Condvar,
+    }
+    struct GatedCommitPort {
+        gate: Arc<CommitHolderGate>,
+        tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    }
+    struct GatedCommitLease {
+        gate: Arc<CommitHolderGate>,
+        charge: Option<crate::runtime::mem_tracker::TrackedBytes>,
+    }
+    impl crate::runtime::fragment::io::FragmentCommitPort for GatedCommitPort {
+        fn acquire(
+            &self,
+            _: UniqueId,
+        ) -> super::super::ExecutionResult<Box<dyn crate::runtime::fragment::io::FragmentCommitLease>>
+        {
+            assert!(!self.gate.registered.swap(true, Ordering::AcqRel));
+            Ok(Box::new(GatedCommitLease {
+                gate: self.gate.clone(),
+                charge: Some(
+                    crate::runtime::mem_tracker::TrackedBytes::try_new(256, self.tracker.clone())
+                        .unwrap(),
+                ),
+            }))
+        }
+    }
+    impl crate::runtime::fragment::io::FragmentCommitLease for GatedCommitLease {
+        fn add_load_stats(
+            &mut self,
+            _: crate::runtime::fragment::io::FragmentSinkLoadStats,
+        ) -> super::super::ExecutionResult<()> {
+            Ok(())
+        }
+        fn add_tablet_commit_info(
+            &mut self,
+            _: crate::runtime::fragment::io::TabletCommitInfo,
+        ) -> super::super::ExecutionResult<()> {
+            Ok(())
+        }
+        fn add_tablet_fail_info(
+            &mut self,
+            _: crate::runtime::fragment::io::TabletFailInfo,
+        ) -> super::super::ExecutionResult<()> {
+            Ok(())
+        }
+        fn finish(
+            &mut self,
+        ) -> super::super::ExecutionResult<crate::runtime::fragment::io::FragmentCommitReport>
+        {
+            unreachable!("no write commit in retirement")
+        }
+        fn handoff(&mut self) -> super::super::ExecutionResult<()> {
+            unreachable!("no write commit in retirement")
+        }
+        fn rollback(&mut self) -> super::super::ExecutionResult<()> {
+            self.gate.rollback_count.fetch_add(1, Ordering::SeqCst);
+            assert!(self.gate.registered.swap(false, Ordering::AcqRel));
+            Ok(())
+        }
+    }
+    impl Drop for GatedCommitLease {
+        fn drop(&mut self) {
+            self.gate.drops.fetch_add(1, Ordering::SeqCst);
+            self.gate.entered.store(true, Ordering::Release);
+            self.gate.cv.notify_all();
+            let mut released = self.gate.released.lock().unwrap();
+            while !*released {
+                released = self.gate.cv.wait(released).unwrap();
+            }
+            drop(released);
+            drop(self.charge.take());
+        }
+    }
+
+    #[test]
+    fn unknown_result_holder_does_not_block_healthy_commit_holder_or_revoke_body_fact() {
+        let id = UniqueId::new(98_602, 1);
+        let gate = Arc::new(CommitHolderGate {
+            registered: AtomicBool::new(false),
+            rollback_count: AtomicUsize::new(0),
+            drops: AtomicUsize::new(0),
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let healthy_tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("healthy fragment holder");
+        let unknown_tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("unresolved fragment holder");
+        let result_drops = Arc::new(AtomicUsize::new(0));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let mut context = FragmentPrepareContext::default();
+        context.commit_port = Arc::new(GatedCommitPort {
+            gate: gate.clone(),
+            tracker: healthy_tracker.clone(),
+        });
+        let mut dormant = prepare_compiled_fragment(empty_result_submission(id), context).unwrap();
+        let writer: Arc<dyn FragmentResultWriter> = Arc::new(SingleResultHolderWriter(Mutex::new(
+            Some(Arc::new(UnknownResultHolder {
+                drops: result_drops.clone(),
+                payload_drops: payload_drops.clone(),
+                charge: std::mem::ManuallyDrop::new(
+                    crate::runtime::mem_tracker::TrackedBytes::try_new(
+                        512,
+                        unknown_tracker.clone(),
+                    )
+                    .unwrap(),
+                ),
+            })),
+        )));
+        dormant
+            .resources
+            .acquire_result_for_static(
+                Some(&novarocks_local_program::StaticSinkProgram::Result),
+                &writer,
+                ResultWriteSpec::new(
+                    id,
+                    crate::runtime::fragment::io::ResultPresentation::MysqlText,
+                    None,
+                    false,
+                ),
+            )
+            .unwrap();
+        drop(writer);
+        let control = dormant.prepared.failure_control();
+        let original = super::super::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::DeadlineExceeded,
+        );
+        let running = dormant.start_failed(original.clone());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !gate.entered.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // Record observations, then release every real gate before assertions.
+        let entered = gate.entered.load(Ordering::Acquire);
+        let stopped_body = running.inner.pipeline.stopped_fact();
+        let terminal_while_held = running.stopped_fact();
+        let charged_while_held = healthy_tracker.current();
+        *gate.released.lock().unwrap() = true;
+        gate.cv.notify_all();
+        running
+            .inner
+            .pipeline
+            .join()
+            .expect_err("original deadline is unchanged");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while running.inner.lifecycle.state.lock().unwrap().advancing && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let advancing = running.inner.lifecycle.state.lock().unwrap().advancing;
+        assert!(
+            entered,
+            "the healthy sibling reached its actual Box destructor"
+        );
+        assert!(
+            stopped_body.is_some(),
+            "all original driver work exited first"
+        );
+        assert!(terminal_while_held.is_none());
+        assert_eq!(
+            charged_while_held, 256,
+            "a returned rollback is not holder exit"
+        );
+        assert!(
+            !advancing,
+            "the actual finisher callback must return after gate release"
+        );
+        assert_eq!(healthy_tracker.current(), 0);
+        assert_eq!(unknown_tracker.current(), 512);
+        assert!(!gate.registered.load(Ordering::Acquire));
+        assert_eq!(gate.rollback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(result_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+        assert!(
+            running.stopped_fact().is_none(),
+            "unknown holder cannot publish FragmentTerminal"
+        );
+        let observed = control.error().unwrap();
+        assert!(observed.same_occurrence(&original));
+        assert_eq!(
+            control.local_exit_fault().unwrap().fact().reason(),
+            super::super::ExecutionReason::FragmentResourceHolderDropPanicked.reason()
+        );
+        running.inner.lifecycle.advance();
+        assert_eq!(gate.rollback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(result_drops.load(Ordering::SeqCst), 1);
+    }
+
+    struct PublisherCaptureDrop {
+        drops: Arc<AtomicUsize>,
+        payload_drops: Arc<AtomicUsize>,
+    }
+    impl Drop for PublisherCaptureDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(OpaqueCompletionPanic(self.payload_drops.clone()));
+        }
+    }
+
+    #[test]
+    fn terminal_publisher_keeps_both_opaque_payloads_without_revoking_physical_facts() {
+        let dormant = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(98_604, 1)),
+            FragmentPrepareContext::default(),
+        )
+        .unwrap();
+        let control = dormant.prepared.failure_control();
+        let weak_control = Arc::downgrade(&control);
+        let running = dormant.start();
+        let frozen = running.join();
+        let body = running.inner.pipeline.stopped_fact().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let capture = PublisherCaptureDrop {
+            drops: drops.clone(),
+            payload_drops: payload_drops.clone(),
+        };
+        let called = calls.clone();
+        let primary_drops = payload_drops.clone();
+        let mut publisher: Option<super::FragmentTerminalPublisher> = Some(Box::new(move |_| {
+            let _capture_is_still_owned = &capture;
+            called.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(OpaqueCompletionPanic(primary_drops.clone()));
+        }));
+        running.bind_terminal_publisher(&mut publisher).unwrap();
+        assert!(publisher.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(running.stopped_fact(), Some(frozen.clone()));
+        assert_eq!(running.inner.pipeline.stopped_fact(), Some(body));
+        assert!(
+            control.error().is_none(),
+            "metadata faults cannot become TaskRequired failures"
+        );
+        assert_eq!(
+            control.local_exit_fault().unwrap().fact().reason(),
+            super::super::ExecutionReason::TerminalPublisherCallPanicked.reason()
+        );
+        let terminal = running.stopped_fact().unwrap();
+        running
+            .inner
+            .lifecycle
+            .publisher
+            .invoke(&terminal, &control);
+        drop(running);
+        drop(control);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak_control.upgrade().is_some() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            weak_control.upgrade().is_none(),
+            "pure metadata quarantine must not retain the Task control owner"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn duplicate_terminal_publisher_preserves_its_original_slot_and_fact() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let running = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(98_603, 1)),
+            FragmentPrepareContext::default(),
+        )
+        .unwrap()
+        .start();
+        let fact = running.join();
+        let called = Arc::new(AtomicUsize::new(0));
+        let target = called.clone();
+        running.bind_test_publisher(move |_| {
+            target.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut rejected: Option<super::FragmentTerminalPublisher> =
+            Some(Box::new(|_| panic!("a refused role must never run")));
+        let error = running.bind_terminal_publisher(&mut rejected).unwrap_err();
+        assert!(rejected.is_some());
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.failure_fact().reason(),
+            super::super::ExecutionReason::CompletionRoleBindingConflict.reason()
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        assert_eq!(running.stopped_fact(), Some(fact));
     }
 
     /// The terminal profile carries the memory hierarchy the fragment charged
@@ -911,24 +1546,38 @@ mod owner_tests {
         .start();
         let terminal = running.join();
 
+        let first_owner = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(98_601, 1)),
+            FragmentPrepareContext::default(),
+        )
+        .unwrap()
+        .start();
+        let last_owner = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(98_601, 2)),
+            FragmentPrepareContext::default(),
+        )
+        .unwrap()
+        .start();
         let first = Arc::new(AtomicUsize::new(0));
         let first_callback = Arc::clone(&first);
-        let expected = terminal.clone();
-        running.subscribe_stopped(move |fact| {
-            assert_eq!(fact, expected);
+        let expected = first_owner.join();
+        first_owner.bind_test_publisher(move |fact| {
+            assert_eq!(fact, &expected);
             first_callback.fetch_add(1, Ordering::SeqCst);
         });
-        running.subscribe_stopped(|_| {
+        running.bind_test_publisher(|_| {
             panic!("injected immediate fragment terminal observer panic");
         });
         let last = Arc::new(AtomicUsize::new(0));
         let last_callback = Arc::clone(&last);
-        let expected = terminal.clone();
-        running.subscribe_stopped(move |fact| {
-            assert_eq!(fact, expected);
+        let expected = last_owner.join();
+        last_owner.bind_test_publisher(move |fact| {
+            assert_eq!(fact, &expected);
             last_callback.fetch_add(1, Ordering::SeqCst);
         });
 
+        first_owner.join();
+        last_owner.join();
         assert_eq!(first.load(Ordering::SeqCst), 1);
         assert_eq!(last.load(Ordering::SeqCst), 1);
         assert_eq!(running.stopped_fact(), Some(terminal));
@@ -943,7 +1592,9 @@ impl FragmentCommitPort for TestFragmentCommitPort {
     fn acquire(
         &self,
         _fragment_instance_id: novarocks_types::UniqueId,
-    ) -> Result<Box<dyn crate::runtime::fragment::io::FragmentCommitLease>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<
+        Box<dyn crate::runtime::fragment::io::FragmentCommitLease>,
+    > {
         Ok(Box::new(TestFragmentCommitLease))
     }
 }
@@ -953,33 +1604,38 @@ struct TestFragmentCommitLease;
 
 #[cfg(test)]
 impl crate::runtime::fragment::io::FragmentCommitLease for TestFragmentCommitLease {
-    fn add_load_stats(&mut self, _stats: crate::runtime::fragment::io::FragmentSinkLoadStats) {}
+    fn add_load_stats(
+        &mut self,
+        _stats: crate::runtime::fragment::io::FragmentSinkLoadStats,
+    ) -> super::ExecutionResult<()> {
+        Ok(())
+    }
 
     fn add_tablet_commit_info(
         &mut self,
         _info: crate::runtime::fragment::io::TabletCommitInfo,
-    ) -> Result<(), String> {
+    ) -> super::ExecutionResult<()> {
         Ok(())
     }
 
     fn add_tablet_fail_info(
         &mut self,
         _info: crate::runtime::fragment::io::TabletFailInfo,
-    ) -> Result<(), String> {
+    ) -> super::ExecutionResult<()> {
         Ok(())
     }
 
     fn finish(
-        self: Box<Self>,
-    ) -> Result<crate::runtime::fragment::io::FragmentCommitReport, String> {
+        &mut self,
+    ) -> super::ExecutionResult<crate::runtime::fragment::io::FragmentCommitReport> {
         Ok(crate::runtime::fragment::io::FragmentCommitReport::default())
     }
 
-    fn handoff(self: Box<Self>) -> Result<(), String> {
+    fn handoff(&mut self) -> super::ExecutionResult<()> {
         Ok(())
     }
 
-    fn rollback(self: Box<Self>) -> Result<(), String> {
+    fn rollback(&mut self) -> super::ExecutionResult<()> {
         Ok(())
     }
 }
@@ -1001,6 +1657,7 @@ impl Default for FragmentPrepareContext {
             root_result_session: None,
             result_spec: None,
             result_identity: None,
+            task_control: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
             execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
@@ -1045,6 +1702,7 @@ impl FragmentPrepareContext {
             root_result_session: None,
             result_spec: None,
             result_identity: None,
+            task_control: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
             execution_runtime: None,
@@ -1144,6 +1802,14 @@ impl FragmentPrepareContext {
         self
     }
 
+    pub fn with_task_control(
+        mut self,
+        control: Arc<crate::runtime::task_control::TaskExecutionControl>,
+    ) -> Self {
+        self.task_control = Some(control);
+        self
+    }
+
     pub fn with_result_identity(
         mut self,
         identity: novarocks_execution_contract::TaskIdentity,
@@ -1208,6 +1874,7 @@ impl FragmentPrepareContext {
             root_result_session: None,
             result_spec,
             result_identity: None,
+            task_control: None,
             root_sink_dop,
             group_execution_scan_dop,
             execution_runtime: None,
@@ -1253,10 +1920,13 @@ impl FragmentPrepareContext {
     fn fail_if_injected(&self, point: PrepareFailurePoint) -> Result<(), FragmentLaunchError> {
         #[cfg(test)]
         if self.prepare_failure == Some(point) {
-            return Err(FragmentLaunchError::new(
+            return Err(FragmentLaunchError::from_failure(
                 FragmentLaunchStage::Register,
                 FragmentLaunchErrorKind::ResourceUnavailable,
-                point.detail(),
+                novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(point.detail()),
+                )
+                .into(),
             ));
         }
         let _ = point;
@@ -1343,7 +2013,54 @@ pub struct DormantFragmentHandle {
     start_failure: Option<StartFailurePoint>,
 }
 
+#[derive(Debug)]
+enum PreparedDrainRefusal {
+    MissingOwner,
+    BeforeConclusion,
+}
+impl std::fmt::Display for PreparedDrainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingOwner => "stopped preparation drain has no original dormant owner",
+            Self::BeforeConclusion => {
+                "prepared work drain requires its original accepted stop conclusion"
+            }
+        })
+    }
+}
+impl std::error::Error for PreparedDrainRefusal {}
+impl novarocks_failure_contract::FailureProjection for PreparedDrainRefusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use super::ExecutionReason as R;
+        let reason = match self {
+            Self::MissingOwner => R::PreparedDrainMissingOwner,
+            Self::BeforeConclusion => R::PreparedDrainBeforeConclusion,
+        };
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            reason.reason(),
+        )
+    }
+}
+
 impl DormantFragmentHandle {
+    /// Transfer the original already-stopped prepared work to the existing
+    /// executor cleanup path. A refusal leaves the caller's owner untouched.
+    /// This does not activate producers or author another Task conclusion.
+    pub fn try_drain_stopped(
+        slot: &mut Option<Self>,
+    ) -> super::ExecutionResult<RunningFragmentHandle> {
+        let dormant = slot.as_ref().ok_or_else(|| {
+            super::ExecutionFailure::from_domain(PreparedDrainRefusal::MissingOwner)
+        })?;
+        if !dormant.prepared.failure_control().is_stopped() {
+            return Err(super::ExecutionFailure::from_domain(
+                PreparedDrainRefusal::BeforeConclusion,
+            ));
+        }
+        let dormant = slot.take().expect("the checked original dormant owner");
+        Ok(dormant.start())
+    }
     /// Transfer the same physical registrations to the task's inbound-close
     /// owner before installation. Without this explicit transfer the fragment
     /// retains its original terminal cleanup and preparation rollback.
@@ -1359,9 +2076,11 @@ impl DormantFragmentHandle {
 
     pub fn start(self) -> RunningFragmentHandle {
         #[cfg(test)]
-        let initial_failure = self
-            .start_failure
-            .map(|failure| super::ExecutionFailure::from(failure.detail()));
+        let initial_failure = self.start_failure.map(|failure| {
+            super::ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(&(failure.detail())),
+            ))
+        });
         #[cfg(not(test))]
         let initial_failure = None;
         self.start_with_initial_failure(initial_failure)
@@ -1387,26 +2106,44 @@ impl DormantFragmentHandle {
             mem_tracker,
             ..
         } = self;
-        let pipeline = match initial_failure {
-            Some(error) => prepared.start_failed(error),
-            None => prepared.start(),
-        };
+        let control = prepared.failure_control();
+        let finisher = prepared.resources_finisher();
         let lifecycle = Arc::new(RunningFragmentLifecycle {
+            control: Arc::clone(&control),
             state: std::sync::Mutex::new(RunningFragmentState {
-                resources,
-                cancel_reason: None,
+                resources: Some(resources.into_runtime()),
+                pipeline_result: None,
+                interrupt: None,
+                advancing: false,
                 terminal: None,
-                stopped_observers: Vec::new(),
             }),
+            terminal_cv: std::sync::Condvar::new(),
+            publisher: crate::exec::pipeline::global_driver_executor::once_role::OnceRole::new(
+                crate::exec::pipeline::global_driver_executor::once_role::Role::TerminalPublisher,
+            ),
+            finisher: Arc::downgrade(&finisher),
             query_id,
             fragment_instance_id,
             profiler,
             mem_tracker,
         });
         let lifecycle_on_stop = Arc::clone(&lifecycle);
-        pipeline.subscribe_stopped(move |stopped| {
-            lifecycle_on_stop.freeze_terminal(stopped.conclusion());
-        });
+        let mut role: Option<
+            crate::exec::pipeline::global_driver_executor::once_role::Callback<
+                crate::exec::pipeline::global_driver_executor::FragmentStoppedFact,
+            >,
+        > = Some(Box::new(move |stopped| {
+            lifecycle_on_stop.finish_from_stopped(stopped.conclusion())
+        }));
+        // The original lifecycle and its mandatory finisher exist before any
+        // driver can finish, including a zero-driver execution.
+        prepared
+            .bind_resources_finisher(&mut role)
+            .expect("one resource owner per dormant fragment");
+        let pipeline = match initial_failure {
+            Some(error) => prepared.start_failed(error),
+            None => prepared.start(),
+        };
         RunningFragmentHandle {
             inner: Arc::new(RunningFragmentInner {
                 pipeline,
@@ -1427,7 +2164,17 @@ struct RunningFragmentInner {
 }
 
 struct RunningFragmentLifecycle {
+    control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     state: std::sync::Mutex<RunningFragmentState>,
+    terminal_cv: std::sync::Condvar,
+    publisher: Arc<
+        crate::exec::pipeline::global_driver_executor::once_role::OnceRole<FragmentTerminalFact>,
+    >,
+    finisher: std::sync::Weak<
+        crate::exec::pipeline::global_driver_executor::once_role::OnceRole<
+            crate::exec::pipeline::global_driver_executor::FragmentStoppedFact,
+        >,
+    >,
     query_id: QueryId,
     fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
@@ -1435,19 +2182,31 @@ struct RunningFragmentLifecycle {
 }
 
 struct RunningFragmentState {
-    resources: FragmentResources,
-    cancel_reason: Option<FragmentCancelReason>,
+    resources: Option<super::resources::RuntimeFragmentResources>,
+    pipeline_result: Option<super::ExecutionResult<()>>,
+    interrupt: Option<String>,
+    advancing: bool,
     terminal: Option<FragmentTerminalFact>,
-    stopped_observers: Vec<FragmentTerminalObserver>,
 }
 
-type FragmentTerminalObserver = Box<dyn FnOnce(FragmentTerminalFact) + Send + 'static>;
+/// The sole application publisher, distinct from the original resource finisher.
+pub type FragmentTerminalPublisher = Box<dyn FnMut(&FragmentTerminalFact) + Send + 'static>;
 
-fn invoke_terminal_observer(observer: FragmentTerminalObserver, terminal: FragmentTerminalFact) {
-    // The terminal fact is immutable and retained before notification. Isolate
-    // every callback so one faulty observer cannot block the remaining owners.
-    if catch_unwind(AssertUnwindSafe(|| observer(terminal))).is_err() {
-        tracing::error!("fragment terminal observer panicked after the fact was frozen");
+// A foreign call may unwind through advance. Restore the original bounded
+// resource cells before the outer named finisher catches that unwind.
+struct ResourceLoan<'a> {
+    owner: &'a RunningFragmentLifecycle,
+    resources: Option<super::resources::RuntimeFragmentResources>,
+    active: bool,
+}
+impl Drop for ResourceLoan<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.resources = self.resources.take();
+        state.advancing = false;
     }
 }
 
@@ -1455,176 +2214,245 @@ impl RunningFragmentHandle {
     pub fn fragment_instance_id(&self) -> novarocks_types::UniqueId {
         self.inner.lifecycle.fragment_instance_id
     }
-
     pub fn submitted_driver_count(&self) -> usize {
         self.inner.pipeline.submitted_driver_count()
     }
-
     pub fn cancel(&self, reason: FragmentCancelReason) {
+        if self.stopped_fact().is_some() {
+            return;
+        }
+        let _ = self.inner.pipeline.cancel(reason.clone());
+        self.inner.lifecycle.interrupt(reason.detail());
+    }
+    pub fn join(&self) -> FragmentTerminalFact {
+        let result = self.inner.pipeline.join();
+        self.inner.lifecycle.finish_from_stopped(result);
         let mut state = self
             .inner
             .lifecycle
             .state
             .lock()
-            .expect("running fragment state lock");
-        if state.terminal.is_some() {
-            return;
-        }
-        if self.inner.pipeline.cancel(reason.detail().to_string()) {
-            state
-                .resources
-                .abort_result_for_cancellation(reason.detail());
-            state.cancel_reason = Some(reason);
-        }
-    }
-
-    pub fn join(&self) -> FragmentTerminalFact {
-        let result = self.inner.pipeline.join();
-        self.inner.lifecycle.freeze_terminal(result)
-    }
-
-    /// Returns the execution conclusion before actual stop when failure or
-    /// cancellation has already won. Success is known only after stop.
-    pub fn conclusion(&self) -> Option<FragmentOutcome> {
-        self.inner.pipeline.conclusion().map(|result| {
-            let state = self
+            .unwrap_or_else(|e| e.into_inner());
+        // Unknown resource exit is not a terminal fact. Its original scope is
+        // retained and process health closes admission; elapsed time is no proof.
+        loop {
+            if let Some(fact) = &state.terminal {
+                return fact.clone();
+            }
+            state = self
                 .inner
                 .lifecycle
-                .state
-                .lock()
-                .expect("running fragment state lock");
-            outcome_from_result(result, state.cancel_reason.clone())
-        })
+                .terminal_cv
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
-
+    pub fn conclusion(&self) -> Option<FragmentOutcome> {
+        self.inner
+            .pipeline
+            .conclusion()
+            .map(|result| outcome_from_result(result, &self.inner.lifecycle.control))
+    }
     pub fn stopped_fact(&self) -> Option<FragmentTerminalFact> {
         self.inner
             .lifecycle
             .state
             .lock()
-            .expect("running fragment state lock")
+            .unwrap_or_else(|e| e.into_inner())
             .terminal
             .clone()
     }
-
-    /// Registers a one-shot observer for actual local stop and resource
-    /// convergence. Registration after stop invokes the observer immediately.
-    pub fn subscribe_stopped(&self, observer: impl FnOnce(FragmentTerminalFact) + Send + 'static) {
-        self.inner.lifecycle.subscribe_stopped(Box::new(observer));
+    #[cfg(test)]
+    fn bind_test_publisher(&self, publisher: impl FnMut(&FragmentTerminalFact) + Send + 'static) {
+        let mut publisher: Option<FragmentTerminalPublisher> = Some(Box::new(publisher));
+        self.bind_terminal_publisher(&mut publisher)
+            .expect("one publisher per independent test fragment");
     }
 
-    pub fn handoff_sink_commit(&self) {
+    /// Bind exactly one Native publisher. Rejection preserves the caller slot.
+    pub fn bind_terminal_publisher(
+        &self,
+        publisher: &mut Option<FragmentTerminalPublisher>,
+    ) -> super::ExecutionResult<()> {
         self.inner
             .lifecycle
-            .state
-            .lock()
-            .expect("running fragment state lock")
-            .resources
-            .handoff_sink_commit();
+            .publisher
+            .bind_notification(publisher)?;
+        if let Some(fact) = self.stopped_fact() {
+            self.inner
+                .lifecycle
+                .publisher
+                .invoke(&fact, &self.inner.lifecycle.control);
+        }
+        Ok(())
     }
 }
 
 impl RunningFragmentLifecycle {
-    fn freeze_terminal(&self, result: super::ExecutionResult<()>) -> FragmentTerminalFact {
-        let (fact, observers) = {
-            let mut state = self.state.lock().expect("running fragment state lock");
-            if let Some(fact) = state.terminal.as_ref() {
-                return fact.clone();
+    fn interrupt(self: &Arc<Self>, reason: &str) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.terminal.is_some() {
+                return;
             }
-            let outcome = outcome_from_result(result, state.cancel_reason.clone());
-            match &outcome {
-                FragmentOutcome::Succeeded => state.resources.finish_success(),
-                FragmentOutcome::Failed(error) => {
-                    state.resources.finish_failure(error.to_string());
-                }
-                FragmentOutcome::Cancelled { reason } => {
-                    state
-                        .resources
-                        .finish_cancelled(reason.detail().to_string());
-                }
+            if state.interrupt.is_none() {
+                state.interrupt = Some(reason.to_owned());
             }
-            // Attach the memory hierarchy before the profile is frozen. The
-            // tracker tree and the account tree are two separate tiers of the
-            // same process and are read side by side, never summed: while
-            // charges still live on trackers, this is what makes the later
-            // migration auditable rather than a matter of trust.
-            if let (Some(profiler), Some(tracker)) =
-                (self.profiler.as_ref(), self.mem_tracker.as_ref())
-            {
-                crate::runtime::profile::attach_mem_tracker_tree(profiler, tracker);
-            }
-            let fact = FragmentTerminalFact::new(
-                self.query_id,
-                self.fragment_instance_id,
-                outcome,
-                self.profiler.as_ref().map(Profiler::to_native_tree),
-            );
-            state.terminal = Some(fact.clone());
-            let observers = std::mem::take(&mut state.stopped_observers);
-            (fact, observers)
-        };
-        for observer in observers {
-            invoke_terminal_observer(observer, fact.clone());
         }
-        fact
+        self.advance();
     }
 
-    fn subscribe_stopped(&self, observer: FragmentTerminalObserver) {
-        let mut observer = Some(observer);
-        let terminal = {
-            let mut state = self.state.lock().expect("running fragment state lock");
-            match state.terminal.clone() {
-                Some(terminal) => Some(terminal),
-                None => {
-                    state
-                        .stopped_observers
-                        .push(observer.take().expect("stopped observer is available"));
-                    None
-                }
+    fn finish_from_stopped(self: &Arc<Self>, result: super::ExecutionResult<()>) -> bool {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.terminal.is_some() {
+                return true;
             }
+            if state.pipeline_result.is_none() {
+                state.pipeline_result = Some(result);
+            }
+        }
+        self.advance();
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal
+            .is_some()
+    }
+
+    fn advance(self: &Arc<Self>) {
+        let resources = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.advancing || state.terminal.is_some() {
+                return;
+            }
+            state.advancing = true;
+            state.resources.take()
         };
-        if let Some(terminal) = terminal {
-            invoke_terminal_observer(
-                observer
-                    .take()
-                    .expect("stopped observer was not registered"),
-                terminal,
-            );
+        let mut loan = ResourceLoan {
+            owner: self,
+            resources,
+            active: true,
+        };
+        loop {
+            let (interrupt, result) = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                (state.interrupt.take(), state.pipeline_result.clone())
+            };
+            let Some(resources) = loan.resources.as_mut() else {
+                return;
+            };
+            if let Some(reason) = interrupt {
+                resources.interrupt(&reason, &self.control);
+            }
+            if let Some(result) = result {
+                let outcome = outcome_from_result(result, &self.control);
+                if !resources.retire(&outcome, &self.control) {
+                    return;
+                }
+                if let (Some(profiler), Some(tracker)) =
+                    (self.profiler.as_ref(), self.mem_tracker.as_ref())
+                {
+                    crate::runtime::profile::attach_mem_tracker_tree(profiler, tracker);
+                }
+                let fact = FragmentTerminalFact::new(
+                    self.query_id,
+                    self.fragment_instance_id,
+                    outcome,
+                    self.profiler.as_ref().map(Profiler::to_native_tree),
+                );
+                {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.terminal = Some(fact.clone());
+                    self.terminal_cv.notify_all();
+                }
+                drop(loan);
+                // Terminal publication is metadata; its failure cannot revoke
+                // either physical pipeline proof or retired resource proof.
+                self.publisher.invoke(&fact, &self.control);
+                if let Some(finisher) = self.finisher.upgrade() {
+                    finisher.complete_deferred(&self.control);
+                }
+                return;
+            }
+            // If cancellation or stop raced the loan, consume that request in
+            // this original scope. The check and loan return share the mutex.
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.interrupt.is_some() || state.pipeline_result.is_some() {
+                continue;
+            }
+            state.resources = loan.resources.take();
+            state.advancing = false;
+            loan.active = false;
+            drop(state);
+            return;
         }
     }
 }
 
 fn outcome_from_result(
     result: super::ExecutionResult<()>,
-    cancel_reason: Option<FragmentCancelReason>,
+    control: &crate::runtime::runtime_state::RuntimeErrorState,
 ) -> FragmentOutcome {
+    use novarocks_execution_contract::{TaskConclusion, TerminationDetail};
+    if let Some(accepted) = control.task_conclusion() {
+        match accepted.neutral().conclusion() {
+            TaskConclusion::Terminated(TerminationDetail::Failed(_)) => {
+                return FragmentOutcome::Failed(FragmentExecutionError::from_failure(
+                    FragmentExecutionErrorKind::Pipeline,
+                    accepted
+                        .originating_failure()
+                        .expect("accepted failure has its actual source")
+                        .clone(),
+                ));
+            }
+            TaskConclusion::Terminated(TerminationDetail::Canceled(reason)) => {
+                return FragmentOutcome::Cancelled {
+                    reason: FragmentCancelReason::new(reason.as_str()),
+                };
+            }
+            TaskConclusion::Terminated(TerminationDetail::Aborted(reason)) => {
+                return FragmentOutcome::Cancelled {
+                    reason: FragmentCancelReason::new(reason.as_str()),
+                };
+            }
+            TaskConclusion::Succeeded => {}
+        }
+    }
     match result {
         Ok(()) => FragmentOutcome::Succeeded,
-        Err(error) => match cancel_reason {
-            Some(reason) => FragmentOutcome::Cancelled { reason },
-            None => FragmentOutcome::Failed(FragmentExecutionError::from_failure(
+        Err(error) => {
+            // Only this local controller's exact typed stop cause supplies a
+            // local cancellation annotation. No text/class or parallel latch
+            // can turn another originating failure into cancellation.
+            if let super::ExecutionFailureCause::Domain(source) = error.cause()
+                && let Some(reason) = source.downcast_ref::<FragmentCancelReason>()
+            {
+                return FragmentOutcome::Cancelled {
+                    reason: reason.clone(),
+                };
+            }
+            FragmentOutcome::Failed(FragmentExecutionError::from_failure(
                 FragmentExecutionErrorKind::Pipeline,
                 error,
-            )),
-        },
+            ))
+        }
     }
 }
 
 impl Drop for RunningFragmentInner {
     fn drop(&mut self) {
-        let reason = FragmentCancelReason::new("running fragment handle dropped");
+        if self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal
+            .is_none()
         {
-            let mut state = self
-                .lifecycle
-                .state
-                .lock()
-                .expect("running fragment state lock");
-            if state.terminal.is_none() && self.pipeline.cancel(reason.detail().to_string()) {
-                state
-                    .resources
-                    .abort_result_for_cancellation(reason.detail());
-                state.cancel_reason = Some(reason);
-            }
+            let reason = FragmentCancelReason::new("running fragment handle dropped");
+            let _ = self.pipeline.cancel(reason.clone());
+            self.lifecycle.interrupt(reason.detail());
         }
     }
 }
@@ -1651,9 +2479,10 @@ mod typed_failure_tests {
             KernelFailure::InvalidProgram(KernelDiagnostic::new("invalid")),
             KernelFailure::Operational(KernelDiagnostic::new("operational")),
         ] {
-            let FragmentOutcome::Failed(error) =
-                outcome_from_result(Err(cause.clone().into()), None)
-            else {
+            let FragmentOutcome::Failed(error) = outcome_from_result(
+                Err(cause.clone().into()),
+                &crate::runtime::runtime_state::RuntimeErrorState::default(),
+            ) else {
                 panic!("unrequested kernel cancellation remains a failure");
             };
             assert_eq!(error.kind(), FragmentExecutionErrorKind::Pipeline);
@@ -1672,17 +2501,70 @@ mod typed_failure_tests {
         }
     }
     #[test]
-    fn typed_failure_fragment_preserves_existing_explicit_cancel_reason_priority() {
-        let reason = FragmentCancelReason::new("existing owner requested cancellation");
+    fn fragment_outcome_uses_the_actual_task_acceptance_in_both_cancel_failure_orders() {
+        use crate::runtime::{runtime_state::RuntimeErrorState, task_control::test_support::Owner};
+        use novarocks_execution_contract::{
+            AbortCause, CancelReason, TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
+        };
+        let owner = Owner::new();
+        let control =
+            RuntimeErrorState::for_task(Arc::new(owner.view(TaskFailurePhase::Execution)));
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let late: super::super::ExecutionFailure = KernelFailure::ResourceExhausted.into();
+        control.set_error(late.clone());
         assert_eq!(
-            outcome_from_result(
-                Err(KernelFailure::ResourceExhausted.into()),
-                Some(reason.clone())
-            ),
+            outcome_from_result(Err(late), &control),
+            FragmentOutcome::Cancelled {
+                reason: FragmentCancelReason::new(CancelReason::UpstreamNoLongerNeeded.as_str())
+            }
+        );
+        let owner = Owner::new();
+        let control =
+            RuntimeErrorState::for_task(Arc::new(owner.view(TaskFailurePhase::Execution)));
+        let original: super::super::ExecutionFailure = KernelFailure::ResourceExhausted.into();
+        control.set_error(original.clone());
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let observation: super::super::ExecutionFailure =
+            FragmentCancelReason::new("late stand-down").into();
+        let FragmentOutcome::Failed(failure) = outcome_from_result(Err(observation), &control)
+        else {
+            panic!("the originating resource failure must remain primary");
+        };
+        assert!(failure.cause().same_occurrence(&original));
+        let owner = Owner::new();
+        let control =
+            RuntimeErrorState::for_task(Arc::new(owner.view(TaskFailurePhase::Execution)));
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let observation = control.error().unwrap();
+        assert!(matches!(
+            outcome_from_result(Err(observation), &control),
+            FragmentOutcome::Cancelled { .. }
+        ));
+        let original: super::super::ExecutionFailure = KernelFailure::ResourceExhausted.into();
+        control.set_error(original.clone());
+        let FragmentOutcome::Failed(failure) = outcome_from_result(Ok(()), &control) else {
+            panic!("legal refinement reads the actual shared origin");
+        };
+        assert!(failure.cause().same_occurrence(&original));
+    }
+    #[test]
+    fn local_fragment_stop_annotation_belongs_only_to_its_exact_typed_cause() {
+        let control = crate::runtime::runtime_state::RuntimeErrorState::default();
+        let reason = FragmentCancelReason::new("local owner stopped");
+        assert_eq!(
+            outcome_from_result(Err(reason.clone().into()), &control),
             FragmentOutcome::Cancelled { reason }
         );
+        assert!(matches!(
+            outcome_from_result(Err(KernelFailure::ResourceExhausted.into()), &control),
+            FragmentOutcome::Failed(_)
+        ));
         assert_eq!(
-            outcome_from_result(Ok(()), None),
+            outcome_from_result(Ok(()), &control),
             FragmentOutcome::Succeeded
         );
     }

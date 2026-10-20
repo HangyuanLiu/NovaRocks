@@ -65,6 +65,34 @@ pub struct DecodedTaskAssignment {
     encoded: Box<[u8]>,
 }
 
+/// A private, already validated carrier could not be restored by its owner.
+#[derive(Debug)]
+pub struct AssignmentRestorationError(prost::DecodeError);
+impl std::fmt::Display for AssignmentRestorationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "validated task assignment could not be restored: {}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for AssignmentRestorationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for AssignmentRestorationError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        // Protocol codes 1000..1009 belong to retained task-carrier restoration.
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::PROTOCOL, std::num::NonZeroU16::new(1000).unwrap()),
+        )
+    }
+}
+
 impl DecodedTaskAssignment {
     /// This task's position among its fragment's instances.
     pub const fn instance_ordinal(&self) -> u32 {
@@ -72,8 +100,8 @@ impl DecodedTaskAssignment {
     }
 
     /// Restores the validated private assignment only when its winner prepares.
-    pub fn into_wire(self) -> Result<novarocks::TaskAssignment, prost::DecodeError> {
-        novarocks::TaskAssignment::decode(self.encoded.as_ref())
+    pub fn into_wire(self) -> Result<novarocks::TaskAssignment, AssignmentRestorationError> {
+        novarocks::TaskAssignment::decode(self.encoded.as_ref()).map_err(AssignmentRestorationError)
     }
 }
 
@@ -459,5 +487,21 @@ mod tests {
                 "fragment {fragment} metadata {metadata}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod restoration_failure_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+    use std::error::Error;
+    #[test]
+    fn restoration_keeps_sdk_source_without_relabeling_it_as_input_or_capacity() {
+        let error = AssignmentRestorationError(prost::DecodeError::new(
+            "resource exhausted in carrier fixture",
+        ));
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(error.failure_fact().resource(), None);
+        assert!(error.source().unwrap().is::<prost::DecodeError>());
     }
 }

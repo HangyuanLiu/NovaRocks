@@ -15,112 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, ListArray};
-use arrow::compute::cast;
-use arrow::datatypes::DataType;
-use arrow_buffer::OffsetBuffer;
-use std::sync::Arc;
-
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use arrow::array::ArrayRef;
 pub fn eval_array_cum_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let arr = arena.eval(args[0], chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_cum_sum expects ListArray, got {:?}", arr.data_type()))?;
-
-    let output_field = match arena.data_type(expr) {
-        Some(DataType::List(field)) => field.clone(),
-        _ => match list.data_type() {
-            DataType::List(field) => field.clone(),
-            other => {
-                return Err(
-                    (format!("array_cum_sum output type must be List, got {:?}", other)).into(),
-                );
-            }
-        },
+) -> ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(expression_contract(
+            "array_cum_sum requires exactly one prepared argument",
+        ));
     };
-    let target_item_type = output_field.data_type().clone();
-
-    let mut values = list.values().clone();
-    if values.data_type() != &target_item_type {
-        values = cast(&values, &target_item_type).map_err(|e| {
-            format!(
-                "array_cum_sum failed to cast element type {:?} -> {:?}: {}",
-                values.data_type(),
-                target_item_type,
-                e
-            )
-        })?;
-    }
-
-    let offsets = list.value_offsets();
-    let out_values: ArrayRef = match target_item_type {
-        DataType::Int64 => {
-            let values = values
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    "array_cum_sum failed to downcast values to Int64Array".to_string()
-                })?;
-            let mut out = Vec::with_capacity(values.len());
-            for row in 0..chunk.len() {
-                let row_idx = super::common::row_index(row, list.len());
-                let start = offsets[row_idx] as usize;
-                let end = offsets[row_idx + 1] as usize;
-                let mut sum = 0_i64;
-                for idx in start..end {
-                    if values.is_null(idx) {
-                        out.push(None);
-                    } else {
-                        sum += values.value(idx);
-                        out.push(Some(sum));
-                    }
-                }
-            }
-            Arc::new(Int64Array::from(out))
-        }
-        DataType::Float64 => {
-            let values = values
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    "array_cum_sum failed to downcast values to Float64Array".to_string()
-                })?;
-            let mut out = Vec::with_capacity(values.len());
-            for row in 0..chunk.len() {
-                let row_idx = super::common::row_index(row, list.len());
-                let start = offsets[row_idx] as usize;
-                let end = offsets[row_idx + 1] as usize;
-                let mut sum = 0.0_f64;
-                for idx in start..end {
-                    if values.is_null(idx) {
-                        out.push(None);
-                    } else {
-                        sum += values.value(idx);
-                        out.push(Some(sum));
-                    }
-                }
-            }
-            Arc::new(Float64Array::from(out))
-        }
-        other => {
-            return Err(
-                (format!("array_cum_sum unsupported output element type: {:?}", other)).into(),
-            );
-        }
-    };
-
-    let out = ListArray::new(
-        output_field,
-        OffsetBuffer::new(offsets.to_vec().into()),
-        out_values,
-        list.nulls().cloned(),
-    );
-    Ok(Arc::new(out) as ArrayRef)
+    let input = arena.eval(*argument, chunk)?;
+    novarocks_functions::builtin::array_cum_sum_core::cumulative_sum(
+        &input,
+        arena.data_type(expr),
+        chunk.len(),
+    )
+    .map_err(ExecutionFailure::from)
 }

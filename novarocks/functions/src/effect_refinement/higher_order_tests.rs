@@ -301,7 +301,7 @@ impl PureCompileControl for Control {
         assert!(units <= MAX_UNOBSERVED_COMPILE_WORK);
         self.checkpoints.lock().unwrap().push(units);
         if units > 0
-            && let Some(error) = self.fail_on_work
+            && let Some(error) = self.fail_on_work.clone()
         {
             return Err(error);
         }
@@ -492,7 +492,7 @@ fn maximum_arity_body_validation_observes_control_before_refiner() {
     ] {
         let owner = Owner::new(&fixture, protocol);
         let control = Control {
-            fail_on_work: Some(error),
+            fail_on_work: Some(error.clone()),
             ..Control::default()
         };
         assert!(matches!(

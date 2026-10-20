@@ -53,7 +53,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         events.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -261,7 +261,7 @@ fn prefixes(run: impl Fn(&Control) -> Result<(), TypeCodecError>) {
     for stop in 0..trace.len() {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
                 ..Default::default()
             };
             assert!(
@@ -579,7 +579,7 @@ fn sender_writer_struct_5000_and_timezone_2000_preserve_complete_original_occurr
     for stop in samples {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
                 ..Default::default()
             };
             assert!(

@@ -34,7 +34,7 @@ impl PureCompileControl for Control {
         );
         trace.push(n);
         if trace.len() == self.stop {
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -190,7 +190,7 @@ fn between_recipe_every_compile_callback_preserves_first_three_causes_without_fo
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let c = control(stop, cause);
+            let c = control(stop, cause.clone());
             let error = PreparedNativeBetweenRecipe::try_new(
                 NativeBetweenPlan::new(false),
                 &ty,

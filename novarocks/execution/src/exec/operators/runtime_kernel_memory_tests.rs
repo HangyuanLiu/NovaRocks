@@ -102,6 +102,9 @@ fn by_runtime_memory_ready_actual_task_state_installs_exact_account_without_gran
         execution_runtime: Some(runtime),
         query_memory: Some(binding.clone()),
         task_identity: Some(task),
+        task_control: Some(crate::runtime::task_control::test_support::control_for(
+            task,
+        )),
         #[cfg(novarocks_dev_controls)]
         exchange_test_observer: None,
     })

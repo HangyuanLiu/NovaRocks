@@ -28,47 +28,117 @@ pub enum CollectionObservation {
 #[derive(Debug)]
 pub enum ArrayLiteralError {
     MissingOutput,
-    NotList(DataType),
-    ElementLength {
-        expected: usize,
-        actual: usize,
-    },
-    ElementCast {
-        source: DataType,
-        target: DataType,
-        cause: String,
-    },
-    OffsetOverflow,
+    NotList(novarocks_failure_contract::BoundedDetail),
+    ElementLength { expected: usize, actual: usize },
+    OffsetOverflow { elements: usize, rows: usize },
+    BackingExtent { required: u128 },
 }
-impl ArrayLiteralError {
-    pub fn legacy_message(self) -> String {
+impl std::fmt::Display for ArrayLiteralError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingOutput => "array_expr missing output type".to_string(),
-            Self::NotList(ty) => format!("array_expr output type must be List, got {ty:?}"),
-            Self::ElementLength { expected, actual } => {
-                format!("array_expr element length mismatch: expected {expected}, got {actual}")
-            }
-            Self::ElementCast {
-                source,
-                target,
-                cause,
-            } => {
-                format!("array_expr failed to cast element type {source:?} -> {target:?}: {cause}")
-            }
-            Self::OffsetOverflow => "array_expr offset overflow".to_string(),
+            Self::MissingOutput => f.write_str("array_expr missing output type"),
+            Self::NotList(ty) => write!(f, "array_expr output type must be List, got {ty}"),
+            Self::ElementLength { expected, actual } => write!(
+                f,
+                "array_expr element length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::OffsetOverflow { elements, rows } => write!(
+                f,
+                "array_expr offset overflow: elements={elements} rows={rows}"
+            ),
+            Self::BackingExtent { required } => write!(
+                f,
+                "array_expr backing requires {required} bytes, maximum {}",
+                isize::MAX
+            ),
         }
     }
 }
+impl std::error::Error for ArrayLiteralError {}
+impl novarocks_failure_contract::FailureProjection for ArrayLiteralError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, ResourceDimension, ResourceFacts, ResourceScope, domain,
+        };
+        let (class, code) = match self {
+            Self::MissingOutput => (FailureClass::Invariant, 201),
+            Self::NotList(_) => (FailureClass::Invariant, 202),
+            Self::ElementLength { .. } => (FailureClass::Invariant, 203),
+            Self::OffsetOverflow { .. } => (FailureClass::Representation, 204),
+            Self::BackingExtent { .. } => (FailureClass::Resource, 205),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        match self {
+            Self::OffsetOverflow { elements, rows } => {
+                let single = *elements as u128 > i32::MAX as u128;
+                fact.with_representation(RepresentationFacts {
+                    boundary: if single {
+                        RepresentationBoundary::MinimumUnit
+                    } else {
+                        RepresentationBoundary::SingleOutput
+                    },
+                    layout: RepresentationLayout {
+                        domain: domain::KERNEL,
+                        code: std::num::NonZeroU16::new(33).unwrap(),
+                    },
+                    required: u64::try_from(if single {
+                        *elements as u128
+                    } else {
+                        *elements as u128 * *rows as u128
+                    })
+                    .ok(),
+                    extent_limit: Some(i32::MAX as u64),
+                    representable_prefix: None,
+                })
+            }
+            Self::BackingExtent { required } => fact.with_resource(ResourceFacts {
+                request_scope: Some(ResourceScope::Request),
+                constraint_scope: Some(ResourceScope::Request),
+                dimension: ResourceDimension::Bytes,
+                requested: u64::try_from(*required).ok(),
+                required_growth: None,
+                limit: Some(isize::MAX as u64),
+                live: None,
+                committed: None,
+            }),
+            _ => fact,
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ArrayLiteralError {}
 #[derive(Debug)]
 pub enum ConstructionFailure<E> {
-    Data(ArrayLiteralError),
-    Control(E),
+    Domain(ArrayLiteralError),
+    Caller(E),
+}
+fn preflight_geometry(rows: usize, elements: usize) -> Result<(), ArrayLiteralError> {
+    let slots = rows as u128 * elements as u128;
+    if slots > i32::MAX as u128 {
+        return Err(ArrayLiteralError::OffsetOverflow { elements, rows });
+    }
+    let offsets = (rows as u128 + 1) * std::mem::size_of::<i32>() as u128;
+    // These are the actual original temporary and output vectors, not a grant.
+    for required in [
+        offsets,
+        elements as u128 * std::mem::size_of::<ArrayRef>() as u128,
+        elements as u128 * std::mem::size_of::<arrow_data::ArrayData>() as u128,
+        elements as u128 * std::mem::size_of::<&arrow_data::ArrayData>() as u128,
+    ] {
+        if required > isize::MAX as u128 {
+            return Err(ArrayLiteralError::BackingExtent { required });
+        }
+    }
+    Ok(())
 }
 fn observe<E>(
     observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
     event: CollectionObservation,
 ) -> Result<(), ConstructionFailure<E>> {
-    observer(event).map_err(ConstructionFailure::Control)
+    observer(event).map_err(ConstructionFailure::Caller)
 }
 fn relax_map_entry_nullability<E>(
     target_type: &DataType,
@@ -134,16 +204,23 @@ impl ArrayLiteralInputs {
         observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
     ) -> Result<Self, ConstructionFailure<E>> {
         observe(observer, CollectionObservation::OpaqueBoundary)?;
-        let output_type = output_type
-            .cloned()
-            .ok_or(ConstructionFailure::Data(ArrayLiteralError::MissingOutput))?;
+        let output_type = output_type.cloned().ok_or(ConstructionFailure::Domain(
+            ArrayLiteralError::MissingOutput,
+        ))?;
         let (field, element_type) = match output_type {
             DataType::List(field) => {
                 let element_type = field.data_type().clone();
                 (field, element_type)
             }
-            other => return Err(ConstructionFailure::Data(ArrayLiteralError::NotList(other))),
+            other => {
+                return Err(ConstructionFailure::Domain(ArrayLiteralError::NotList(
+                    novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                        "{other:?}"
+                    )),
+                )));
+            }
         };
+        preflight_geometry(num_rows, num_elements).map_err(ConstructionFailure::Domain)?;
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         let raw_arrays = Vec::with_capacity(num_elements);
         observe(observer, CollectionObservation::OpaqueBoundary)?;
@@ -161,7 +238,7 @@ impl ArrayLiteralInputs {
         observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
     ) -> Result<(), ConstructionFailure<E>> {
         if array.len() != self.num_rows {
-            return Err(ConstructionFailure::Data(
+            return Err(ConstructionFailure::Domain(
                 ArrayLiteralError::ElementLength {
                     expected: self.num_rows,
                     actual: array.len(),
@@ -171,7 +248,7 @@ impl ArrayLiteralInputs {
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         self.element_type =
             relax_map_entry_nullability(&self.element_type, array.data_type(), observer)
-                .map_err(ConstructionFailure::Control)?;
+                .map_err(ConstructionFailure::Caller)?;
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         self.raw_arrays.push(array);
         Ok(())
@@ -180,7 +257,7 @@ impl ArrayLiteralInputs {
     /// already have the frozen item type, so that port is never invoked there.
     pub fn finish<E>(
         mut self,
-        mut special_cast: impl FnMut(&ArrayRef, &DataType) -> Result<ArrayRef, String>,
+        mut special_cast: impl FnMut(&ArrayRef, &DataType) -> Result<ArrayRef, E>,
         observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
     ) -> Result<ArrayRef, ConstructionFailure<E>> {
         if self.num_elements == 0 {
@@ -218,15 +295,10 @@ impl ArrayLiteralInputs {
                 out
             } else {
                 observe(observer, CollectionObservation::OpaqueBoundary)?;
-                let out = special_cast(&array, &self.element_type);
+                let out = special_cast(&array, &self.element_type)
+                    .map_err(ConstructionFailure::Caller)?;
                 observe(observer, CollectionObservation::OpaqueBoundary)?;
-                out.map_err(|cause| {
-                    ConstructionFailure::Data(ArrayLiteralError::ElementCast {
-                        source: array.data_type().clone(),
-                        target: self.element_type.clone(),
-                        cause,
-                    })
-                })?
+                out
             };
             element_arrays.push(array);
         }
@@ -238,9 +310,6 @@ impl ArrayLiteralInputs {
         for _ in 0..self.num_rows {
             observe(observer, CollectionObservation::Step)?;
             current += self.num_elements as i64;
-            if current > i32::MAX as i64 {
-                return Err(ConstructionFailure::Data(ArrayLiteralError::OffsetOverflow));
-            }
             offsets.push(current as i32);
         }
         observe(observer, CollectionObservation::OpaqueBoundary)?;
@@ -255,11 +324,7 @@ impl ArrayLiteralInputs {
             data_refs.push(data);
         }
         observe(observer, CollectionObservation::OpaqueBoundary)?;
-        let mut mutable = MutableArrayData::new(
-            data_refs,
-            true,
-            self.num_rows.saturating_mul(self.num_elements),
-        );
+        let mut mutable = MutableArrayData::new(data_refs, true, self.num_rows * self.num_elements);
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         for row in 0..self.num_rows {
             for idx in 0..element_arrays.len() {
@@ -274,5 +339,76 @@ impl ArrayLiteralInputs {
         let list = ListArray::new(self.field, OffsetBuffer::new(offsets.into()), values, None);
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         Ok(Arc::new(list))
+    }
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    #[test]
+    fn array_literal_checks_exact_output_and_backing_extent_without_allocation() {
+        assert!(preflight_geometry(1, i32::MAX as usize).is_ok());
+        let error = preflight_geometry(1, i32::MAX as usize + 1).unwrap_err();
+        assert_eq!(
+            error.failure_fact().representation().unwrap().boundary,
+            RepresentationBoundary::MinimumUnit
+        );
+        let error = preflight_geometry(2, i32::MAX as usize).unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(
+            fact.representation().unwrap().boundary,
+            RepresentationBoundary::SingleOutput
+        );
+        assert_eq!(
+            fact.representation().unwrap().required,
+            Some(2 * i32::MAX as u64)
+        );
+        let error = preflight_geometry(usize::MAX, 0).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(error.failure_fact().resource().unwrap().committed, None);
+    }
+    #[test]
+    fn refused_cast_keeps_original_cause_without_later_observation() {
+        use std::cell::Cell;
+        let observed = Cell::new(0);
+        let mut observer = |_| {
+            observed.set(observed.get() + 1);
+            Ok::<(), &'static str>(())
+        };
+        let output = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let mut inputs =
+            ArrayLiteralInputs::from_output(Some(&output), 1, 1, &mut observer).unwrap();
+        inputs
+            .push_evaluated(
+                Arc::new(arrow_array::Int32Array::from(vec![7])),
+                &mut observer,
+            )
+            .unwrap();
+        let before = observed.get();
+        let error = inputs
+            .finish(|_, _| Err("original cast refusal"), &mut observer)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ConstructionFailure::Caller("original cast refusal")
+        ));
+        // Entry, vector construction, element step, then pre-cast boundary.
+        assert_eq!(observed.get() - before, 4);
+    }
+    #[test]
+    fn invalid_output_cause_does_not_retain_arrow_field() {
+        let field = Arc::new(Field::new("child", DataType::Int32, true));
+        let weak = Arc::downgrade(&field);
+        let output = DataType::Struct(vec![field].into());
+        let error =
+            match ArrayLiteralInputs::from_output(Some(&output), 1, 1, &mut |_| Ok::<(), ()>(())) {
+                Err(ConstructionFailure::Domain(error)) => error,
+                _ => panic!("expected invalid frozen output"),
+            };
+        drop(output);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
     }
 }

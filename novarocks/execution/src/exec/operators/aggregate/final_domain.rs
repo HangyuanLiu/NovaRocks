@@ -28,11 +28,15 @@ pub(crate) enum FinalAggregateDomainError {
     MembershipKeyCount {
         actual: usize,
     },
-    FinalKeyMaterialization(String),
-    FinalKeyStructure(String),
+    FinalKeyMaterialization(crate::runtime::fragment::ExecutionFailure),
+    FinalKeyStructure(novarocks_failure_contract::BoundedDetail),
+    FinalKeyUtf8(std::str::Utf8Error),
+    OffsetCountExtent {
+        rows: usize,
+    },
     FinalKeyTypeMismatch {
-        expected: DataType,
-        actual: DataType,
+        expected: novarocks_failure_contract::BoundedDetail,
+        actual: novarocks_failure_contract::BoundedDetail,
     },
     FinalKeyRowCountMismatch {
         expected: usize,
@@ -56,6 +60,14 @@ impl fmt::Display for FinalAggregateDomainError {
             Self::FinalKeyStructure(detail) => {
                 write!(formatter, "invalid final aggregate key column: {detail}")
             }
+            Self::FinalKeyUtf8(source) => write!(
+                formatter,
+                "final aggregate Utf8 key bytes are invalid: {source}"
+            ),
+            Self::OffsetCountExtent { rows } => write!(
+                formatter,
+                "final aggregate Utf8 offset count exceeds usize for {rows} rows"
+            ),
             Self::FinalKeyTypeMismatch { expected, actual } => write!(
                 formatter,
                 "final aggregate key materialization type mismatch: expected {expected:?}, got {actual:?}"
@@ -68,7 +80,58 @@ impl fmt::Display for FinalAggregateDomainError {
     }
 }
 
-impl Error for FinalAggregateDomainError {}
+impl Error for FinalAggregateDomainError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::FinalKeyMaterialization(source) => Some(source),
+            Self::FinalKeyUtf8(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for FinalAggregateDomainError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts,
+        };
+        let reason = match self {
+            Self::FinalKeyMaterialization(source) => return source.failure_fact(),
+            Self::MembershipKeyCount { .. } => ExecutionReason::FinalAggregateKeyCount,
+            Self::FinalKeyStructure(_) => ExecutionReason::FinalAggregateKeyStructure,
+            Self::FinalKeyTypeMismatch { .. } => ExecutionReason::FinalAggregateKeyType,
+            Self::FinalKeyRowCountMismatch { .. } => ExecutionReason::FinalAggregateKeyRows,
+            Self::FinalKeyUtf8(_) => ExecutionReason::FinalAggregateUtf8,
+            Self::OffsetCountExtent { rows } => {
+                return FailureFact::new(
+                    FailureClass::Resource,
+                    ExecutionReason::FinalAggregateOffsetExtent.reason(),
+                )
+                .with_resource(ResourceFacts {
+                    request_scope: None,
+                    constraint_scope: None,
+                    dimension: ResourceDimension::Items,
+                    requested: u64::try_from(*rows as u128 + 1).ok(),
+                    required_growth: None,
+                    limit: u64::try_from(usize::MAX).ok(),
+                    live: None,
+                    committed: None,
+                });
+            }
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<FinalAggregateDomainError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(source: FinalAggregateDomainError) -> Self {
+        Self::from_domain(source)
+    }
+}
+fn structure(detail: impl fmt::Display) -> FinalAggregateDomainError {
+    FinalAggregateDomainError::FinalKeyStructure(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    )
+}
 
 /// Materializes the one install-frozen membership key from finalized aggregate
 /// state. Execution owns typed final-domain encoding and resource accounting;
@@ -94,8 +157,13 @@ pub(crate) fn extract_final_aggregate_key(
     }
     if array.data_type() != &expected_type {
         return Err(FinalAggregateDomainError::FinalKeyTypeMismatch {
-            expected: expected_type,
-            actual: array.data_type().clone(),
+            expected: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                "{expected_type:?}"
+            )),
+            actual: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                "{:?}",
+                array.data_type()
+            )),
         });
     }
     Ok((expected_type, array))
@@ -108,7 +176,7 @@ fn final_key_row_count(final_key_column: &KeyColumn) -> Result<usize, FinalAggre
         key_type: &str,
     ) -> Result<usize, FinalAggregateDomainError> {
         if values != nulls {
-            return Err(FinalAggregateDomainError::FinalKeyStructure(format!(
+            return Err(structure(format_args!(
                 "{key_type} values/null bitmap length mismatch: values={values} nulls={nulls}"
             )));
         }
@@ -141,31 +209,24 @@ fn final_key_row_count(final_key_column: &KeyColumn) -> Result<usize, FinalAggre
             nulls,
         } => {
             let expected_offsets = nulls.len().checked_add(1).ok_or_else(|| {
-                FinalAggregateDomainError::FinalKeyStructure(
-                    "Utf8 null bitmap length overflows offset count".to_string(),
-                )
+                FinalAggregateDomainError::OffsetCountExtent { rows: nulls.len() }
             })?;
             if offsets.len() != expected_offsets
                 || offsets.first() != Some(&0)
                 || offsets.last() != Some(&data.len())
             {
-                return Err(FinalAggregateDomainError::FinalKeyStructure(
-                    "Utf8 offsets do not match the key data and null bitmap".to_string(),
+                return Err(structure(
+                    "Utf8 offsets do not match the key data and null bitmap",
                 ));
             }
             for window in offsets.windows(2) {
                 let start = window[0];
                 let end = window[1];
                 if start > end || end > data.len() {
-                    return Err(FinalAggregateDomainError::FinalKeyStructure(
-                        "Utf8 offsets are not monotonic and in-bounds".to_string(),
-                    ));
+                    return Err(structure("Utf8 offsets are not monotonic and in-bounds"));
                 }
-                std::str::from_utf8(&data[start..end]).map_err(|error| {
-                    FinalAggregateDomainError::FinalKeyStructure(format!(
-                        "Utf8 key bytes are invalid: {error}"
-                    ))
-                })?;
+                std::str::from_utf8(&data[start..end])
+                    .map_err(FinalAggregateDomainError::FinalKeyUtf8)?;
             }
             Ok(nulls.len())
         }
@@ -234,5 +295,42 @@ mod tests {
             extract_final_aggregate_key(&malformed),
             Err(FinalAggregateDomainError::FinalKeyStructure(_))
         ));
+    }
+    #[test]
+    fn malformed_retained_key_preserves_original_utf8_error_without_retaining_storage() {
+        use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
+        use crate::runtime::mem_tracker::MemTracker;
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let tracker = MemTracker::new_root("final aggregate key source");
+        let weak = std::sync::Arc::downgrade(&tracker);
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut offsets = AggregateVec::new_in(allocator.clone());
+        offsets.extend_from_slice(&[0usize, 1]);
+        let mut data = AggregateVec::new_in(allocator.clone());
+        data.push(0xffu8);
+        let mut nulls = AggregateVec::new_in(allocator.clone());
+        nulls.push(1u8);
+        let columns = vec![KeyColumn::Utf8 {
+            offsets,
+            data,
+            nulls,
+        }];
+        assert!(tracker.current() > 0);
+        let error = extract_final_aggregate_key(&columns).unwrap_err();
+        let original = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<std::str::Utf8Error>()
+            .unwrap();
+        assert_eq!(original.valid_up_to(), 0);
+        assert_eq!(original.error_len(), Some(1));
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Invariant);
+        assert_eq!(fact.reason().code(), 409);
+        drop(columns);
+        assert_eq!(tracker.current(), 0);
+        drop(allocator);
+        drop(tracker);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(error.failure_fact(), fact);
     }
 }

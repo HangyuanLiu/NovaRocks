@@ -145,14 +145,14 @@ impl fmt::Display for RelationCodecError {
 impl std::error::Error for RelationCodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Control(e) => Some(e),
-            Self::Read(e) => Some(e),
-            Self::Payload(e) => Some(e),
-            Self::Type(e) => Some(e),
-            Self::Properties(e) => Some(e),
-            Self::Identity(e) => Some(e),
-            Self::Index(e) => Some(e),
-            Self::InvalidShape(_) => None,
+            Self::Control(source) => Some(source),
+            Self::Read(source) => Some(source),
+            Self::Payload(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Properties(source) => Some(source),
+            Self::Identity(source) => Some(source),
+            Self::Index(source) => Some(source),
+            _ => None,
         }
     }
 }

@@ -272,7 +272,7 @@ pub(crate) fn author_physical_writer_request_observed<'entry, 'source>(
                         Ok(()) => Ok(()),
                         Err(error) => {
                             let exit = match &error {
-                                PhysicalWriterRequestError::Control(cause) => SqlSourceJournalError::Control(*cause),
+                                PhysicalWriterRequestError::Control(cause) => SqlSourceJournalError::Control(cause.clone()),
                                 _ => SqlSourceJournalError::InvalidSource("Writer state contributor request rejected"),
                             };
                             callback_failure = Some(error);

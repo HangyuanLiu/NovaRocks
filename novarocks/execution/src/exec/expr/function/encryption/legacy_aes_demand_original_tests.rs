@@ -46,6 +46,8 @@ fn call(
         eval_aes_decrypt(arena, expr, args, chunk)
     }
     .unwrap_err()
+    .detail()
+    .to_owned()
 }
 #[test]
 fn legacy_aes_original_wrong_arity_demands_no_child() {

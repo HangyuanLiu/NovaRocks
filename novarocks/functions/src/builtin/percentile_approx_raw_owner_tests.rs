@@ -268,7 +268,7 @@ fn payload() -> Vec<u8> {
     for value in [1.0, 2.0, 3.0, 4.0] {
         crate::approx_percentile_core::add_value(&mut state, value).unwrap();
     }
-    crate::approx_percentile_core::encode_state(&state)
+    crate::approx_percentile_core::encode_state(&state).unwrap()
 }
 fn data_rows(n: usize) -> Vec<ArrayRef> {
     let p = payload();
@@ -283,7 +283,7 @@ fn data_rows(n: usize) -> Vec<ArrayRef> {
 fn percentile_raw_owner_full_any_null_and_original_value_errors() {
     let arrays = data_rows(4);
     let expected =
-        crate::percentile_approx_raw_core::evaluate_legacy(&arrays[0], &arrays[1]).unwrap();
+        crate::percentile_approx_raw_core::evaluate_required(&arrays[0], &arrays[1]).unwrap();
     let host = Arc::new(Host::default());
     let mut kernel = instance(&arrays, &host);
     let arguments = args(&arrays);
@@ -309,60 +309,75 @@ fn percentile_raw_owner_full_any_null_and_original_value_errors() {
             let host = Arc::new(Host::default());
             let mut kernel = instance(&arrays, &host);
             let arguments = args(&arrays);
-            let output = kernel
-                .evaluate(Selection::all(n), &arguments, &Control::default())
-                .unwrap();
+            let result = kernel.evaluate(Selection::all(n), &arguments, &Control::default());
             if n == 0 {
+                let output = result.unwrap();
                 assert!(output.errors().is_empty());
+                drop(output);
             } else {
-                let error =
+                let cause = result.unwrap_err();
+                let expected =
                     crate::percentile_approx_raw_core::row(&arrays[0], 0, &arrays[1]).unwrap_err();
-                assert_eq!(output.errors().len(), n);
-                for data in output.errors() {
-                    assert_eq!(data.message(), error);
-                }
+                assert_eq!(
+                    novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+                    novarocks_failure_contract::FailureClass::Invariant
+                );
+                assert_eq!(
+                    novarocks_failure_contract::FailureProjection::failure_fact(&cause),
+                    novarocks_failure_contract::FailureProjection::failure_fact(&expected)
+                );
+                assert_eq!(cause.to_string(), expected.to_string());
             }
-            drop(output);
             drop(kernel);
             empty(&host);
         }
     }
 }
 #[test]
-fn percentile_raw_owner_long_actual_type_diagnostic_no_clipping_and_last_drop() {
-    let field = arrow_schema::Field::new(
+fn percentile_raw_owner_unsupported_type_is_bounded_and_keeps_no_field_or_array() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let field = Arc::new(arrow_schema::Field::new(
         "actual-original-unsupported".repeat(28),
         DataType::UInt32,
         true,
-    );
+    ));
+    let weak_field = Arc::downgrade(&field);
     let ty = DataType::Struct(vec![field].into());
     let arrays = vec![
         arrow_array::new_null_array(&ty, 2),
         Arc::new(Float64Array::from(vec![0.5; 2])) as ArrayRef,
     ];
-    let original = crate::percentile_approx_raw_core::row(&arrays[0], 1, &arrays[1]).unwrap_err();
-    assert!(original.len() > 512);
+    let weak_array = Arc::downgrade(&arrays[0]);
     let host = Arc::new(Host::default());
     let mut kernel = instance(&arrays, &host);
     let arguments = args(&arrays);
     let selected = [1];
-    let output = kernel
+    let cause = kernel
         .evaluate(
             Selection::try_sparse(2, &selected).unwrap(),
             &arguments,
             &Control::default(),
         )
-        .unwrap();
-    assert_eq!(output.errors()[0].selected_ordinal(), 0);
-    assert_eq!(output.errors()[0].message(), original);
-    let cloned = output.errors()[0].with_selected_ordinal(9);
-    drop(output);
+        .unwrap_err();
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+    assert!(
+        cause
+            .to_string()
+            .starts_with("percentile_approx_raw: unsupported percentile payload type")
+    );
+    assert!(cause.to_string().len() <= 512);
+    let clone = cause.clone();
+    drop(cause);
     drop(kernel);
-    assert!(host.ledger.lock().unwrap().bytes > 0);
-    assert_eq!(cloned.message(), original);
-    drop(cloned);
+    drop(arguments);
+    drop(arrays);
+    drop(ty);
+    assert!(weak_field.upgrade().is_none());
+    assert!(weak_array.upgrade().is_none());
+    assert_eq!(clone.failure_fact().class(), FailureClass::Invariant);
     empty(&host);
 }
+
 #[test]
 fn percentile_raw_owner_qnull_skips_bad_json_and_sparse_excludes_bad_rows() {
     let good = payload();
@@ -394,7 +409,7 @@ fn percentile_raw_owner_every_callback_seven_causes_no_tail_and_latch() {
     for value in 0..321 {
         crate::approx_percentile_core::add_value(&mut state, value as f64).unwrap();
     }
-    let encoded = crate::approx_percentile_core::encode_state(&state);
+    let encoded = crate::approx_percentile_core::encode_state(&state).unwrap();
     let arrays = vec![
         Arc::new(BinaryArray::from(vec![Some(encoded.as_slice())])) as ArrayRef,
         Arc::new(Float64Array::from(vec![0.75])) as ArrayRef,
@@ -527,7 +542,7 @@ fn percentile_raw_owner_v3_actual_serde_and_unbounded_fields_match_original() {
             Arc::new(Float64Array::from(vec![0.5])) as ArrayRef,
         ];
         let expected =
-            crate::percentile_approx_raw_core::evaluate_legacy(&arrays[0], &arrays[1]).unwrap();
+            crate::percentile_approx_raw_core::evaluate_required(&arrays[0], &arrays[1]).unwrap();
         let host = Arc::new(Host::default());
         let mut kernel = instance(&arrays, &host);
         let arguments = args(&arrays);
@@ -609,26 +624,33 @@ fn percentile_raw_owner_full_fixed_size_binary_widths_lazy_null_failure() {
         let host = Arc::new(Host::default());
         let mut kernel = instance(&arrays, &host);
         let arguments = args(&arrays);
-        let output = kernel
-            .evaluate(Selection::all(2), &arguments, &Control::default())
-            .unwrap();
+        let result = kernel.evaluate(Selection::all(2), &arguments, &Control::default());
         if width == 16 {
+            let output = result.unwrap();
             assert!(output.values().is_null(0));
             assert!(output.errors().is_empty());
+            drop(output);
         } else {
-            assert_eq!(output.errors().len(), 2);
-            for (ordinal, data) in output.errors().iter().enumerate() {
-                let expected = crate::percentile_input::numeric_value_at(
-                    &arrays[1],
-                    ordinal,
-                    crate::percentile_input::PercentileInputDiagnostic::ApproxRaw,
-                )
-                .unwrap_err();
-                assert_eq!(data.selected_ordinal(), ordinal);
-                assert_eq!(data.message(), expected);
-            }
+            let cause = result.unwrap_err();
+            assert_eq!(
+                novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            let expected = crate::percentile_input::numeric_value_at_with_failure(
+                &arrays[1],
+                0,
+                &mut |source| {
+                    source
+                        .into_failure(crate::percentile_input::PercentileInputDiagnostic::ApproxRaw)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(cause.to_string(), expected.to_string());
+            assert_eq!(
+                novarocks_failure_contract::FailureProjection::failure_fact(&cause),
+                novarocks_failure_contract::FailureProjection::failure_fact(&expected)
+            );
         }
-        drop(output);
         drop(kernel);
         empty(&host);
     }
@@ -651,7 +673,7 @@ impl PureCompileControl for CompileTrace {
             assert!(at <= stop, "compile callback after primary failure");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -674,7 +696,7 @@ fn percentile_raw_owner_compile_all_callbacks_three_causes_no_tail() {
             CompileControlError::ResourceExhausted,
         ] {
             let control = CompileTrace {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..CompileTrace::default()
             };
             let error =
@@ -758,6 +780,7 @@ fn percentile_raw_owner_original_v3_long_parser_data_is_not_clipped() {
         Arc::new(Float64Array::from(vec![0.5])) as ArrayRef,
     ];
     let expected = crate::percentile_approx_raw_core::row(&arrays[0], 0, &arrays[1]).unwrap_err();
+    let expected = original_serde_diagnostic(&expected);
     assert!(expected.len() > 512);
     let host = Arc::new(Host::default());
     let mut kernel = instance(&arrays, &host);
@@ -767,6 +790,10 @@ fn percentile_raw_owner_original_v3_long_parser_data_is_not_clipped() {
         .unwrap();
     assert_eq!(out.errors().len(), 1);
     assert_eq!(out.errors()[0].message(), expected);
+    assert_eq!(
+        out.errors()[0].reason(),
+        crate::DataFailureReason::InvalidEncoding
+    );
     let diagnostic = out.errors()[0].clone();
     drop(out);
     drop(kernel);
@@ -778,10 +805,11 @@ fn percentile_raw_owner_original_v3_long_parser_data_is_not_clipped() {
 
 #[test]
 fn percentile_raw_owner_lossless_diagnostic_all_control_and_owned_frontiers() {
-    let field = arrow_schema::Field::new("actual", DataType::UInt32, true)
-        .with_name("original_diagnostic_field".repeat(32));
+    // Exercise full value diagnostics through a real malformed JSON value.
+    // Unsupported physical shapes have their separate unmaskable oracle.
+    let encoded = long_parser_payload();
     let arrays = vec![
-        arrow_array::new_null_array(&DataType::Struct(vec![field].into()), 1),
+        Arc::new(BinaryArray::from(vec![Some(encoded.as_slice())])) as ArrayRef,
         Arc::new(Float64Array::from(vec![0.5])) as ArrayRef,
     ];
     let prepared = prepared(&arrays);
@@ -856,4 +884,26 @@ fn percentile_raw_owner_lossless_diagnostic_all_control_and_owned_frontiers() {
             empty(&host);
         }
     }
+}
+
+fn original_serde_diagnostic(cause: &KernelFailure) -> String {
+    let mut source: &(dyn std::error::Error + 'static) = cause;
+    loop {
+        if let Some(source) = source.downcast_ref::<serde_json::Error>() {
+            return source.to_string();
+        }
+        source = source
+            .source()
+            .expect("original JSON parser source retained");
+    }
+}
+fn long_parser_payload() -> Vec<u8> {
+    let metadata = format!(
+        "{{\"quantiles\":{{\"{}\":[]}},\"compression\":10000}}",
+        "unknown".repeat(200)
+    );
+    let mut encoded = vec![0xa2, 3];
+    encoded.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(metadata.as_bytes());
+    encoded
 }

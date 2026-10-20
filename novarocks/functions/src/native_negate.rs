@@ -60,15 +60,7 @@ pub fn native_negate_computed_result_type(
         let prepared = PreparedNativeNegateRecipe::try_new(source, &result, control)?;
         Ok(prepared.result)
     })();
-    if outcome
-        .as_ref()
-        .err()
-        .is_some_and(|error: &ArithmeticPrepareError| error.control_error().is_some())
-    {
-        return outcome;
-    }
-    work.finish()?;
-    outcome
+    work.finish_result(outcome, ArithmeticPrepareError::from)
 }
 
 #[derive(Clone, Debug)]
@@ -139,15 +131,7 @@ impl PreparedNativeNegateRecipe {
                 zero,
             })
         })();
-        if outcome
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.control_error().is_some())
-        {
-            return outcome;
-        }
-        work.finish()?;
-        outcome
+        work.finish_result(outcome, ArithmeticPrepareError::from)
     }
     pub fn source_type(&self) -> &FunctionValueType {
         &self.source
@@ -277,8 +261,7 @@ impl PreparedNativeNegateRecipe {
             // remains the host's responsibility, independent of observation.
             work.flush()?;
             let operand = argument.array().slice(row, 1);
-            let zero =
-                crate::legacy_literal::eval(&self.zero, 1).map_err(|message| invalid(&message))?;
+            let zero = crate::legacy_literal::eval(&self.zero, 1)?;
             work.flush()?;
             // Same source/result dtype and one row bound the original owned
             // loops: D128 factors stop at the 39th checked multiply, twice;
@@ -294,12 +277,23 @@ impl PreparedNativeNegateRecipe {
                 false,
                 DecimalOverflowPolicy::OutputNull,
             );
-            work.flush()?;
             match answer {
-                Ok(array) => Ok(NativeNegateRowResult::Value(array)),
-                Err(message) => Ok(NativeNegateRowResult::RowError(RowDataError::new(
-                    ordinal, &message,
-                ))),
+                Ok(array) => {
+                    work.flush()?;
+                    Ok(NativeNegateRowResult::Value(array))
+                }
+                Err(cause) => match cause.classify() {
+                    crate::legacy_arithmetic::ClassifiedArithmeticFailure::Value(cause) => {
+                        Ok(NativeNegateRowResult::RowError(RowDataError::with_reason(
+                            ordinal,
+                            cause.reason(),
+                            &cause.to_string(),
+                        )))
+                    }
+                    crate::legacy_arithmetic::ClassifiedArithmeticFailure::Outer(cause) => {
+                        Err(KernelFailure::from_domain(cause))
+                    }
+                },
             }
         })();
         work.finish_result(outcome)
@@ -309,3 +303,7 @@ impl PreparedNativeNegateRecipe {
 #[cfg(test)]
 #[path = "native_negate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_negate_compile_author_tests.rs"]
+mod compile_author_tests;

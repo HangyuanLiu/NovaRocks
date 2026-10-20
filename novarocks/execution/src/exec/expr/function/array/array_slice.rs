@@ -16,7 +16,9 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, Int64Array, ListArray, make_array};
 use arrow::datatypes::DataType;
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -28,7 +30,12 @@ pub fn eval_array_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if !matches!(args.len(), 2 | 3) {
+        return Err(expression_contract(
+            "array_slice has an invalid prepared argument count",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
     let offset_arr = arena.eval(args[1], chunk)?;
     let length_arr = if args.len() == 3 {
@@ -37,35 +44,48 @@ pub fn eval_array_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         None
     };
 
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_slice expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_slice expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
     let offset_arr = offset_arr
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "array_slice expects BIGINT offset".to_string())?;
+        .ok_or_else(|| expression_contract("array_slice expects BIGINT offset"))?;
     let length_arr = length_arr
         .as_ref()
         .map(|a| {
             a.as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "array_slice expects BIGINT length".to_string())
+                .ok_or_else(|| expression_contract("array_slice expects BIGINT length"))
         })
         .transpose()?;
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list.data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_slice output must be List, got {other:?}"
+            )));
+        }
+        None => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("array_slice output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "array_slice output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
 
+    super::common::validate_rows(list.len(), chunk.len(), "array_slice input")?;
+    super::common::validate_rows(offset_arr.len(), chunk.len(), "array_slice offset")?;
+    if let Some(length) = length_arr {
+        super::common::validate_rows(length.len(), chunk.len(), "array_slice length")?;
+    }
     let values = list.values();
     let values_data = values.to_data();
     let data_refs = vec![&values_data];
@@ -73,7 +93,7 @@ pub fn eval_array_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let mut offsets = Vec::with_capacity(chunk.len() + 1);
     offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     let list_offsets = list.value_offsets();
@@ -83,7 +103,8 @@ pub fn eval_array_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             .as_ref()
             .map(|a| super::common::row_index(row, a.len()));
 
-        if list.is_null(row)
+        let list_row = super::common::row_index(row, list.len());
+        if list.is_null(list_row)
             || offset_arr.is_null(off_idx)
             || len_idx
                 .and_then(|i| length_arr.as_ref().map(|a| a.is_null(i)))
@@ -94,8 +115,8 @@ pub fn eval_array_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             continue;
         }
 
-        let row_start = list_offsets[row] as i64;
-        let row_end = list_offsets[row + 1] as i64;
+        let row_start = list_offsets[list_row] as i64;
+        let row_end = list_offsets[list_row + 1] as i64;
         let row_len = row_end - row_start;
 
         let offset = offset_arr.value(off_idx);
@@ -120,21 +141,22 @@ pub fn eval_array_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             _ => row_len - start,
         };
 
-        let mut end = start + take_len;
+        let mut end = start.saturating_add(take_len);
         if end > row_len {
             end = row_len;
         }
 
         let abs_start = (row_start + start) as usize;
         let abs_end = (row_start + end) as usize;
+        let next = novarocks_functions::aggregate_scalar::checked_list_output_offset(
+            current,
+            abs_end - abs_start,
+        )?;
         if abs_end > abs_start {
             mutable.extend(0, abs_start, abs_end);
         }
 
-        current += end - start;
-        if current > i32::MAX as i64 {
-            return Err(("array_slice offset overflow".to_string()).into());
-        }
+        current = next;
         offsets.push(current as i32);
         null_builder.append_non_null();
     }
@@ -144,13 +166,19 @@ pub fn eval_array_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         && check_exact(output_field.data_type(), out_values.data_type()).is_ok()
     {
         out_values = retag_column(&out_values, output_field.data_type())
-            .map_err(|mismatch| format!("array_slice failed to retag values: {mismatch:?}"))?;
+            .map_err(ExecutionFailure::from_domain)?;
     }
-    let list = ListArray::new(
+    let list = ListArray::try_new(
         output_field,
         OffsetBuffer::new(offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_slice constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(list) as ArrayRef)
 }

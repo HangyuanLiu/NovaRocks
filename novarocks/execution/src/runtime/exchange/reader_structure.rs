@@ -30,7 +30,7 @@ use novarocks_type_contract::{
     owned_resources::{layout::LayoutResourceError, vec::original_resize_growth},
 };
 
-fn model_error(cause: ReaderStructureFailure<ExchangeReceiveFailure>) -> ExchangeReceiveFailure {
+fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> ExchangeFailure {
     match cause {
         ReaderStructureFailure::Creator(cause) => cause,
         ReaderStructureFailure::Layout(cause) => cause.into(),
@@ -84,23 +84,23 @@ impl std::fmt::Display for BorrowedIpcDiagnostic<'_> {
     }
 }
 fn field_error(
-    cause: FieldVerificationFailure<ExchangeReceiveFailure>,
+    cause: FieldVerificationFailure<ExchangeFailure>,
     ordinal: usize,
     expected: &DataType,
     actual: arrow::ipc::Field<'_>,
-) -> ExchangeReceiveFailure {
+) -> ExchangeFailure {
     match cause {
         // Preserve the exact original observer refusal without diagnostics or
         // tail work on the failed creator/control path.
         FieldVerificationFailure::Observer(cause) => cause,
-        FieldVerificationFailure::InvalidShape(cause) => format!(
+        FieldVerificationFailure::InvalidShape(cause) => super::failure::payload(format_args!(
             "exchange column {ordinal} differs from its frozen value layout: expected={expected:?} actual={} ({cause})",
             BorrowedIpcDiagnostic(actual),
-        ).into(),
+        )),
     }
 }
 
-fn work(owner: &dyn InputConstructionOwner) -> Result<(), ExchangeReceiveFailure> {
+fn work(owner: &dyn InputConstructionOwner) -> Result<(), ExchangeFailure> {
     owner.observe(
         0,
         &[],
@@ -116,7 +116,7 @@ fn inspect_stream(
     prefer_wire_ids: bool,
     source_owner: &dyn InputConstructionOwner,
     scratch_owner: &dyn InputConstructionOwner,
-) -> Result<usize, ExchangeReceiveFailure> {
+) -> Result<usize, ExchangeFailure> {
     let mut offset = 0_usize;
     let mut metadata_len = 0_usize;
     let mut metadata_capacity = 0_usize;
@@ -130,13 +130,18 @@ fn inspect_stream(
     while offset < bytes.len() {
         work(scratch_owner)?;
         let (start, len) = match novarocks_arrow_ipc_frame::standard_prefix(bytes, offset)
-            .map_err(|cause| format!("Arrow IPC standard prefix is invalid: {cause:?}"))?
+            .map_err(|cause| super::failure::metadata("standard prefix", cause))?
         {
             novarocks_arrow_ipc_frame::ContinuationPrefix::End { .. } => break,
             novarocks_arrow_ipc_frame::ContinuationPrefix::Metadata { start, len } => (start, len),
         };
-        let metadata = novarocks_arrow_ipc_frame::metadata_slice(bytes, start, len)
-            .map_err(|_| "Arrow IPC metadata extent exceeds its original payload".to_string())?;
+        let metadata =
+            novarocks_arrow_ipc_frame::metadata_slice(bytes, start, len).map_err(|source| {
+                super::failure::metadata(
+                    "Arrow IPC metadata extent exceeds its original payload",
+                    source,
+                )
+            })?;
         let metadata_end = start
             .checked_add(len)
             .ok_or(LayoutResourceError::Arithmetic)?;
@@ -154,45 +159,46 @@ fn inspect_stream(
             metadata,
             &novarocks_arrow_ipc_frame::VerifierOptions::default(),
         )
-        .map_err(|error| format!("failed to verify Arrow IPC message: {error}"))?;
+        .map_err(|error| super::failure::metadata("verify IPC message", error))?;
         work(scratch_owner)?;
-        let body = novarocks_arrow_ipc_frame::nonnegative_length(message.bodyLength())
-            .map_err(|_| "Arrow IPC message body length is negative".to_string())?;
+        let body = novarocks_arrow_ipc_frame::nonnegative_length(message.bodyLength()).map_err(
+            |source| super::failure::metadata("Arrow IPC message body length is negative", source),
+        )?;
         let body_range = novarocks_arrow_ipc_frame::checked_range(bytes.len(), metadata_end, body)
-            .map_err(|_| {
-                "Arrow IPC message body extent exceeds its original payload".to_string()
-            })?;
+            .map_err(|source| super::failure::metadata("IPC message body extent", source))?;
         if !seen_schema {
             if message.header_type() != arrow::ipc::MessageHeader::Schema {
-                return Err("Arrow IPC first message is not a schema".to_string().into());
+                return Err(super::failure::payload(
+                    "Arrow IPC first message is not a schema",
+                ));
             }
             let schema = message
                 .header_as_schema()
-                .ok_or_else(|| "Arrow IPC schema payload missing".to_string())?;
+                .ok_or_else(|| super::failure::payload("Arrow IPC schema payload missing"))?;
             if schema.endianness() != arrow::ipc::Endianness::Little {
-                return Err("Arrow IPC schema endianness is unsupported"
-                    .to_string()
-                    .into());
+                return Err(super::failure::payload(
+                    "Arrow IPC schema endianness is unsupported",
+                ));
             }
             let fields = schema
                 .fields()
-                .ok_or_else(|| "Arrow IPC schema fields missing".to_string())?;
+                .ok_or_else(|| super::failure::payload("Arrow IPC schema fields missing"))?;
             let marker = expected.slots().is_empty()
                 && fields.len() == 1
                 && fields.get(0).name() == Some(EXCHANGE_ZERO_COLUMN_MARKER_FIELD);
             if fields.len() != expected.slots().len() && !marker {
-                return Err("exchange frozen declaration differs from IPC field count"
-                    .to_string()
-                    .into());
+                return Err(super::failure::payload(
+                    "exchange frozen declaration differs from IPC field count",
+                ));
             }
-            let mut request = |layout, class| -> Result<(), ExchangeReceiveFailure> {
+            let mut request = |layout, class| -> Result<(), ExchangeFailure> {
                 match class {
                     ReaderStructureClass::SourceHeader => source_owner.request(layout)?,
                     ReaderStructureClass::Temporary => scratch_owner.request(layout)?,
                 }
                 Ok(())
             };
-            let mut opaque = |bytes, class| -> Result<(), ExchangeReceiveFailure> {
+            let mut opaque = |bytes, class| -> Result<(), ExchangeFailure> {
                 match class {
                     ReaderStructureClass::SourceHeader => {
                         source_owner.observe_opaque_upper_bound(bytes)?
@@ -265,7 +271,9 @@ fn inspect_stream(
         offset = body_range.end;
     }
     if !seen_schema {
-        return Err("Arrow IPC stream schema is missing".to_string().into());
+        return Err(super::failure::payload(
+            "Arrow IPC stream schema is missing",
+        ));
     }
     Ok(batches)
 }
@@ -281,31 +289,35 @@ fn upcoming_record<'a>(
     factory: &dyn InputConstructionFactory,
     expected: &ChunkSchemaRef,
     schema: &arrow::datatypes::Schema,
-) -> Result<Option<(arrow::ipc::RecordBatch<'a>, &'a [u8])>, ExchangeReceiveFailure> {
+) -> Result<Option<(arrow::ipc::RecordBatch<'a>, &'a [u8])>, ExchangeFailure> {
     while offset < bytes.len() {
         work(scratch)?;
         let (start, len) = match novarocks_arrow_ipc_frame::standard_prefix(bytes, offset)
-            .map_err(|cause| format!("Arrow IPC standard prefix is invalid: {cause:?}"))?
+            .map_err(|cause| super::failure::metadata("standard prefix", cause))?
         {
             novarocks_arrow_ipc_frame::ContinuationPrefix::End { .. } => return Ok(None),
             novarocks_arrow_ipc_frame::ContinuationPrefix::Metadata { start, len } => (start, len),
         };
-        let metadata = novarocks_arrow_ipc_frame::metadata_slice(bytes, start, len)
-            .map_err(|_| "Arrow IPC metadata extent exceeds its original payload".to_string())?;
+        let metadata =
+            novarocks_arrow_ipc_frame::metadata_slice(bytes, start, len).map_err(|source| {
+                super::failure::metadata(
+                    "Arrow IPC metadata extent exceeds its original payload",
+                    source,
+                )
+            })?;
         let message = novarocks_arrow_ipc_frame::verified_message(
             metadata,
             &novarocks_arrow_ipc_frame::VerifierOptions::default(),
         )
-        .map_err(|cause| format!("failed to verify Arrow IPC message: {cause}"))?;
+        .map_err(|cause| super::failure::metadata("verify IPC message", cause))?;
         let end = start
             .checked_add(len)
             .ok_or(LayoutResourceError::Arithmetic)?;
-        let body = novarocks_arrow_ipc_frame::nonnegative_length(message.bodyLength())
-            .map_err(|_| "Arrow IPC message body length is negative".to_string())?;
-        let body_range =
-            novarocks_arrow_ipc_frame::checked_range(bytes.len(), end, body).map_err(|_| {
-                "Arrow IPC message body extent exceeds its original payload".to_string()
-            })?;
+        let body = novarocks_arrow_ipc_frame::nonnegative_length(message.bodyLength()).map_err(
+            |source| super::failure::metadata("Arrow IPC message body length is negative", source),
+        )?;
+        let body_range = novarocks_arrow_ipc_frame::checked_range(bytes.len(), end, body)
+            .map_err(|source| super::failure::metadata("IPC message body extent", source))?;
         offset = body_range.end;
         let original_body = &bytes[body_range];
         match message.header_type() {
@@ -315,23 +327,21 @@ fn upcoming_record<'a>(
                     .map(|batch| (batch, original_body)));
             }
             arrow::ipc::MessageHeader::Schema => {
-                return Err(
-                    "failed to read batch: Ipc error: Expected a record batch, but found a schema"
-                        .to_string()
-                        .into(),
-                );
+                return Err(super::failure::payload(
+                    "failed to read batch: Ipc error: Expected a record batch, but found a schema",
+                ));
             }
             arrow::ipc::MessageHeader::DictionaryBatch => {
-                let dictionary = message
-                    .header_as_dictionary_batch()
-                    .ok_or_else(|| "Arrow IPC dictionary payload missing".to_string())?;
+                let dictionary = message.header_as_dictionary_batch().ok_or_else(|| {
+                    super::failure::payload("Arrow IPC dictionary payload missing")
+                })?;
                 work(scratch)?;
                 let old_len = dictionaries.len();
                 let old_capacity = dictionaries.capacity();
                 let present = dictionaries.contains_key(&dictionary.id());
                 work(scratch)?;
                 if !present {
-                    let bytes = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ValueTypeStorageLifetime, ExchangeReceiveFailure>(
+                    let bytes = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ValueTypeStorageLifetime, ExchangeFailure>(
                         dictionaries.len(), dictionaries.capacity(), || work(scratch),
                     )?;
                     if bytes != 0 {
@@ -356,11 +366,11 @@ fn upcoming_record<'a>(
                     }
                 }
                 dictionaries.insert(dictionary.id(), body_storage);
-                let mut request = |layout, _class| -> Result<(), ExchangeReceiveFailure> {
+                let mut request = |layout, _class| -> Result<(), ExchangeFailure> {
                     scratch.request(layout)?;
                     Ok(())
                 };
-                let mut opaque = |bytes, class| -> Result<(), ExchangeReceiveFailure> {
+                let mut opaque = |bytes, class| -> Result<(), ExchangeFailure> {
                     match class {
                         novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Retained => body_owner.observe_opaque_upper_bound(bytes)?,
                         novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Temporary => scratch.observe_opaque_upper_bound(bytes)?,
@@ -378,9 +388,9 @@ fn upcoming_record<'a>(
                     .dictionary_batch(
                         schema,
                         dictionary.id(),
-                        dictionary
-                            .data()
-                            .ok_or_else(|| "Arrow IPC dictionary record missing".to_string())?,
+                        dictionary.data().ok_or_else(|| {
+                            super::failure::payload("Arrow IPC dictionary record missing")
+                        })?,
                         original_body,
                     )
                     .map_err(model_error)?;
@@ -393,7 +403,7 @@ fn upcoming_record<'a>(
                     // Same exact sequence of unique IDs as the real private
                     // dictionary cache; its table uses ArrayRef entries, not
                     // this separate finite-holder map's different entry layout.
-                    let private_table = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ArrayRef, ExchangeReceiveFailure>(
+                    let private_table = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ArrayRef, ExchangeFailure>(
                         old_len,
                         old_capacity,
                         || work(scratch),
@@ -425,11 +435,11 @@ pub(super) fn decode_owned(
     wire: &ExchangeWireMeta,
     prefer_wire_ids: bool,
     factory: &dyn InputConstructionFactory,
-) -> Result<Vec<Chunk>, ExchangeReceiveFailure> {
+) -> Result<Vec<Chunk>, ExchangeFailure> {
     if !expected.is_typed() {
-        return Err("exchange requires complete frozen execution schema"
-            .to_string()
-            .into());
+        return Err(super::failure::contract(
+            "exchange requires complete frozen execution schema",
+        ));
     }
     let source_owner = factory.begin_typed_construction(expected)?;
     let scratch_owner = factory.begin_typed_construction(expected)?;
@@ -455,7 +465,7 @@ pub(super) fn decode_owned(
         })?;
     work(scratch_owner.as_ref())?;
     let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-        .map_err(|error| format!("failed to create Arrow IPC reader: {error}"))?;
+        .map_err(|source| super::failure::arrow(super::failure::ArrowOperation::Decode, source))?;
     work(scratch_owner.as_ref())?;
     let mut out = Vec::with_capacity(count);
     let mut dictionaries = std::collections::HashMap::new();
@@ -487,14 +497,14 @@ pub(super) fn decode_owned(
                 novarocks_functions::arrow_ipc_construction::original_reader_buffer_header_upper_bound()?,
             )?;
             let mut array_storage = owner.storage_lifetime();
-            let mut request = |layout, class| -> Result<(), ExchangeReceiveFailure> {
+            let mut request = |layout, class| -> Result<(), ExchangeFailure> {
                 match class {
                     novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Retained => owner.request(layout)?,
                     novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Temporary => temporary.request(layout)?,
                 }
                 Ok(())
             };
-            let mut opaque = |bytes, class| -> Result<(), ExchangeReceiveFailure> {
+            let mut opaque = |bytes, class| -> Result<(), ExchangeFailure> {
                 match class {
                     novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Retained => owner.observe_opaque_upper_bound(bytes)?,
                     novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Temporary => temporary.observe_opaque_upper_bound(bytes)?,
@@ -532,9 +542,13 @@ pub(super) fn decode_owned(
         let Some(batch) = reader.next() else {
             break;
         };
-        let batch = batch.map_err(|error| format!("failed to read batch: {error}"))?;
+        let batch = batch.map_err(|source| {
+            super::failure::arrow(super::failure::ArrowOperation::Decode, source)
+        })?;
         let (_array_owner, temporary, array_storage) = array_owner.ok_or_else(|| {
-            "Arrow IPC reader produced a batch without its original constructor frame".to_string()
+            super::failure::contract(
+                "Arrow IPC reader produced a batch without its original constructor frame",
+            )
         })?;
         let source = DecodedSourceBatch {
             batch,
@@ -560,7 +574,7 @@ pub(super) fn decode_owned(
             // count-only publishes rows, so array scratch cannot follow it.
             value
         } else {
-            value.retaining_array_type_storage_observed::<ExchangeReceiveFailure>(
+            value.retaining_array_type_storage_observed::<ExchangeFailure>(
                 &array_storage,
                 |layout| Ok(owner.request(layout)?),
             )?
@@ -569,11 +583,9 @@ pub(super) fn decode_owned(
         // Count comes from the same verified original message headers; retain
         // a local check before push so no extra unobserved vector growth occurs.
         if out.len() == count {
-            return Err(
-                "Arrow IPC reader produced more batches than its verified header count"
-                    .to_string()
-                    .into(),
-            );
+            return Err(super::failure::contract(
+                "Arrow IPC reader produced more batches than its verified header count",
+            ));
         }
         out.push(value);
     }
@@ -841,11 +853,32 @@ mod tests {
             .unwrap();
         source[later_start + name] = 255;
         let error = decode_owned(&source, &expected, &wire, true, factory.as_ref()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("failed to verify Arrow IPC message")
-        );
+        // The independent locked verifier owns this actual malformed-string
+        // rejection. Assert its original type/diagnostic survives, rather
+        // than requiring the old transport wrapper's static wording.
+        fn assert_original<E: std::error::Error + 'static>(
+            failure: &(dyn std::error::Error + 'static),
+            original: &E,
+        ) {
+            let mut source = Some(failure);
+            while let Some(current) = source {
+                if let Some(actual) = current.downcast_ref::<E>() {
+                    assert_eq!(actual.to_string(), original.to_string());
+                    return;
+                }
+                source = current.source();
+            }
+            panic!("original FlatBuffer verifier source was lost");
+        }
+        let original = novarocks_arrow_ipc_frame::verified_message(
+            &source[later_start + 8..later_start + schema_end],
+            &novarocks_arrow_ipc_frame::VerifierOptions::default(),
+        )
+        .unwrap_err();
+        assert_original(&error, &original);
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
+        assert_eq!(fact.class(), novarocks_failure_contract::FailureClass::Data);
+        assert_eq!(fact.reason().code(), 110);
         assert!(!error.to_string().contains("Expected a record batch"));
         drop(factory);
         assert_eq!(tracker.current(), 0);
@@ -872,7 +905,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            ExchangeReceiveFailure::Construction(ConstructionFailure::Memory(_))
+            ExchangeFailure::Execution(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Memory(_)))
         ));
         assert_eq!(tracker.current(), baseline);
         drop(source);

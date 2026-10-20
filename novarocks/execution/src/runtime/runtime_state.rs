@@ -57,66 +57,227 @@ impl std::fmt::Debug for RuntimeState {
     }
 }
 
-#[derive(Debug, Default)]
+/// Task work delegates to its exact accepted owner. Local execution explicitly
+/// owns a separate failure domain and never synthesizes a Task identity.
 pub struct RuntimeErrorState {
+    control: RuntimeFailureControl,
+}
+enum RuntimeFailureControl {
+    Local(LocalFailureState),
+    Task(std::sync::Arc<crate::runtime::task_control::TaskExecutionControl>),
+}
+#[derive(Default)]
+struct LocalCleanupFacts {
+    facts: [Option<novarocks_failure_contract::FailureFact>; 4],
+    dropped: u64,
+}
+impl LocalCleanupFacts {
+    fn record(&mut self, fact: novarocks_failure_contract::FailureFact) {
+        if let Some(slot) = self.facts.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(fact);
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+}
+#[derive(Default)]
+struct LocalFailureState {
+    // A local encoding/evaluation domain has no Task identity to invent.
+    health: std::sync::Arc<crate::runtime::execution_health::ExecutionHealth>,
+    cleanup: std::sync::Mutex<LocalCleanupFacts>,
     error: std::sync::Mutex<Option<ExecutionFailure>>,
+    has_error: std::sync::atomic::AtomicBool,
+    stop_observable: std::sync::Arc<crate::runtime::observable::Observable>,
     stopped: std::sync::Condvar,
     #[cfg(test)]
     waiting: std::sync::atomic::AtomicUsize,
 }
-
+impl Default for RuntimeErrorState {
+    fn default() -> Self {
+        Self {
+            control: RuntimeFailureControl::Local(LocalFailureState::default()),
+        }
+    }
+}
+impl std::fmt::Debug for RuntimeErrorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeErrorState")
+            .field("error", &self.error())
+            .finish_non_exhaustive()
+    }
+}
+impl crate::runtime::fragment::ExecutionFailureReporter for RuntimeErrorState {
+    fn report_cleanup(&self, cause: &ExecutionFailure) {
+        RuntimeErrorState::report_cleanup(self, cause);
+    }
+    fn report_unresolved_exit(&self, cause: &ExecutionFailure) {
+        RuntimeErrorState::report_unresolved_exit(self, cause);
+    }
+    fn report_failure(&self, error: ExecutionFailure) {
+        self.set_error(error);
+    }
+}
 impl RuntimeErrorState {
+    pub fn for_task(
+        control: std::sync::Arc<crate::runtime::task_control::TaskExecutionControl>,
+    ) -> Self {
+        Self {
+            control: RuntimeFailureControl::Task(control),
+        }
+    }
+    /// Local callers supervise their explicitly local execution scope. Task
+    /// work reports to its application's shared ExecutionHealth instead.
+    pub(crate) fn exit_health_reporter(
+        &self,
+    ) -> crate::runtime::task_control::ExecutionExitReporter {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.exit_health_reporter(),
+            RuntimeFailureControl::Local(local) => {
+                crate::runtime::task_control::ExecutionExitReporter::new(
+                    local.health.clone(),
+                    crate::runtime::execution_health::ExecutionExitOrigin::Local,
+                )
+            }
+        }
+    }
+    pub fn local_exit_fault(&self) -> Option<crate::runtime::execution_health::ExecutionExitFault> {
+        match &self.control {
+            RuntimeFailureControl::Local(local) => local.health.failure(),
+            RuntimeFailureControl::Task(_) => None,
+        }
+    }
+    pub fn report_cleanup(&self, cause: &ExecutionFailure) {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.report_cleanup(cause),
+            RuntimeFailureControl::Local(local) => {
+                use novarocks_failure_contract::FailureProjection;
+                let fact = cause.failure_fact();
+                local
+                    .cleanup
+                    .lock()
+                    .expect("local cleanup facts lock")
+                    .record(fact);
+            }
+        }
+    }
+    pub fn report_unresolved_exit(&self, cause: &ExecutionFailure) {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.report_unresolved_exit(cause),
+            RuntimeFailureControl::Local(local) => {
+                use novarocks_failure_contract::FailureProjection;
+                local.health.report_unresolved(
+                    crate::runtime::execution_health::ExecutionExitOrigin::Local,
+                    cause.failure_fact(),
+                );
+            }
+        }
+    }
     pub fn set_error(&self, err: impl Into<ExecutionFailure>) {
-        let err = err.into();
-        let mut guard = self.error.lock().expect("runtime error lock");
-        if guard.is_none() {
-            *guard = Some(err);
-            self.stopped.notify_all();
+        let _ = self.accept_error(err.into());
+    }
+    pub(crate) fn accept_error(&self, err: ExecutionFailure) -> bool {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => {
+                owner.report_failure(err).decision
+                    != novarocks_execution_contract::ConclusionDecision::Keep
+            }
+            RuntimeFailureControl::Local(local) => {
+                let accepted = {
+                    let mut guard = local.error.lock().expect("local runtime error lock");
+                    if guard.is_some() {
+                        false
+                    } else {
+                        *guard = Some(err);
+                        local.has_error.store(true, Ordering::Release);
+                        true
+                    }
+                };
+                if accepted {
+                    local.stopped.notify_all();
+                    local.stop_observable.notify_observers();
+                }
+                accepted
+            }
+        }
+    }
+    pub(crate) fn stop_observable(&self) -> std::sync::Arc<crate::runtime::observable::Observable> {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.stop_observable(),
+            RuntimeFailureControl::Local(local) => local.stop_observable.clone(),
+        }
+    }
+    /// A fragment outcome is a projection of the same Task receipt. Pure
+    /// local execution has no Task authority to inspect or manufacture.
+    pub(crate) fn task_conclusion(
+        &self,
+    ) -> Option<
+        std::sync::Arc<novarocks_execution_contract::AcceptedTaskConclusion<ExecutionFailure>>,
+    > {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.accepted(),
+            RuntimeFailureControl::Local(_) => None,
         }
     }
 
     pub fn error(&self) -> Option<ExecutionFailure> {
-        self.error.lock().expect("runtime error lock").clone()
-    }
-
-    /// Cooperative kernels need presence, not a cloned diagnostic payload.
-    /// Keep the same lock and first-wins owner as the lossless error reader.
-    pub(crate) fn is_stopped(&self) -> bool {
-        self.error.lock().expect("runtime error lock").is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn waiting_count(&self) -> usize {
-        self.waiting.load(Ordering::Acquire)
-    }
-
-    /// Wait without holding execution after this exact fragment stops.
-    /// The predicate and notification share the error lock, including an error
-    /// published before registration and spurious condition-variable wakes.
-    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> ExecutionResult<()> {
-        match self.wait_for_error(duration).as_ref() {
-            Some(error) => Err(error.clone()),
-            None => Ok(()),
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.error(),
+            RuntimeFailureControl::Local(local) => {
+                if !local.has_error.load(Ordering::Acquire) {
+                    return None;
+                }
+                local
+                    .error
+                    .lock()
+                    .expect("local runtime error lock")
+                    .clone()
+            }
         }
     }
-
-    /// Read only the stop fact. The original Condvar still owns registration,
-    /// notification and spurious-wake handling; no diagnostic is copied.
-    pub(crate) fn wait_until_stopped(&self, duration: std::time::Duration) -> bool {
-        self.wait_for_error(duration).is_some()
+    /// Hot checkpoints read only the actual owner's presence flag.
+    pub(crate) fn is_stopped(&self) -> bool {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.is_stopped(),
+            RuntimeFailureControl::Local(local) => local.has_error.load(Ordering::Acquire),
+        }
     }
-
+    #[cfg(test)]
+    pub(crate) fn waiting_count(&self) -> usize {
+        match &self.control {
+            RuntimeFailureControl::Local(local) => local.waiting.load(Ordering::Acquire),
+            RuntimeFailureControl::Task(_) => {
+                panic!("Task wait registration belongs to its actual owner")
+            }
+        }
+    }
+    pub(crate) fn wait_interruptibly(&self, duration: Duration) -> ExecutionResult<()> {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.wait_interruptibly(duration),
+            RuntimeFailureControl::Local(local) => match local.wait_for_error(duration).as_ref() {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            },
+        }
+    }
+    pub(crate) fn wait_until_stopped(&self, duration: Duration) -> bool {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.wait_until_stopped(duration),
+            RuntimeFailureControl::Local(local) => local.wait_for_error(duration).is_some(),
+        }
+    }
+}
+impl LocalFailureState {
     fn wait_for_error(
         &self,
-        duration: std::time::Duration,
+        duration: Duration,
     ) -> std::sync::MutexGuard<'_, Option<ExecutionFailure>> {
-        let guard = self.error.lock().expect("runtime error lock");
+        let guard = self.error.lock().expect("local runtime error lock");
         #[cfg(test)]
         self.waiting.fetch_add(1, Ordering::Release);
         let (guard, _) = self
             .stopped
             .wait_timeout_while(guard, duration, |error| error.is_none())
-            .expect("runtime stop wait");
+            .expect("local runtime stop wait");
         #[cfg(test)]
         self.waiting.fetch_sub(1, Ordering::Release);
         guard
@@ -184,6 +345,27 @@ impl RuntimeState {
         self.exchange_test_observer.clone()
     }
 
+    pub fn for_local_execution(
+        query_options: Option<QueryOptions>,
+        cache_options: Option<ExecutionCacheOptions>,
+        query_id: Option<QueryId>,
+        fragment_instance_id: Option<UniqueId>,
+        backend_num: Option<i32>,
+        mem_tracker: Option<std::sync::Arc<MemTracker>>,
+        execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
+    ) -> Self {
+        Self::new(
+            query_options,
+            cache_options,
+            query_id,
+            fragment_instance_id,
+            backend_num,
+            mem_tracker,
+            execution_runtime,
+            std::sync::Arc::new(RuntimeErrorState::default()),
+        )
+    }
+
     pub fn new(
         query_options: Option<QueryOptions>,
         cache_options: Option<ExecutionCacheOptions>,
@@ -192,6 +374,7 @@ impl RuntimeState {
         backend_num: Option<i32>,
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
         execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
+        error_state: std::sync::Arc<RuntimeErrorState>,
     ) -> Self {
         let mem_tracker = mem_tracker.or_else(|| {
             // An execution runtime still gates host-owned query accounting, so
@@ -217,7 +400,7 @@ impl RuntimeState {
         Self {
             query_options,
             cache_options,
-            error_state: std::sync::Arc::new(RuntimeErrorState::default()),
+            error_state,
             last_report_exec_state_ns: AtomicI64::new(monotonic_now_ns()),
             query_id,
             fragment_instance_id,
@@ -305,12 +488,12 @@ impl RuntimeState {
     /// Handle to the dedicated sink I/O execution service (IW-1).
     ///
     /// Operators reach this via `&RuntimeState` in `bind_runtime_state` /
-    /// `push_chunk` so they never grab the shared `data_runtime` directly.
-    pub fn sink_io_executor(&self) -> Result<IoExecutor, String> {
+    /// `StepContext` so they never grab the shared `data_runtime` directly.
+    pub fn sink_io_executor(&self) -> Result<IoExecutor, RuntimeBindingFailure> {
         self.execution_runtime
             .as_ref()
             .map(|runtime| runtime.services().sink_io().clone())
-            .ok_or_else(|| "fragment runtime is unavailable".to_string())
+            .ok_or(RuntimeBindingFailure::MissingExecutionRuntime)
     }
 
     pub fn execution_runtime(&self) -> Option<&ExecutionRuntime> {
@@ -377,9 +560,15 @@ mod tests {
         let state = RuntimeErrorState::default();
         assert!(!state.is_stopped());
         assert!(!state.wait_until_stopped(Duration::ZERO));
-        let first = ExecutionFailure::from("original runtime diagnostic".repeat(1024));
+        let first = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(
+                &("original runtime diagnostic".repeat(1024)),
+            ),
+        ));
         state.set_error(first.clone());
-        state.set_error("later runtime diagnostic");
+        state.set_error(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(&("later runtime diagnostic")),
+        ));
         assert!(state.is_stopped());
         assert!(state.wait_until_stopped(Duration::from_secs(30)));
         assert_eq!(state.error(), Some(first.clone()));
@@ -397,7 +586,9 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(state.waiting_count(), 1);
-        state.set_error("actual runtime stop");
+        state.set_error(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(&("actual runtime stop")),
+        ));
         assert!(waiter.join().expect("stop reader"));
         assert_eq!(state.waiting_count(), 0);
     }
@@ -425,7 +616,8 @@ mod tests {
             )
             .expect("test runtime"),
         );
-        let state = RuntimeState::new(None, None, None, None, None, None, Some(runtime));
+        let state =
+            RuntimeState::for_local_execution(None, None, None, None, None, None, Some(runtime));
         let exec = state.sink_io_executor().expect("sink_io executor");
         let handle = exec.spawn(async {
             std::thread::current()
@@ -437,6 +629,89 @@ mod tests {
         assert!(
             name.contains("novarocks-sink-io"),
             "sink_io task ran on unexpected thread: {name}"
+        );
+    }
+}
+
+/// An installed runtime capability is absent where execution requires it.
+/// This is a binding invariant, distinct from a scheduler or memory refusal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeBindingFailure {
+    MissingExecutionRuntime,
+    MissingOperatorMemoryTracker {
+        operator: novarocks_failure_contract::BoundedDetail,
+    },
+}
+impl std::fmt::Display for RuntimeBindingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingExecutionRuntime => f.write_str("fragment runtime is unavailable"),
+            Self::MissingOperatorMemoryTracker { operator } => write!(
+                f,
+                "{operator} memory tracker must be bound before its first state"
+            ),
+        }
+    }
+}
+impl std::error::Error for RuntimeBindingFailure {}
+impl novarocks_failure_contract::FailureProjection for RuntimeBindingFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::MissingExecutionRuntime => {
+                crate::runtime::fragment::ExecutionReason::ExecutionRuntimeMissing
+            }
+            Self::MissingOperatorMemoryTracker { .. } => {
+                crate::runtime::fragment::ExecutionReason::OperatorMemoryTrackerMissing
+            }
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<RuntimeBindingFailure> for ExecutionFailure {
+    fn from(cause: RuntimeBindingFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+
+#[cfg(test)]
+mod secondary_exit_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+
+    #[test]
+    fn local_cleanup_and_unknown_exit_cannot_create_or_replace_the_execution_error() {
+        let state = RuntimeErrorState::default();
+        let cause = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
+        state.report_cleanup(&cause);
+        state.report_unresolved_exit(&cause);
+        assert!(state.error().is_none());
+        assert!(!state.is_stopped());
+        assert_eq!(
+            state.local_exit_fault().unwrap().fact(),
+            cause.failure_fact()
+        );
+        state.set_error(cause.clone());
+        let before = state.error().unwrap();
+        for _ in 0..8 {
+            state.report_cleanup(&cause);
+            state.report_unresolved_exit(&cause);
+        }
+        assert_eq!(state.error(), Some(before));
+        let RuntimeFailureControl::Local(local) = &state.control else {
+            unreachable!()
+        };
+        let facts = local.cleanup.lock().unwrap();
+        assert!(
+            facts
+                .facts
+                .iter()
+                .all(|record| *record == Some(cause.failure_fact()))
+        );
+        assert_eq!(facts.dropped, 5);
+        assert_eq!(
+            state.local_exit_fault().unwrap().origin(),
+            crate::runtime::execution_health::ExecutionExitOrigin::Local
         );
     }
 }

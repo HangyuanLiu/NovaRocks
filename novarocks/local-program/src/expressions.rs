@@ -517,7 +517,7 @@ impl std::error::Error for StaticExpressionError {}
 
 /// Original expression failures and original request-control interruptions stay
 /// distinct at pure compilation. The result owns no control capability.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExpressionsCompileError {
     Expression(StaticExpressionError),
     Control(CompileControlError),
@@ -946,7 +946,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let index = trace.len();
             trace.push(units);
-            if let Some((at, cause)) = self.stop
+            if let Some((at, cause)) = self.stop.clone()
                 && index == at
             {
                 return Err(cause);
@@ -978,7 +978,7 @@ mod tests {
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = TestControl::new(Some((at, cause)));
+                let control = TestControl::new(Some((at, cause.clone())));
                 let result = ImmutableExpressions::try_new_for_compile(
                     nodes.to_vec(),
                     false,
@@ -1090,7 +1090,7 @@ mod tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = TestControl::new(Some((1, cause)));
+            let control = TestControl::new(Some((1, cause.clone())));
             assert!(
                 matches!(ImmutableExpressions::try_new_for_compile(nodes.clone(), false, HashMap::new(), None, &control),
                 Err(ExpressionsCompileError::Control(actual)) if actual == cause)

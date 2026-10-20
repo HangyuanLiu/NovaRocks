@@ -168,7 +168,21 @@ fn pure_differential_concat_scalar_profiles_dynamic_separators_and_limits() {
                     );
                     assert_eq!(
                         summary.matched_failures,
-                        0,
+                        if max_len == 4096
+                            && matches!(
+                                source.data_type(),
+                                DataType::Timestamp(
+                                    arrow::datatypes::TimeUnit::Second
+                                        | arrow::datatypes::TimeUnit::Millisecond
+                                        | arrow::datatypes::TimeUnit::Microsecond,
+                                    _
+                                )
+                            )
+                        {
+                            2
+                        } else {
+                            0
+                        },
                         "{name} {:?}, mode={mode}, limit={max_len}",
                         source.data_type()
                     );
@@ -178,7 +192,7 @@ fn pure_differential_concat_scalar_profiles_dynamic_separators_and_limits() {
     }
 }
 #[test]
-fn pure_differential_concat_original_invalid_date_and_decimal_overflow_domain() {
+fn pure_differential_concat_date_range_and_signed_minimum_do_not_panic() {
     for name in ["group_concat", "string_agg"] {
         let summary = assert_aggregate_matches_v1(
             AggregateDiffSpec::new(name)
@@ -188,31 +202,28 @@ fn pure_differential_concat_original_invalid_date_and_decimal_overflow_domain() 
                 .semantics(semantics(1024, false)),
         );
         assert_eq!(summary.matched_failures, 2);
-        if cfg!(debug_assertions) {
-            for (array, panic) in [
-                (
-                    Arc::new(Date32Array::from(vec![i32::MAX])) as ArrayRef,
-                    "attempt to add with overflow",
-                ),
-                (
-                    Arc::new(
-                        Decimal128Array::from(vec![i128::MIN])
-                            .with_precision_and_scale(38, 2)
-                            .unwrap(),
-                    ) as ArrayRef,
-                    "attempt to negate with overflow",
-                ),
-            ] {
-                let mut spec = AggregateDiffSpec::new(name)
-                    .original_state_interpretation(false, vec![])
-                    .column(array)
-                    .column(Arc::new(StringArray::from(vec![","])))
-                    .semantics(semantics(1024, false));
-                spec.expected_panic_payload = Some(panic.to_owned());
-                let summary = assert_aggregate_matches_v1(spec);
-                assert_eq!(summary.matched_panics, 2);
-            }
-        }
+        let date = assert_aggregate_matches_v1(
+            AggregateDiffSpec::new(name)
+                .original_state_interpretation(false, vec![])
+                .column(Arc::new(Date32Array::from(vec![i32::MAX])))
+                .column(Arc::new(StringArray::from(vec![","])))
+                .semantics(semantics(1024, false)),
+        );
+        assert_eq!(date.matched_failures, 2);
+        assert_eq!(date.matched_panics, 0);
+        let decimal = assert_aggregate_matches_v1(
+            AggregateDiffSpec::new(name)
+                .original_state_interpretation(false, vec![])
+                .column(Arc::new(
+                    Decimal128Array::from(vec![i128::MIN])
+                        .with_precision_and_scale(38, 2)
+                        .unwrap(),
+                ))
+                .column(Arc::new(StringArray::from(vec![","])))
+                .semantics(semantics(1024, false)),
+        );
+        assert_eq!(decimal.matched_failures, 0);
+        assert_eq!(decimal.matched_panics, 0);
     }
 }
 

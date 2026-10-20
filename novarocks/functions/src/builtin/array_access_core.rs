@@ -18,15 +18,17 @@
 //! ONE original array access normalizer, index algorithm and UTF8 projection.
 use super::{
     array_literal_core::CollectionObservation,
-    map_lookup_core::{cast_output, row_index},
+    collection_arrow::{ArrowSite, arrow_failure, cast_output, contract},
+    map_lookup_core::row_index,
 };
+use crate::KernelFailure;
 use arrow_array::builder::StringBuilder;
 use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, ListArray, StringArray, UInt32Array};
 use arrow_schema::DataType;
 use arrow_select::take::take;
 #[derive(Debug)]
 pub enum AccessFailure<E> {
-    Data(String),
+    Operation(KernelFailure),
     Control(E),
 }
 fn observe<E>(
@@ -48,36 +50,36 @@ impl ArrayAccessInputs {
         observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
     ) -> Result<Self, AccessFailure<E>> {
         array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-            AccessFailure::Data(format!(
+            AccessFailure::Operation(contract(format_args!(
                 "element_at expects ListArray, got {:?}",
                 array.data_type()
-            ))
+            )))
         })?;
         if subscript.data_type() != &DataType::Int32 {
             observe(observer, CollectionObservation::OpaqueBoundary)?;
             // The ORIGINAL common::cast_with_special_rules always reaches Arrow's
             // default cast for target Int32. No date/decimal/VARCHAR branch applies.
-            let normalized =
-                cast_output(subscript.clone(), Some(&DataType::Int32)).map_err(|cause| {
-                    AccessFailure::Data(format!(
-                        "element_at: failed to cast {:?} -> Int32: {}",
-                        subscript.data_type(),
-                        cause
-                    ))
-                })?;
+            let normalized = cast_output(
+                subscript.clone(),
+                Some(&DataType::Int32),
+                "element_at subscript",
+            )
+            .map_err(AccessFailure::Operation)?;
             subscript = normalized;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
         }
         subscript
             .as_any()
             .downcast_ref::<Int32Array>()
-            .ok_or_else(|| AccessFailure::Data("element_at expects INT subscript".to_string()))?;
+            .ok_or_else(|| {
+                AccessFailure::Operation(contract("element_at expects INT subscript"))
+            })?;
         if let Some(flags) = &check {
             flags
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| {
-                    AccessFailure::Data("element_at check flag must be BOOLEAN".to_string())
+                    AccessFailure::Operation(contract("element_at check flag must be BOOLEAN"))
                 })?;
         }
         Ok(Self {
@@ -105,30 +107,30 @@ impl ArrayAccessInputs {
                 .expect("original BOOLEAN admission")
         })
     }
-    pub fn validate_legacy_lengths(&self) -> Result<(), String> {
+    pub fn validate_direct_lengths(&self) -> Result<(), KernelFailure> {
         let list = self.list();
         let subscript_arr = self.subscript();
         let check_arr = self.flags();
         if subscript_arr.len() != 1 && subscript_arr.len() != list.len() {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "element_at subscript length mismatch: list rows={}, subscript rows={}",
                 list.len(),
                 subscript_arr.len()
-            ));
+            )));
         }
         if let Some(flags) = check_arr
             && flags.len() != 1
             && flags.len() != list.len()
         {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "element_at check flag length mismatch: list rows={}, check rows={}",
                 list.len(),
                 flags.len()
-            ));
+            )));
         }
         Ok(())
     }
-    pub fn legacy_rows(&self, row: usize) -> AccessRows {
+    pub fn direct_rows(&self, row: usize) -> AccessRows {
         AccessRows {
             list: row,
             subscript: row_index(row, self.subscript.len()),
@@ -147,7 +149,7 @@ pub fn lookup_observed<E>(
     selection: crate::Selection<'_>,
     mut rows: impl FnMut(usize, usize) -> Result<AccessRows, E>,
     output_type: Option<&DataType>,
-    mut before_take: impl FnMut(&dyn Array, &[Option<u32>]) -> Result<(), E>,
+    mut before_take: impl FnMut(&dyn Array, &UInt32Array) -> Result<(), E>,
     observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, AccessFailure<E>> {
     let list = inputs.list();
@@ -156,11 +158,35 @@ pub fn lookup_observed<E>(
     let offsets = list.value_offsets();
     let values = list.values();
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let mut indices = Vec::with_capacity(selection.len());
+    super::string_failure::array_layout::<Option<u32>>(selection.len())
+        .map_err(AccessFailure::Operation)?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(selection.len())
+        .map_err(|source| {
+            AccessFailure::Operation(super::string_failure::reservation::<Option<u32>>(
+                selection.len(),
+                source,
+            ))
+        })?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     for (ordinal, row) in selection.iter().enumerate() {
         observe(observer, CollectionObservation::Step)?;
         let rows = rows(ordinal, row).map_err(AccessFailure::Control)?;
+        if rows.list >= list.len() || rows.subscript >= subscript_arr.len() {
+            return Err(AccessFailure::Operation(contract(
+                "array access row mapping is outside its physical carriers",
+            )));
+        }
+        match (check_arr, rows.check) {
+            (None, None) => {}
+            (Some(flags), Some(index)) if index < flags.len() => {}
+            _ => {
+                return Err(AccessFailure::Operation(contract(
+                    "array access check address differs from its prepared flag",
+                )));
+            }
+        }
         let row = rows.list;
         let subscript_idx = rows.subscript;
         let check_idx = rows.check;
@@ -180,43 +206,58 @@ pub fn lookup_observed<E>(
         let subscript = subscript_arr.value(subscript_idx);
         if subscript <= 0 {
             if check_out_of_bounds {
-                return Err(AccessFailure::Data(
-                    "Array subscript start at 1".to_string(),
-                ));
+                return Err(AccessFailure::Operation(KernelFailure::from_domain(
+                    AccessCause::BelowOne { ordinal, subscript },
+                )));
             }
             indices.push(None);
             continue;
         }
-        let subscript = usize::try_from(subscript).map_err(|_| {
-            AccessFailure::Data("element_at subscript conversion failed".to_string())
+        let subscript = usize::try_from(subscript).map_err(|source| {
+            AccessFailure::Operation(KernelFailure::from_domain(AccessCause::Conversion {
+                operation: "element_at subscript conversion failed",
+                source,
+            }))
         })?;
         if subscript > row_len {
             if check_out_of_bounds {
-                return Err(AccessFailure::Data(format!(
-                    "Array subscript must be less than or equal to array length: {} > {}",
-                    subscript, row_len
+                return Err(AccessFailure::Operation(KernelFailure::from_domain(
+                    AccessCause::AboveLength {
+                        ordinal,
+                        subscript,
+                        len: row_len,
+                    },
                 )));
             }
             indices.push(None);
             continue;
         }
         let target = start + subscript - 1;
-        let target = u32::try_from(target).map_err(|_| {
-            AccessFailure::Data("element_at index exceeds UInt32 range".to_string())
+        let target = u32::try_from(target).map_err(|source| {
+            AccessFailure::Operation(KernelFailure::from_domain(AccessCause::Conversion {
+                operation: "element_at index exceeds UInt32 range",
+                source,
+            }))
         })?;
         indices.push(Some(target));
     }
-    before_take(values.as_ref(), &indices).map_err(AccessFailure::Control)?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let indices = UInt32Array::from(indices);
-    let out =
-        take(values.as_ref(), &indices, None).map_err(|e| AccessFailure::Data(e.to_string()))?;
+    observe(observer, CollectionObservation::OpaqueBoundary)?;
+    let out = if values.is_empty() {
+        // No source value can be addressed. A NULL result of the known value
+        // type does not require a dummy Arrow take at physical index zero.
+        arrow_array::new_null_array(values.data_type(), selection.len())
+    } else {
+        before_take(values.as_ref(), &indices).map_err(AccessFailure::Control)?;
+        take(values.as_ref(), &indices, None).map_err(|source| {
+            AccessFailure::Operation(arrow_failure("element_at", ArrowSite::Take, source))
+        })?
+    };
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let out = maybe_unquote_wrapped_utf8_observed(out, observer)?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let out = cast_output(out, output_type).map_err(|cause| {
-        AccessFailure::Data(format!("element_at: failed to cast output: {}", cause))
-    })?;
+    let out = cast_output(out, output_type, "element_at").map_err(AccessFailure::Operation)?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     Ok(out)
 }
@@ -230,7 +271,7 @@ pub fn maybe_unquote_wrapped_utf8_observed<E>(
     let arr = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| AccessFailure::Data("failed to downcast to StringArray".to_string()))?;
+        .ok_or_else(|| AccessFailure::Operation(contract("failed to downcast to StringArray")))?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let mut builder = StringBuilder::new();
     observe(observer, CollectionObservation::OpaqueBoundary)?;
@@ -258,4 +299,148 @@ pub fn maybe_unquote_wrapped_utf8_observed<E>(
     let result = std::sync::Arc::new(builder.finish()) as ArrayRef;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     Ok(result)
+}
+
+#[derive(Debug)]
+enum AccessCause {
+    BelowOne {
+        ordinal: usize,
+        subscript: i32,
+    },
+    AboveLength {
+        ordinal: usize,
+        subscript: usize,
+        len: usize,
+    },
+    Conversion {
+        operation: &'static str,
+        source: std::num::TryFromIntError,
+    },
+}
+impl std::fmt::Display for AccessCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BelowOne { ordinal, subscript } => {
+                let _ = (ordinal, subscript);
+                f.write_str("Array subscript start at 1")
+            }
+            Self::AboveLength {
+                ordinal,
+                subscript,
+                len,
+            } => {
+                let _ = ordinal;
+                write!(
+                    f,
+                    "Array subscript must be less than or equal to array length: {subscript} > {len}"
+                )
+            }
+            Self::Conversion { operation, .. } => f.write_str(operation),
+        }
+    }
+}
+impl std::error::Error for AccessCause {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Conversion { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for AccessCause {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let (class, code) = match self {
+            Self::Conversion { .. } => (FailureClass::Invariant, 380),
+            _ => (FailureClass::Data, 379),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for AccessCause {}
+
+#[cfg(test)]
+mod source_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::{error::Error, sync::Arc};
+    #[test]
+    fn required_strict_subscript_failure_keeps_ordinal_and_does_not_retain_input_arrays() {
+        let mut builder =
+            arrow_array::builder::ListBuilder::new(arrow_array::builder::Int32Builder::new());
+        builder.values().append_value(7);
+        builder.append(true);
+        let list: ArrayRef = Arc::new(builder.finish());
+        let weak = Arc::downgrade(&list);
+        let index: ArrayRef = Arc::new(Int32Array::from(vec![0]));
+        let flag: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let mut observer = |_| Ok::<_, KernelFailure>(());
+        let inputs = ArrayAccessInputs::new(list, index, Some(flag), &mut observer).unwrap();
+        let error = lookup_observed(
+            &inputs,
+            crate::Selection::all(1),
+            |_, row| Ok(inputs.direct_rows(row)),
+            None,
+            |_, _| panic!("strict subscript error precedes any take"),
+            &mut observer,
+        )
+        .unwrap_err();
+        let AccessFailure::Operation(failure) = error else {
+            panic!("strict domain cause");
+        };
+        drop(inputs);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 379);
+        let source = failure
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<AccessCause>()
+            .unwrap();
+        assert!(matches!(
+            source,
+            AccessCause::BelowOne {
+                ordinal: 0,
+                subscript: 0
+            }
+        ));
+    }
+    #[test]
+    fn empty_list_of_fixed_lists_produces_typed_null_without_a_dummy_take() {
+        let child = Arc::new(arrow_schema::Field::new("nested", DataType::Int32, false));
+        let values: ArrayRef = Arc::new(arrow_array::FixedSizeListArray::new(
+            child,
+            2,
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        ));
+        let expected = values.data_type().clone();
+        let field = Arc::new(arrow_schema::Field::new("item", expected.clone(), true));
+        let list: ArrayRef = Arc::new(ListArray::new(
+            field,
+            arrow_buffer::OffsetBuffer::new(vec![0i32, 0].into()),
+            values,
+            None,
+        ));
+        let index: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+        let mut observer = |_| Ok::<_, KernelFailure>(());
+        let inputs = ArrayAccessInputs::new(list, index, None, &mut observer).unwrap();
+        let output = lookup_observed(
+            &inputs,
+            crate::Selection::all(1),
+            |_, row| Ok(inputs.direct_rows(row)),
+            None,
+            |_, _| panic!("an empty source has no take input"),
+            &mut observer,
+        )
+        .unwrap();
+        assert_eq!(output.data_type(), &expected);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output.null_count(), 1);
+    }
 }

@@ -76,7 +76,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         state.trace.push(units);
-        match state.stop {
+        match state.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -227,7 +227,7 @@ fn prefixes(
         for cause in CAUSES {
             let control = Control::default();
             assert!(
-                matches!(call(&control, Some((at,cause))), Err(Error::Control(actual)) if actual == cause)
+                matches!(call(&control, Some((at,cause.clone()))), Err(Error::Control(actual)) if actual == cause)
             );
             assert_eq!(control.trace(), trace[..=at]);
         }
@@ -638,7 +638,7 @@ fn aggregate_materialization_wide_actual_320_arguments_and_consumed_emit_prefixe
         for cause in CAUSES {
             let control = Control::default();
             with_receivers(&control, &raw, true, |headers, functions| {
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(prepare_aggregate_bindings_materialization(headers,functions,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause)
                 );
@@ -676,7 +676,7 @@ fn aggregate_materialization_wide_actual_320_arguments_and_consumed_emit_prefixe
                     limits(),
                 )
                 .unwrap();
-                control.arm(Some((at, cause)));
+                control.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(materialize_aggregate_bindings(prepared),Err(Error::Control(actual)) if actual==cause)
                 );

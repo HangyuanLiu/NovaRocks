@@ -352,7 +352,7 @@ mod tests {
             fixed_length: None,
         };
         let error = decode_value_type(&unspecified, root()).expect_err("unspecified");
-        assert_eq!(error.kind(), crate::ProtocolErrorKind::InvalidEnum);
+        assert_eq!(error.kind(), &crate::ProtocolErrorKind::InvalidEnum);
 
         let unknown = dto::ValueType {
             kind: 9999,
@@ -362,7 +362,7 @@ mod tests {
             decode_value_type(&unknown, root())
                 .expect_err("unknown")
                 .kind(),
-            crate::ProtocolErrorKind::InvalidEnum
+            &crate::ProtocolErrorKind::InvalidEnum
         );
     }
 
@@ -378,7 +378,7 @@ mod tests {
             decode_value_type(&missing_scale, root())
                 .expect_err("missing scale")
                 .kind(),
-            crate::ProtocolErrorKind::MissingField
+            &crate::ProtocolErrorKind::MissingField
         );
 
         let stray = dto::ValueType {
@@ -391,7 +391,7 @@ mod tests {
             decode_value_type(&stray, root())
                 .expect_err("stray parameters")
                 .kind(),
-            crate::ProtocolErrorKind::InconsistentFields
+            &crate::ProtocolErrorKind::InconsistentFields
         );
 
         let out_of_range_scale = dto::ValueType {
@@ -404,7 +404,7 @@ mod tests {
             decode_value_type(&out_of_range_scale, root())
                 .expect_err("scale")
                 .kind(),
-            crate::ProtocolErrorKind::OutOfRange
+            &crate::ProtocolErrorKind::OutOfRange
         );
     }
 
@@ -429,7 +429,7 @@ mod tests {
             decode_value(&encoded, ConnectorValueType::Integer, root())
                 .expect_err("mismatch")
                 .kind(),
-            crate::ProtocolErrorKind::InvalidValue
+            &crate::ProtocolErrorKind::InvalidValue
         );
 
         let out_of_range = dto::Value {
@@ -439,7 +439,7 @@ mod tests {
             decode_value(&out_of_range, ConnectorValueType::SmallInt, root())
                 .expect_err("out of range")
                 .kind(),
-            crate::ProtocolErrorKind::OutOfRange
+            &crate::ProtocolErrorKind::OutOfRange
         );
     }
 
@@ -463,7 +463,7 @@ mod tests {
             decode_value(&oversized, ConnectorValueType::Varbinary, root())
                 .expect_err("oversized")
                 .kind(),
-            crate::ProtocolErrorKind::OutOfRange
+            &crate::ProtocolErrorKind::OutOfRange
         );
     }
 
@@ -476,7 +476,7 @@ mod tests {
             decode_value(&short, ConnectorValueType::Uuid, root())
                 .expect_err("short uuid")
                 .kind(),
-            crate::ProtocolErrorKind::InvalidValue
+            &crate::ProtocolErrorKind::InvalidValue
         );
     }
 
@@ -487,7 +487,7 @@ mod tests {
             decode_value(&empty, ConnectorValueType::BigInt, root())
                 .expect_err("absent")
                 .kind(),
-            crate::ProtocolErrorKind::MissingField
+            &crate::ProtocolErrorKind::MissingField
         );
     }
 }

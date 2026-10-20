@@ -44,6 +44,82 @@ pub enum ResultBufferKey {
     Task(TaskIdentity),
 }
 
+/// A refusal authored before a reservation mutates the retained budget.
+/// Temporary aggregate contention continues to return Blocked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultReservationError {
+    ProcessLimit {
+        requested: usize,
+        limit: usize,
+    },
+    StreamLimit {
+        key: ResultBufferKey,
+        requested: usize,
+        limit: usize,
+    },
+    WriterFinished,
+    WriterAborted,
+}
+impl std::fmt::Display for ResultReservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcessLimit { requested, limit } => write!(
+                f,
+                "single result reservation of {requested} bytes exceeds process retained-byte cap {limit}"
+            ),
+            Self::StreamLimit {
+                requested, limit, ..
+            } => write!(
+                f,
+                "single result reservation of {requested} bytes exceeds stream retained-byte cap {limit}"
+            ),
+            Self::WriterFinished => f.write_str("result buffer session was already finished"),
+            Self::WriterAborted => f.write_str("result buffer session was already aborted"),
+        }
+    }
+}
+impl std::error::Error for ResultReservationError {}
+impl novarocks_execution_contract::failure::FailureProjection for ResultReservationError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        let (reason, requested, limit, scope) = match self {
+            Self::ProcessLimit { requested, limit } => (
+                R::ResultProcessReservation,
+                *requested,
+                *limit,
+                Some(ResourceScope::Process),
+            ),
+            Self::StreamLimit {
+                key,
+                requested,
+                limit,
+            } => (
+                R::ResultStreamReservation,
+                *requested,
+                *limit,
+                matches!(key, ResultBufferKey::Task(_)).then_some(ResourceScope::Task),
+            ),
+            Self::WriterFinished => {
+                return FailureFact::new(FailureClass::Control, R::ResultWriterFinished.reason());
+            }
+            Self::WriterAborted => {
+                return FailureFact::new(FailureClass::Control, R::ResultWriterAborted.reason());
+            }
+        };
+        FailureFact::new(FailureClass::Resource, reason.reason()).with_resource(ResourceFacts {
+            dimension: ResourceDimension::Bytes,
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: scope,
+            requested: u64::try_from(requested).ok(),
+            required_growth: None,
+            limit: u64::try_from(limit).ok(),
+            live: None,
+            committed: None,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResultBufferWriteState {
     Open,
@@ -115,12 +191,12 @@ impl ResultRetainedBudget {
     pub fn try_reserve_process(
         self: &Arc<Self>,
         bytes: usize,
-    ) -> Result<ResultWriteAdmission, String> {
+    ) -> Result<ResultWriteAdmission, ResultReservationError> {
         if bytes > self.process_byte_cap {
-            return Err(format!(
-                "single process result reservation of {bytes} bytes exceeds process retained-byte cap {}",
-                self.process_byte_cap
-            ));
+            return Err(ResultReservationError::ProcessLimit {
+                requested: bytes,
+                limit: self.process_byte_cap,
+            });
         }
         {
             let mut state = self.state.lock().expect("result retained budget lock");
@@ -171,17 +247,19 @@ impl ResultRetainedBudget {
         key: ResultBufferKey,
         stream_byte_cap: usize,
         bytes: usize,
-    ) -> Result<ResultWriteAdmission, String> {
+    ) -> Result<ResultWriteAdmission, ResultReservationError> {
         if bytes > stream_byte_cap {
-            return Err(format!(
-                "single result reservation of {bytes} bytes exceeds stream retained-byte cap {stream_byte_cap}"
-            ));
+            return Err(ResultReservationError::StreamLimit {
+                key,
+                requested: bytes,
+                limit: stream_byte_cap,
+            });
         }
         if bytes > self.process_byte_cap {
-            return Err(format!(
-                "single result reservation of {bytes} bytes exceeds process retained-byte cap {}",
-                self.process_byte_cap
-            ));
+            return Err(ResultReservationError::ProcessLimit {
+                requested: bytes,
+                limit: self.process_byte_cap,
+            });
         }
         {
             let mut state = self.state.lock().expect("result retained budget lock");
@@ -271,8 +349,15 @@ impl ResultBufferWriteHandle {
         })
     }
 
-    pub fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, String> {
-        self.require_open()?;
+    pub fn try_acquire(
+        &self,
+        bytes: usize,
+    ) -> Result<ResultWriteAdmission, ResultReservationError> {
+        match *self.state.lock().expect("result buffer write handle lock") {
+            ResultBufferWriteState::Open => {}
+            ResultBufferWriteState::Finished => return Err(ResultReservationError::WriterFinished),
+            ResultBufferWriteState::Aborted => return Err(ResultReservationError::WriterAborted),
+        }
         self.retained_budget
             .try_reserve(self.key, self.retained_byte_cap, bytes)
     }
@@ -1392,6 +1477,88 @@ mod tests {
     }
 
     #[test]
+    fn actual_reservation_refusal_keeps_cap_scope_source_and_never_mutates_or_invents_a_wait() {
+        use novarocks_execution::runtime::fragment::{
+            ExecutionFailure,
+            io::{FragmentIoError, FragmentIoErrorKind, FragmentIoOperation},
+        };
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, ResourceScope,
+        };
+        use std::error::Error;
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(8).unwrap());
+        let handle = ResultBufferWriteHandle::open(
+            ResultBufferKey::Task(test_task_identity(730_201)),
+            true,
+            NonZeroUsize::new(6).unwrap(),
+            Arc::clone(&budget),
+            None,
+        )
+        .unwrap();
+        let held = granted_result_credit(budget.try_reserve_process(4).unwrap());
+        let refused = match handle.try_acquire(7) {
+            Err(cause) => cause,
+            Ok(_) => panic!("one reservation exceeds its stream cap"),
+        };
+        let fact = refused.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().code(), 21);
+        let resource = fact.resource().unwrap();
+        assert_eq!(resource.constraint_scope, Some(ResourceScope::Task));
+        assert_eq!(resource.requested, Some(7));
+        assert_eq!(resource.limit, Some(6));
+        assert_eq!(resource.committed, None);
+        assert_eq!(resource.live, None);
+        assert_eq!(budget.retained_bytes_for_test(), 4);
+        let io = FragmentIoError::from_domain(
+            FragmentIoOperation::ResultWrite,
+            FragmentIoErrorKind::Unavailable,
+            refused,
+        );
+        let outer = ExecutionFailure::from_domain(io);
+        assert_eq!(outer.failure_fact(), fact);
+        let mut source = outer.source();
+        let mut original = None;
+        while let Some(cause) = source {
+            if let Some(cause) = cause.downcast_ref::<ResultReservationError>() {
+                original = Some(*cause);
+                break;
+            }
+            source = cause.source();
+        }
+        assert_eq!(original, Some(refused));
+        assert!(matches!(
+            handle.try_acquire(5).unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        assert_eq!(budget.retained_bytes_for_test(), 4);
+        let process = match budget.try_reserve_process(9) {
+            Err(cause) => cause,
+            Ok(_) => panic!("one process reservation exceeds its cap"),
+        };
+        assert_eq!(process.failure_fact().reason().code(), 20);
+        assert_eq!(
+            process.failure_fact().resource().unwrap().constraint_scope,
+            Some(ResourceScope::Process)
+        );
+        drop(held);
+        assert_eq!(budget.retained_bytes_for_test(), 0);
+        let task = granted_result_credit(handle.try_acquire(5).unwrap());
+        assert_eq!(budget.retained_bytes_for_test(), 5);
+        handle.finish().unwrap();
+        let closed = match handle.try_acquire(1) {
+            Err(cause) => cause,
+            Ok(_) => panic!("finished writer cannot acquire"),
+        };
+        assert_eq!(closed, ResultReservationError::WriterFinished);
+        assert_eq!(closed.failure_fact().class(), FailureClass::Control);
+        assert_eq!(closed.failure_fact().resource(), None);
+        drop(task);
+        assert_eq!(budget.retained_bytes_for_test(), 0);
+        handle.abort(ResultAbort::PrepareRollback);
+    }
+
+    #[test]
     fn process_only_and_task_reservations_contend_in_the_same_budget() {
         let budget = ResultRetainedBudget::new(NonZeroUsize::new(12).unwrap());
         let identity = test_task_identity(730);
@@ -1541,11 +1708,12 @@ mod tests {
     #[test]
     fn process_only_reservation_errors_above_cap_and_checks_sum_overflow() {
         let budget = ResultRetainedBudget::new(NonZeroUsize::new(8).unwrap());
-        assert!(
-            budget
-                .try_reserve_process(9)
-                .unwrap_err()
-                .contains("exceeds process retained-byte cap")
+        assert_eq!(
+            budget.try_reserve_process(9).unwrap_err(),
+            ResultReservationError::ProcessLimit {
+                requested: 9,
+                limit: 8
+            }
         );
         assert_budget_conservation(&budget, 0, 0, 0, 0);
         let credit = granted_result_credit(budget.try_reserve_process(8).unwrap());
@@ -1620,7 +1788,10 @@ mod tests {
         )
         .unwrap();
         let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_observed::<
+            novarocks_execution::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             schema,
             vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
             1,
@@ -2296,7 +2467,14 @@ mod tests {
         let error = handle
             .try_acquire(9)
             .expect_err("one packet cannot exceed its stream cap");
-        assert!(error.contains("exceeds stream retained-byte cap"));
+        assert_eq!(
+            error,
+            ResultReservationError::StreamLimit {
+                key: ResultBufferKey::LegacyFragment(finst_id),
+                requested: 9,
+                limit: 8
+            }
+        );
         assert_eq!(handle.retained_bytes(), 0);
     }
 

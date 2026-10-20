@@ -27,7 +27,7 @@ fn legacy_ds_hll_semantic_decoder_full_error_before_owner() {
         .err()
         .expect("original duplicate SET failure");
     assert_eq!(
-        error,
+        (error).to_string(),
         "ds_hll: failed to deserialize HLL payload: InvalidData => SET mode contains duplicate coupons"
     );
 }

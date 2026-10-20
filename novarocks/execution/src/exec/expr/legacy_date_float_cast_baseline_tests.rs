@@ -37,7 +37,7 @@ pub(super) fn actual(
     target: DataType,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ty = FunctionValueType::new(input.data_type().clone(), true);
     let schema = Arc::new(Schema::new(vec![ty.try_to_field("date_source").unwrap()]));
     let batch = RecordBatch::try_new(schema, vec![input.clone()]).unwrap();
@@ -51,10 +51,14 @@ pub(super) fn actual(
     let cast = arena.push_typed(ExprNode::Cast(source, policy), target);
     arena.eval(cast, &chunk)
 }
-pub(super) fn original(input: &ArrayRef, target: DataType) -> Result<ArrayRef, String> {
+pub(super) fn original(
+    input: &ArrayRef,
+    target: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     actual(input, target, DecimalOverflowPolicy::ReportError, true)
 }
-pub(super) fn assert_literal(array: &ArrayRef, row: usize, literal: i32) {
+pub(super) fn assert_literal(array: &ArrayRef, row: usize, literal: impl Into<i64>) {
+    let literal = literal.into();
     match array.data_type() {
         DataType::Float32 => assert_eq!(
             array
@@ -124,7 +128,7 @@ fn legacy_date_float_original_invalid_full_error_and_hidden_null_mask() {
     for target in [DataType::Float32, DataType::Float64] {
         let bad: ArrayRef = Arc::new(Date32Array::from(vec![None, Some(i32::MIN)]));
         assert_eq!(
-            original(&bad, target.clone()).unwrap_err(),
+            (original(&bad, target.clone()).unwrap_err()).to_string(),
             format!("CAST failed: from Date32 to {target:?}: invalid Date32 value -2147483648")
         );
         let hidden: ArrayRef = Arc::new(Date32Array::new(
@@ -137,39 +141,28 @@ fn legacy_date_float_original_invalid_full_error_and_hidden_null_mask() {
     }
 }
 #[test]
-fn legacy_date_float_original_extreme_days_year_multiply_panic_and_release_wrapping() {
+fn date_float_legal_wide_years_and_out_of_calendar_days_are_checked() {
     for target in [DataType::Float32, DataType::Float64] {
         for (days, literal) in [
-            (day(262142, 12, 31), -1673546065),
-            (day(-262143, 1, 1), 1673537397),
-            (day(214749, 1, 1), -2147477195),
-            (day(-214749, 1, 1), 2147477397),
+            (day(262142, 12, 31), 2_621_421_231_i64),
+            (day(-262143, 1, 1), -2_621_429_899),
+            (day(214749, 1, 1), 2_147_490_101),
+            (day(-214749, 1, 1), -2_147_489_899),
         ] {
             let input: ArrayRef = Arc::new(Date32Array::from(vec![days]));
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                original(&input, target.clone())
-            }));
-            if cfg!(debug_assertions) {
-                assert!(
-                    result.is_err(),
-                    "original year multiply must panic at {days}"
-                );
-            } else {
-                assert_literal(&result.unwrap().unwrap(), 0, literal);
-            }
+            assert_literal(&original(&input, target.clone()).unwrap(), 0, literal);
         }
         let maximum: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            original(&maximum, target.clone())
-        }));
-        if cfg!(debug_assertions) {
-            assert!(result.is_err());
-        } else {
-            assert_eq!(
-                result.unwrap().unwrap_err(),
-                format!("CAST failed: from Date32 to {target:?}: invalid Date32 value 2147483647")
-            );
-        }
+        let failure = original(&maximum, target.clone()).unwrap_err();
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(
+            failure.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+        assert_eq!(
+            failure.to_string(),
+            format!("CAST failed: from Date32 to {target:?}: invalid Date32 value 2147483647")
+        );
         for (year, literal) in [(214748, 2147481231), (-214748, -2147478769)] {
             let input: ArrayRef = Arc::new(Date32Array::from(vec![day(year, 12, 31)]));
             assert_literal(&original(&input, target.clone()).unwrap(), 0, literal);
@@ -202,7 +195,7 @@ fn legacy_float_date_original_invalid_nonfinite_error_and_null_mask() {
             ] {
                 for allow in [false, true] {
                     assert_eq!(
-                        actual(&input, DataType::Date32, policy, allow).unwrap_err(),
+                        (actual(&input, DataType::Date32, policy, allow).unwrap_err()).to_string(),
                         format!(
                             "CAST failed: from {source:?} to Date32: invalid date literal {message}"
                         )

@@ -47,7 +47,7 @@ fn task_state(
     runtime: Arc<ExecutionRuntime>,
     task: TaskIdentity,
     memory: Option<QueryMemoryBinding>,
-) -> Result<Arc<RuntimeState>, String> {
+) -> ExecutionResult<Arc<RuntimeState>> {
     build_runtime_state(RuntimeStateInputs {
         query_options: None,
         query_id: Some(task.query_execution_id().query_id()),
@@ -58,6 +58,9 @@ fn task_state(
         execution_runtime: Some(runtime),
         query_memory: memory,
         task_identity: Some(task),
+        task_control: Some(crate::runtime::task_control::test_support::control_for(
+            task,
+        )),
         #[cfg(novarocks_dev_controls)]
         exchange_test_observer: None,
     })
@@ -84,21 +87,20 @@ impl RuntimeScalarFrameForTest {
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let state = task_state(runtime, task, memory)?;
         let mut control = control(&state);
         control.bind_mem_tracker(
             state
                 .mem_tracker()
-                .ok_or("task state has no actual allocation tracker")?,
+                .ok_or_else(|| fixture_failure("task state has no actual allocation tracker"))?,
         );
         let instance = CompiledExpressionInstance::try_new_with_allocator(
             program,
             site,
             &control,
             control.allocator(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         Ok(Self {
             instance,
             site,
@@ -112,11 +114,10 @@ impl RuntimeScalarFrameForTest {
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let state = task_state(runtime, task, memory)?;
         let control = control(&state);
-        let instance = CompiledExpressionInstance::try_new(program, site, &control)
-            .map_err(|error| error.to_string())?;
+        let instance = CompiledExpressionInstance::try_new(program, site, &control)?;
         Ok(Self {
             instance,
             site,
@@ -157,13 +158,13 @@ impl RuntimeInvocationWrapperForTest {
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let state = task_state(runtime, task, memory)?;
         let mut control = control(&state);
         control.bind_mem_tracker(
             state
                 .mem_tracker()
-                .ok_or("task state has no actual allocation tracker")?,
+                .ok_or_else(|| fixture_failure("task state has no actual allocation tracker"))?,
         );
         let mut selected = None;
         for call in program
@@ -178,23 +179,25 @@ impl RuntimeInvocationWrapperForTest {
                 && scope.root == site
                 && selected.replace(Arc::clone(kernel)).is_some()
             {
-                return Err(
-                    "wrapper fixture requires one exact whole-invocation occurrence".into(),
-                );
+                return Err(fixture_failure(
+                    "wrapper fixture requires one exact whole-invocation occurrence",
+                ));
             }
         }
-        let prepared = selected.ok_or("wrapper fixture has no whole-invocation occurrence")?;
+        let prepared = selected
+            .ok_or_else(|| fixture_failure("wrapper fixture has no whole-invocation occurrence"))?;
         if prepared.invocation_resource_profile().is_none() {
-            return Err("wrapper fixture whole-invocation source is uncovered".into());
+            return Err(fixture_failure(
+                "wrapper fixture whole-invocation source is uncovered",
+            ));
         }
         let host = control
             .allocator()
-            .ok_or("task state has no actual allocation host")?;
+            .ok_or_else(|| fixture_failure("task state has no actual allocation host"))?;
         let instance = InvocationScalarEvaluationInstance::instantiate_with_allocator(
             prepared,
             Some(host.clone()),
-        )
-        .map_err(|cause| cause.to_string())?;
+        )?;
         Ok(Self {
             instance,
             control,
@@ -255,7 +258,7 @@ impl RuntimeScalarWrapperForTest {
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let state = task_state(runtime, task, memory)?;
         let control = control(&state);
         let mut selected = None;
@@ -271,15 +274,19 @@ impl RuntimeScalarWrapperForTest {
                 && scope.root == site
                 && selected.replace(Arc::clone(kernel)).is_some()
             {
-                return Err("wrapper fixture requires one exact scalar occurrence".into());
+                return Err(fixture_failure(
+                    "wrapper fixture requires one exact scalar occurrence",
+                ));
             }
         }
-        let prepared = selected.ok_or("wrapper fixture has no scalar occurrence")?;
+        let prepared =
+            selected.ok_or_else(|| fixture_failure("wrapper fixture has no scalar occurrence"))?;
         if prepared.invocation_resource_profile().is_none() {
-            return Err("wrapper fixture scalar source is uncovered".into());
+            return Err(fixture_failure(
+                "wrapper fixture scalar source is uncovered",
+            ));
         }
-        let instance =
-            ScalarEvaluationInstance::instantiate(prepared).map_err(|error| error.to_string())?;
+        let instance = ScalarEvaluationInstance::instantiate(prepared)?;
         Ok(Self {
             instance,
             control,
@@ -309,4 +316,11 @@ impl RuntimeScalarWrapperForTest {
             },
         )
     }
+}
+
+fn fixture_failure(detail: &str) -> crate::runtime::fragment::ExecutionFailure {
+    novarocks_functions::KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+        detail,
+    ))
+    .into()
 }

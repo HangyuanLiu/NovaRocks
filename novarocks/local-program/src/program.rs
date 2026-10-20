@@ -939,7 +939,7 @@ pub struct LocalProgramGraph {
     sink: Option<StaticSinkProgram>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalProgramError {
     Empty,
     TooManyNodes,
@@ -955,6 +955,8 @@ pub enum LocalProgramError {
     InvalidRequirement,
     InvalidSink,
     UnsupportedKernelAbi,
+    Layout(crate::LayoutError),
+    Sink(crate::StaticSinkError),
 }
 
 impl fmt::Display for LocalProgramError {
@@ -963,11 +965,19 @@ impl fmt::Display for LocalProgramError {
     }
 }
 
-impl std::error::Error for LocalProgramError {}
+impl std::error::Error for LocalProgramError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Layout(source) => Some(source),
+            Self::Sink(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// A graph compilation failure preserves the original request-control cause.
 /// No control capability or allocation grant enters the completed graph.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramCompileError {
     Program(LocalProgramError),
     Control(CompileControlError),
@@ -1023,7 +1033,6 @@ impl ProgramWork<'_> {
     fn identity(
         &mut self,
         layout: &StaticLayout,
-        ordinary: LocalProgramError,
     ) -> Result<crate::LayoutIdentity, ProgramCompileError> {
         self.flush()?;
         let result = if let Some(work) = &self.0 {
@@ -1031,10 +1040,14 @@ impl ProgramWork<'_> {
                 .identity_for_compile(work.control())
                 .map_err(|error| match error {
                     LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
-                    LayoutCompileError::Layout(_) => ProgramCompileError::Program(ordinary),
+                    LayoutCompileError::Layout(source) => {
+                        ProgramCompileError::Program(LocalProgramError::Layout(source))
+                    }
                 })
         } else {
-            layout.identity().map_err(|_| ordinary.into())
+            layout
+                .identity()
+                .map_err(|source| LocalProgramError::Layout(source).into())
         };
         if matches!(&result, Err(ProgramCompileError::Control(_))) {
             return result;
@@ -1049,8 +1062,7 @@ impl ProgramWork<'_> {
     ) -> Result<bool, ProgramCompileError> {
         if !execution.is_typed() || !provider.is_typed() {
             // Explicit expansion fixtures retain their original exact law.
-            return Ok(self.identity(execution, LocalProgramError::LayoutMismatch)?
-                == self.identity(provider, LocalProgramError::LayoutMismatch)?);
+            return Ok(self.identity(execution)? == self.identity(provider)?);
         }
         self.flush()?;
         let result = if let Some(work) = &self.0 {
@@ -1058,12 +1070,12 @@ impl ProgramWork<'_> {
                 .writer_projection_matches_for_compile(provider, work.control())
                 .map_err(|error| match error {
                     LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
-                    LayoutCompileError::Layout(_) => LocalProgramError::InvalidNodeShape.into(),
+                    LayoutCompileError::Layout(source) => LocalProgramError::Layout(source).into(),
                 })
         } else {
             execution
                 .writer_projection_matches(provider)
-                .map_err(|_| LocalProgramError::InvalidNodeShape.into())
+                .map_err(|source| LocalProgramError::Layout(source).into())
         };
         if matches!(&result, Err(ProgramCompileError::Control(_))) {
             return result;
@@ -1084,12 +1096,14 @@ impl ProgramWork<'_> {
                     .typed_projection_matches_for_compile(columns, expected, work.control())
                     .map_err(|error| match error {
                         LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
-                        LayoutCompileError::Layout(_) => LocalProgramError::InvalidSink.into(),
+                        LayoutCompileError::Layout(source) => {
+                            LocalProgramError::Layout(source).into()
+                        }
                     })
             } else {
                 layout
                     .typed_projection_matches(columns, expected)
-                    .map_err(|_| LocalProgramError::InvalidSink.into())
+                    .map_err(|source| LocalProgramError::Layout(source).into())
             };
             if matches!(&result, Err(ProgramCompileError::Control(_))) {
                 return result;
@@ -1102,16 +1116,15 @@ impl ProgramWork<'_> {
                 .project_by_slots_for_compile(columns, work.control())
                 .map_err(|error| match error {
                     LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
-                    LayoutCompileError::Layout(_) => LocalProgramError::InvalidSink.into(),
+                    LayoutCompileError::Layout(source) => LocalProgramError::Layout(source).into(),
                 })?
         } else {
             layout
                 .project_by_slots(columns)
-                .map_err(|_| LocalProgramError::InvalidSink)?
+                .map_err(LocalProgramError::Layout)?
         };
         self.flush()?;
-        Ok(self.identity(&projected, LocalProgramError::InvalidSink)?
-            == self.identity(expected, LocalProgramError::InvalidSink)?)
+        Ok(self.identity(&projected)? == self.identity(expected)?)
     }
     fn sink(&mut self, sink: &StaticSinkProgram) -> Result<(), ProgramCompileError> {
         self.flush()?;
@@ -1119,13 +1132,13 @@ impl ProgramWork<'_> {
             sink.validate_for_compile(work.control())
                 .map_err(|error| match error {
                     SinkCompileError::Control(cause) => ProgramCompileError::Control(cause),
-                    SinkCompileError::Sink(_) => {
-                        ProgramCompileError::Program(LocalProgramError::InvalidSink)
+                    SinkCompileError::Sink(source) => {
+                        ProgramCompileError::Program(LocalProgramError::Sink(source))
                     }
                 })
         } else {
             sink.validate()
-                .map_err(|_| LocalProgramError::InvalidSink.into())
+                .map_err(|source| LocalProgramError::Sink(source).into())
         };
         if matches!(&result, Err(ProgramCompileError::Control(_))) {
             return result;
@@ -1323,11 +1336,7 @@ impl LocalProgramGraph {
                 return Err(LocalProgramError::UnreachableNode.into());
             }
         }
-        if work.identity(
-            &nodes[root.index()].output_layout,
-            LocalProgramError::LayoutMismatch,
-        )? != profile.layout()
-        {
+        if work.identity(&nodes[root.index()].output_layout)? != profile.layout() {
             return Err(LocalProgramError::LayoutMismatch.into());
         }
         let mut required_scans = BTreeSet::new();
@@ -1341,8 +1350,7 @@ impl LocalProgramGraph {
             work.step()?;
             match requirement {
                 BindingRequirement::ResultSink { layout } => {
-                    if work.identity(layout, LocalProgramError::LayoutMismatch)? != profile.layout()
-                    {
+                    if work.identity(layout)? != profile.layout() {
                         return Err(LocalProgramError::InvalidRequirement.into());
                     }
                 }
@@ -1361,10 +1369,7 @@ impl LocalProgramGraph {
                         return Err(LocalProgramError::InvalidRequirement.into());
                     };
                     let same_header = work.opaque(|| relation == source.relation_header())?;
-                    if !same_header
-                        || work.identity(layout, LocalProgramError::LayoutMismatch)?
-                            != work.identity(output_layout, LocalProgramError::LayoutMismatch)?
-                    {
+                    if !same_header || work.identity(layout)? != work.identity(output_layout)? {
                         return Err(LocalProgramError::InvalidRequirement.into());
                     }
                     required_scans.insert(node.index());
@@ -1408,7 +1413,7 @@ impl LocalProgramGraph {
                     work.step()?;
                 }
                 BindingRequirement::ExchangeOutput { layout, .. } => {
-                    work.identity(layout, LocalProgramError::LayoutMismatch)?;
+                    work.identity(layout)?;
                 }
             }
         }
@@ -1594,10 +1599,7 @@ fn check_node_layout(
     let found = found.ok_or(LocalProgramError::InvalidRequirement)?;
     let correct_kind = expected_kind(&found.kind);
     work.step()?;
-    if !correct_kind
-        || work.identity(layout, LocalProgramError::LayoutMismatch)?
-            != work.identity(&found.output_layout, LocalProgramError::LayoutMismatch)?
-    {
+    if !correct_kind || work.identity(layout)? != work.identity(&found.output_layout)? {
         return Err(LocalProgramError::InvalidRequirement.into());
     }
     Ok(())
@@ -1676,10 +1678,7 @@ fn layout_matches(
     expected: &StaticLayout,
     work: &mut ProgramWork<'_>,
 ) -> Result<bool, ProgramCompileError> {
-    Ok(work.identity(
-        &nodes[child.index()].output_layout,
-        LocalProgramError::LayoutMismatch,
-    )? == work.identity(expected, LocalProgramError::LayoutMismatch)?)
+    Ok(work.identity(&nodes[child.index()].output_layout)? == work.identity(expected)?)
 }
 fn validate_relationships(
     node: &ProgramNode,
@@ -1740,9 +1739,7 @@ fn validate_relationships(
                     return Err(LocalProgramError::LayoutMismatch.into());
                 }
             }
-            if work.identity(&node.output_layout, LocalProgramError::LayoutMismatch)?
-                != work.identity(root_result_layout, LocalProgramError::LayoutMismatch)?
-            {
+            if work.identity(&node.output_layout)? != work.identity(root_result_layout)? {
                 return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
@@ -1763,9 +1760,7 @@ fn validate_shape(
             }
         }
         ProgramNodeKind::Values { values } => {
-            if work.identity(values.layout(), LocalProgramError::LayoutMismatch)?
-                != work.identity(&node.output_layout, LocalProgramError::LayoutMismatch)?
-            {
+            if work.identity(values.layout())? != work.identity(&node.output_layout)? {
                 return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
@@ -2557,7 +2552,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let index = trace.len();
             trace.push((phase, units));
-            if let Some((at, cause)) = self.stop
+            if let Some((at, cause)) = self.stop.clone()
                 && at == index
             {
                 return Err(cause);
@@ -2703,7 +2698,7 @@ mod tests {
                 for at in [0, quantum, delegate, trace.len() - 1] {
                     let control = OriginalControl {
                         trace: Default::default(),
-                        stop: Some((at, cause)),
+                        stop: Some((at, cause.clone())),
                     };
                     assert!(
                         matches!(compile_fixture(&source, &control), Err(ProgramCompileError::Control(actual)) if actual == cause)
@@ -2744,10 +2739,10 @@ mod tests {
         for cause in causes() {
             let control = OriginalControl {
                 trace: Default::default(),
-                stop: Some((1, cause)),
+                stop: Some((1, cause.clone())),
             };
             let error = run(&control).unwrap_err();
-            assert_eq!(error, ProgramCompileError::Control(cause));
+            assert_eq!(error, ProgramCompileError::Control(cause.clone()));
             assert_eq!(
                 error
                     .source()
@@ -2909,7 +2904,7 @@ mod tests {
         for cause in causes() {
             let control = OriginalControl {
                 trace: Default::default(),
-                stop: Some((trace.len() - 1, cause)),
+                stop: Some((trace.len() - 1, cause.clone())),
             };
             assert!(
                 matches!(run(&control), Err(ProgramCompileError::Control(actual)) if actual == cause)

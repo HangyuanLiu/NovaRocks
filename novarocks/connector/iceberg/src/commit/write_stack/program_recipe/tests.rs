@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at
         {
             return Err(cause);
@@ -537,7 +537,7 @@ fn actual_long_schema_and_copy_keep_original_entry_quantum_and_tail_causes() {
     for cause in causes() {
         for &at in &stops {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(
@@ -561,7 +561,7 @@ fn actual_input_field_copy_refuses_before_publication_without_rechecking_control
     for cause in causes() {
         for at in stops {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             let result = (|| {
@@ -578,25 +578,40 @@ fn actual_input_field_copy_refuses_before_publication_without_rechecking_control
 }
 
 #[test]
-fn ordinary_source_failure_still_observes_original_terminal_control() {
+fn ordinary_source_failure_keeps_original_provider_fact_and_actual_control_prefix() {
+    use novarocks_failure_contract::FailureProjection;
     let draft = draft(&data_handle(None), data_input());
-    let success = Control::default();
     assert_provider_failure(&draft, "frozen input schema");
-    assert!(matches!(
-        compile(&draft, &success),
-        Err(ConnectorWriteRecipeCompileError::Provider(_))
-    ));
-    let trace = success.trace.lock().unwrap().clone();
+    let baseline = Control::default();
+    let Err(ConnectorWriteRecipeCompileError::Provider(original)) = compile(&draft, &baseline)
+    else {
+        panic!("original frozen input error required");
+    };
+    let trace = baseline.trace.lock().unwrap().clone();
+    assert!(!trace.is_empty());
     for cause in causes() {
-        let control = Control {
-            refusal: Some((trace.len(), cause)),
+        for at in 1..=trace.len() {
+            let control = Control {
+                refusal: Some((at, cause.clone())),
+                ..Control::default()
+            };
+            assert!(
+                matches!(compile(&draft, &control), Err(ConnectorWriteRecipeCompileError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+        }
+        let late = Control {
+            refusal: Some((trace.len() + 1, cause)),
             ..Control::default()
         };
-        assert!(
-            matches!(compile(&draft, &control), Err(ConnectorWriteRecipeCompileError::Control(error))
-            if error == cause)
-        );
-        assert_eq!(*control.trace.lock().unwrap(), trace);
+        let Err(ConnectorWriteRecipeCompileError::Provider(actual)) = compile(&draft, &late) else {
+            panic!("late callback replaced frozen input error");
+        };
+        assert_eq!(actual.failure_fact(), original.failure_fact());
+        assert_eq!(actual.path(), original.path());
+        assert_eq!(actual.kind(), original.kind());
+        assert_eq!(actual.detail(), original.detail());
+        assert_eq!(*late.trace.lock().unwrap(), trace);
     }
 }
 

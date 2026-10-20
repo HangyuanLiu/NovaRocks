@@ -21,7 +21,7 @@ use arrow::array::{ArrayRef, BinaryBuilder, Decimal128Builder, Int64Builder};
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use crate::exec::mv::state_codec::{
     decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
 };
@@ -35,7 +35,10 @@ enum SumStateLayout {
     Decimal128,
 }
 
-pub fn sum_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn sum_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     match (sum_state_layout(a)?, sum_state_layout(b)?) {
         (SumStateLayout::Empty, SumStateLayout::Empty) => Ok(Vec::new()),
         (SumStateLayout::Int64, SumStateLayout::Empty)
@@ -45,10 +48,10 @@ pub fn sum_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
             let (right_count, right_sum) = decode_sum_int64(b)?;
             let row_count = left_count
                 .checked_add(right_count)
-                .ok_or_else(|| "sum_state_union row count overflow".to_string())?;
+                .ok_or_else(|| super::failure::numeric("sum_state_union row count overflow"))?;
             let sum = left_sum
                 .checked_add(right_sum)
-                .ok_or_else(|| "sum_state_union int64 sum overflow".to_string())?;
+                .ok_or_else(|| super::failure::numeric("sum_state_union int64 sum overflow"))?;
             if row_count == 0 && sum == 0 {
                 Ok(Vec::new())
             } else {
@@ -62,19 +65,19 @@ pub fn sum_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
             let (right_count, right_sum) = decode_sum_decimal128(b)?;
             let row_count = left_count
                 .checked_add(right_count)
-                .ok_or_else(|| "sum_state_union row count overflow".to_string())?;
-            let sum = left_sum
-                .checked_add(right_sum)
-                .ok_or_else(|| "sum_state_union decimal128 sum overflow".to_string())?;
+                .ok_or_else(|| super::failure::numeric("sum_state_union row count overflow"))?;
+            let sum = left_sum.checked_add(right_sum).ok_or_else(|| {
+                super::failure::numeric("sum_state_union decimal128 sum overflow")
+            })?;
             if row_count == 0 && sum == 0 {
                 Ok(Vec::new())
             } else {
                 Ok(encode_sum_decimal128(row_count, sum))
             }
         }
-        (left, right) => Err(format!(
+        (left, right) => Err(super::failure::invalid_state(format_args!(
             "sum_state_union layout mismatch: left={left:?} right={right:?}"
-        )),
+        ))),
     }
 }
 
@@ -83,13 +86,16 @@ pub fn eval_sum_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("sum_state_union expects 2 arguments, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "sum_state_union expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_sum_state_union_arrays(&lhs, &rhs))?)
+    eval_sum_state_union_arrays(&lhs, &rhs)
 }
 
 pub fn eval_sum_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -97,13 +103,12 @@ pub fn eval_sum_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if !(1..=2).contains(&args.len()) {
-        return Err((format!(
+        return Err(super::failure::contract(format_args!(
             "sum_state_visible expects 1 or 2 arguments, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
     // First-refresh physicalization may attach a typed NULL witness to keep
@@ -111,22 +116,26 @@ pub fn eval_sum_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     // plan still carries the historical one-argument function metadata, so
     // the witness—not the legacy call result annotation—is authoritative for
     // the BE-local decoder when it is present.
-    let output_type = args
-        .get(1)
-        .and_then(|witness| arena.data_type(*witness))
-        .cloned()
-        .or_else(|| arena.data_type(expr).cloned())
-        .unwrap_or(DataType::Int64);
-    Ok((eval_sum_state_visible_array(&input, &output_type))?)
+    let output_expr = args.get(1).copied().unwrap_or(expr);
+    let output_type = arena.data_type(output_expr).cloned().ok_or_else(|| {
+        super::failure::contract("sum_state_visible is missing its frozen output type")
+    })?;
+    eval_sum_state_visible_array(&input, &output_type)
 }
 
-pub fn eval_sum_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_sum_state_union_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count("sum_state_union", lhs.len(), rhs.len())?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::StateOutputTally::default();
     for row in 0..rows {
         let left = binary_value_or_empty(lhs, row_index(row, lhs.len())?, "sum_state_union", 0)?;
         let right = binary_value_or_empty(rhs, row_index(row, rhs.len())?, "sum_state_union", 1)?;
-        builder.append_value(sum_state_union(left, right)?);
+        let payload = sum_state_union(left, right)?;
+        extent.append(payload.len())?;
+        builder.append_value(payload);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -134,7 +143,7 @@ pub fn eval_sum_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<Arr
 pub fn eval_sum_state_visible_array(
     input: &ArrayRef,
     output_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     match output_type {
         DataType::Decimal128(precision, scale) => {
             let mut builder = Decimal128Builder::with_capacity(input.len())
@@ -148,7 +157,7 @@ pub fn eval_sum_state_visible_array(
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
-        DataType::Int64 | DataType::Null => {
+        DataType::Int64 => {
             let mut builder = Int64Builder::new();
             for row in 0..input.len() {
                 let state = binary_value_or_empty(input, row, "sum_state_visible", 0)?;
@@ -159,22 +168,28 @@ pub fn eval_sum_state_visible_array(
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
-        other => Err(format!(
+        other => Err(super::failure::contract(format_args!(
             "sum_state_visible expects Int64 or Decimal128 output type, got {other:?}"
-        )),
+        ))),
     }
 }
 
-fn sum_state_layout(bytes: &[u8]) -> Result<SumStateLayout, String> {
+fn sum_state_layout(
+    bytes: &[u8],
+) -> Result<SumStateLayout, crate::runtime::fragment::ExecutionFailure> {
     match bytes.len() {
         0 => Ok(SumStateLayout::Empty),
         17 => Ok(SumStateLayout::Int64),
         25 => Ok(SumStateLayout::Decimal128),
-        len => Err(format!("sum_state invalid state length: {len}")),
+        len => Err(super::failure::invalid_state(format_args!(
+            "sum_state invalid state length: {len}"
+        ))),
     }
 }
 
-fn sum_state_visible_as_int64(s: &[u8]) -> Result<Option<i64>, String> {
+fn sum_state_visible_as_int64(
+    s: &[u8],
+) -> Result<Option<i64>, crate::runtime::fragment::ExecutionFailure> {
     let (row_count, sum) = decode_sum_int64(s)?;
     if row_count == 0 {
         Ok(None)
@@ -183,7 +198,9 @@ fn sum_state_visible_as_int64(s: &[u8]) -> Result<Option<i64>, String> {
     }
 }
 
-fn sum_state_visible_as_decimal128(s: &[u8]) -> Result<Option<i128>, String> {
+fn sum_state_visible_as_decimal128(
+    s: &[u8],
+) -> Result<Option<i128>, crate::runtime::fragment::ExecutionFailure> {
     let (row_count, sum) = decode_sum_decimal128(s)?;
     if row_count == 0 {
         Ok(None)
@@ -197,7 +214,9 @@ fn sum_state_visible_as_decimal128(s: &[u8]) -> Result<Option<i128>, String> {
 // opaque state by its self-identifying fixed width, then widen only the
 // returned BE value. This keeps the provider-owned state opaque to FE while
 // avoiding an invalid assumption that output and state layouts coincide.
-fn sum_state_visible_as_decimal128_for_output(s: &[u8]) -> Result<Option<i128>, String> {
+fn sum_state_visible_as_decimal128_for_output(
+    s: &[u8],
+) -> Result<Option<i128>, crate::runtime::fragment::ExecutionFailure> {
     match sum_state_layout(s)? {
         SumStateLayout::Empty => Ok(None),
         SumStateLayout::Int64 => sum_state_visible_as_int64(s).map(|value| value.map(i128::from)),
@@ -267,7 +286,7 @@ mod tests {
     fn sum_state_union_mismatched_layouts_error() {
         let err = sum_state_union(&encode_sum_int64(1, 10), &encode_sum_decimal128(1, 10))
             .expect_err("mixed int64 and decimal states should fail");
-        assert!(err.contains("layout mismatch"));
+        assert!(err.to_string().contains("layout mismatch"));
     }
 
     #[test]

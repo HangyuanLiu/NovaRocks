@@ -40,7 +40,7 @@ use novarocks_type_contract::{
 pub use resources::{ControlProjectionFacts, ControlProjectionLimits};
 use resources::{Model, unbounded};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlCodecError {
     Control(CompileControlError),
     InvalidShape(&'static str),
@@ -57,7 +57,17 @@ impl fmt::Display for ControlCodecError {
         }
     }
 }
-impl std::error::Error for ControlCodecError {}
+impl std::error::Error for ControlCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Flow(source) => Some(source),
+            Self::Roots(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ControlCodecError {}
 impl From<CompileControlError> for ControlCodecError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
@@ -420,7 +430,7 @@ pub fn encode_expression_control(
     let mut model = encode_model(roots, 0, unbounded())?;
     let encoded = encode_in(roots, &mut model, &mut |_| Ok(()), false, &mut work);
     if let Err(ControlCodecError::Control(c)) = &encoded {
-        return Err((*c).into());
+        return Err(c.clone().into());
     }
     work.finish()?;
     Ok(encoded?.0)
@@ -459,9 +469,9 @@ pub fn encode_expression_control_observed(
             match m.gate_with(*f, admit) {
                 Ok(_) => Ok(()),
                 Err(e) => {
-                    let c = match e {
-                        ControlCodecError::Control(c) => c,
-                        _ => CompileControlError::ResourceExhausted,
+                    let c = match &e {
+                        ControlCodecError::Control(c) => c.clone(),
+                        _ => CompileControlError::from_domain(e.clone()),
                     };
                     ordinary = Some(e);
                     Err(c)
@@ -594,7 +604,7 @@ pub fn decode_expression_control(
     let mut m = decode_model(fragment, input, 0, unbounded())?;
     let projected = project_decode_in(input, &mut m, &mut |_| Ok(()), None, false, &mut work);
     if let Err(ControlCodecError::Control(c)) = &projected {
-        return Err((*c).into());
+        return Err(c.clone().into());
     }
     work.finish()?;
     let (domains, uses, bindings) = projected?;
@@ -752,9 +762,9 @@ pub fn decode_expression_control_observed(
             match m.gate_with(*f, admit) {
                 Ok(_) => Ok(()),
                 Err(e) => {
-                    let c = match e {
-                        ControlCodecError::Control(c) => c,
-                        _ => CompileControlError::ResourceExhausted,
+                    let c = match &e {
+                        ControlCodecError::Control(c) => c.clone(),
+                        _ => CompileControlError::from_domain(e.clone()),
                     };
                     ordinary = Some(e);
                     Err(c)
@@ -780,9 +790,9 @@ pub fn decode_expression_control_observed(
             match m.gate_with(*f, admit) {
                 Ok(_) => Ok(()),
                 Err(e) => {
-                    let c = match e {
-                        ControlCodecError::Control(c) => c,
-                        _ => CompileControlError::ResourceExhausted,
+                    let c = match &e {
+                        ControlCodecError::Control(c) => c.clone(),
+                        _ => CompileControlError::from_domain(e.clone()),
                     };
                     ordinary = Some(e);
                     Err(c)

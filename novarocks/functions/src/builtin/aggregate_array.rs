@@ -18,7 +18,7 @@
 //! Selected ARRAY family through its original tracked rows and output codec.
 use super::aggregate_array_core::{self as core, ArrayAggConfig, ArrayAggKind, ArrayAggState};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
@@ -111,7 +111,6 @@ impl ArrayKernel {
                 intermediate,
                 &mut ScalarWork::new(Some(work)),
             )
-            .map_err(ScalarStateError::into_kernel_failure)
         })
     }
 }
@@ -235,7 +234,6 @@ impl PreparedAggregateKernel for ArrayKernel {
                 false,
                 &mut ScalarWork::new(Some(work)),
             )
-            .map_err(ScalarStateError::into_kernel_failure)
         });
         if result.is_err() {
             state.latch_failure()
@@ -257,7 +255,7 @@ impl PreparedAggregateKernel for ArrayKernel {
                 ));
             }
             core::merge_input_list_array(input.state().array())
-                .map_err(ScalarStateError::into_kernel_failure)?;
+                .map_err(KernelFailure::from_domain)?;
             Ok(input)
         })
     }
@@ -289,7 +287,6 @@ impl PreparedAggregateKernel for ArrayKernel {
                 address,
                 &mut ScalarWork::new(Some(work)),
             )
-            .map_err(ScalarStateError::into_kernel_failure)
         });
         if result.is_err() {
             state.latch_failure()

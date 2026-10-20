@@ -102,7 +102,7 @@ pub struct FrozenFragmentCalls {
     entries: Arc<BTreeMap<PhysicalCallSite, FrozenPhysicalCall>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrozenCallError {
     MissingLegacyMetadata(crate::MissingLegacyBindingMetadata),
     Control(CompileControlError),
@@ -128,7 +128,17 @@ impl fmt::Display for FrozenCallError {
         write!(f, "invalid frozen call table: {self:?}")
     }
 }
-impl std::error::Error for FrozenCallError {}
+impl std::error::Error for FrozenCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MissingLegacyMetadata(source) => Some(source),
+            Self::Control(source) => Some(source),
+            Self::Roots(source) => Some(source),
+            Self::InvalidEffects(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for FrozenCallError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
@@ -163,10 +173,8 @@ fn resource_error(error: novarocks_type_contract::ControlResourceError) -> Froze
 fn resource_control(error: novarocks_type_contract::ControlResourceError) -> CompileControlError {
     match error {
         novarocks_type_contract::ControlResourceError::Control(cause) => cause,
-        // The base and child facts were already produced by locked authors;
-        // merging scalar counters cannot introduce source-model failures.
-        novarocks_type_contract::ControlResourceError::SourceModel(_) => {
-            CompileControlError::ResourceExhausted
+        source @ novarocks_type_contract::ControlResourceError::SourceModel(_) => {
+            CompileControlError::from_domain(source)
         }
     }
 }

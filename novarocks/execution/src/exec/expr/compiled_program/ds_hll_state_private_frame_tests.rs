@@ -20,7 +20,7 @@ use super::*;
 mod fixture;
 use crate::runtime::mem_tracker::MemTracker;
 fn host(tracker: Arc<MemTracker>) -> Arc<dyn novarocks_functions::AggregateStateAllocator> {
-    crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker)
+    crate::runtime::tracked_state_allocator::expression_allocation_host(tracker)
 }
 #[test]
 fn ds_scalar_private_adapter_frame_every_declared_arity_true_host_and_no_host_refusal() {
@@ -51,17 +51,8 @@ fn ds_scalar_private_adapter_frame_every_declared_arity_true_host_and_no_host_re
             .downcast_ref::<BinaryArray>()
             .unwrap();
         assert!(bytes.is_null(1));
-        if count == 3 {
-            assert_eq!(output.errors().len(), 2);
-            assert_eq!(output.errors()[0].selected_ordinal(), 0);
-            assert_eq!(
-                output.errors()[0].message(),
-                "ds_hll_count_distinct_state target type expects string input, got Int64(88)"
-            );
-        } else {
-            assert!(output.errors().is_empty());
-            assert_eq!(bytes.value(0)[3], if count == 1 { 17 } else { 10 });
-        }
+        assert!(output.errors().is_empty());
+        assert_eq!(bytes.value(0)[3], if count == 1 { 17 } else { 10 });
         assert!(tracker.current() > 0);
         drop(output);
         drop(instance);
@@ -81,10 +72,10 @@ fn ds_scalar_private_adapter_frame_real_tracker_refusal_and_failure_latch() {
         Some(host(tracker.clone())),
     )
     .unwrap();
-    assert!(matches!(
-        instance.evaluate(&batch, Selection::all(3), &Control),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = instance
+        .evaluate(&batch, Selection::all(3), &Control)
+        .unwrap_err();
+    crate::runtime_filter::assert_real_tracker_capacity(&refusal, 1);
     assert_eq!(tracker.current(), 0);
     assert!(matches!(
         instance.evaluate(&batch, Selection::all(3), &Control),
@@ -126,11 +117,41 @@ fn ds_scalar_private_adapter_frame_sparse_original_row_identity_and_empty_select
 #[path = "ds_hll_state_private_if_fixture.rs"]
 mod if_fixture;
 #[test]
-fn ds_scalar_private_adapter_if_selected_long_row_data_is_maskable_and_lossless() {
+fn ds_scalar_if_type_contract_is_unmaskable_and_numeric_value_is_row_data() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
     let p = if_fixture::program();
     let batch = if_fixture::source_batch(&p);
-    let tracker = MemTracker::new_root("ds-scalar-if-data");
+    let tracker = MemTracker::new_root("ds-scalar-if-shape");
     tracker.install_limit_once(4 * 1024 * 1024).unwrap();
+    let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+        p,
+        root(),
+        &Control,
+        Some(host(tracker.clone())),
+    )
+    .unwrap();
+    let error = instance
+        .evaluate(&batch, Selection::all(3), &Control)
+        .unwrap_err();
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Invariant);
+    assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+    assert_eq!(fact.reason().code(), 311);
+    assert!(
+        error
+            .to_string()
+            .starts_with("ds_hll_count_distinct_state target type expects string input, got List(")
+    );
+    assert!(error.to_string().len() <= 512);
+    assert!(matches!(
+        instance.evaluate(&batch, Selection::all(3), &Control),
+        Err(KernelFailure::InstanceFailed)
+    ));
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+
+    let p = if_fixture::row_data_program();
+    let batch = if_fixture::row_data_batch(&p);
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
         p,
         root(),
@@ -142,13 +163,24 @@ fn ds_scalar_private_adapter_if_selected_long_row_data_is_maskable_and_lossless(
         .evaluate(&batch, Selection::all(3), &Control)
         .unwrap();
     assert_eq!(output.errors().len(), 1);
-    assert_eq!(output.errors()[0].selected_ordinal(), 1);
-    assert!(output.errors()[0].message().len() > 512);
-    assert!(
-        output.errors()[0]
-            .message()
-            .starts_with("ds_hll_count_distinct_state target type expects string input, got List(")
+    let error = &output.errors()[0];
+    assert_eq!(error.selected_ordinal(), 1);
+    assert_eq!(
+        error.reason(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange
     );
+    assert_eq!(
+        error.message(),
+        "ds_hll_count_distinct_state log_k out of range: 999"
+    );
+    assert_eq!(output.values().null_count(), 3);
+    drop(output);
+    let rows = [0, 2];
+    let output = instance
+        .evaluate(&batch, Selection::try_sparse(3, &rows).unwrap(), &Control)
+        .unwrap();
+    assert!(output.errors().is_empty());
+    assert_eq!(output.values().null_count(), 2);
     drop(output);
     drop(instance);
     assert_eq!(tracker.current(), 0);

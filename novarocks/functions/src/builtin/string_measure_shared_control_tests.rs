@@ -102,8 +102,12 @@ fn string_measure_shared_all_profiles_seven_causes_actual_callbacks_and_failed_l
 fn string_measure_shared_original_int_projection_preserves_full_overflow_message() {
     for value in [i64::MIN, i32::MIN as i64 - 1, i32::MAX as i64 + 1, i64::MAX] {
         let error = length_int32(vec![None, Some(value)]).unwrap_err();
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_eq!(error.failure_fact().reason().code(), 41);
+        let _ = super::super::string_failure::original_source::<std::num::TryFromIntError>(&error);
         assert_eq!(
-            legacy_failure(error),
+            error.to_string(),
             format!("length result out of INT range: {value}")
         );
     }

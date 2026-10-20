@@ -85,9 +85,30 @@ pub enum TypeMismatchKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeMismatch {
     pub nested_path: Vec<NestedStep>,
-    pub expected: DataType,
-    pub actual: DataType,
+    // A diagnostic must not retain Arrow Field/metadata backing after its
+    // creating input and finite construction hold have exited.
+    pub expected: novarocks_failure_contract::BoundedDetail,
+    pub actual: novarocks_failure_contract::BoundedDetail,
     pub kind: TypeMismatchKind,
+}
+
+impl std::fmt::Display for TypeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "chunk schema type mismatch at {:?}: expected {}, got {} ({:?})",
+            self.nested_path, self.expected, self.actual, self.kind
+        )
+    }
+}
+impl std::error::Error for TypeMismatch {}
+impl novarocks_failure_contract::FailureProjection for TypeMismatch {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::SchemaTypeMismatch.reason(),
+        )
+    }
 }
 
 /// The one recursive descriptor check. Returns `Ok(())` when `actual`
@@ -114,8 +135,12 @@ fn check_exact_inner(
 
     let mismatch = |kind: TypeMismatchKind, path: &[NestedStep]| TypeMismatch {
         nested_path: path.to_vec(),
-        expected: expected.clone(),
-        actual: actual.clone(),
+        expected: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "{expected:?}"
+        )),
+        actual: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "{actual:?}"
+        )),
         kind,
     };
 
@@ -339,8 +364,12 @@ fn retag_mismatch(
 ) -> TypeMismatch {
     TypeMismatch {
         nested_path: path.to_vec(),
-        expected: expected.clone(),
-        actual: actual.clone(),
+        expected: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "{expected:?}"
+        )),
+        actual: novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "{actual:?}"
+        )),
         kind,
     }
 }
@@ -433,6 +462,27 @@ mod tests {
         Arc::new(builder.finish())
     }
 
+    #[test]
+    fn mismatch_keeps_semantic_facts_without_pinning_arrow_metadata_backing() {
+        let field = Arc::new(Field::new("payload", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([("large".into(), "x".repeat(8192))]),
+        ));
+        let weak = Arc::downgrade(&field);
+        let expected = DataType::Struct(vec![field].into());
+        let actual = DataType::Struct(Vec::<Arc<Field>>::new().into());
+        let failure = check_exact(&expected, &actual).unwrap_err();
+        assert_eq!(failure.kind, StructArityMismatch);
+        assert!(failure.nested_path.is_empty());
+        drop(expected);
+        drop(actual);
+        assert!(
+            weak.upgrade().is_none(),
+            "failure records must not retain unfunded Arrow type backing"
+        );
+        assert!(
+            failure.expected.as_str().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
+        );
+    }
     #[test]
     fn identical_scalars_pass_exact_check() {
         assert!(check_exact(&DataType::Int64, &DataType::Int64).is_ok());

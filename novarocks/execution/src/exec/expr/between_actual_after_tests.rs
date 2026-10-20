@@ -201,7 +201,7 @@ fn original_negate_error() -> String {
         ),
         DataType::Int64,
     );
-    arena.eval(negate, &chunk).unwrap_err()
+    arena.eval(negate, &chunk).unwrap_err().detail().to_owned()
 }
 #[test]
 fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower_error_is_first() {

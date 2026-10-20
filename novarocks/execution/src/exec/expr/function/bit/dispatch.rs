@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::ArrayRef;
 use std::collections::HashMap;
 
@@ -45,24 +45,29 @@ pub fn eval_bit_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let canonical = BIT_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "bit_shift_left" => Ok((super::bit_ops::eval_bit_shift_left(arena, expr, args, chunk))?),
-        "bit_shift_right" => Ok((super::bit_ops::eval_bit_shift_right(arena, expr, args, chunk))?),
+        "bit_shift_left" => super::bit_ops::eval_bit_shift_left(arena, expr, args, chunk),
+        "bit_shift_right" => super::bit_ops::eval_bit_shift_right(arena, expr, args, chunk),
         "bit_shift_right_logical" => {
-            Ok((super::bit_ops::eval_bit_shift_right_logical(arena, expr, args, chunk))?)
+            super::bit_ops::eval_bit_shift_right_logical(arena, expr, args, chunk)
         }
-        "bitand" => Ok((super::bit_ops::eval_bitand(arena, expr, args, chunk))?),
-        "bitnot" => Ok((super::bit_ops::eval_bitnot(arena, expr, args, chunk))?),
-        "bitor" => Ok((super::bit_ops::eval_bitor(arena, expr, args, chunk))?),
-        "bitxor" => Ok((super::bit_ops::eval_bitxor(arena, expr, args, chunk))?),
-        "xx_hash3_128" => Ok((super::xx_hash3_128::eval_xx_hash3_128(arena, expr, args, chunk))?),
-        other => Err((format!("unsupported bit function: {}", other)).into()),
+        "bitand" => super::bit_ops::eval_bitand(arena, expr, args, chunk),
+        "bitnot" => super::bit_ops::eval_bitnot(arena, expr, args, chunk),
+        "bitor" => super::bit_ops::eval_bitor(arena, expr, args, chunk),
+        "bitxor" => super::bit_ops::eval_bitxor(arena, expr, args, chunk),
+        "xx_hash3_128" => super::xx_hash3_128::eval_xx_hash3_128(arena, expr, args, chunk),
+        other => Err(novarocks_functions::KernelFailure::InvalidProgram(
+            novarocks_functions::KernelDiagnostic::new(&format!(
+                "unsupported bit function: {other}"
+            )),
+        )
+        .into()),
     }
 }
 

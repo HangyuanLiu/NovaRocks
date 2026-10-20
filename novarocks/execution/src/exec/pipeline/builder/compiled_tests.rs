@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn run(program: Arc<novarocks_local_program::LocalProgram>) -> Vec<Chunk> {
-    let state = Arc::new(RuntimeState::new(
+    let state = Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,
@@ -149,7 +149,9 @@ fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
             Err(message) => message,
         };
         assert!(
-            message.contains("neither a Filter predicate nor a Scan residual"),
+            message
+                .to_string()
+                .contains("neither a Filter predicate nor a Scan residual"),
             "{message}"
         );
     }
@@ -161,5 +163,8 @@ fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
         Ok(_) => panic!("a sink partition root is not a node predicate"),
         Err(message) => message,
     };
-    assert!(message.contains("is not a node predicate"), "{message}");
+    assert!(
+        message.to_string().contains("is not a node predicate"),
+        "{message}"
+    );
 }

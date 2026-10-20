@@ -20,6 +20,7 @@
 //! This permanent original-equivalence expectation must not be changed to #1.
 use super::super::window_fixture::{package_typed, window_catalog};
 use super::*;
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
 use arrow::datatypes::DataType;
@@ -116,14 +117,16 @@ fn by_window_compiled_function_major_error_order_across_partitions() {
         ),
     );
     operator.prepare().unwrap();
-    let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
-    let first = match processor.push_chunk(
-        &state,
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap(),
-    ) {
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
+    let first = match processor
+        .input_without_output(Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap())
+    {
         Err(first) => first,
-        Ok(()) => processor.set_finishing(&state).unwrap_err(),
+        Ok(()) => {
+            processor.signal_eos().unwrap();
+            processor.collect_until_finished().unwrap_err()
+        }
     };
     match first.cause() {
         ExecutionFailureCause::WindowInvocationData(data) => {
@@ -138,9 +141,22 @@ fn by_window_compiled_function_major_error_order_across_partitions() {
         }
         other => panic!("actual original whole-call Data: {other:?}"),
     }
-    assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
-    assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
+    assert_eq!(
+        processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap_err(),
+        first
+    );
+    assert_eq!(processor.signal_eos().unwrap_err(), first);
+    assert_eq!(state.error(), Some(first.clone()));
+    drop(processor);
     drop(operator);
     drop(first);
+    assert!(
+        tracker.current() > 0,
+        "the early failure observer still owns original invocation data"
+    );
+    drop(state);
     assert_eq!(tracker.current(), 0);
 }

@@ -462,22 +462,22 @@ impl RootSegmentDelivery {
         let body = match reply.outcome() {
             RootReplyView::Data { body, .. } => body,
             _ => {
-                return Err(invalid_result_delivery(
+                return Err(result_protocol_error(
                     "a root segment delivery requires a data item",
                 ));
             }
         };
         if client_rows.is_some() != (reply.kind() == RootOutputKind::ClientRows) {
-            return Err(invalid_result_delivery(
+            return Err(result_protocol_error(
                 "a root segment's row profile must match its output kind",
             ));
         }
         if let Some((profile, before)) = client_rows {
-            let validated = before.validate_body(profile, body).map_err(|error| {
-                invalid_result_delivery(format!("root segment rows are malformed: {error}"))
-            })?;
+            let validated = before
+                .validate_body(profile, body)
+                .map_err(client_body_error)?;
             if validated.after().completed_rows() - before.completed_rows() != rows {
-                return Err(invalid_result_delivery(
+                return Err(result_protocol_error(
                     "a root segment's row count differs from its body",
                 ));
             }
@@ -603,9 +603,7 @@ impl ResultFailureView {
                 return error;
             }
             if self.receiver.changed().await.is_err() {
-                return failed_result_delivery_message(
-                    "logical result owner disappeared before success EOF",
-                );
+                return ResultOwnerObservation::FailureOwnerClosed.into_error();
             }
         }
     }
@@ -643,7 +641,7 @@ impl QueryResultTransport {
             .reserve_owned()
             .await
             .map(|permit| ResultQueuePermit { permit })
-            .map_err(|_| failed_result_delivery_message("result stream consumer disappeared"))
+            .map_err(|_| ResultOwnerObservation::ConsumerClosed.into_error())
     }
 
     pub(crate) fn enqueue(&self, permit: ResultQueuePermit, delivery: ResultDelivery) {
@@ -715,7 +713,7 @@ impl QueryResultStream {
 
     pub async fn next(&mut self) -> Result<Option<ResultDelivery>, QueryExecutionError> {
         if self.schema.is_some() {
-            return Err(invalid_result_delivery(
+            return Err(result_protocol_error(
                 "result schema must begin before reading result batches",
             ));
         }
@@ -751,9 +749,7 @@ impl QueryResultStream {
             }
             None => {
                 self.terminal_seen = true;
-                Err(failed_result_delivery_message(
-                    "result stream closed before success EOF",
-                ))
+                Err(ResultOwnerObservation::QueueClosedBeforeEnd.into_error())
             }
         }
     }
@@ -763,8 +759,62 @@ fn invalid_result_delivery(message: impl Into<Arc<str>>) -> QueryExecutionError 
     QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, message)
 }
 
-fn failed_result_delivery_message(message: impl Into<Arc<str>>) -> QueryExecutionError {
-    QueryExecutionError::new(QueryExecutionErrorKind::Failed, message)
+fn result_protocol_error(message: &'static str) -> QueryExecutionError {
+    use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        QueryFailureReason::ResultProtocol.failure_fact(),
+        SafeDetail::truncating(message),
+        ExecutionFailureSite::Coordinator,
+    ))
+}
+
+fn client_body_error(error: novarocks_result_contract::ClientBodyError) -> QueryExecutionError {
+    use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        error.failure_fact(),
+        SafeDetail::truncating(error.safe_detail()),
+        ExecutionFailureSite::Coordinator,
+    ))
+}
+
+/// These local channel observations grant no Task, Backend or physical-exit proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultOwnerObservation {
+    FailureOwnerClosed,
+    ConsumerClosed,
+    QueueClosedBeforeEnd,
+}
+impl novarocks_execution_contract::failure::FailureProjection for ResultOwnerObservation {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::FailureOwnerClosed => 161,
+            Self::ConsumerClosed => 162,
+            Self::QueueClosedBeforeEnd => 163,
+        };
+        FailureFact::stop_observation(FailureReason::new(
+            domain::QUERY,
+            std::num::NonZeroU16::new(code).unwrap(),
+        ))
+    }
+}
+impl ResultOwnerObservation {
+    fn into_error(self) -> QueryExecutionError {
+        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        let detail = match self {
+            Self::FailureOwnerClosed => "logical result failure owner closed before success EOF",
+            Self::ConsumerClosed => "result stream consumer closed",
+            Self::QueueClosedBeforeEnd => "result queue closed before success EOF",
+        };
+        QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            self.failure_fact(),
+            SafeDetail::truncating(detail),
+            ExecutionFailureSite::Coordinator,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1039,7 +1089,8 @@ mod tests {
             ResultDeliveryDisposition::Completed
         );
 
-        let expected = QueryExecutionError::new(QueryExecutionErrorKind::Failed, "encode schema");
+        let expected =
+            client_body_error(novarocks_result_contract::ClientBodyError::InvalidRowLength);
         let (failed, failed_receipt) =
             SchemaDelivery::new(id.query_id(), result_schema(), carrier());
         failed.fail(expected.clone());
@@ -1071,7 +1122,21 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("result batches must not precede the schema"),
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        let input = error.execution_failure().unwrap();
+        use novarocks_execution_contract::failure::FailureProjection;
+        assert_eq!(
+            input.fact(),
+            crate::execution_error::QueryFailureReason::ResultProtocol.failure_fact()
+        );
+        assert_eq!(
+            input.detail().as_str(),
+            "result schema must begin before reading result batches"
+        );
+        assert_eq!(
+            input.site(),
+            crate::execution_error::ExecutionFailureSite::Coordinator
+        );
         let delivered_schema = stream.begin_schema().unwrap();
         assert_eq!(delivered_schema.query_id(), id.query_id());
         delivered_schema.complete();
@@ -1090,7 +1155,7 @@ mod tests {
             .try_acquire(&root.owner.scope(), ResultWindowClass::Client)
             .unwrap();
         let reply = RetainedRootReply::try_new(
-            RootResultReply {
+            novarocks_execution_contract::root_result::RootReadResponse::Reply(RootResultReply {
                 root_task: TaskIdentity::new(
                     id,
                     StageId::new(1).unwrap(),
@@ -1109,7 +1174,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-            },
+            }),
             window.retain_alias(),
             4096,
         )
@@ -1140,15 +1205,14 @@ mod tests {
         assert_eq!(delivery.execution_id(), id);
         assert_eq!(delivery.sequence(), ResultPacketSequence::new(0));
         assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
-        delivery.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            "client disconnected",
-        ));
+        let original =
+            client_body_error(novarocks_result_contract::ClientBodyError::InvalidRowLength);
+        delivery.fail(original.clone());
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
-        assert!(matches!(
+        assert_eq!(
             receipt.await.unwrap(),
-            ResultDeliveryDisposition::Failed(_)
-        ));
+            ResultDeliveryDisposition::Failed(original)
+        );
 
         let (eof, eof_receipt) = EndDelivery::success_eof(id, ResultPacketSequence::new(1));
         let slot = transport.reserve_owned().await.unwrap();
@@ -1168,6 +1232,208 @@ mod tests {
         drop(root);
     }
 
+    #[test]
+    fn rejected_root_segment_keeps_body_facts_and_releases_its_actual_retained_owner() {
+        use novarocks_execution_contract::{
+            TaskIdentity,
+            failure::FailureProjection,
+            root_result::{
+                RootReadOutcome, RootReadResponse, RootResultData, RootResultEnd, RootResultReply,
+            },
+        };
+        use novarocks_result_contract::{ClientBodyError, RootProfileId};
+        use novarocks_types::{BackendProcessId, StageId, TaskId};
+        let (control, capacity) = workload();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let id = execution_id(5);
+        let task = TaskIdentity::new(
+            id,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let mut observations = Vec::new();
+        for case in 0..5 {
+            let profile = ClientRowProfile::try_new(if case == 1 { 5 } else { 16 }, 64).unwrap();
+            let body: &[u8] = if case == 0 {
+                &[0, 0, 0, 0, 1]
+            } else {
+                &[2, 0, 0, 0, 1, 7]
+            };
+            let outcome = if case == 4 {
+                RootReadOutcome::End(RootResultEnd {
+                    sequence: std::num::NonZeroU64::new(1).unwrap(),
+                    output_rows: 0,
+                })
+            } else {
+                RootReadOutcome::Data(
+                    RootResultData::try_new(
+                        RootOutputKind::ClientRows,
+                        std::num::NonZeroU64::new(1).unwrap(),
+                        bytes::Bytes::copy_from_slice(body),
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let window = capacity
+                .try_acquire(&root.owner.scope(), ResultWindowClass::Client)
+                .unwrap();
+            let retained = Arc::new(
+                RetainedRootReply::try_new(
+                    RootReadResponse::Reply(RootResultReply {
+                        root_task: task,
+                        profile: RootProfileId::V1,
+                        kind: RootOutputKind::ClientRows,
+                        accepted_consumed: 0,
+                        outcome,
+                    }),
+                    window.retain_alias(),
+                    4096,
+                )
+                .unwrap(),
+            );
+            let last_owner = Arc::downgrade(&retained);
+            drop(window);
+            let row_profile = (case != 3).then_some((profile, ClientRowStreamCursor::default()));
+            let result = RootSegmentDelivery::try_new(
+                id,
+                ResultPacketSequence::new(0),
+                retained,
+                row_profile,
+                if case == 2 { 2 } else { 1 },
+            );
+            let error = match result {
+                Err(error) => Some(error),
+                Ok((delivery, receipt)) => {
+                    drop(delivery);
+                    drop(receipt);
+                    None
+                }
+            };
+            observations.push((
+                case,
+                error,
+                last_owner.upgrade().is_none(),
+                capacity.snapshot().held_positions,
+            ));
+        }
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        for (case, error, owner_exited, held) in observations {
+            assert!(
+                owner_exited,
+                "the original retained reply must really drop on refusal"
+            );
+            assert_eq!(held, [0; 4]);
+            let error = error.expect("the exact original segment guard must reject");
+            let input = error.execution_failure().unwrap();
+            let (fact, detail) = match case {
+                0 => (
+                    ClientBodyError::InvalidRowLength.failure_fact(),
+                    ClientBodyError::InvalidRowLength.safe_detail(),
+                ),
+                1 => (
+                    ClientBodyError::SegmentTooLarge.failure_fact(),
+                    ClientBodyError::SegmentTooLarge.safe_detail(),
+                ),
+                2 => (
+                    crate::execution_error::QueryFailureReason::ResultProtocol.failure_fact(),
+                    "a root segment's row count differs from its body",
+                ),
+                3 => (
+                    crate::execution_error::QueryFailureReason::ResultProtocol.failure_fact(),
+                    "a root segment's row profile must match its output kind",
+                ),
+                4 => (
+                    crate::execution_error::QueryFailureReason::ResultProtocol.failure_fact(),
+                    "a root segment delivery requires a data item",
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(input.fact(), fact);
+            assert_eq!(input.detail().as_str(), detail);
+            assert_eq!(
+                input.site(),
+                crate::execution_error::ExecutionFailureSite::Coordinator
+            );
+            assert_eq!(input.fact().resource(), None);
+            assert_eq!(input.fact().representation(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_and_consumer_closure_are_distinct_local_stop_observations() {
+        use crate::{coordination::AttemptFailureClass, execution_error::ExecutionFailureSite};
+        use novarocks_execution_contract::failure::{FailureClass, FailureEvidence};
+        let id = execution_id(6);
+        let (transport, schema_receipt, failure_sender, mut stream) =
+            QueryResultStream::try_channel(id.query_id(), result_schema(), carrier(), 1).unwrap();
+        stream.begin_schema().unwrap().complete();
+        assert_eq!(
+            schema_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Completed
+        );
+        drop(transport);
+        let queue_error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("queue closure without End must be observed"),
+        };
+        assert_eq!(
+            queue_error,
+            ResultOwnerObservation::QueueClosedBeforeEnd.into_error()
+        );
+        assert!(stream.next().await.unwrap().is_none());
+        drop(failure_sender);
+
+        let (transport, schema_receipt, _failure_sender, stream) =
+            QueryResultStream::try_channel(id.query_id(), result_schema(), carrier(), 1).unwrap();
+        drop(stream);
+        assert_eq!(
+            schema_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Dropped
+        );
+        let consumer_error = match transport.reserve_owned().await {
+            Err(error) => error,
+            Ok(_) => panic!("a closed consumer cannot receive a new queue permit"),
+        };
+        assert_eq!(
+            consumer_error,
+            ResultOwnerObservation::ConsumerClosed.into_error()
+        );
+        for error in [
+            queue_error,
+            consumer_error,
+            ResultOwnerObservation::FailureOwnerClosed.into_error(),
+        ] {
+            let input = error.execution_failure().unwrap();
+            assert_eq!(input.fact().class(), FailureClass::Control);
+            assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        }
+    }
+
+    #[test]
+    fn invalid_channel_configuration_stays_an_application_precondition() {
+        let error = match QueryResultStream::try_channel(
+            execution_id(7).query_id(),
+            result_schema(),
+            carrier(),
+            0,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("zero channel capacity violates its constructor contract"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(error.execution_failure(), None);
+        assert_eq!(error.message(), "result delivery capacity must be nonzero");
+    }
+
     #[tokio::test]
     async fn stream_failure_is_terminal_without_success_eof() {
         let id = execution_id(3);
@@ -1179,7 +1445,8 @@ mod tests {
             ResultDeliveryDisposition::Completed
         );
 
-        let expected = QueryExecutionError::new(QueryExecutionErrorKind::Failed, "attempt failed");
+        let expected =
+            client_body_error(novarocks_result_contract::ClientBodyError::InvalidRowLength);
         failure_sender.send_replace(Some(expected.clone()));
         let actual = match stream.next().await {
             Err(error) => error,
@@ -1211,6 +1478,10 @@ mod tests {
             Ok(_) => panic!("owner loss must preempt a queued success EOF"),
         };
         assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            error,
+            ResultOwnerObservation::FailureOwnerClosed.into_error()
+        );
         assert_eq!(
             eof_receipt.await.unwrap(),
             ResultDeliveryDisposition::Dropped

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::md5_shared::{self, Operation};
 
@@ -24,7 +25,7 @@ pub fn eval_md5sum_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let mut inputs = Vec::with_capacity(args.len());
     // Keep admission before evaluation of the next child, as in the original shell.
     for (idx, arg) in args.iter().enumerate() {
@@ -34,10 +35,11 @@ pub fn eval_md5sum_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             idx,
         )?);
     }
-    Ok((md5_shared::evaluate_legacy(
+    md5_shared::evaluate_required(
         Operation::Md5sumNumeric,
         &inputs,
         chunk.len(),
         arena.data_type(expr),
-    ))?)
+    )
+    .map_err(ExecutionFailure::from)
 }

@@ -16,6 +16,29 @@
 // under the License.
 //! Single build-side chunk store for hash join.
 
+use crate::runtime::fragment::ExecutionFailure;
+#[derive(Debug)]
+struct JoinStoreContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinStoreContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinStoreContract {}
+impl novarocks_failure_contract::FailureProjection for JoinStoreContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinStoreContract.reason(),
+        )
+    }
+}
+fn contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinStoreContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
@@ -146,9 +169,8 @@ impl BuildStoreBuilder {
         }
     }
 
-    pub(crate) fn push_chunk(&mut self, chunk: &Chunk) -> Result<(), String> {
+    pub(crate) fn push_chunk(&mut self, chunk: &Chunk) -> Result<(), ExecutionFailure> {
         self.push_chunk_core(chunk, None)
-            .map_err(|cause| cause.to_string())
     }
     pub(crate) fn push_chunk_owned(
         &mut self,
@@ -168,10 +190,12 @@ impl BuildStoreBuilder {
         if let Some(schema) = self.schema.as_ref() {
             validate_chunk_schema(schema, chunk)?;
         }
-        let next_rows = self
-            .row_count
-            .checked_add(chunk.len())
-            .ok_or_else(|| "join build store row count overflow".to_string())?;
+        let next_rows = self.row_count.checked_add(chunk.len()).ok_or_else(|| {
+            ExecutionFailure::from_domain(JoinStoreRows {
+                live: self.row_count,
+                incoming: chunk.len(),
+            })
+        })?;
         if let Some(owner) = owner {
             let growth = novarocks_type_contract::owned_resources::vec::push_growth(&self.batches)
                 .map_err(|cause| match cause {
@@ -209,8 +233,8 @@ impl BuildStoreBuilder {
         self.row_count
     }
 
-    pub(crate) fn finish(self) -> Result<Option<BuildStore>, String> {
-        self.finish_core(None).map_err(|cause| cause.to_string())
+    pub(crate) fn finish(self) -> Result<Option<BuildStore>, ExecutionFailure> {
+        self.finish_core(None)
     }
     pub(crate) fn finish_owned(
         self,
@@ -240,7 +264,9 @@ impl BuildStoreBuilder {
                 &arrow_schema,
                 self.batches.iter().map(ChunkBatchProjection::record_batch),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|cause| {
+                ExecutionFailure::from_domain(super::gather::GatherKernelFailure(cause))
+            })?;
             if let Some(owner) = owner {
                 // Original concat payload and its internal allocations are not
                 // relabeled as this wrapper request. Preserve actual source
@@ -276,17 +302,17 @@ impl BuildStoreBuilder {
     }
 }
 
-fn validate_chunk_schema(expected: &ChunkSchemaRef, chunk: &Chunk) -> Result<(), String> {
+fn validate_chunk_schema(expected: &ChunkSchemaRef, chunk: &Chunk) -> Result<(), ExecutionFailure> {
     let actual = chunk.chunk_schema();
     if expected.slots() == actual.slots() {
         return Ok(());
     }
     if expected.slots().len() != actual.slots().len() {
-        return Err(format!(
+        return Err(contract(format_args!(
             "join build store schema slot count mismatch: expected={} actual={}",
             expected.slots().len(),
             actual.slots().len()
-        ));
+        )));
     }
     for (idx, (expected_slot, actual_slot)) in expected
         .slots()
@@ -295,26 +321,63 @@ fn validate_chunk_schema(expected: &ChunkSchemaRef, chunk: &Chunk) -> Result<(),
         .enumerate()
     {
         if expected_slot.slot_id() != actual_slot.slot_id() {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "join build store schema slot mismatch at index {idx}: expected={} actual={}",
                 expected_slot.slot_id(),
                 actual_slot.slot_id()
-            ));
+            )));
         }
         if expected_slot.field() != actual_slot.field() {
-            return Err(format!(
+            return Err(contract(format_args!(
                 "join build store schema field mismatch at slot {}: expected={:?} actual={:?}",
                 expected_slot.slot_id(),
                 expected_slot.field(),
                 actual_slot.field()
-            ));
+            )));
         }
     }
-    Err("join build store schema mismatch".to_string())
+    Err(contract("join build store schema mismatch"))
 }
 
+#[derive(Debug)]
+struct JoinStoreRows {
+    live: usize,
+    incoming: usize,
+}
+impl std::fmt::Display for JoinStoreRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "join build store row capacity exceeded: live={} incoming={}",
+            self.live, self.incoming
+        )
+    }
+}
+impl std::error::Error for JoinStoreRows {}
+impl novarocks_failure_contract::FailureProjection for JoinStoreRows {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope,
+        };
+        FailureFact::new(
+            FailureClass::Resource,
+            crate::runtime::fragment::ExecutionReason::JoinStoreRows.reason(),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Operator),
+            constraint_scope: Some(ResourceScope::Operator),
+            dimension: ResourceDimension::Positions,
+            requested: u64::try_from(self.incoming).ok(),
+            required_growth: u64::try_from(self.incoming).ok(),
+            limit: Some(usize::MAX as u64),
+            live: u64::try_from(self.live).ok(),
+            committed: None,
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
+    use novarocks_failure_contract::FailureProjection;
     use std::sync::Arc;
 
     use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch};
@@ -379,7 +442,10 @@ mod tests {
             .push_chunk(&one_column_chunk_with_slot(SlotId(2), "k", vec![2]))
             .expect_err("slot mismatch");
 
-        assert!(err.contains("join build store schema slot mismatch"));
+        assert!(
+            err.detail()
+                .contains("join build store schema slot mismatch")
+        );
     }
 
     #[test]

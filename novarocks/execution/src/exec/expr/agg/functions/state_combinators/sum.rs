@@ -81,7 +81,7 @@ impl AggregateFunction for SumStateAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_sum_state_spec(func, input_type, input_is_intermediate, false)
     }
 
@@ -93,7 +93,7 @@ impl AggregateFunction for SumStateAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_sum_state_input_view("sum_state", spec, array)
     }
 
@@ -101,7 +101,7 @@ impl AggregateFunction for SumStateAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_sum_state_merge_view("sum_state", array)
     }
 
@@ -125,7 +125,7 @@ impl AggregateFunction for SumStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_sum_state("sum_state", spec, offset, state_ptrs, input)
     }
 
@@ -135,7 +135,7 @@ impl AggregateFunction for SumStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_sum_state("sum_state", spec, offset, state_ptrs, input)
     }
 
@@ -145,7 +145,7 @@ impl AggregateFunction for SumStateAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_sum_state_array(spec, offset, group_states)
     }
 }
@@ -156,7 +156,7 @@ impl AggregateFunction for SumStateSignedAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_sum_state_spec(func, input_type, input_is_intermediate, true)
     }
 
@@ -168,7 +168,7 @@ impl AggregateFunction for SumStateSignedAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_sum_state_input_view("sum_state_signed", spec, array)
     }
 
@@ -176,7 +176,7 @@ impl AggregateFunction for SumStateSignedAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_sum_state_merge_view("sum_state_signed", array)
     }
 
@@ -200,7 +200,7 @@ impl AggregateFunction for SumStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_sum_state("sum_state_signed", spec, offset, state_ptrs, input)
     }
 
@@ -210,7 +210,7 @@ impl AggregateFunction for SumStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_sum_state("sum_state_signed", spec, offset, state_ptrs, input)
     }
 
@@ -220,7 +220,7 @@ impl AggregateFunction for SumStateSignedAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_sum_state_array(spec, offset, group_states)
     }
 }
@@ -231,7 +231,7 @@ impl AggregateFunction for SumStateMergeAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_sum_state_merge_spec(func, input_type)
     }
 
@@ -249,7 +249,7 @@ impl AggregateFunction for SumStateMergeAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_sum_state_merge_view("sum_state_merge", array)
     }
 
@@ -257,7 +257,7 @@ impl AggregateFunction for SumStateMergeAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_sum_state_merge_view("sum_state_merge", array)
     }
 
@@ -277,12 +277,18 @@ impl AggregateFunction for SumStateMergeAgg {
         spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(spec.kind, AggKind::SumStateMerge) {
-            return Err("sum_state_merge tracker initialization kind mismatch".to_string());
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "sum_state_merge tracker initialization kind mismatch",
+                ),
+            );
         }
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked sum_state_merge requires a memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked sum_state_merge requires a memory tracker",
+            )
         })?;
         unsafe {
             ptr.cast::<SumStateMergeState>()
@@ -313,7 +319,7 @@ impl AggregateFunction for SumStateMergeAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_sum_state_opaque("sum_state_merge", spec, offset, state_ptrs, input)
     }
 
@@ -323,7 +329,7 @@ impl AggregateFunction for SumStateMergeAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_sum_state_opaque("sum_state_merge", spec, offset, state_ptrs, input)
     }
 
@@ -333,7 +339,7 @@ impl AggregateFunction for SumStateMergeAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_sum_state_merge_array(spec, offset, group_states)
     }
 }
@@ -343,7 +349,7 @@ fn build_sum_state_spec(
     input_type: Option<&DataType>,
     input_is_intermediate: bool,
     signed: bool,
-) -> Result<AggSpec, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     let name = if signed {
         "sum_state_signed"
     } else {
@@ -351,11 +357,18 @@ fn build_sum_state_spec(
     };
     let declared_arg_type = func.types.as_ref().and_then(|t| t.input_arg_type.as_ref());
     let state_kind = if input_is_intermediate {
-        let arg_type = declared_arg_type
-            .ok_or_else(|| format!("{name} merge requires original logical input type"))?;
+        let arg_type = declared_arg_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "{name} merge requires original logical input type"
+            ))
+        })?;
         sum_state_kind_from_merge_input(name, arg_type, signed)?
     } else {
-        let input_type = input_type.ok_or_else(|| format!("{name} input type missing"))?;
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "{name} input type missing"
+            ))
+        })?;
         sum_state_kind_from_logical_input(name, input_type, signed)?
     };
 
@@ -378,13 +391,19 @@ fn build_sum_state_spec(
 fn build_sum_state_merge_spec(
     func: &AggFunction,
     input_type: Option<&DataType>,
-) -> Result<AggSpec, String> {
-    let input_type = input_type.ok_or_else(|| "sum_state_merge input type missing".to_string())?;
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+    let input_type = input_type.ok_or_else(|| {
+        crate::exec::expr::agg::functions::aggregate_binding_contract(
+            "sum_state_merge input type missing",
+        )
+    })?;
     if input_type != &DataType::Binary {
-        return Err(format!(
-            "sum_state_merge input must be Binary, got {:?}",
-            input_type
-        ));
+        return Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "sum_state_merge input must be Binary, got {:?}",
+                input_type
+            )),
+        );
     }
 
     Ok(AggSpec {
@@ -400,24 +419,30 @@ fn sum_state_kind_from_logical_input(
     name: &str,
     input_type: &DataType,
     signed: bool,
-) -> Result<SumStateKind, String> {
+) -> crate::runtime::fragment::ExecutionResult<SumStateKind> {
     if signed {
         let DataType::Struct(fields) = input_type else {
-            return Err(format!(
-                "{name} expects struct input (value, change_op), got {:?}",
-                input_type
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "{name} expects struct input (value, change_op), got {:?}",
+                    input_type
+                ),
             ));
         };
         if fields.len() != 2 {
-            return Err(format!(
-                "{name} expects 2 arguments, got struct with {} fields",
-                fields.len()
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "{name} expects 2 arguments, got struct with {} fields",
+                    fields.len()
+                ),
             ));
         }
         if fields[1].data_type() != &DataType::Int8 {
-            return Err(format!(
-                "{name} change_op must be Int8, got {:?}",
-                fields[1].data_type()
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "{name} change_op must be Int8, got {:?}",
+                    fields[1].data_type()
+                ),
             ));
         }
         return sum_state_kind_from_value_type(name, fields[0].data_type());
@@ -429,15 +454,17 @@ fn sum_state_kind_from_merge_input(
     name: &str,
     input_type: &DataType,
     signed: bool,
-) -> Result<SumStateKind, String> {
+) -> crate::runtime::fragment::ExecutionResult<SumStateKind> {
     if signed
         && let DataType::Struct(fields) = input_type
         && fields.len() == 2
     {
         if fields[1].data_type() != &DataType::Int8 {
-            return Err(format!(
-                "{name} change_op must be Int8, got {:?}",
-                fields[1].data_type()
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "{name} change_op must be Int8, got {:?}",
+                    fields[1].data_type()
+                ),
             ));
         }
         return sum_state_kind_from_value_type(name, fields[0].data_type());
@@ -448,16 +475,20 @@ fn sum_state_kind_from_merge_input(
 fn sum_state_kind_from_value_type(
     name: &str,
     data_type: &DataType,
-) -> Result<SumStateKind, String> {
+) -> crate::runtime::fragment::ExecutionResult<SumStateKind> {
     match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             Ok(SumStateKind::Int64)
         }
         DataType::Decimal128(_, _) => Ok(SumStateKind::Decimal128),
         DataType::Float32 | DataType::Float64 => {
-            Err(format!("{name} does not support {data_type:?} input"))
+            Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{name} does not support {data_type:?} input"),
+            ))
         }
-        other => Err(format!("{name} unsupported input type: {other:?}")),
+        other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} unsupported input type: {other:?}"),
+        )),
     }
 }
 
@@ -479,10 +510,12 @@ fn build_sum_state_input_view<'a>(
     name: &str,
     spec: &AggSpec,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
-    let arr = array
-        .as_ref()
-        .ok_or_else(|| format!("{name} input missing"))?;
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+    let arr = array.as_ref().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+            "{name} input missing"
+        ))
+    })?;
     match &spec.kind {
         AggKind::SumStateInt64 | AggKind::SumStateDecimal128 => {
             let actual = sum_state_kind_from_value_type(name, arr.data_type())?;
@@ -492,7 +525,11 @@ fn build_sum_state_input_view<'a>(
             let actual = sum_state_kind_from_logical_input(name, arr.data_type(), true)?;
             ensure_expected_state_kind(name, &spec.kind, actual)?;
         }
-        other => return Err(format!("{name} input kind mismatch: {other:?}")),
+        other => {
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{name} input kind mismatch: {other:?}"),
+            ));
+        }
     }
     Ok(AggInputView::Any(arr))
 }
@@ -501,16 +538,22 @@ fn ensure_expected_state_kind(
     name: &str,
     kind: &AggKind,
     actual: SumStateKind,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let expected = match kind {
         AggKind::SumStateInt64 | AggKind::SumStateSignedInt64 => SumStateKind::Int64,
         AggKind::SumStateDecimal128 | AggKind::SumStateSignedDecimal128 => SumStateKind::Decimal128,
-        other => return Err(format!("{name} input kind mismatch: {other:?}")),
+        other => {
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{name} input kind mismatch: {other:?}"),
+            ));
+        }
     };
     if expected != actual {
-        return Err(format!(
-            "{name} input type does not match selected state kind: expected {:?}, got {:?}",
-            expected, actual
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "{name} input type does not match selected state kind: expected {:?}, got {:?}",
+                expected, actual
+            ),
         ));
     }
     Ok(())
@@ -519,14 +562,17 @@ fn ensure_expected_state_kind(
 fn build_sum_state_merge_view<'a>(
     name: &str,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
-    let arr = array
-        .as_ref()
-        .ok_or_else(|| format!("{name} merge input missing"))?;
-    let binary = arr
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| format!("{name} merge input must be BinaryArray"))?;
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+    let arr = array.as_ref().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+            "{name} merge input missing"
+        ))
+    })?;
+    let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+            "{name} merge input must be BinaryArray"
+        ))
+    })?;
     Ok(AggInputView::Binary(binary))
 }
 
@@ -562,16 +608,27 @@ fn add_int_delta(
     row_count_delta: i64,
     sum_delta: i64,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     unsafe {
         let next_row_count = (*state)
             .row_count
             .checked_add(row_count_delta)
-            .ok_or_else(|| format!("{context} overflow while adding row_count delta"))?;
-        let next_sum = (*state)
-            .sum
-            .checked_add(sum_delta)
-            .ok_or_else(|| format!("{context} overflow while adding sum delta"))?;
+            .ok_or_else(|| {
+                super::failure::sum_overflow(
+                    (*state).row_count as i128,
+                    row_count_delta as i128,
+                    super::failure::SumOperation::RowCount,
+                    context,
+                )
+            })?;
+        let next_sum = (*state).sum.checked_add(sum_delta).ok_or_else(|| {
+            super::failure::sum_overflow(
+                (*state).sum as i128,
+                sum_delta as i128,
+                super::failure::SumOperation::Sum,
+                context,
+            )
+        })?;
         (*state).row_count = next_row_count;
         (*state).sum = next_sum;
     }
@@ -583,16 +640,27 @@ fn add_decimal_delta(
     row_count_delta: i64,
     sum_delta: i128,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     unsafe {
         let next_row_count = (*state)
             .row_count
             .checked_add(row_count_delta)
-            .ok_or_else(|| format!("{context} overflow while adding row_count delta"))?;
-        let next_sum = (*state)
-            .sum
-            .checked_add(sum_delta)
-            .ok_or_else(|| format!("{context} overflow while adding sum delta"))?;
+            .ok_or_else(|| {
+                super::failure::sum_overflow(
+                    (*state).row_count as i128,
+                    row_count_delta as i128,
+                    super::failure::SumOperation::RowCount,
+                    context,
+                )
+            })?;
+        let next_sum = (*state).sum.checked_add(sum_delta).ok_or_else(|| {
+            super::failure::sum_overflow(
+                (*state).sum as i128,
+                sum_delta as i128,
+                super::failure::SumOperation::Sum,
+                context,
+            )
+        })?;
         (*state).row_count = next_row_count;
         (*state).sum = next_sum;
     }
@@ -605,7 +673,7 @@ fn update_sum_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match spec.kind {
         AggKind::SumStateInt64 => update_sum_state_int(name, offset, state_ptrs, input),
         AggKind::SumStateDecimal128 => update_sum_state_decimal(name, offset, state_ptrs, input),
@@ -615,7 +683,9 @@ fn update_sum_state(
         AggKind::SumStateSignedDecimal128 => {
             update_sum_state_signed_decimal(name, offset, state_ptrs, input)
         }
-        _ => Err(format!("{name} update kind mismatch")),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} update kind mismatch"),
+        )),
     }
 }
 
@@ -624,9 +694,11 @@ fn update_sum_state_int(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Any(array) = input else {
-        return Err(format!("{name} batch input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} batch input type mismatch"),
+        ));
     };
     for (row, &base) in state_ptrs.iter().enumerate() {
         if let Some(value) = int_value_at(name, array, row)? {
@@ -641,18 +713,20 @@ fn update_sum_state_decimal(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Any(array) = input else {
-        return Err(format!("{name} batch input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} batch input type mismatch"),
+        ));
     };
     let decimal = array
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "{name} expects Decimal128 input, got {:?}",
                 array.data_type()
-            )
+            ))
         })?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         if decimal.is_null(row) {
@@ -673,7 +747,7 @@ fn update_sum_state_signed_int(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let (struct_arr, value_arr, op_arr) = signed_parts(name, input)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         if struct_arr.is_null(row) {
@@ -685,9 +759,14 @@ fn update_sum_state_signed_int(
         let Some((row_count_delta, sign)) = signed_delta(name, op_arr, row)? else {
             continue;
         };
-        let sum_delta = value
-            .checked_mul(sign)
-            .ok_or_else(|| format!("{name} overflow while applying change_op"))?;
+        let sum_delta = value.checked_mul(sign).ok_or_else(|| {
+            super::failure::sum_overflow(
+                value as i128,
+                sign as i128,
+                super::failure::SumOperation::Change,
+                name,
+            )
+        })?;
         add_int_delta(
             int_state_slot(base, offset),
             row_count_delta,
@@ -703,16 +782,16 @@ fn update_sum_state_signed_decimal(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let (struct_arr, value_arr, op_arr) = signed_parts(name, input)?;
     let decimal = value_arr
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "{name} value must be Decimal128, got {:?}",
                 value_arr.data_type()
-            )
+            ))
         })?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         if struct_arr.is_null(row) || decimal.is_null(row) {
@@ -724,7 +803,14 @@ fn update_sum_state_signed_decimal(
         let sum_delta = decimal
             .value(row)
             .checked_mul(sign as i128)
-            .ok_or_else(|| format!("{name} overflow while applying change_op"))?;
+            .ok_or_else(|| {
+                super::failure::sum_overflow(
+                    decimal.value(row) as i128,
+                    sign as i128 as i128,
+                    super::failure::SumOperation::Change,
+                    name,
+                )
+            })?;
         add_decimal_delta(
             decimal_state_slot(base, offset),
             row_count_delta,
@@ -735,13 +821,19 @@ fn update_sum_state_signed_decimal(
     Ok(())
 }
 
-fn int_value_at(name: &str, array: &ArrayRef, row: usize) -> Result<Option<i64>, String> {
+fn int_value_at(
+    name: &str,
+    array: &ArrayRef,
+    row: usize,
+) -> Result<Option<i64>, crate::runtime::fragment::ExecutionFailure> {
     macro_rules! typed_value {
         ($ty:ty) => {{
-            let arr = array
-                .as_any()
-                .downcast_ref::<$ty>()
-                .ok_or_else(|| format!("failed to downcast {:?} input", array.data_type()))?;
+            let arr = array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+                    "failed to downcast {:?} input",
+                    array.data_type()
+                ))
+            })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -754,29 +846,43 @@ fn int_value_at(name: &str, array: &ArrayRef, row: usize) -> Result<Option<i64>,
         DataType::Int16 => typed_value!(Int16Array),
         DataType::Int32 => typed_value!(Int32Array),
         DataType::Int64 => typed_value!(Int64Array),
-        DataType::Float32 | DataType::Float64 => Err(format!(
-            "{name} does not support {:?} input",
-            array.data_type()
+        DataType::Float32 | DataType::Float64 => {
+            Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!("{name} does not support {:?} input", array.data_type()),
+            ))
+        }
+        other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} unsupported input type: {other:?}"),
         )),
-        other => Err(format!("{name} unsupported input type: {other:?}")),
     }
 }
 
 fn signed_parts<'a>(
     name: &str,
     input: &'a AggInputView<'a>,
-) -> Result<(&'a StructArray, &'a ArrayRef, &'a Int8Array), String> {
+) -> Result<
+    (&'a StructArray, &'a ArrayRef, &'a Int8Array),
+    crate::runtime::fragment::ExecutionFailure,
+> {
     let AggInputView::Any(array) = input else {
-        return Err(format!("{name} batch input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} batch input type mismatch"),
+        ));
     };
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| format!("{name} expects struct input"))?;
+        .ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
+                "{name} expects struct input"
+            ))
+        })?;
     if struct_arr.num_columns() != 2 {
-        return Err(format!(
-            "{name} expects 2 arguments, got {}",
-            struct_arr.num_columns()
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "{name} expects 2 arguments, got {}",
+                struct_arr.num_columns()
+            ),
         ));
     }
     let value_arr = struct_arr.column(0);
@@ -785,22 +891,28 @@ fn signed_parts<'a>(
         .as_any()
         .downcast_ref::<Int8Array>()
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "{name} change_op must be Int8, got {:?}",
                 op_arr_ref.data_type()
-            )
+            ))
         })?;
     Ok((struct_arr, value_arr, op_arr))
 }
 
-fn signed_delta(name: &str, op_arr: &Int8Array, row: usize) -> Result<Option<(i64, i64)>, String> {
+fn signed_delta(
+    name: &str,
+    op_arr: &Int8Array,
+    row: usize,
+) -> Result<Option<(i64, i64)>, crate::runtime::fragment::ExecutionFailure> {
     if op_arr.is_null(row) {
         return Ok(None);
     }
     match op_arr.value(row) {
         CHANGE_OP_INSERT => Ok(Some((1, 1))),
         CHANGE_OP_DELETE => Ok(Some((-1, -1))),
-        other => Err(format!("unknown {name} change_op: {other}")),
+        other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("unknown {name} change_op: {other}"),
+        )),
     }
 }
 
@@ -810,9 +922,11 @@ fn merge_sum_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Binary(array) = input else {
-        return Err(format!("{name} merge input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} merge input type mismatch"),
+        ));
     };
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
@@ -827,7 +941,11 @@ fn merge_sum_state(
                 let (row_count, sum) = decode_sum_decimal128(array.value(row))?;
                 add_decimal_delta(decimal_state_slot(base, offset), row_count, sum, name)?;
             }
-            _ => return Err(format!("{name} merge kind mismatch")),
+            _ => {
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    format_args!("{name} merge kind mismatch"),
+                ));
+            }
         }
     }
     Ok(())
@@ -837,8 +955,9 @@ fn build_sum_state_array(
     spec: &AggSpec,
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::BinaryOutput::default();
     for &base in group_states {
         match spec.kind {
             AggKind::SumStateInt64 | AggKind::SumStateSignedInt64 => {
@@ -846,7 +965,9 @@ fn build_sum_state_array(
                 if state.row_count == 0 && state.sum == 0 {
                     builder.append_value([]);
                 } else {
-                    builder.append_value(encode_sum_int64(state.row_count, state.sum));
+                    let bytes = encode_sum_int64(state.row_count, state.sum);
+                    extent.append(bytes.len())?;
+                    builder.append_value(bytes);
                 }
             }
             AggKind::SumStateDecimal128 | AggKind::SumStateSignedDecimal128 => {
@@ -854,10 +975,16 @@ fn build_sum_state_array(
                 if state.row_count == 0 && state.sum == 0 {
                     builder.append_value([]);
                 } else {
-                    builder.append_value(encode_sum_decimal128(state.row_count, state.sum));
+                    let bytes = encode_sum_decimal128(state.row_count, state.sum);
+                    extent.append(bytes.len())?;
+                    builder.append_value(bytes);
                 }
             }
-            _ => return Err("sum_state build array kind mismatch".to_string()),
+            _ => {
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    "sum_state build array kind mismatch",
+                ));
+            }
         }
     }
     Ok(Arc::new(builder.finish()))
@@ -869,12 +996,16 @@ fn merge_sum_state_opaque(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     if !matches!(spec.kind, AggKind::SumStateMerge) {
-        return Err(format!("{name} merge kind mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} merge kind mismatch"),
+        ));
     }
     let AggInputView::Binary(array) = input else {
-        return Err(format!("{name} merge input type mismatch"));
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!("{name} merge input type mismatch"),
+        ));
     };
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
@@ -885,7 +1016,11 @@ fn merge_sum_state_opaque(
         let mut replacement = AggregateVec::new_in(state.allocator.clone());
         replacement
             .try_reserve_exact(merged.len())
-            .map_err(|_| state.allocator.allocation_error("reserve merged sum state"))?;
+            .map_err(|source| {
+                state
+                    .allocator
+                    .allocation_error("reserve merged sum state", source)
+            })?;
         replacement.extend_from_slice(&merged);
         state.state = replacement;
     }
@@ -896,13 +1031,17 @@ fn build_sum_state_merge_array(
     spec: &AggSpec,
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if !matches!(spec.kind, AggKind::SumStateMerge) {
-        return Err("sum_state_merge build array kind mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "sum_state_merge build array kind mismatch",
+        ));
     }
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::BinaryOutput::default();
     for &base in group_states {
         let state = unsafe { &*state_merge_slot(base, offset) };
+        extent.append(state.state.len())?;
         builder.append_value(&state.state);
     }
     Ok(Arc::new(builder.finish()))
@@ -1026,7 +1165,11 @@ mod tests {
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &input).unwrap();
         }
 
-        fn try_update(&mut self, input: AggInputView<'_>, rows: usize) -> Result<(), String> {
+        fn try_update(
+            &mut self,
+            input: AggInputView<'_>,
+            rows: usize,
+        ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
             let ptr = self.ptr();
             let state_ptrs = vec![ptr; rows];
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &input)
@@ -1045,7 +1188,10 @@ mod tests {
             dead_code,
             reason = "Retained to exercise fallible aggregate state merges in focused tests."
         )]
-        fn try_merge(&mut self, input: ArrayRef) -> Result<(), String> {
+        fn try_merge(
+            &mut self,
+            input: ArrayRef,
+        ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
             let rows = input.len();
             let input_slot = Some(input);
             let view = super::super::super::build_merge_view(&self.spec, &input_slot).unwrap();
@@ -1278,7 +1424,10 @@ mod tests {
 
         let err = cell.try_update(view, 1).unwrap_err();
 
-        assert!(err.contains("unknown sum_state_signed change_op"));
+        assert!(
+            err.to_string()
+                .contains("unknown sum_state_signed change_op")
+        );
     }
 
     #[test]
@@ -1365,7 +1514,10 @@ mod tests {
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
         let err = cell.try_update(view, 1).unwrap_err();
 
-        assert!(err.contains("sum_state overflow while adding sum delta"));
+        assert!(
+            err.to_string()
+                .contains("sum_state overflow while adding sum delta")
+        );
         assert_eq!(final_int_state(&cell.finalize()), (1, i64::MAX - 1));
     }
 
@@ -1435,7 +1587,11 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(output_err.contains("state combinator output_type must be Binary"));
+        assert!(
+            output_err
+                .to_string()
+                .contains("state combinator output_type must be Binary")
+        );
 
         let intermediate_err = crate::exec::expr::agg::spec::build_spec_from_type(
             &sum_func_with_signature(
@@ -1448,7 +1604,11 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(intermediate_err.contains("state combinator intermediate_type must be Binary"));
+        assert!(
+            intermediate_err
+                .to_string()
+                .contains("state combinator intermediate_type must be Binary")
+        );
     }
 
     #[test]
@@ -1464,7 +1624,11 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(output_err.contains("state combinator output_type must be Binary"));
+        assert!(
+            output_err
+                .to_string()
+                .contains("state combinator output_type must be Binary")
+        );
 
         let intermediate_err = crate::exec::expr::agg::spec::build_spec_from_type(
             &sum_func_with_signature(
@@ -1477,7 +1641,11 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(intermediate_err.contains("state combinator intermediate_type must be Binary"));
+        assert!(
+            intermediate_err
+                .to_string()
+                .contains("state combinator intermediate_type must be Binary")
+        );
     }
 
     #[test]
@@ -1485,7 +1653,10 @@ mod tests {
         let err = SumStateAgg
             .build_spec_from_type(&sum_func("sum_state"), Some(&DataType::Float64), false)
             .unwrap_err();
-        assert!(err.contains("sum_state does not support Float64"));
+        assert!(
+            err.to_string()
+                .contains("sum_state does not support Float64")
+        );
 
         let input = Arc::new(Float64Array::from(vec![Some(1.0)])) as ArrayRef;
         let input_slot = Some(input);
@@ -1500,7 +1671,10 @@ mod tests {
             Ok(_) => panic!("sum_state float input unexpectedly built a view"),
             Err(err) => err,
         };
-        assert!(err.contains("sum_state does not support Float64"));
+        assert!(
+            err.to_string()
+                .contains("sum_state does not support Float64")
+        );
     }
 
     #[test]
@@ -1531,7 +1705,10 @@ mod tests {
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
         let err = cell.try_update(view, 1).unwrap_err();
 
-        assert!(err.contains("sum_state overflow while adding sum delta"));
+        assert!(
+            err.to_string()
+                .contains("sum_state overflow while adding sum delta")
+        );
         assert_eq!(final_decimal_state(&cell.finalize()), (1, i128::MAX - 1));
     }
 
@@ -1564,7 +1741,11 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(missing_err.contains("sum_state merge requires original logical input type"));
+        assert!(
+            missing_err
+                .to_string()
+                .contains("sum_state merge requires original logical input type")
+        );
 
         let binary_err = super::super::super::build_spec_from_type(
             &sum_func_with_arg("sum_state", DataType::Binary),
@@ -1572,6 +1753,10 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(binary_err.contains("sum_state unsupported input type: Binary"));
+        assert!(
+            binary_err
+                .to_string()
+                .contains("sum_state unsupported input type: Binary")
+        );
     }
 }

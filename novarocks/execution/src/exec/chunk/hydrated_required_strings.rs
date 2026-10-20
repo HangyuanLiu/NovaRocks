@@ -83,7 +83,10 @@ mod tests {
             storage.clone(),
         )
         .unwrap();
-        Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
             vec![array],
             2,
@@ -287,7 +290,7 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
 
-    fn masked_assertion(chunk: &Chunk) -> Result<ArrayRef, String> {
+    fn masked_assertion(chunk: &Chunk) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         use crate::exec::expr::function::FunctionKind;
         use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
         use novarocks_functions::FunctionValueType;
@@ -381,6 +384,7 @@ mod tests {
         assert!(
             masked_assertion(&typed_source(unmasked, false))
                 .unwrap_err()
+                .to_string()
                 .contains("assert_true")
         );
         drop(hydrated);

@@ -44,7 +44,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        match self.refuse {
+        match self.refuse.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -258,7 +258,7 @@ fn physical_source_author_preserves_three_typed_compile_causes_at_every_callback
         ] {
             let c = Control {
                 trace: Mutex::default(),
-                refuse: Some((at, cause)),
+                refuse: Some((at, cause.clone())),
             };
             assert!(
                 matches!(run(&a,Kind::TimeToSec,&[3],&c),Err(SourceError::Control(actual)) if actual==cause)

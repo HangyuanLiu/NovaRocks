@@ -128,7 +128,7 @@ fn check_both_traces(
             for borrowed in [false, true] {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(matches!(
                     invoke(borrowed, stream, field, ty, invoice, &control),

@@ -49,7 +49,7 @@ impl PureCompileControl for Control {
         let index = events.len();
         events.push((phase, units));
         if self.refuse == Some(index) {
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -312,9 +312,12 @@ fn candidate_complete_value_quantum_preserves_every_original_refusal_prefix_with
         CompileControlError::ResourceExhausted,
     ] {
         for index in 0..trace.len() {
-            let control = Control::at(Some(index), cause);
+            let control = Control::at(Some(index), cause.clone());
             let mut arena = make_arena();
-            assert_cause(insert(&mut arena, b.clone(), &control).unwrap_err(), cause);
+            assert_cause(
+                insert(&mut arena, b.clone(), &control).unwrap_err(),
+                cause.clone(),
+            );
             assert_eq!(control.trace(), trace[..=index]);
             assert_eq!(arena.nodes.len(), 1);
         }
@@ -340,13 +343,13 @@ fn ordinary_source_refusal_observes_its_tail_and_preserves_primary_tail_control(
         CompileControlError::ResourceExhausted,
     ] {
         for index in 0..trace.len() {
-            let control = Control::at(Some(index), cause);
+            let control = Control::at(Some(index), cause.clone());
             let mut arena = ScalarArena::with_constant_policy(policy());
             assert_cause(
                 arena
                     .intern_observed(ScalarNode::Constant(value.clone()), bad.clone(), &control)
                     .unwrap_err(),
-                cause,
+                cause.clone(),
             );
             assert_eq!(control.trace(), trace[..=index]);
             assert!(arena.nodes.is_empty());

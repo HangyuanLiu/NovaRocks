@@ -35,8 +35,8 @@ use sha2::{Digest, Sha256};
 
 use crate::LayoutIdentity;
 
-const MAX_SLOT_METADATA_DEPTH: usize = 64;
-const MAX_SLOT_METADATA_NODES: usize = 65_536;
+pub(crate) const MAX_SLOT_METADATA_DEPTH: usize = 64;
+pub(crate) const MAX_SLOT_METADATA_NODES: usize = 65_536;
 
 /// Semantic slot facts that Arrow fields do not fully represent. An absent
 /// unique ID is a known absence, distinct from an unspecified slot record.
@@ -68,7 +68,7 @@ pub struct StaticLayout {
     storage: ValueTypeStorageLifetime,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayoutError {
     ArityMismatch,
     DuplicateSlot,
@@ -80,6 +80,9 @@ pub enum LayoutError {
     ValueBindingMismatch,
     TypedProjectionRequiresOwner,
     AllocationModel,
+    ValueType(novarocks_type_contract::ExecutionValueTypeError),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    Encoding(novarocks_failure_contract::SharedFailureCause),
 }
 
 impl fmt::Display for LayoutError {
@@ -97,19 +100,63 @@ impl fmt::Display for LayoutError {
             Self::ValueBindingMismatch => "static layout conflicts with its explicit value binding",
             Self::TypedProjectionRequiresOwner => "typed static layout projection requires the creating owner's storage and request port",
             Self::AllocationModel => "static layout allocation request cannot be represented",
+            Self::ValueType(source) => return source.fmt(formatter),
+            Self::Resource(source) => return source.fmt(formatter),
+            Self::Encoding(source) => return source.fmt(formatter),
         })
     }
 }
 
-impl std::error::Error for LayoutError {}
+impl std::error::Error for LayoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ValueType(source) => Some(source),
+            Self::Resource(source) => Some(source),
+            Self::Encoding(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// A compilation failure keeps its original control cause separate from layout
 /// diagnostics. These APIs authorize neither allocation nor retained memory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayoutCompileError {
     Layout(LayoutError),
     Control(CompileControlError),
 }
+#[derive(Debug)]
+struct LayoutEncodingFailure(serde_json::Error);
+impl fmt::Display for LayoutEncodingFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "canonical layout encoding failed: {}", self.0)
+    }
+}
+impl std::error::Error for LayoutEncodingFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for LayoutEncodingFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        FailureFact::new(
+            FailureClass::Unexpected,
+            FailureReason::new(
+                domain::LOCAL_PROGRAM,
+                std::num::NonZeroU16::new(211).unwrap(),
+            ),
+        )
+    }
+}
+impl LayoutError {
+    fn encoding(source: serde_json::Error) -> Self {
+        Self::Encoding(novarocks_failure_contract::SharedFailureCause::new(
+            LayoutEncodingFailure(source),
+        ))
+    }
+}
+
 impl From<LayoutError> for LayoutCompileError {
     fn from(error: LayoutError) -> Self {
         Self::Layout(error)
@@ -121,15 +168,15 @@ impl From<CompileControlError> for LayoutCompileError {
     }
 }
 impl From<novarocks_type_contract::ExecutionValueTypeError> for LayoutCompileError {
-    fn from(_: novarocks_type_contract::ExecutionValueTypeError) -> Self {
-        Self::Layout(LayoutError::ValueBindingMismatch)
+    fn from(source: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::Layout(LayoutError::ValueType(source))
     }
 }
 impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
     for LayoutCompileError
 {
-    fn from(_: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
-        Self::Layout(LayoutError::AllocationModel)
+    fn from(source: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Layout(LayoutError::Resource(source))
     }
 }
 impl fmt::Display for LayoutCompileError {
@@ -983,12 +1030,10 @@ impl StaticLayout {
         &self,
         work: &mut LayoutWork<'_>,
     ) -> Result<LayoutIdentity, LayoutCompileError> {
-        let schema = work.opaque(|| {
-            serde_json::to_value(self.schema.as_ref()).map_err(|_| LayoutError::Encode)
-        })?;
+        let schema = work
+            .opaque(|| serde_json::to_value(self.schema.as_ref()).map_err(LayoutError::encoding))?;
         let schema = canonicalize_json(schema, work)?;
-        let schema =
-            work.opaque(|| serde_json::to_vec(&schema).map_err(|_| LayoutError::Encode))?;
+        let schema = work.opaque(|| serde_json::to_vec(&schema).map_err(LayoutError::encoding))?;
         let mut digest = Sha256::new();
         digest.update(b"novarocks-static-layout-v2");
         digest.update((schema.len() as u64).to_le_bytes());
@@ -1346,12 +1391,12 @@ mod tests {
         for cause in causes() {
             for prefix in 0..trace.len() {
                 let stopped = OriginalControl {
-                    stop: Some((prefix, cause)),
+                    stop: Some((prefix, cause.clone())),
                     ..OriginalControl::default()
                 };
                 assert_eq!(
                     execution.writer_projection_matches_for_compile(&provider, &stopped),
-                    Err(LayoutCompileError::Control(cause))
+                    Err(LayoutCompileError::Control(cause.clone()))
                 );
                 assert_eq!(
                     stopped.trace.lock().unwrap().as_slice(),
@@ -1682,7 +1727,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let index = trace.len();
             trace.push((phase, units));
-            if let Some((at, cause)) = self.stop
+            if let Some((at, cause)) = self.stop.clone()
                 && at == index
             {
                 return Err(cause);
@@ -1800,7 +1845,7 @@ mod tests {
             for entry in 0..4 {
                 let control = OriginalControl {
                     trace: Default::default(),
-                    stop: Some((0, cause)),
+                    stop: Some((0, cause.clone())),
                 };
                 let result = match entry {
                     0 => StaticLayout::try_new_for_compile(schema.clone(), slots.clone(), &control)
@@ -1823,7 +1868,7 @@ mod tests {
                         .map(|_| ()),
                     _ => layout.identity_for_compile(&control).map(|_| ()),
                 };
-                assert_eq!(result, Err(LayoutCompileError::Control(cause)));
+                assert_eq!(result, Err(LayoutCompileError::Control(cause.clone())));
                 assert_eq!(
                     *control.trace.lock().unwrap(),
                     vec![(CompilePhase::LowerProgram, 0)]
@@ -1846,7 +1891,7 @@ mod tests {
             for at in [1, trace.len() - 1] {
                 let control = OriginalControl {
                     trace: Default::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(StaticLayout::try_new_for_compile(schema.clone(), slots.clone(), &control), Err(LayoutCompileError::Control(actual)) if actual == cause)
@@ -1896,7 +1941,7 @@ mod tests {
         for cause in causes() {
             let control = OriginalControl {
                 trace: Default::default(),
-                stop: Some((1, cause)),
+                stop: Some((1, cause.clone())),
             };
             assert!(
                 matches!(StaticLayout::try_new_for_compile(schema.clone(), Arc::from([]), &control), Err(LayoutCompileError::Control(actual)) if actual == cause)
@@ -1907,7 +1952,7 @@ mod tests {
             );
             let control = OriginalControl {
                 trace: Default::default(),
-                stop: Some((trace.len() - 1, cause)),
+                stop: Some((trace.len() - 1, cause.clone())),
             };
             assert!(
                 matches!(layout.project_by_slots_for_compile(&[SlotId::new(99)], &control), Err(LayoutCompileError::Control(actual)) if actual == cause)
@@ -1923,7 +1968,7 @@ mod tests {
         for cause in causes() {
             let control = OriginalControl {
                 trace: Default::default(),
-                stop: Some((1, cause)),
+                stop: Some((1, cause.clone())),
             };
             assert!(
                 matches!(layout.project_by_slots_for_compile(&[], &control), Err(LayoutCompileError::Control(actual)) if actual == cause)
@@ -1963,11 +2008,11 @@ mod tests {
             for at in [quantum, tail] {
                 let control = OriginalControl {
                     trace: Default::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     layout.identity_for_compile(&control),
-                    Err(LayoutCompileError::Control(cause))
+                    Err(LayoutCompileError::Control(cause.clone()))
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             }
@@ -2007,7 +2052,7 @@ mod tests {
         for cause in causes() {
             let control = OriginalControl {
                 trace: Default::default(),
-                stop: Some((quantum, cause)),
+                stop: Some((quantum, cause.clone())),
             };
             assert_eq!(
                 compile(&control, |work| sort_entries(&mut entries(), work)),

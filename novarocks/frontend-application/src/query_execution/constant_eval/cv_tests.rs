@@ -526,10 +526,21 @@ fn checked_decimal_error_remains_ordinary_evaluation_while_policy_null_is_succes
                     .unwrap()
             );
         } else {
-            let Err(SqlConstantEvaluationError::Evaluation(message)) = result else {
-                panic!("ordinary runtime error");
+            let Err(SqlConstantEvaluationError::Source(source)) = result else {
+                panic!("typed data evaluation source");
             };
-            assert!(message.contains("'add' operation involving decimal values overflows"));
+            use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+            assert_eq!(source.failure_fact().class(), FailureClass::Data);
+            assert!(
+                source
+                    .detail()
+                    .contains("'add' operation involving decimal values overflows")
+            );
+            assert!(
+                source
+                    .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
+                    .is_some()
+            );
         }
     }
 }
@@ -546,7 +557,7 @@ impl PureCompileControl for Control {
         let mut checks = self.checks.lock().unwrap();
         let index = checks.len();
         checks.push(units);
-        if let Some((at, cause)) = self.fail_at
+        if let Some((at, cause)) = self.fail_at.clone()
             && at == index
         {
             return Err(cause);
@@ -570,7 +581,7 @@ fn assert_all_callbacks(
     ] {
         for at in 0..trace.len() {
             let refusing = Control {
-                fail_at: Some((at, cause)),
+                fail_at: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert!(
@@ -639,7 +650,8 @@ fn ordinary_kernel_error_and_nonnullable_decline_observe_exact_original_completi
     assert_all_callbacks(&request, |result| {
         assert!(matches!(
             result,
-            Err(SqlConstantEvaluationError::Evaluation(_))
+            Err(SqlConstantEvaluationError::Source(source))
+            if novarocks_execution_contract::failure::FailureProjection::failure_fact(source).class() == novarocks_execution_contract::failure::FailureClass::Data
         ))
     });
     let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
@@ -734,6 +746,37 @@ fn malformed_selected_utf8_bytes_decline_without_constructing_invalid_str() {
     }
 }
 
+fn assert_regexp_count_literal_regex_syntax_source(error: &SqlConstantEvaluationError) {
+    use novarocks_failure_contract::FailureProjection;
+    let SqlConstantEvaluationError::Source(source) = error else {
+        panic!("literal regexp_count preserves its typed source: {error:?}");
+    };
+    assert_eq!(
+        source.failure_fact(),
+        novarocks_functions::DataFailureReason::InvalidValue.failure_fact(),
+        "literal regex syntax keeps its exact originating data fact"
+    );
+    let original = source
+        .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
+        .expect("the FE bridge retains the original execution failure");
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(original);
+    let mut has_regex_syntax = false;
+    while let Some(current) = cause {
+        if matches!(
+            current.downcast_ref::<regex::Error>(),
+            Some(regex::Error::Syntax(_))
+        ) {
+            has_regex_syntax = true;
+            break;
+        }
+        cause = current.source();
+    }
+    assert!(
+        has_regex_syntax,
+        "the original regex::Error::Syntax remains in the source chain: {error:?}"
+    );
+}
+
 #[test]
 fn regexp_count_fold_receipt_reuses_literal_error_null_and_selected_pool_contract() {
     use novarocks_type_contract::RegexpCountPatternSource as Source;
@@ -761,8 +804,14 @@ fn regexp_count_fold_receipt_reuses_literal_error_null_and_selected_pool_contrac
     let error = constant_evaluator()
         .eval_scalar(&request, &TestControl)
         .unwrap_err();
+    assert_regexp_count_literal_regex_syntax_source(&error);
+    let SqlConstantEvaluationError::Source(source) = &error else {
+        unreachable!("the exact typed source was checked above");
+    };
     assert!(
-        matches!(error, SqlConstantEvaluationError::Evaluation(ref message) if message.starts_with("Invalid regex expression: [0-9.")),
+        source
+            .detail()
+            .starts_with("Invalid regex expression: [0-9."),
         "{error:?}"
     );
     request.args[0] = arg(Arc::new(StringArray::from(vec![None::<&str>])), true);
@@ -799,7 +848,16 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
             let result = constant_evaluator().eval_scalar(request, control);
             if matches!(&request.kind, FoldNodeKind::Function { name } if name.eq_ignore_ascii_case("regexp_count"))
             {
-                let failed = matches!(&result, Err(SqlConstantEvaluationError::Evaluation(message)) if message.starts_with("Invalid regex expression:"));
+                let failed = if let Err(error) = &result {
+                    assert_regexp_count_literal_regex_syntax_source(error);
+                    let SqlConstantEvaluationError::Source(source) = error else {
+                        unreachable!("the exact typed source was checked above");
+                    };
+                    assert!(source.detail().starts_with("Invalid regex expression:"));
+                    true
+                } else {
+                    false
+                };
                 SEEN.lock()
                     .unwrap()
                     .push((request.regexp_count_pattern_source, failed));
@@ -854,7 +912,8 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
     );
     assert!(
         seen.iter()
-            .all(|row| *row == (Some(Source::NativeV1Utf8LiteralWhenPresent), true))
+            .all(|row| *row == (Some(Source::NativeV1Utf8LiteralWhenPresent), true)),
+        "the fold author must preserve the exact emitted source and typed decline: {seen:?}"
     );
     assert!(owner.plan().fragments().values().any(|fragment| fragment.expressions().iter().any(|(_,expression)| matches!(&expression.kind,novarocks_physical_plan::ExprKind::FunctionCall {function,..} if function.function_id.as_str()=="builtin.scalar/regexp_count/v1"))), "failed literal evaluation must retain the actual call, never fold to NULL");
 }

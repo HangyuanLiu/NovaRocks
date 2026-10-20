@@ -42,8 +42,8 @@ pub fn format_sec_to_time(seconds: i64) -> String {
     format!("{sign}{hour:02}:{minute:02}:{second:02}")
 }
 
-pub(super) fn evaluate_sec_to_time<'a>(
-    input: CalendarInput<'_, 'a>,
+pub(super) fn evaluate_sec_to_time<'a, E>(
+    input: CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
@@ -135,30 +135,27 @@ impl KernelEvaluationControl for LegacyControl {
 }
 /// Preserve the raw v1 admission diagnostic and actual output carrier.
 /// The arena shell still owns child evaluation and its original indexing panic.
-pub fn evaluate_legacy_sec_to_time(array: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn evaluate_legacy_sec_to_time(array: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
     array
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "sec_to_time expects int".to_string())?;
+        .ok_or_else(|| invalid("sec_to_time expects int"))?;
     let types = [FunctionArgumentType::Value(FunctionValueType::new(
         DataType::Int64,
         true,
     ))];
     let args = [EvaluatedArgument::Column(array)];
     let target = FunctionValueType::new(DataType::Utf8, true);
-    let input = CalendarInput {
+    let input: CalendarInput<'_, '_> = CalendarInput {
         types: &types,
         carrier: &DataType::Utf8,
         target: &target,
         arguments: &args,
         selected: Selection::all(array.len()),
-        row_error_boundary: None,
-        carrier_error_boundary: None,
+        row_error_port: None,
         legacy: true,
     };
-    evaluate_sec_to_time(input, &LegacyControl)
-        .map(|values| values.values().clone())
-        .map_err(|error| error.to_string())
+    evaluate_sec_to_time(input, &LegacyControl).map(|values| values.values().clone())
 }
 #[cfg(test)]
 #[path = "calendar_sec_to_time_tests.rs"]

@@ -113,7 +113,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push(units);
-        if let Some((failure_at, cause)) = self.failure
+        if let Some((failure_at, cause)) = self.failure.clone()
             && at == failure_at
         {
             return Err(cause);
@@ -306,7 +306,7 @@ fn every_actual_small_callback_preserves_three_primary_causes_and_caller_tail() 
     assert_eq!(trace, [0, 0, 1, 3]);
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert_eq!(append_in_scope(&control), Err(cause.into()));
             assert_eq!(control.trace(), trace[..=at]);
         }
@@ -395,7 +395,7 @@ fn hand_cumulative_requests_exact_and_one_under_preserve_actual_prefix_and_hook_
     assert_eq!(
         reserve_for_push_in::<_, ControlResourceError>(
             &mut values,
-            &mut |_| Err(ordinary),
+            &mut |_| Err(ordinary.clone()),
             &mut work,
         ),
         Err(ordinary)
@@ -543,7 +543,7 @@ fn boxing_each_actual_callback_preserves_three_causes_and_original_caller_scope(
         assert_eq!(trace, [0, 0, 1, 0]);
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert_eq!(boxing_in_scope(spare, &control), Err(cause.into()));
                 assert_eq!(control.trace(), trace[..=at]);
             }
@@ -622,7 +622,8 @@ fn boxing_closed_elements_drop_once_on_parent_control_errors_and_final_owner_dro
                     drops: drops.clone(),
                 });
             }
-            let control = failure.map_or_else(Control::default, |at| Control::refusing(at, cause));
+            let control =
+                failure.map_or_else(Control::default, |at| Control::refusing(at, cause.clone()));
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             let result =
                 boxed_slice_in::<_, ControlResourceError>(source, &mut |_| Ok(()), &mut work);
@@ -651,8 +652,11 @@ fn boxing_closed_elements_drop_once_on_parent_control_errors_and_final_owner_dro
     let control = Control::refusing(1, CompileControlError::Cancelled);
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let ordinary = ControlResourceError::SourceModel("actual boxing caller source refusal");
-    let result =
-        boxed_slice_in::<_, ControlResourceError>(source, &mut |_| Err(ordinary), &mut work);
+    let result = boxed_slice_in::<_, ControlResourceError>(
+        source,
+        &mut |_| Err(ordinary.clone()),
+        &mut work,
+    );
     assert!(matches!(result, Err(error) if error == ordinary));
     assert_eq!(control.trace(), [0]);
     assert_eq!(drops.load(Ordering::SeqCst), 1);

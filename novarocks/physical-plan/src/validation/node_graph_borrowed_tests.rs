@@ -53,7 +53,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after first refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -177,7 +177,7 @@ fn prefixes<T>(call: impl Fn(&Control) -> Result<T, ControlResourceError>) {
     assert_eq!(trace[0], 0);
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::at(at, cause);
+            let control = Control::at(at, cause.clone());
             assert!(
                 matches!(call(&control), Err(ControlResourceError::Control(actual)) if actual == cause)
             );
@@ -464,7 +464,7 @@ fn borrowed_graph_actual_320_definitions_keep_source_order_and_all_growth_on_one
     // actual beginning/interior/tail callbacks, not invented per-node probes.
     for at in [0, trace.len() / 2, trace.len() - 1] {
         for cause in CAUSES {
-            let control = Control::at(at, cause);
+            let control = Control::at(at, cause.clone());
             assert_eq!(
                 borrowed_events(&fragment, &control, None),
                 Err(cause.into())

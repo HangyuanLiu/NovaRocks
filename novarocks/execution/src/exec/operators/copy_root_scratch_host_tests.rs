@@ -18,7 +18,8 @@
 //! Root scratch probes borrow the ACTUAL production opaque/tracker adapter.
 //! These assertions cover root plan vectors only, not all recursive scratch,
 //! Arrow output, RSS, or formal query memory settlement.
-use super::{MemTracker, expression_allocation_host};
+use super::MemTracker;
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
 use novarocks_functions::selected_copy::{
     CopyError, TakeRootScratchFacts, preflight_take, preflight_take_root_scratch_in,
@@ -199,15 +200,19 @@ fn by_copy_root_scratch_host_actual_capacity_refusal_is_not_layout_permission() 
         .install_limit_once(i64::try_from(facts.bytes() - 1).unwrap())
         .unwrap();
     let control = Control::new(Arc::clone(&tracker), None);
-    assert!(matches!(
-        preflight_take_root_scratch_in(
-            array.as_ref(),
-            &indices,
-            expression_allocation_host(Arc::clone(&tracker)),
-            &control
-        ),
-        Err(CopyError::Control(KernelFailure::ResourceExhausted))
-    ));
+    let Err(CopyError::Control(refusal)) = preflight_take_root_scratch_in(
+        array.as_ref(),
+        &indices,
+        expression_allocation_host(Arc::clone(&tracker)),
+        &control,
+    ) else {
+        panic!("the real root scratch capacity must refuse before its plan");
+    };
+    super::opaque_memory_host_tests::assert_tracker_refusal(
+        &refusal,
+        i64::try_from(facts.bytes() - 1).unwrap(),
+        Some(facts.bytes() as u64),
+    );
     assert_eq!(
         control.trace(),
         vec![(0, 0), (0, 0)],

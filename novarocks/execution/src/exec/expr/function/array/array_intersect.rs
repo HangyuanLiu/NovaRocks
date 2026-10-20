@@ -30,7 +30,9 @@ use crc32c::crc32c_append;
 use hashbrown::HashMap;
 
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use novarocks_types::largeint;
 
@@ -187,7 +189,7 @@ fn decimalv2_crc_hash(value: i128) -> u32 {
     hash.rotate_left(16)
 }
 
-fn value_key(values: &ArrayRef, idx: usize) -> Result<IntersectValue, String> {
+fn value_key(values: &ArrayRef, idx: usize) -> ExecutionResult<IntersectValue> {
     match values.data_type() {
         DataType::Boolean => {
             let arr = values.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -265,22 +267,21 @@ fn value_key(values: &ArrayRef, idx: usize) -> Result<IntersectValue, String> {
             let arr = values
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "array_intersect failed to downcast LARGEINT values".to_string())?;
-            let decoded = largeint::i128_from_be_bytes(arr.value(idx))
-                .map_err(|e| format!("array_intersect LARGEINT decode failed: {e}"))?;
+                .ok_or_else(|| {
+                    expression_contract("array_intersect failed to downcast LARGEINT values")
+                })?;
+            let decoded =
+                largeint::i128_from_be_bytes(arr.value(idx)).map_err(ExecutionFailure::from)?;
             Ok(IntersectValue::LargeInt(decoded))
         }
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => Ok(
             IntersectValue::GenericHash(hash_complex_value(values, idx)?),
         ),
-        other => Err(format!(
-            "array_intersect unsupported hash key type: {:?}",
-            other
-        )),
+        other => Err(super::common::unsupported_comparison(other, false)),
     }
 }
 
-fn hash_complex_value(values: &ArrayRef, idx: usize) -> Result<u64, String> {
+fn hash_complex_value(values: &ArrayRef, idx: usize) -> ExecutionResult<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hash_complex_value_impl(values, idx, &mut hasher)?;
     Ok(hasher.finish())
@@ -290,7 +291,7 @@ fn hash_complex_value_impl(
     values: &ArrayRef,
     idx: usize,
     hasher: &mut std::collections::hash_map::DefaultHasher,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     if super::common::is_logically_null(values.as_ref(), idx) {
         0u8.hash(hasher);
         return Ok(());
@@ -302,7 +303,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to BooleanArray"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -310,7 +311,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Int8Array"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -318,7 +319,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Int16Array"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -326,7 +327,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Int32Array"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -334,7 +335,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Int64Array"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -342,7 +343,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Float32Array"))?
                 .value(idx)
                 .to_bits()
                 .hash(hasher);
@@ -351,7 +352,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Float64Array"))?
                 .value(idx)
                 .to_bits()
                 .hash(hasher);
@@ -360,7 +361,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to StringArray"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -368,7 +369,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Date32Array"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -376,7 +377,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to Decimal128Array"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -384,7 +385,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<TimestampSecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to TimestampSecondArray"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -392,7 +393,9 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast to TimestampMillisecondArray")
+                })?
                 .value(idx)
                 .hash(hasher);
         }
@@ -400,7 +403,9 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast to TimestampMicrosecondArray")
+                })?
                 .value(idx)
                 .hash(hasher);
         }
@@ -408,7 +413,9 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?
+                .ok_or_else(|| {
+                    expression_contract("failed to downcast to TimestampNanosecondArray")
+                })?
                 .value(idx)
                 .hash(hasher);
         }
@@ -416,7 +423,7 @@ fn hash_complex_value_impl(
             values
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?
+                .ok_or_else(|| expression_contract("failed to downcast to FixedSizeBinaryArray"))?
                 .value(idx)
                 .hash(hasher);
         }
@@ -424,7 +431,7 @@ fn hash_complex_value_impl(
             let list = values
                 .as_any()
                 .downcast_ref::<ListArray>()
-                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast to ListArray"))?;
             let offsets = list.value_offsets();
             let start = offsets[idx] as usize;
             let end = offsets[idx + 1] as usize;
@@ -438,7 +445,7 @@ fn hash_complex_value_impl(
             let s = values
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast to StructArray"))?;
             s.num_columns().hash(hasher);
             for col_idx in 0..s.num_columns() {
                 hash_complex_value_impl(s.column(col_idx), idx, hasher)?;
@@ -448,7 +455,7 @@ fn hash_complex_value_impl(
             let map = values
                 .as_any()
                 .downcast_ref::<MapArray>()
-                .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+                .ok_or_else(|| expression_contract("failed to downcast to MapArray"))?;
             let offsets = map.value_offsets();
             let start = offsets[idx] as usize;
             let end = offsets[idx + 1] as usize;
@@ -461,10 +468,7 @@ fn hash_complex_value_impl(
             }
         }
         other => {
-            return Err(format!(
-                "array_intersect hash unsupported type: {:?}",
-                other
-            ));
+            return Err(super::common::unsupported_comparison(other, false));
         }
     }
     Ok(())
@@ -481,31 +485,40 @@ pub fn eval_array_intersect<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() < 2 {
-        return Err(("array_intersect expects at least two arguments".to_string()).into());
+        return Err(expression_contract(
+            "array_intersect expects at least two arguments",
+        ));
     }
 
     let mut list_arrays = Vec::with_capacity(args.len());
     for arg in args {
         let arr = arena.eval(*arg, chunk)?;
         arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_intersect expects ListArray, got {:?}",
                 arr.data_type()
-            )
+            ))
         })?;
+        super::common::validate_rows(arr.len(), chunk.len(), "array_intersect source")?;
         list_arrays.push(arr);
     }
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list_arrays[0].data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_intersect output must be List, got {other:?}"
+            )));
+        }
+        None => match list_arrays[0].data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("array_intersect output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "array_intersect output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
@@ -532,7 +545,7 @@ pub fn eval_array_intersect<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let mut offsets = Vec::with_capacity(chunk.len() + 1);
     offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
@@ -608,28 +621,35 @@ pub fn eval_array_intersect<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             .collect::<Vec<_>>();
         matched.sort_unstable();
         for (_, first_idx) in matched {
+            let next =
+                novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
             mutable.extend(0, first_idx, first_idx + 1);
-            current += 1;
+            current = next;
         }
         if let Some(first_null_index) = shared_null_index {
             // Copy the existing NULL rather than requiring a physical validity
             // buffer, which NullArray deliberately does not carry.
+            let next =
+                novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
             mutable.extend(0, first_null_index, first_null_index + 1);
-            current += 1;
-        }
-        if current > i32::MAX as i64 {
-            return Err(("array_intersect offset overflow".to_string()).into());
+            current = next;
         }
         offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let list = ListArray::new(
+    let list = ListArray::try_new(
         output_field,
         OffsetBuffer::new(offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_intersect constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(list) as ArrayRef)
 }

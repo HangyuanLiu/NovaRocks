@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::ArrayRef;
 use std::collections::HashMap;
 
@@ -45,16 +47,19 @@ pub fn eval_matching_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let canonical = MATCHING_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "ilike" => Ok((super::ilike::eval_ilike(arena, expr, args, chunk))?),
-        "regexp" => Ok((super::regexp::eval_regexp(arena, expr, args, chunk))?),
-        other => Err((format!("unsupported matching function: {}", other)).into()),
+        "ilike" => super::ilike::eval_ilike(arena, expr, args, chunk),
+        "regexp" => super::regexp::eval_regexp(arena, expr, args, chunk),
+        other => Err(expression_contract(format_args!(
+            "unsupported matching function: {}",
+            other
+        ))),
     }
 }
 

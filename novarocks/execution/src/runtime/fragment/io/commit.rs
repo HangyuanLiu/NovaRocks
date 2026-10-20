@@ -40,15 +40,28 @@ pub struct FragmentCommitReport {
 /// A registration owned by the application host for one fragment instance.
 ///
 /// Dropping an active lease rolls the registration back. `finish` transfers
-/// its facts to the host and prevents a second rollback.
+/// its facts to the host and prevents a second rollback. Settlement closes
+/// registration mutation permission before its operation starts. Every later
+/// operation must return a typed invariant refusal; only final owner Drop remains.
+/// A completed operation does not prove that the owner Box has exited.
 pub trait FragmentCommitLease: Send {
-    fn add_load_stats(&mut self, stats: FragmentSinkLoadStats);
-    fn add_tablet_commit_info(&mut self, info: TabletCommitInfo) -> Result<(), String>;
-    fn add_tablet_fail_info(&mut self, info: TabletFailInfo) -> Result<(), String>;
-    fn finish(self: Box<Self>) -> Result<FragmentCommitReport, String>;
+    fn add_load_stats(
+        &mut self,
+        stats: FragmentSinkLoadStats,
+    ) -> crate::runtime::fragment::ExecutionResult<()>;
+    fn add_tablet_commit_info(
+        &mut self,
+        info: TabletCommitInfo,
+    ) -> crate::runtime::fragment::ExecutionResult<()>;
+    fn add_tablet_fail_info(
+        &mut self,
+        info: TabletFailInfo,
+    ) -> crate::runtime::fragment::ExecutionResult<()>;
+    // Operations borrow the original owner; its final Box Drop is a separate exit phase.
+    fn finish(&mut self) -> crate::runtime::fragment::ExecutionResult<FragmentCommitReport>;
     /// Transfer the registered facts to the host's later lifecycle finalizer.
-    fn handoff(self: Box<Self>) -> Result<(), String>;
-    fn rollback(self: Box<Self>) -> Result<(), String>;
+    fn handoff(&mut self) -> crate::runtime::fragment::ExecutionResult<()>;
+    fn rollback(&mut self) -> crate::runtime::fragment::ExecutionResult<()>;
 }
 
 /// Application-owned admission for fragment commit/report facts.
@@ -59,7 +72,7 @@ pub trait FragmentCommitPort: Send + Sync + 'static {
     fn acquire(
         &self,
         fragment_instance_id: UniqueId,
-    ) -> Result<Box<dyn FragmentCommitLease>, String>;
+    ) -> crate::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>>;
 }
 
 #[derive(Debug, Default)]
@@ -69,7 +82,7 @@ impl FragmentCommitPort for UnavailableFragmentCommitPort {
     fn acquire(
         &self,
         _fragment_instance_id: UniqueId,
-    ) -> Result<Box<dyn FragmentCommitLease>, String> {
-        Err("fragment commit port is unavailable".to_string())
+    ) -> crate::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>> {
+        Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into())
     }
 }

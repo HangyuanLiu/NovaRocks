@@ -111,7 +111,7 @@ pub(super) fn evaluate<'a>(
             project_observed(argument.array(), Some(target.data_type()), &mut observer).map_err(
                 |e| match e {
                     MapEntriesFailure::Control(cause) => cause,
-                    MapEntriesFailure::Data(text) => internal(&text),
+                    MapEntriesFailure::Operation(cause) => cause,
                 },
             )?;
         let mut indices = reserve::<Option<u64>>(selection.len(), &work)?;

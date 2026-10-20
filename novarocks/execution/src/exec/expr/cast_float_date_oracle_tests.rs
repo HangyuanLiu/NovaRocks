@@ -95,7 +95,7 @@ fn compare_value(
         Err(message) => match new {
             CastRowResult::RowError(error) => {
                 assert_eq!(error.selected_ordinal(), ordinal);
-                assert_eq!(error.message(), message);
+                assert_eq!(error.message(), (message).detail());
             }
             other => panic!("original strict error {message:?} was changed to {other:?}"),
         },

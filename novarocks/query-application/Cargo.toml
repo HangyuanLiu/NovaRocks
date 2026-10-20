@@ -11,6 +11,7 @@ workspace = true
 mem-1-m07-exact-mysql-write = []
 
 [dependencies]
+novarocks-function-contract.workspace = true
 novarocks-failpoint = { workspace = true }
 novarocks-type-contract.workspace = true
 arrow.workspace = true

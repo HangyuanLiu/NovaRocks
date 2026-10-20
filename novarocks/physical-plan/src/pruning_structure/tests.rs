@@ -47,7 +47,7 @@ impl PureCompileControl for Control {
         assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
         self.work.lock().unwrap().push(units);
         if (!self.positive_only || units > 0)
-            && let Some(failure) = self.failure
+            && let Some(failure) = self.failure.clone()
         {
             Err(failure)
         } else {
@@ -1071,16 +1071,16 @@ fn entry_and_midwork_control_errors_remain_outer_and_typed() {
         CompileControlError::ResourceExhausted,
     ] {
         let control = Control {
-            failure: Some(failure),
+            failure: Some(failure.clone()),
             ..Default::default()
         };
         assert_eq!(
             PruningDomainStructure::try_new(&package, &witness, &control).unwrap_err(),
-            PruningStructureError::Control(failure)
+            PruningStructureError::Control(failure.clone())
         );
         assert_eq!(*control.work.lock().unwrap(), [0]);
         let control = Control {
-            failure: Some(failure),
+            failure: Some(failure.clone()),
             positive_only: true,
             ..Default::default()
         };
@@ -1278,7 +1278,7 @@ fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_first_positive_
     ] {
         for positive_only in [false, true] {
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive_only,
                 ..Default::default()
             };
@@ -1289,27 +1289,27 @@ fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_first_positive_
                     &control,
                 )
                 .unwrap_err(),
-                FrozenPruningError::Control(failure)
+                FrozenPruningError::Control(failure.clone())
             );
             assert_eq!(
                 *control.work.lock().unwrap(),
                 if positive_only { vec![0, 256] } else { vec![0] }
             );
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive_only,
                 ..Default::default()
             };
             assert_eq!(
                 table.dynamic_items_observed(&control).unwrap_err(),
-                FrozenPruningError::Control(failure)
+                FrozenPruningError::Control(failure.clone())
             );
             assert_eq!(
                 *control.work.lock().unwrap(),
                 if positive_only { vec![0, 256] } else { vec![0] }
             );
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive_only,
                 ..Default::default()
             };
@@ -1317,7 +1317,7 @@ fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_first_positive_
             input.pruning = table.clone();
             assert_eq!(
                 FragmentPackage::try_new(input, package_admission(), &control).unwrap_err(),
-                FragmentPackageError::Control(failure)
+                FragmentPackageError::Control(failure.clone())
             );
             let work = control.work.lock().unwrap();
             assert_eq!(work.first(), Some(&0));

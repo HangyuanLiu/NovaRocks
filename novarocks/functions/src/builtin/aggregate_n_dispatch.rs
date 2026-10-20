@@ -23,7 +23,7 @@ use super::aggregate_n_largeint::{
 };
 use super::aggregate_n_largeint_emission::NEmissionAccess;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::ScalarStateError;
+
 use crate::kernel_control::invalid;
 use crate::*;
 use arrow_array::ArrayRef;
@@ -68,8 +68,8 @@ impl NEmissionAccess for NProfileState {
     }
     fn with_core(
         &self,
-        operation: impl FnOnce(&PhysicalState<HostAggregateAllocator>) -> Result<(), ScalarStateError>,
-    ) -> Result<(), ScalarStateError> {
+        operation: impl FnOnce(&PhysicalState<HostAggregateAllocator>) -> Result<(), KernelFailure>,
+    ) -> Result<(), KernelFailure> {
         match self {
             Self::LargeInt(state) => state.with_core(operation),
             Self::Physical(_) => Err(mismatch().into()),

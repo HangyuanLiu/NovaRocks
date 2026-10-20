@@ -64,7 +64,7 @@ fn run(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     match name {
         "bit_shift_left" => eval_bit_shift_left(arena, expr, args, chunk),
         "bit_shift_right" => eval_bit_shift_right(arena, expr, args, chunk),
@@ -76,7 +76,7 @@ fn evaluate(
     name: &'static str,
     inputs: Vec<ArrayRef>,
     output: Option<DataType>,
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let (mut arena, args, chunk) = fixture(inputs);
     let expr = output.map_or(ExprId(usize::MAX), |ty| {
         arena.push_typed(
@@ -257,18 +257,14 @@ fn legacy_shift_raw_full_argument_and_output_errors_use_original_arrow_source() 
             } else {
                 vec![counts(vec![Some(1)]), bad]
             };
-            assert_eq!(
-                evaluate(name, inputs, None).unwrap_err(),
-                format!("{name}: failed to cast arg{index} to BIGINT: {cause}")
-            );
+            let error = evaluate(name, inputs, None).unwrap_err();
+            assert_arrow_cause(&error, &cause);
         }
         let target = unsupported().data_type().clone();
         let raw: ArrayRef = counts(vec![Some(1)]);
         let cause = cast(&raw, &target).unwrap_err();
-        assert_eq!(
-            evaluate(name, vec![raw, counts(vec![Some(0)])], Some(target)).unwrap_err(),
-            format!("{name}: failed to cast output: {cause}")
-        );
+        let error = evaluate(name, vec![raw, counts(vec![Some(0)])], Some(target)).unwrap_err();
+        assert_arrow_cause(&error, &cause);
     }
 }
 #[test]
@@ -278,10 +274,10 @@ fn legacy_shift_raw_evaluates_right_child_before_left_conversion_failure() {
         let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Int64);
         let expected = arena.eval(missing, &chunk).unwrap_err();
         args.push(missing);
-        assert_eq!(
-            run(name, &arena, ExprId(usize::MAX), &args, &chunk).unwrap_err(),
-            expected
-        );
+        let observed = run(name, &arena, ExprId(usize::MAX), &args, &chunk).unwrap_err();
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(observed.failure_fact(), expected.failure_fact());
+        assert_eq!(observed.detail(), expected.detail());
     }
 }
 #[test]
@@ -299,4 +295,17 @@ fn legacy_shift_raw_empty_args_keep_original_index_panic() {
             .unwrap();
         assert_eq!(text, "index out of bounds: the len is 0 but the index is 0");
     }
+}
+
+fn assert_arrow_cause(
+    error: &crate::runtime::fragment::ExecutionFailure,
+    expected: &arrow::error::ArrowError,
+) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    let mut source: &dyn std::error::Error = error;
+    while !source.is::<arrow::error::ArrowError>() {
+        source = source.source().unwrap();
+    }
+    assert_eq!(source.to_string(), expected.to_string());
 }

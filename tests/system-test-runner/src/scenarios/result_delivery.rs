@@ -20,6 +20,7 @@ use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation, TextR
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::ServerHandle;
+use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
 use novarocks_proto_models::{novarocks as proto, result as result_proto};
 use prost::Message;
 use serde::Deserialize;
@@ -75,6 +76,26 @@ struct RefusalManifest {
     path: String,
     cases: Vec<RefusalCase>,
     health: HealthQuery,
+    identity_refusal: IdentityRefusalFreeze,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityRefusalFreeze {
+    class: String,
+    domain: u16,
+    reason: u16,
+    evidence: String,
+    safe_detail: String,
+    ack_receipt: bool,
+    resource_facts: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum RefusalResponseContract {
+    TypedIdentityRefusal,
+    MalformedNoBody,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -85,6 +106,7 @@ struct RefusalCase {
     kind: String,
     wanted_sequence: u64,
     grpc_status: u16,
+    response_contract: RefusalResponseContract,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +157,83 @@ fn refusal_request(
     })
 }
 
+// This independent response oracle does not call the Root response decoder.
+// Transport status alone cannot prove the owning channel's typed refusal.
+fn assert_root_refusal_response(
+    case: &RefusalCase,
+    request: &proto::FetchRootResultRequest,
+    response: &super::native_trust::GrpcProbe,
+) -> Result<()> {
+    ensure!(
+        response.http_status == 200 && response.grpc_status == Some(case.grpc_status),
+        "root refusal transport status differs from its frozen case"
+    );
+    let body = response
+        .response_body
+        .as_deref()
+        .context("root refusal requires the original bounded response body observation")?;
+    ensure!(
+        body.len() <= 4096,
+        "root refusal response exceeds the original probe cap"
+    );
+    match case.response_contract {
+        RefusalResponseContract::MalformedNoBody => {
+            ensure!(
+                case.grpc_status == 3 && body.is_empty(),
+                "malformed request must return grpc3 without a business response"
+            );
+        }
+        RefusalResponseContract::TypedIdentityRefusal => {
+            ensure!(
+                case.grpc_status == 0,
+                "a legal request uses its typed owner refusal"
+            );
+            ensure!(
+                body.len() >= 5 && body[0] == 0,
+                "root refusal requires one complete uncompressed gRPC frame"
+            );
+            let length = u32::from_be_bytes(body[1..5].try_into()?) as usize;
+            ensure!(
+                body[5..].len() == length,
+                "root refusal has a truncated or additional frame"
+            );
+            let decoded = proto::FetchRootResultResponse::decode(&body[5..])?;
+            ensure!(
+                decoded.root_task == request.root_task
+                    && decoded.profile_id == request.profile_id
+                    && decoded.output_kind == request.output_kind,
+                "typed refusal changed the original exact root/profile/purpose binding"
+            );
+            let Some(proto::fetch_root_result_response::Result::Refused(refused)) = decoded.result
+            else {
+                anyhow::bail!(
+                    "legal foreign-root request must return Refused, without a reply/ACK or deferral"
+                );
+            };
+            let fact = novarocks_task_codec::status::decode_failure_fact(
+                refused
+                    .fact
+                    .as_ref()
+                    .context("typed root refusal omitted its domain fact")?,
+                novarocks_proto_codec::FieldPath::root("independent_root_refusal").field("fact"),
+            )?;
+            let expected = FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(43).unwrap()),
+            );
+            ensure!(
+                fact == expected,
+                "owning channel identity refusal lost its exact originating fact or invented resources: {fact:?}"
+            );
+            ensure!(
+                refused.safe_detail == "root read was refused by its owning channel",
+                "owning channel refusal changed its fixed safe description"
+            );
+        }
+    }
+    Ok(())
+}
+
 struct RootReadRefusal;
 
 impl Scenario for RootReadRefusal {
@@ -157,13 +256,28 @@ impl Scenario for RootReadRefusal {
             "root refusal requires native 1FE+3BE"
         );
         let manifest: RefusalManifest = serde_json::from_str(include_str!(
-            "../../../../docs/testing/mem-1-m07/inputs/root-read-refusal-freeze-v1.json"
+            "../../../../docs/testing/mem-1-m07/inputs/root-read-refusal-freeze-v2.json"
         ))?;
         ensure!(
-            manifest.schema_version == 1
+            manifest.schema_version == 2
                 && manifest.topology == "1FE+3BE"
                 && !manifest.scope.is_empty()
                 && manifest.cases.len() == 7
+                && manifest
+                    .cases
+                    .iter()
+                    .filter(|case| case.response_contract
+                        == RefusalResponseContract::TypedIdentityRefusal)
+                    .count()
+                    == 1
+                && manifest.identity_refusal.class == "Data"
+                && manifest.identity_refusal.domain == domain::WORKER.get()
+                && manifest.identity_refusal.reason == 43
+                && manifest.identity_refusal.evidence == "Originating"
+                && manifest.identity_refusal.safe_detail
+                    == "root read was refused by its owning channel"
+                && !manifest.identity_refusal.ack_receipt
+                && !manifest.identity_refusal.resource_facts
                 && manifest.path == "/novarocks.NovaRocksGrpc/FetchRootResult",
             "unsupported root refusal manifest"
         );
@@ -172,14 +286,14 @@ impl Scenario for RootReadRefusal {
         let root_task = foreign_root_task();
         let mut observations = Vec::new();
         for case in &manifest.cases {
-            let payload = refusal_request(case, &root_task)?.encode_to_vec();
+            let request = refusal_request(case, &root_task)?;
+            let payload = request.encode_to_vec();
             let mut frame = vec![0];
             frame.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
             frame.extend_from_slice(&payload);
             let response =
                 super::native_trust::bounded_authenticated_probe(context, &manifest.path, &frame)?;
-            let matches =
-                response.http_status == 200 && response.grpc_status == Some(case.grpc_status);
+            let checked = assert_root_refusal_response(case, &request, &response);
             observations.push(serde_json::json!({"expected":case,"response":response,"request_bytes":frame.len()}));
             std::fs::write(
                 context
@@ -188,9 +302,10 @@ impl Scenario for RootReadRefusal {
                 serde_json::to_vec_pretty(&observations)?,
             )?;
             ensure!(
-                matches,
-                "root read refusal differs from frozen case {}",
-                case.name
+                checked.is_ok(),
+                "root read refusal differs from frozen case {}: {:?}",
+                case.name,
+                checked.err()
             );
         }
         let before = (0..3)
@@ -1300,5 +1415,133 @@ mod census_tests {
         rows[0] = available;
         rows[1]["value"] = json!(-1);
         assert!(root_census(&rows).is_err());
+    }
+}
+
+#[cfg(test)]
+mod root_refusal_v2_tests {
+    use super::*;
+
+    fn freeze() -> RefusalManifest {
+        serde_json::from_str(include_str!(
+            "../../../../docs/testing/mem-1-m07/inputs/root-read-refusal-freeze-v2.json"
+        ))
+        .unwrap()
+    }
+    fn captured(message: proto::FetchRootResultResponse) -> super::super::native_trust::GrpcProbe {
+        let payload = message.encode_to_vec();
+        let mut frame = vec![0];
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&payload);
+        super::super::native_trust::GrpcProbe {
+            http_status: 200,
+            grpc_status: Some(0),
+            grpc_message: None,
+            response_body: Some(frame),
+        }
+    }
+    fn refused(request: &proto::FetchRootResultRequest) -> proto::FetchRootResultResponse {
+        proto::FetchRootResultResponse {
+            root_task: request.root_task.clone(),
+            profile_id: request.profile_id,
+            output_kind: request.output_kind.clone(),
+            result: Some(proto::fetch_root_result_response::Result::Refused(
+                proto::RootReadRefusal {
+                    fact: Some(novarocks_task_codec::status::encode_failure_fact(
+                        FailureFact::new(
+                            FailureClass::Data,
+                            FailureReason::new(
+                                domain::WORKER,
+                                std::num::NonZeroU16::new(43).unwrap(),
+                            ),
+                        ),
+                    )),
+                    safe_detail: "root read was refused by its owning channel".into(),
+                },
+            )),
+        }
+    }
+    #[test]
+    fn legal_foreign_root_requires_complete_original_typed_identity_refusal() {
+        let freeze = freeze();
+        assert_eq!(freeze.schema_version, 2);
+        let case = &freeze.cases[0];
+        assert_eq!(
+            case.response_contract,
+            RefusalResponseContract::TypedIdentityRefusal
+        );
+        let request = refusal_request(case, &foreign_root_task()).unwrap();
+        let original = refused(&request);
+        assert!(assert_root_refusal_response(case, &request, &captured(original.clone())).is_ok());
+        for mode in 0..6 {
+            let mut changed = original.clone();
+            match mode {
+                0 => changed.profile_id = 2,
+                1 => changed.root_task.as_mut().unwrap().task_id += 1,
+                2 => changed.result = None,
+                3 => {
+                    let Some(proto::fetch_root_result_response::Result::Refused(value)) =
+                        changed.result.as_mut()
+                    else {
+                        unreachable!()
+                    };
+                    value.fact = None;
+                }
+                4 => {
+                    let Some(proto::fetch_root_result_response::Result::Refused(value)) =
+                        changed.result.as_mut()
+                    else {
+                        unreachable!()
+                    };
+                    value.fact.as_mut().unwrap().reason.as_mut().unwrap().code = 44;
+                }
+                _ => {
+                    let Some(proto::fetch_root_result_response::Result::Refused(value)) =
+                        changed.result.as_mut()
+                    else {
+                        unreachable!()
+                    };
+                    value.safe_detail = "foreign Display is not the safe owner summary".into();
+                }
+            }
+            assert!(
+                assert_root_refusal_response(case, &request, &captured(changed)).is_err(),
+                "accepted mutation {mode}"
+            );
+        }
+        let mut unknown = captured(original.clone());
+        unknown.response_body = None;
+        assert!(assert_root_refusal_response(case, &request, &unknown).is_err());
+        let mut empty = captured(original.clone());
+        empty.response_body = Some(Vec::new());
+        assert!(assert_root_refusal_response(case, &request, &empty).is_err());
+        let mut suffix = captured(original);
+        suffix
+            .response_body
+            .as_mut()
+            .unwrap()
+            .extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert!(assert_root_refusal_response(case, &request, &suffix).is_err());
+    }
+    #[test]
+    fn all_six_malformed_requests_keep_grpc3_and_no_business_body() {
+        let freeze = freeze();
+        for case in &freeze.cases[1..] {
+            assert_eq!(
+                case.response_contract,
+                RefusalResponseContract::MalformedNoBody
+            );
+            assert_eq!(case.grpc_status, 3);
+            let request = refusal_request(case, &foreign_root_task()).unwrap();
+            let mut response = super::super::native_trust::GrpcProbe {
+                http_status: 200,
+                grpc_status: Some(3),
+                grpc_message: None,
+                response_body: Some(Vec::new()),
+            };
+            assert!(assert_root_refusal_response(case, &request, &response).is_ok());
+            response.response_body = captured(refused(&request)).response_body;
+            assert!(assert_root_refusal_response(case, &request, &response).is_err());
+        }
     }
 }

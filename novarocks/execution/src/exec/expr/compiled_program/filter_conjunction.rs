@@ -74,8 +74,8 @@ impl CompiledFilterConjunctionInstance {
             let mut roots = Vec::with_capacity(predicates.len());
             let mut actual_input = None;
             for (ordinal, definition) in predicates.iter().enumerate() {
-                let ordinal =
-                    u32::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?;
+                let ordinal = novarocks_local_program::checked_program_ordinal(ordinal)
+                    .map_err(KernelFailure::from_domain)?;
                 let site = ProgramExpressionRootSite::Node {
                     node,
                     role: if scan {

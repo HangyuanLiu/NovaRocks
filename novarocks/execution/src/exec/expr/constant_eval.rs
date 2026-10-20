@@ -21,8 +21,11 @@
 use arrow::array::{ArrayRef, UInt32Array};
 use novarocks_functions::{ConstantValue, selected_copy::preflight_broadcast};
 
-pub(super) fn broadcast(value: &ConstantValue, rows: usize) -> Result<ArrayRef, String> {
-    broadcast_body(value, rows, None, None).map_err(|error| error.to_string())
+pub(super) fn broadcast(
+    value: &ConstantValue,
+    rows: usize,
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    broadcast_body(value, rows, None, None)
 }
 /// Same immutable ordinal/index/take operation under its actual constructor.
 /// The caller keeps the source pool's finite storage through any array aliases.
@@ -77,21 +80,9 @@ fn broadcast_body(
     // callers use the same actual indices and sole structural take author.
     if owners.is_none() {
         preflight_broadcast(source.as_ref(), value.ordinal(), rows, |_| Ok(()))
-            .map_err(|error| error.to_string())?;
+            .map_err(constant_copy_failure)?;
     }
-    let mut indices = if let Some((owner, _)) = owners {
-        owner.request(
-            std::alloc::Layout::array::<u32>(rows)
-                .map_err(|_| novarocks_functions::KernelFailure::ResourceExhausted)?,
-        )?;
-        let mut indices = Vec::new();
-        indices
-            .try_reserve_exact(rows)
-            .map_err(|_| novarocks_functions::KernelFailure::ResourceExhausted)?;
-        indices
-    } else {
-        Vec::with_capacity(rows)
-    };
+    let mut indices = constant_indices(rows, owners.map(|(owner, _)| owner))?;
     indices.resize(rows, value.ordinal());
     if let Some((temporary, _)) = owners {
         let mut request = |layout| temporary.request(layout);
@@ -144,8 +135,11 @@ fn broadcast_body(
         )
         .map_err(copy_failure)?;
     }
-    let output = arrow::compute::take(source.as_ref(), &indices, None)
-        .map_err(|error| format!("constant pool broadcast failed: {error}"))?;
+    let output = arrow::compute::take(source.as_ref(), &indices, None).map_err(|source| {
+        crate::runtime::fragment::ExecutionFailure::from_domain(ConstantBroadcastFailure::Arrow(
+            source,
+        ))
+    })?;
     if let Some(control) = control {
         control.checkpoint(0)?;
     }
@@ -158,28 +152,178 @@ fn broadcast_body(
     Ok(output)
 }
 
+fn constant_indices(
+    rows: usize,
+    owner: Option<&dyn crate::exec::pipeline::operator::InputConstructionOwner>,
+) -> crate::runtime::fragment::ExecutionResult<Vec<u32>> {
+    let layout = std::alloc::Layout::array::<u32>(rows).map_err(|source| {
+        crate::runtime::fragment::ExecutionFailure::from_domain(
+            ConstantBroadcastFailure::IndexBacking { rows, source },
+        )
+    })?;
+    if let Some(owner) = owner {
+        owner.request(layout)?;
+    }
+    let mut indices = Vec::new();
+    indices.try_reserve_exact(rows).map_err(|source| {
+        crate::runtime::fragment::ExecutionFailure::from_domain(
+            novarocks_functions::allocation_failure::AllocationRefusal::new(
+                "reserve constant broadcast indices",
+                source,
+            ),
+        )
+    })?;
+    Ok(indices)
+}
+
 fn copy_failure(
     failure: novarocks_functions::selected_copy::CopyConstructionError<
         crate::exec::pipeline::operator::ConstructionFailure,
     >,
 ) -> crate::runtime::fragment::ExecutionFailure {
     use crate::exec::pipeline::operator::ConstructionFailure;
-    use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+    use novarocks_functions::selected_copy::CopyConstructionError;
     match failure {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
-        CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
-        CopyConstructionError::Copy(CopyError::Extent) => {
-            novarocks_functions::KernelFailure::ResourceExhausted.into()
+        CopyConstructionError::Copy(source) => constant_copy_failure(source),
+    }
+}
+fn constant_copy_failure(
+    source: novarocks_functions::selected_copy::CopyError,
+) -> crate::runtime::fragment::ExecutionFailure {
+    match source {
+        novarocks_functions::selected_copy::CopyError::Control(cause) => cause.into(),
+        source => crate::runtime::fragment::ExecutionFailure::from_domain(
+            ConstantBroadcastFailure::Copy(source),
+        ),
+    }
+}
+
+/// This boundary broadcasts one checked constant-pool value. A refusal of
+/// its whole-copy geometry is distinct from the actual creator's capacity
+/// error and from the caller's original control failure.
+#[derive(Debug)]
+enum ConstantBroadcastFailure {
+    IndexBacking {
+        rows: usize,
+        source: std::alloc::LayoutError,
+    },
+    Copy(novarocks_functions::selected_copy::CopyError),
+    Arrow(arrow::error::ArrowError),
+}
+impl std::fmt::Display for ConstantBroadcastFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexBacking { rows, source } => write!(
+                f,
+                "constant broadcast index backing requires {} bytes: {source}",
+                *rows as u128 * std::mem::size_of::<u32>() as u128,
+            ),
+            Self::Copy(source) => source.fmt(f),
+            Self::Arrow(source) => write!(f, "constant pool broadcast failed: {source}"),
         }
-        CopyConstructionError::Copy(CopyError::Invalid(message)) => {
-            ConstructionFailure::InvalidSource(message.to_owned()).into()
+    }
+}
+impl std::error::Error for ConstantBroadcastFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IndexBacking { source, .. } => Some(source),
+            Self::Copy(source) => Some(source),
+            Self::Arrow(source) => Some(source),
         }
-        CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
-            ConstructionFailure::InvalidSource(format!(
-                "constant broadcast carrier {ty:?} is unsupported"
-            ))
-            .into()
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ConstantBroadcastFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        match self {
+            Self::IndexBacking { rows, .. } => {
+                novarocks_functions::allocation_failure::rust_array_backing_failure_fact(
+                    ExecutionReason::ConstantBroadcastIndexBacking.reason(),
+                    *rows as u128 * std::mem::size_of::<u32>() as u128,
+                    novarocks_failure_contract::RepresentationBoundary::SingleOutput,
+                )
+            }
+            Self::Copy(source) => source.failure_fact(),
+            Self::Arrow(_) => FailureFact::new(
+                FailureClass::Invariant,
+                ExecutionReason::ConstantBroadcastArrow.reason(),
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    use novarocks_functions::{KernelFailure, selected_copy::CopyError};
+    #[test]
+    fn constant_index_backing_retains_actual_layout_source_before_any_allocation() {
+        use std::error::Error;
+        let failure = constant_indices(usize::MAX, None).unwrap_err();
+        let fact = failure.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(
+            fact.reason(),
+            crate::runtime::fragment::ExecutionReason::ConstantBroadcastIndexBacking.reason()
+        );
+        let extent = fact.representation().unwrap();
+        assert_eq!(extent.required, None);
+        assert_eq!(extent.extent_limit, Some(isize::MAX as u64));
+        assert_eq!(extent.boundary, RepresentationBoundary::SingleOutput);
+        assert!(fact.resource().is_none());
+        let mut source = failure.source();
+        let mut original_layout = false;
+        while let Some(actual) = source {
+            original_layout |= actual.is::<std::alloc::LayoutError>();
+            source = actual.source();
+        }
+        assert!(original_layout);
+        assert_eq!(constant_indices(0, None).unwrap().capacity(), 0);
+    }
+    #[test]
+    fn constant_adapter_forwards_real_copy_geometry_instead_of_inventing_its_boundary() {
+        let source = arrow::array::StringArray::from(vec![Some("xy")]);
+        let error = novarocks_functions::selected_copy::preflight_broadcast(
+            &source,
+            0,
+            i32::MAX as usize,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        let expected = error.failure_fact();
+        let failure = constant_copy_failure(error);
+        assert_eq!(failure.failure_fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Representation);
+        assert_eq!(
+            expected.representation().unwrap().boundary,
+            RepresentationBoundary::SingleOutput
+        );
+        let source = arrow::array::Int64Array::from(vec![1]);
+        let error =
+            novarocks_functions::selected_copy::preflight_broadcast(&source, 0, usize::MAX, |_| {
+                Ok(())
+            })
+            .unwrap_err();
+        let expected = error.failure_fact();
+        let failure = constant_copy_failure(error);
+        assert_eq!(failure.failure_fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Representation);
+        let extent = expected.representation().unwrap();
+        assert_eq!(extent.layout.code.get(), 80);
+        assert_eq!(extent.required, None);
+        assert_eq!(extent.extent_limit, Some(isize::MAX as u64));
+        assert_eq!(extent.boundary, RepresentationBoundary::SingleOutput);
+        assert!(expected.resource().is_none());
+
+        let failure = constant_copy_failure(CopyError::Control(KernelFailure::ResourceExhausted));
+        assert_eq!(
+            failure.failure_fact(),
+            KernelFailure::ResourceExhausted.failure_fact()
+        );
+        assert_eq!(failure.failure_fact().representation(), None);
     }
 }

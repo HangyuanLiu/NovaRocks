@@ -126,10 +126,15 @@ fn ds_hll_local_stage_after_dop_one_original_raw_and_empty_two_driver_lifecycle(
         ));
         operator.set_mem_tracker(tracker.clone());
         operator.prepare().expect("prepare actual aggregate schema");
-        let processor = operator.as_processor_mut().unwrap();
-        processor.push_chunk(&state, source).unwrap();
-        processor.set_finishing(&state).unwrap();
-        let result = processor.pull_chunk(&state).unwrap().unwrap();
+        let mut processor =
+            crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
+        processor.input_without_output(source).unwrap();
+        processor.signal_eos().unwrap();
+        let result = processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             result
                 .record_batch()
@@ -140,6 +145,7 @@ fn ds_hll_local_stage_after_dop_one_original_raw_and_empty_two_driver_lifecycle(
                 .value(0),
             100_093
         );
+        drop(processor);
         drop(operator);
         assert!(
             tracker.current() > 0,
@@ -194,22 +200,32 @@ fn ds_hll_local_stage_after_actual_partial_and_final_cancel_first_cause_no_repla
         operator.set_mem_tracker(tracker.clone());
         operator.prepare().expect("prepare actual aggregate schema");
         let creator_bytes = tracker.current();
-        let processor = operator.as_processor_mut().unwrap();
-        processor.push_chunk(&state, first.clone()).unwrap();
-        assert!(tracker.current() > 0);
-        phase.error.set_error("local aggregate actual task stop");
-        let primary = processor.push_chunk(&state, first.clone()).unwrap_err();
-        assert_eq!(
-            primary.cause(),
-            &crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+        let mut processor = crate::exec::pipeline::test_driver::TestDriver::with_control(
+            operator.as_mut(),
+            phase.error.clone(),
         );
+        processor.input_without_output(first.clone()).unwrap();
+        assert!(tracker.current() > 0);
+        let originating =
+            crate::runtime::fragment::ExecutionFailure::from(KernelFailure::ResourceExhausted);
+        phase.error.set_error(originating.clone());
+        let primary = processor.input_without_output(first.clone()).unwrap_err();
+        assert!(primary.same_occurrence(&originating));
+        assert_eq!(primary.context(), originating.context());
+        // The local driver preserves its already known originating cause.
+        assert!(phase.error.error().unwrap().same_occurrence(&originating));
         assert_eq!(tracker.current(), creator_bytes);
-        assert!(processor.is_finished());
-        assert!(!processor.need_input());
-        assert!(!processor.has_output());
-        assert_eq!(processor.push_chunk(&state, first).unwrap_err(), primary);
-        assert_eq!(processor.set_finishing(&state).unwrap_err(), primary);
-        assert_eq!(processor.pull_chunk(&state).unwrap_err(), primary);
+        assert_eq!(processor.drive().unwrap_err(), primary);
+        assert_eq!(processor.input_without_output(first).unwrap_err(), primary);
+        assert_eq!(processor.signal_eos().unwrap_err(), primary);
+        assert_eq!(
+            processor
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .unwrap_err(),
+            primary
+        );
+        drop(processor);
         drop(operator);
         drop(partial_output);
         drop(source);

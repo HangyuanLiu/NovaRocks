@@ -25,12 +25,13 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{NullBuffer, OffsetBuffer};
+use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use novarocks_types::SlotId;
 use std::{collections::HashMap, sync::Arc};
 fn setup(
     mut columns: Vec<ArrayRef>,
     rows: usize,
-) -> Result<(ExprArena, Vec<ExprId>, Chunk), String> {
+) -> crate::runtime::fragment::ExecutionResult<(ExprArena, Vec<ExprId>, Chunk)> {
     if columns.is_empty() {
         columns.push(Arc::new(Int32Array::from(vec![0; rows])))
     }
@@ -56,7 +57,7 @@ fn array(
     columns: Vec<ArrayRef>,
     rows: usize,
     output: Option<DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let empty = columns.is_empty();
     let (mut arena, mut ids, chunk) = setup(columns, rows)?;
     if empty {
@@ -89,7 +90,10 @@ fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bo
         false,
     ))
 }
-fn lookup(columns: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn lookup(
+    columns: Vec<ArrayRef>,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = columns[0].len();
     let (mut arena, ids, chunk) = setup(columns, rows)?;
     let id = match output {
@@ -157,11 +161,11 @@ fn original_array_literal_row_major_null_elements_and_raw_coercion() {
 #[test]
 fn original_array_literal_inferred_null_output_errors_precede_child_eval() {
     assert_eq!(
-        array(vec![], 2, None).unwrap_err(),
+        (array(vec![], 2, None).unwrap_err()).to_string(),
         "array_expr output type must be List, got Null"
     );
     assert_eq!(
-        array(vec![], 2, Some(DataType::Int32)).unwrap_err(),
+        (array(vec![], 2, Some(DataType::Int32)).unwrap_err()).to_string(),
         "array_expr output type must be List, got Int32"
     );
     // ExprArena::push infers Null; that output is read before the invalid child id.
@@ -171,7 +175,7 @@ fn original_array_literal_inferred_null_output_errors_precede_child_eval() {
         elements: ids.clone(),
     });
     assert_eq!(
-        super::array_expr::eval_array_expr(&arena, id, &ids, &chunk).unwrap_err(),
+        (super::array_expr::eval_array_expr(&arena, id, &ids, &chunk).unwrap_err()).to_string(),
         "array_expr output type must be List, got Null"
     );
 }
@@ -190,11 +194,12 @@ fn map_null_probe_duplicate_key_parent_null_and_invalid_key_refusal() {
         Some(vec![true, true, false]),
     );
     assert_eq!(
-        lookup(
+        (lookup(
             vec![m, Arc::new(Int32Array::from(vec![None, Some(2), None]))],
             None,
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "map key type is nullable"
     );
     let valid = map(
@@ -257,7 +262,7 @@ fn original_map_raw_third_flag_and_full_carrier_errors() {
         Some(vec![true, false]),
     );
     assert_eq!(
-        lookup(
+        (lookup(
             vec![
                 m.clone(),
                 Arc::new(Int32Array::from(vec![2, 2])),
@@ -265,7 +270,8 @@ fn original_map_raw_third_flag_and_full_carrier_errors() {
             ],
             None
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "Key not present in map"
     );
     assert_eq!(
@@ -283,7 +289,7 @@ fn original_map_raw_third_flag_and_full_carrier_errors() {
         vec![None, None]
     );
     assert_eq!(
-        lookup(
+        (lookup(
             vec![
                 m,
                 Arc::new(Int32Array::from(vec![1, 2])),
@@ -291,18 +297,20 @@ fn original_map_raw_third_flag_and_full_carrier_errors() {
             ],
             None
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "element_at check flag must be BOOLEAN"
     );
     assert_eq!(
-        lookup(
+        (lookup(
             vec![
                 Arc::new(Int32Array::from(vec![1])),
                 Arc::new(Int32Array::from(vec![1]))
             ],
             None
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "element_at expects MapArray, got Int32"
     );
 }
@@ -315,7 +323,7 @@ fn map_null_keys_are_rejected_and_value_key_type_mismatch_remains_explicit() {
         None,
     );
     assert_eq!(
-        lookup(vec![m, Arc::new(NullArray::new(1))], None).unwrap_err(),
+        (lookup(vec![m, Arc::new(NullArray::new(1))], None).unwrap_err()).to_string(),
         "map key type is nullable"
     );
     let m = map(
@@ -325,7 +333,7 @@ fn map_null_keys_are_rejected_and_value_key_type_mismatch_remains_explicit() {
         None,
     );
     assert_eq!(
-        lookup(vec![m, Arc::new(Int32Array::from(vec![1]))], None).unwrap_err(),
+        (lookup(vec![m, Arc::new(Int32Array::from(vec![1]))], None).unwrap_err()).to_string(),
         "map key type mismatch: Utf8 vs Int32"
     );
 }
@@ -385,9 +393,12 @@ fn original_map_constructor_rejects_null_keys_without_widening_its_output_contra
                 .expect("a NULL map key must return an explicit failure instead of panicking");
         let error =
             result.expect_err("a NULL map key cannot widen the frozen non-null key contract");
-        assert!(
-            error.to_ascii_lowercase().contains("key")
-                && error.to_ascii_lowercase().contains("null"),
+        assert_eq!(
+            error.failure_fact(),
+            FailureFact::new(
+                FailureClass::Data,
+                crate::runtime::fragment::ExecutionReason::MapNullKey.reason(),
+            ),
             "{error}"
         );
     }
@@ -484,7 +495,33 @@ fn original_map_constructor_keeps_eager_child_failure_before_own_key_failure() {
         },
         target,
     );
-    assert_eq!(arena.eval(call, &chunk).unwrap_err(), original);
+    let failure = arena.eval(call, &chunk).unwrap_err();
+    for error in [&original, &failure] {
+        assert_eq!(
+            error.failure_fact(),
+            FailureFact::new(
+                FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::ChunkMissingSlot.reason(),
+            )
+        );
+        let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = error.cause() else {
+            panic!("the eager value child must retain its original chunk-access cause: {error:?}");
+        };
+        assert_eq!(
+            source.downcast_ref::<crate::exec::chunk::ChunkAccessFailure>(),
+            Some(&crate::exec::chunk::ChunkAccessFailure::MissingSlot {
+                slot: SlotId::new(999),
+                columns: 1,
+            })
+        );
+        assert_eq!(
+            error.detail(),
+            "slot id 999 not found in chunk (num_columns=1)"
+        );
+        assert_eq!(error.context(), None);
+    }
+    // Separate evaluations produce separate failures even when every fact agrees.
+    assert!(!failure.same_occurrence(&original));
 }
 
 #[test]

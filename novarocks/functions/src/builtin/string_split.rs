@@ -33,18 +33,12 @@ pub enum Observation {
     OpaqueBoundary,
 }
 #[derive(Debug)]
-pub enum CoreError {
+enum SplitContract {
     FirstStringRequired,
     SecondStringRequired,
     LengthMismatch,
-    Kernel(KernelFailure),
 }
-impl From<KernelFailure> for CoreError {
-    fn from(cause: KernelFailure) -> Self {
-        Self::Kernel(cause)
-    }
-}
-impl std::fmt::Display for CoreError {
+impl std::fmt::Display for SplitContract {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FirstStringRequired => {
@@ -54,22 +48,52 @@ impl std::fmt::Display for CoreError {
                 f.write_str("split: second argument must be a string array")
             }
             Self::LengthMismatch => f.write_str("split: argument length mismatch"),
-            Self::Kernel(cause) => write!(f, "{cause}"),
         }
     }
+}
+impl std::error::Error for SplitContract {}
+impl novarocks_failure_contract::FailureProjection for SplitContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(368).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for SplitContract {}
+// Check the actual List and child Utf8 formats before either builder appends.
+// No representable input prefix or memory grant is inferred from these facts.
+fn append_piece(
+    builder: &mut ListBuilder<StringBuilder>,
+    piece: &str,
+    row_children: &mut usize,
+    child_offset: &mut i32,
+    byte_offset: &mut i32,
+) -> Result<(), KernelFailure> {
+    // Every previously successful append bounded this count by i32::MAX.
+    let next_row = *row_children + 1;
+    crate::aggregate_scalar::checked_list_output_offset(0, next_row)?;
+    let next_child = crate::aggregate_scalar::checked_list_output_offset(*child_offset, 1)?;
+    let next_byte = crate::aggregate_scalar::checked_utf8_output_offset(*byte_offset, piece.len())?;
+    builder.values().append_value(piece);
+    *row_children = next_row;
+    *child_offset = next_child;
+    *byte_offset = next_byte;
+    Ok(())
 }
 fn sources<'a>(
     left: &'a dyn Array,
     right: &'a dyn Array,
-) -> Result<(&'a StringArray, &'a StringArray), CoreError> {
+) -> Result<(&'a StringArray, &'a StringArray), KernelFailure> {
     let left = left
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or(CoreError::FirstStringRequired)?;
+        .ok_or_else(|| KernelFailure::from_domain(SplitContract::FirstStringRequired))?;
     let right = right
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or(CoreError::SecondStringRequired)?;
+        .ok_or_else(|| KernelFailure::from_domain(SplitContract::SecondStringRequired))?;
     Ok((left, right))
 }
 fn evaluate_rows(
@@ -78,10 +102,12 @@ fn evaluate_rows(
     selection: Selection<'_>,
     mut address: impl FnMut(usize, usize) -> (usize, usize),
     observe: &mut impl FnMut(Observation) -> Result<(), KernelFailure>,
-) -> Result<ArrayRef, CoreError> {
+) -> Result<ArrayRef, KernelFailure> {
     observe(Observation::OpaqueBoundary)?;
     let value_builder = StringBuilder::new();
     let mut list_builder = ListBuilder::new(value_builder);
+    let mut child_offset = 0i32;
+    let mut byte_offset = 0i32;
     observe(Observation::OpaqueBoundary)?;
     for (ordinal, batch_row) in selection.iter().enumerate() {
         let (row, delimiter_row) = address(ordinal, batch_row);
@@ -95,6 +121,7 @@ fn evaluate_rows(
             observe(Observation::OpaqueBoundary)?;
             continue;
         }
+        let mut row_children = 0usize;
         let haystack = left.value(row);
         let delimiter = right.value(delimiter_row);
         if delimiter.is_empty() {
@@ -103,7 +130,13 @@ fn evaluate_rows(
                 let mut buf = [0u8; 4];
                 let s = ch.encode_utf8(&mut buf);
                 observe(Observation::OpaqueBoundary)?;
-                list_builder.values().append_value(s);
+                append_piece(
+                    &mut list_builder,
+                    s,
+                    &mut row_children,
+                    &mut child_offset,
+                    &mut byte_offset,
+                )?;
                 observe(Observation::OpaqueBoundary)?;
             }
             observe(Observation::OpaqueBoundary)?;
@@ -121,13 +154,25 @@ fn evaluate_rows(
             };
             let end = start + pos;
             observe(Observation::OpaqueBoundary)?;
-            list_builder.values().append_value(&haystack[start..end]);
+            append_piece(
+                &mut list_builder,
+                &haystack[start..end],
+                &mut row_children,
+                &mut child_offset,
+                &mut byte_offset,
+            )?;
             observe(Observation::OpaqueBoundary)?;
             start = end + delimiter.len();
             observe(Observation::Step)?;
         }
         observe(Observation::OpaqueBoundary)?;
-        list_builder.values().append_value(&haystack[start..]);
+        append_piece(
+            &mut list_builder,
+            &haystack[start..],
+            &mut row_children,
+            &mut child_offset,
+            &mut byte_offset,
+        )?;
         list_builder.append(true);
         observe(Observation::OpaqueBoundary)?;
     }
@@ -136,10 +181,10 @@ fn evaluate_rows(
     observe(Observation::OpaqueBoundary)?;
     Ok(result)
 }
-pub fn evaluate_legacy(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
-    let (left, right) = sources(left.as_ref(), right.as_ref()).map_err(|e| e.to_string())?;
+pub fn evaluate_required(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
+    let (left, right) = sources(left.as_ref(), right.as_ref())?;
     if right.len() != left.len() {
-        return Err(CoreError::LengthMismatch.to_string());
+        return Err(KernelFailure::from_domain(SplitContract::LengthMismatch));
     }
     evaluate_rows(
         left,
@@ -148,7 +193,6 @@ pub fn evaluate_legacy(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, St
         |_, row| (row, row),
         &mut |_| Ok(()),
     )
-    .map_err(|e| e.to_string())
 }
 pub fn evaluate_observed(
     left: &dyn Array,
@@ -156,7 +200,7 @@ pub fn evaluate_observed(
     selection: Selection<'_>,
     address: impl FnMut(usize, usize) -> (usize, usize),
     observe: &mut impl FnMut(Observation) -> Result<(), KernelFailure>,
-) -> Result<ArrayRef, CoreError> {
+) -> Result<ArrayRef, KernelFailure> {
     let (left, right) = sources(left, right)?;
     evaluate_rows(left, right, selection, address, observe)
 }
@@ -268,11 +312,7 @@ pub(super) fn evaluate<'a>(
                 Observation::Step => work.step(),
                 Observation::OpaqueBoundary => work.flush(),
             },
-        )
-        .map_err(|error| match error {
-            CoreError::Kernel(cause) => cause,
-            other => internal(&other.to_string()),
-        })?;
+        )?;
         SelectedValues::try_new_observed(
             selection,
             input.contract().result_type().data_type(),

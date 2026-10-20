@@ -1122,6 +1122,11 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         ),
         (
             "novarocks.TaskOperationReceipt",
+            "result",
+            &["verdict", "domain_failure"][..],
+        ),
+        (
+            "novarocks.TaskOperationVerdict",
             "ack",
             &[
                 "create_task",
@@ -1748,8 +1753,30 @@ fn admission_ticket_contract_is_exact_and_append_only() {
     let receipt = pool
         .get_message_by_name("novarocks.TaskOperationReceipt")
         .expect("task operation receipt descriptor");
+    assert_eq!(receipt.fields().count(), 3);
+    let operation_id = receipt
+        .get_field_by_name("operation_id")
+        .expect("exact request identity");
+    assert_eq!(operation_id.number(), 1);
+    assert!(operation_id.containing_oneof().is_none());
+    for (name, number) in [("verdict", 2), ("domain_failure", 3)] {
+        let field = receipt
+            .get_field_by_name(name)
+            .expect("explicit receipt branch");
+        assert_eq!(field.number(), number);
+        assert_eq!(
+            field
+                .containing_oneof()
+                .expect("mandatory result sum")
+                .name(),
+            "result"
+        );
+    }
+    let verdict = pool
+        .get_message_by_name("novarocks.TaskOperationVerdict")
+        .expect("task operation verdict descriptor");
     assert_eq!(
-        receipt
+        verdict
             .get_field_by_name("query_context_admission_ticket")
             .expect("admission ticket receipt")
             .number(),

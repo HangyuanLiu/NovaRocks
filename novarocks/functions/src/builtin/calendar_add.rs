@@ -16,10 +16,8 @@
 // under the License.
 
 //! The original day/week shift expression, including its existing extreme-value panic order.
-use super::{
-    calendar_extended::{DateInput, timestamp_value_for_type},
-    calendar_extended_shared::CalendarInput,
-};
+use super::calendar_timestamp::timestamp_value;
+use super::{calendar_extended::DateInput, calendar_extended_shared::CalendarInput};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, SelectedValues, datetime_value,
     kernel_control::{internal, invalid},
@@ -42,9 +40,9 @@ pub fn shift_calendar_days(
     let delta = days * factor;
     date.map(|date| date + Duration::days(delta))
 }
-pub(super) fn evaluate_day_shift<'a>(
+pub(super) fn evaluate_day_shift<'a, E>(
     factor: i64,
-    input: CalendarInput<'_, 'a>,
+    input: CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
@@ -142,9 +140,8 @@ pub(super) fn evaluate_day_shift<'a>(
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
             work.flush()?;
             for value in values {
-                projected.push(
-                    value.and_then(|date| timestamp_value_for_type(date, target.data_type()).ok()),
-                );
+                projected
+                    .push(value.and_then(|date| timestamp_value(date, TimeUnit::Microsecond).ok()));
                 work.step()?;
             }
             work.flush()?;
@@ -244,7 +241,7 @@ mod legacy_goldens {
     }
 
     #[test]
-    fn legacy_day_family_keeps_requested_seconds_in_the_microsecond_carrier() {
+    fn raw_day_family_broadcast_keeps_the_frozen_microsecond_scale() {
         let arguments: Vec<ArrayRef> = vec![
             Arc::new(arrow_array::StringArray::from(vec!["1970-01-01 00:00:10"])),
             Arc::new(Int64Array::from(vec![1, -1])),
@@ -252,7 +249,7 @@ mod legacy_goldens {
         let output = evaluate_legacy_calendar(
             CalendarOperation::DaysShift(1),
             &arguments,
-            &DataType::Timestamp(TimeUnit::Second, None),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
             2,
         )
         .unwrap();
@@ -263,7 +260,7 @@ mod legacy_goldens {
                 .unwrap()
                 .iter()
                 .collect::<Vec<_>>(),
-            vec![Some(86410), Some(-86390)]
+            vec![Some(86_410_000_000), Some(-86_390_000_000)]
         );
     }
 }

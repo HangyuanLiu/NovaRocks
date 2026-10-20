@@ -158,7 +158,11 @@ impl CompiledStaticPlan {
         constants: ConstantPolicy,
     ) -> Result<Self, BackendApplicationError>
     where
-        E: std::error::Error + Send + Sync + 'static,
+        E: std::error::Error
+            + novarocks_execution_contract::failure::FailureProjection
+            + Send
+            + Sync
+            + 'static,
         PureProviderProgramCatalog<E>: Send + Sync,
     {
         let model = Arc::new(
@@ -291,6 +295,28 @@ struct BackendApplicationServices {
 #[cfg(test)]
 const UNROUTED_DETAIL: &str = "the native task protocol has no execution binding in this process";
 
+#[cfg(test)]
+#[derive(Debug)]
+struct UnroutedBinding;
+#[cfg(test)]
+impl std::fmt::Display for UnroutedBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(UNROUTED_DETAIL)
+    }
+}
+#[cfg(test)]
+impl std::error::Error for UnroutedBinding {}
+#[cfg(test)]
+impl novarocks_execution_contract::failure::FailureProjection for UnroutedBinding {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        FailureFact::new(
+            FailureClass::Dependency,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(60000).unwrap()),
+        )
+    }
+}
+
 /// The query-context half of the execution binding the task protocol owner
 /// does not have yet.
 ///
@@ -309,9 +335,9 @@ struct UnroutedQueryContextHost;
 #[cfg(test)]
 impl QueryContextHost for UnroutedQueryContextHost {
     fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
-        Err(HostRejection::new(
+        Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
-            UNROUTED_DETAIL,
+            UnroutedBinding,
         ))
     }
 
@@ -324,9 +350,9 @@ impl QueryContextHost for UnroutedQueryContextHost {
         _context: QueryContextRef,
         _domain: &QueryContextDomainUpdate,
     ) -> Result<(), HostRejection> {
-        Err(HostRejection::new(
+        Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
-            UNROUTED_DETAIL,
+            UnroutedBinding,
         ))
     }
 }
@@ -347,11 +373,11 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
         _input: TaskCreationInput,
-        _preparation_stop: novarocks_worker::TaskPreparationStopView,
+        _preparation_stop: novarocks_worker::TaskPreparationContext<'_>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
-        Err(HostRejection::new(
+        Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
-            UNROUTED_DETAIL,
+            UnroutedBinding,
         ))
     }
 
@@ -361,9 +387,9 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
     ) -> Result<(), HostRejection> {
-        Err(HostRejection::new(
+        Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
-            UNROUTED_DETAIL,
+            UnroutedBinding,
         ))
     }
 
@@ -374,9 +400,9 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         _descriptor: &TaskDescriptor,
         _reporter: TaskStatusReporter,
     ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
-        Err(HostRejection::new(
+        Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
-            UNROUTED_DETAIL,
+            UnroutedBinding,
         ))
     }
 
@@ -386,9 +412,9 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         _domain: &TaskDomainUpdate,
         _operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
-        Err(HostRejection::new(
+        Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
-            UNROUTED_DETAIL,
+            UnroutedBinding,
         ))
     }
 }
@@ -519,6 +545,7 @@ fn compose_backend_application_services(
         root_producer_limits.positions(),
         root_producer_limits.stack_bytes(),
         Arc::clone(&result_retained_budget),
+        execution_runtime.execution_health(),
     )
     .map_err(|error| {
         BackendApplicationError::new(
@@ -603,6 +630,7 @@ fn compose_backend_application_services(
         Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
         execution_host,
         backend_task_execution_ports(
+            execution_runtime.execution_health(),
             #[cfg(novarocks_dev_controls)]
             test_session.and_then(|session| session.observation.clone()),
         ),
@@ -695,6 +723,14 @@ impl BackendApplicationHost {
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
         for (component, failure) in [
+            (
+                "execution_exit",
+                Ok(self
+                    .execution_runtime
+                    .execution_health()
+                    .failure()
+                    .map(|fault| fault.to_string())),
+            ),
             ("grpc_listener", self.grpc_server.poll_failure()),
             (
                 "control_grpc_listener",
@@ -751,7 +787,12 @@ impl BackendApplicationHost {
         let producer_result = self.root_producer_pool.shutdown();
         #[cfg(novarocks_dev_controls)]
         let producer_result = combine_shutdown_results(controls_result, producer_result);
-        let execution_result = self.execution_runtime.shutdown_driver_execution();
+        // This shutdown result is only a redacted CLI diagnostic, never a
+        // Task cause, retry decision or resource-release proof.
+        let execution_result = self
+            .execution_runtime
+            .shutdown_driver_execution()
+            .map_err(|cause| cause.safe_detail().to_string());
         // Driver shutdown publishes every actual-stop fact. Only after that
         // may the fixed completion owner drain its exact slots and return.
         let completion_result = self.task_completion_supervisor.shutdown();
@@ -1104,6 +1145,12 @@ impl BackendApplicationHost {
             Some(session) => service.with_test_controls(session.native.clone()),
             None => service,
         };
+        let root_reader = novarocks_native_adapter::root_result_reader::NativeRootResultReader::new(
+            Arc::clone(&services.task_execution_registry),
+        );
+        #[cfg(novarocks_dev_controls)]
+        let root_reader = root_reader
+            .with_test_controls(test_session.as_ref().map(|session| session.native.clone()));
         let mut grpc_server = match NativeRpcServerHandle::start_with_admission(
             &bind_host,
             grpc_port,
@@ -1118,11 +1165,7 @@ impl BackendApplicationHost {
             native_ingress,
             transport_admission.clone(),
             TransportClass::Data,
-            Some(Arc::new(
-                novarocks_native_adapter::root_result_reader::NativeRootResultReader::new(
-                    Arc::clone(&services.task_execution_registry),
-                ),
-            )),
+            Some(Arc::new(root_reader)),
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -1367,6 +1410,9 @@ mod tests {
             Arc::new(UnroutedQueryContextHost),
             Arc::new(UnroutedTaskExecutionHost),
             novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
+                Arc::new(
+                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+                ),
                 #[cfg(novarocks_dev_controls)]
                 None,
             ),
@@ -2020,9 +2066,12 @@ mod tests {
                 }),
             )
             .expect("sealed rand subset");
-        let providers =
-            PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
-                .expect("empty provider catalog");
+        let providers = PureProviderProgramCatalog::<std::convert::Infallible>::try_new(
+            &[],
+            vec![],
+            &Unbounded,
+        )
+        .expect("empty provider catalog");
         let plan = CompiledStaticPlan::try_new(
             limits,
             Arc::new(functions),

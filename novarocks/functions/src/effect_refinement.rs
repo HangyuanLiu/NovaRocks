@@ -480,6 +480,9 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                     }
                     crate::kernel_input::validate_type_observed(channel.value_type, &mut work)
                         .map_err(|error| match error {
+                            crate::KernelFailure::CompileControl(cause) => {
+                                CallEffectRefinementError::Control(cause)
+                            }
                             crate::KernelFailure::Cancelled => {
                                 CallEffectRefinementError::Control(CompileControlError::Cancelled)
                             }
@@ -564,16 +567,17 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
             merge_state,
         })
     })();
-    // Ordinary failures report the pending completed work. An original control
-    // refusal is primary and must never invoke its control again.
-    if result.is_err() && !matches!(&result, Err(CallEffectRefinementError::Control(_))) {
-        work.finish().map_err(CallEffectRefinementError::Control)?;
+    // Success already flushed before constructing the borrowed receipt.
+    // A failed author reads only this scope's existing refusal latch.
+    if result.is_err() {
+        return work.finish_result(result, CallEffectRefinementError::Control);
     }
     result
 }
 
 fn input_type_failure<E: Error>(error: crate::KernelFailure) -> CallEffectRefinementError<E> {
     match error {
+        crate::KernelFailure::CompileControl(cause) => CallEffectRefinementError::Control(cause),
         crate::KernelFailure::Cancelled => {
             CallEffectRefinementError::Control(CompileControlError::Cancelled)
         }
@@ -766,11 +770,7 @@ impl RefinedCallEffects<'_> {
             }
             Ok(())
         })();
-        if matches!(&result, Err(CallEffectRefinementError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(CallEffectRefinementError::Control)?;
-        result
+        work.finish_result(result, CallEffectRefinementError::Control)
     }
     pub fn compose_for_use(
         &self,
@@ -985,7 +985,7 @@ mod tests {
             input: CallEffectInput<'_>,
             _: &dyn PureCompileControl,
         ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-            if let Some(error) = self.control_failure {
+            if let Some(error) = self.control_failure.clone() {
                 return Err(FunctionEffectOwnerError::Control(error));
             }
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -1196,7 +1196,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let mut failing = Owner::new();
-            failing.control_failure = Some(error);
+            failing.control_failure = Some(error.clone());
             assert!(
                 matches!(refine_call_effects(&failing, input, &Control(false)), Err(CallEffectRefinementError::Control(actual)) if actual == error)
             );
@@ -1232,7 +1232,7 @@ mod tests {
                     assert!(ordinal <= stop, "callback after original refusal");
                 }
                 trace.push(units);
-                match self.refusal {
+                match self.refusal.clone() {
                     Some((stop, cause)) if ordinal == stop => Err(cause),
                     _ => Ok(()),
                 }
@@ -1242,24 +1242,46 @@ mod tests {
             argument_uses: CallArgumentUses::SelectedChannels(&other_arguments),
             ..input
         };
-        for (candidate, frozen, succeeds) in [
+        for (case, (candidate, frozen, succeeds)) in [
             (input, result.facts(), true),
             (input, &forged, false),
             (foreign_input, result.facts(), false),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let control = FrozenControl::default();
             let validation = result.validate_frozen(candidate, frozen, &control);
             assert_eq!(validation.is_ok(), succeeds);
+            match case {
+                0 => validation.unwrap(),
+                1 => assert!(matches!(
+                    validation,
+                    Err(CallEffectRefinementError::InvalidInput(_))
+                )),
+                2 => assert!(matches!(
+                    validation,
+                    Err(CallEffectRefinementError::Contract(
+                        EffectContractError::CallIdentityMismatch
+                    ))
+                )),
+                _ => unreachable!(),
+            }
             let baseline = control.trace.into_inner().unwrap();
-            assert_eq!(baseline, if succeeds { vec![0, 1] } else { vec![0, 0] });
+            // Forged frozen metadata and a swapped immutable input already
+            // refused before a completion tail. Success retains its real unit.
+            assert_eq!(baseline, if succeeds { vec![0, 1] } else { vec![0] });
             for stop in 0..baseline.len() {
                 for cause in [
                     CompileControlError::Cancelled,
                     CompileControlError::DeadlineExceeded,
                     CompileControlError::ResourceExhausted,
+                    CompileControlError::from_domain(
+                        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+                    ),
                 ] {
                     let control = FrozenControl {
-                        refusal: Some((stop, cause)),
+                        refusal: Some((stop, cause.clone())),
                         ..FrozenControl::default()
                     };
                     assert!(matches!(
@@ -1268,6 +1290,31 @@ mod tests {
                     ));
                     assert_eq!(control.trace.into_inner().unwrap(), baseline[..=stop]);
                 }
+            }
+            if !succeeds {
+                let late = FrozenControl {
+                    refusal: Some((baseline.len(), CompileControlError::Cancelled)),
+                    ..FrozenControl::default()
+                };
+                let actual = result.validate_frozen(candidate, frozen, &late);
+                match case {
+                    1 => assert!(matches!(
+                        actual,
+                        Err(CallEffectRefinementError::InvalidInput(_))
+                    )),
+                    2 => assert!(matches!(
+                        actual,
+                        Err(CallEffectRefinementError::Contract(
+                            EffectContractError::CallIdentityMismatch
+                        ))
+                    )),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    late.trace.into_inner().unwrap(),
+                    baseline,
+                    "late cancellation cannot replace an authored validation error"
+                );
             }
         }
         let relaxed = SemanticParameters::try_new([(
@@ -1421,6 +1468,152 @@ mod tests {
         };
         assert!(refine_call_effects(&owner, input, &Control(false)).is_err());
         assert_eq!(owner.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn real_refinement_declaration_and_frozen_mismatch_precede_late_controls() {
+        struct Tail {
+            calls: std::sync::Mutex<Vec<u32>>,
+            stop: Option<usize>,
+            source: CompileControlError,
+        }
+        impl PureCompileControl for Tail {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                let mut calls = self.calls.lock().unwrap();
+                let at = calls.len();
+                calls.push(units);
+                if self.stop == Some(at) {
+                    Err(self.source.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let owner = Owner::new();
+        let id = FunctionId::try_new("fixture/effect").unwrap();
+        let foreign = FunctionId::try_new("fixture/foreign").unwrap();
+        let selected = selected();
+        let args = [FunctionArgument::Value {
+            value_type: FunctionValueType::new(arrow_schema::DataType::Int64, true),
+            constant: None,
+        }];
+        let environment = [SemanticParameterRef {
+            id: SemanticParameterId::new(1),
+            expected_key: SemanticParameterKey::AllowThrowException,
+        }];
+        let parameters = SemanticParameters::try_new([(
+            environment[0].id,
+            SemanticParameterValue::AllowThrowException(true),
+        )])
+        .unwrap();
+        let uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
+        let context = novarocks_type_contract::ExpressionEffectContext {
+            use_id: novarocks_type_contract::ExpressionUseId::new(0),
+            domain: novarocks_type_contract::EvaluationDomainId::new(0),
+            demand: novarocks_type_contract::EvaluationDemand::Value,
+        };
+        let input = CallEffectInput {
+            context,
+            argument_uses: CallArgumentUses::SelectedChannels(&uses),
+            function_id: &id,
+            kind: FunctionKind::Scalar,
+            selected: &selected,
+            request: FunctionBindingRequest {
+                arguments: &args,
+                logical_argument_count: 1,
+                expected_result_type: None,
+            },
+            environment: &environment,
+            parameters: &parameters,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            proof_scope: CallProofScope::Unconditional,
+        };
+        let source = CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        );
+        let baseline = Tail {
+            calls: Default::default(),
+            stop: None,
+            source: source.clone(),
+        };
+        assert!(matches!(
+            refine_call_effects(
+                &owner,
+                CallEffectInput {
+                    function_id: &foreign,
+                    ..input
+                },
+                &baseline
+            ),
+            Err(CallEffectRefinementError::Owner(
+                FunctionBindingError::UnknownFunction
+            ))
+        ));
+        let trace = baseline.calls.lock().unwrap().clone();
+        assert!(!trace.is_empty());
+        let late = Tail {
+            calls: Default::default(),
+            stop: Some(trace.len()),
+            source: source.clone(),
+        };
+        assert!(matches!(
+            refine_call_effects(
+                &owner,
+                CallEffectInput {
+                    function_id: &foreign,
+                    ..input
+                },
+                &late
+            ),
+            Err(CallEffectRefinementError::Owner(
+                FunctionBindingError::UnknownFunction
+            ))
+        ));
+        assert_eq!(*late.calls.lock().unwrap(), trace);
+        assert_eq!(owner.calls.load(Ordering::Relaxed), 0);
+        for at in 0..trace.len() {
+            let earlier = Tail {
+                calls: Default::default(),
+                stop: Some(at),
+                source: source.clone(),
+            };
+            assert!(
+                matches!(refine_call_effects(&owner,CallEffectInput{function_id:&foreign,..input},&earlier),Err(CallEffectRefinementError::Control(actual)) if actual==source)
+            );
+            assert_eq!(*earlier.calls.lock().unwrap(), trace[..=at]);
+        }
+        let receipt = refine_call_effects(&owner, input, &Control(false)).unwrap();
+        let mut forged = receipt.facts().clone();
+        forged.value_stability = FunctionVolatility::Volatile;
+        let late = Tail {
+            calls: Default::default(),
+            stop: Some(1),
+            source: source.clone(),
+        };
+        assert!(matches!(
+            receipt.validate_frozen(input, &forged, &late),
+            Err(CallEffectRefinementError::InvalidInput(_))
+        ));
+        assert_eq!(*late.calls.lock().unwrap(), [0]);
+        let baseline = Tail {
+            calls: Default::default(),
+            stop: None,
+            source: source.clone(),
+        };
+        receipt
+            .validate_frozen(input, receipt.facts(), &baseline)
+            .unwrap();
+        let trace = baseline.calls.lock().unwrap().clone();
+        let at = trace.len() - 1;
+        let success_tail = Tail {
+            calls: Default::default(),
+            stop: Some(at),
+            source: source.clone(),
+        };
+        assert!(
+            matches!(receipt.validate_frozen(input,receipt.facts(),&success_tail),Err(CallEffectRefinementError::Control(actual)) if actual==source)
+        );
+        assert_eq!(*success_tail.calls.lock().unwrap(), trace);
     }
 }
 

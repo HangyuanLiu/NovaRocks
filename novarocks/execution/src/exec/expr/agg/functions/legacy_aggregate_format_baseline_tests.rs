@@ -18,15 +18,13 @@
 //! Independent legacy text-format receipts before sharing the formatter.
 use super::common::{AggScalarValue as V, scalar_to_string};
 use arrow::datatypes::{DataType, Field, TimeUnit};
-use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
-};
+use novarocks_failure_contract::{FailureClass, FailureProjection};
+use std::sync::Arc;
 #[test]
 fn legacy_aggregate_formatter_negative_timestamp_units_and_zone_spelling() {
     for (unit, expected) in [
         (TimeUnit::Second, "1969-12-31 23:59:59"),
-        (TimeUnit::Millisecond, "1970-01-01 00:00:00.999"),
+        (TimeUnit::Millisecond, "1969-12-31 23:59:59.999"),
         (TimeUnit::Microsecond, "1969-12-31 23:59:59.999999"),
         (TimeUnit::Nanosecond, "1969-12-31 23:59:59.999999999"),
     ] {
@@ -43,14 +41,12 @@ fn legacy_aggregate_formatter_negative_timestamp_units_and_zone_spelling() {
             format!("{expected} Asia/Shanghai")
         );
     }
-    assert_eq!(
-        scalar_to_string(
-            &V::Timestamp(i64::MAX),
-            &DataType::Timestamp(TimeUnit::Second, None)
-        )
-        .unwrap(),
-        "1970-01-01 00:00:00"
-    );
+    let error = scalar_to_string(
+        &V::Timestamp(i64::MAX),
+        &DataType::Timestamp(TimeUnit::Second, None),
+    )
+    .unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
 }
 #[test]
 fn legacy_aggregate_formatter_recursive_parent_type_and_scalar_encodings() {
@@ -84,34 +80,24 @@ fn legacy_aggregate_formatter_recursive_parent_type_and_scalar_encodings() {
         "1970-01-01"
     );
     assert_eq!(
-        scalar_to_string(&V::Date32(i32::MIN), &DataType::Date32).unwrap_err(),
-        "invalid date32 value"
+        scalar_to_string(&V::Date32(i32::MIN), &DataType::Date32)
+            .unwrap_err()
+            .failure_fact()
+            .class(),
+        FailureClass::Data
     );
 }
 #[test]
-fn legacy_aggregate_formatter_original_debug_overflow_panics() {
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    for (value, ty, expected) in [
-        (
-            V::Date32(i32::MAX),
-            DataType::Date32,
-            "attempt to add with overflow",
-        ),
-        (
-            V::Decimal128(i128::MIN),
-            DataType::Decimal128(38, 2),
-            "attempt to negate with overflow",
-        ),
-    ] {
-        let panic = catch_unwind(AssertUnwindSafe(|| scalar_to_string(&value, &ty)))
-            .expect_err("original debug overflow");
-        let text = panic
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            .unwrap();
-        assert_eq!(text, expected);
-    }
+fn aggregate_formatter_limits_are_typed_and_signed_minimum_formats_without_panic() {
+    assert_eq!(
+        scalar_to_string(&V::Date32(i32::MAX), &DataType::Date32)
+            .unwrap_err()
+            .failure_fact()
+            .class(),
+        FailureClass::Data
+    );
+    assert_eq!(
+        scalar_to_string(&V::Decimal128(i128::MIN), &DataType::Decimal128(38, 2)).unwrap(),
+        "-1701411834604692317316873037158841057.28"
+    );
 }

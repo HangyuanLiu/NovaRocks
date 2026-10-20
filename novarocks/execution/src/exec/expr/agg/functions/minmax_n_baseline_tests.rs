@@ -30,13 +30,20 @@ struct LegacyState {
 impl LegacyState {
     fn new(name: &str, value: DataType, tracker: Arc<MemTracker>) -> Self {
         let input = DataType::Struct(Fields::from(vec![
-            Field::new("value", value, true),
+            Field::new("value", value.clone(), true),
             Field::new("n", DataType::Int64, true),
         ]));
         let spec = MinMaxNAgg
             .build_spec_from_type(
                 &AggFunction {
                     name: name.into(),
+                    types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                        input_arg_type: Some(value.clone()),
+                        intermediate_type: Some(DataType::Binary),
+                        output_type: Some(DataType::List(Arc::new(Field::new(
+                            "item", value, true,
+                        )))),
+                    }),
                     ..Default::default()
                 },
                 Some(&input),
@@ -55,7 +62,11 @@ impl LegacyState {
     fn pointer(&mut self) -> AggStatePtr {
         self.raw.as_mut_ptr() as AggStatePtr
     }
-    fn update(&mut self, values: ArrayRef, limits: ArrayRef) -> Result<(), String> {
+    fn update(
+        &mut self,
+        values: ArrayRef,
+        limits: ArrayRef,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let fields = Fields::from(vec![
             Field::new("v", values.data_type().clone(), true),
             Field::new("n", limits.data_type().clone(), true),
@@ -64,11 +75,11 @@ impl LegacyState {
         let pointers = vec![self.pointer(); input.len()];
         MinMaxNAgg.update_batch(&self.spec, 0, &pointers, &AggInputView::Any(&input))
     }
-    fn merge(&mut self, input: ArrayRef) -> Result<(), String> {
+    fn merge(&mut self, input: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); input.len()];
         MinMaxNAgg.merge_batch(&self.spec, 0, &pointers, &AggInputView::Any(&input))
     }
-    fn output(&mut self, partial: bool) -> Result<ArrayRef, String> {
+    fn output(&mut self, partial: bool) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let pointer = self.pointer();
         MinMaxNAgg.build_array(&self.spec, 0, &[pointer], partial)
     }
@@ -155,9 +166,10 @@ fn legacy_n_limit_admission_precedes_value_null_and_mismatch_keeps_original_mess
                 MemTracker::new_root("legacy-n-limit"),
             );
             assert_eq!(
-                state
+                (state
                     .update(new_null_array(&DataType::Int64, 1), ints(vec![limit]))
-                    .unwrap_err(),
+                    .unwrap_err())
+                .to_string(),
                 error
             );
             assert!(!state.initialized());
@@ -171,19 +183,21 @@ fn legacy_n_limit_admission_precedes_value_null_and_mismatch_keeps_original_mess
             .update(new_null_array(&DataType::Int64, 1), limits(2, 1))
             .unwrap();
         assert_eq!(
-            state
+            (state
                 .update(new_null_array(&DataType::Int64, 1), limits(3, 1))
-                .unwrap_err(),
+                .unwrap_err())
+            .to_string(),
             "min_n/max_n limit mismatch while merging states: 2 vs 3"
         );
         assert_eq!(state.limit(), 2);
         assert_eq!(
-            state
+            (state
                 .update(
                     new_null_array(&DataType::Int64, 1),
                     Arc::new(BooleanArray::from(vec![true]))
                 )
-                .unwrap_err(),
+                .unwrap_err())
+            .to_string(),
             "min_n/max_n limit must be integer"
         );
     }
@@ -311,7 +325,7 @@ fn legacy_n_merge_accepts_trailing_bytes_four_carriers_and_zero_limit_after_full
         let mut malformed = 0u32.to_le_bytes().to_vec();
         malformed.extend_from_slice(&1u32.to_le_bytes());
         assert_eq!(
-            state.merge(binary(&malformed)).unwrap_err(),
+            (state.merge(binary(&malformed)).unwrap_err()).to_string(),
             "min_n/max_n decode tag overflow: pos=8 need=1 len=8"
         );
     }
@@ -341,7 +355,10 @@ fn legacy_n_decode_full_errors_and_prior_values_survive_partial_graph_failure() 
             "min_n/max_n decode unknown tag 255",
         ),
     ] {
-        assert_eq!(state.merge(binary(&bytes)).unwrap_err(), error);
+        assert_eq!(
+            (state.merge(binary(&bytes)).unwrap_err()).to_string(),
+            error
+        );
         assert_eq!(int_output(&mut state), vec![Some(7)]);
         assert_eq!(tracker.current(), stable);
     }
@@ -352,7 +369,7 @@ fn legacy_n_decode_full_errors_and_prior_values_survive_partial_graph_failure() 
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.push(255);
     assert_eq!(
-        state.merge(binary(&bytes)).unwrap_err(),
+        (state.merge(binary(&bytes)).unwrap_err()).to_string(),
         "min_n/max_n utf8 decode failed: invalid utf-8 sequence of 1 bytes from index 0"
     );
     assert_eq!(tracker.current(), stable);
@@ -364,19 +381,22 @@ fn legacy_n_initializes_limit_before_retained_allocation_failure_and_can_retry_s
     let tracker = MemTracker::new_root("legacy-n-value-oom");
     tracker.install_limit_once(1).unwrap();
     let mut state = LegacyState::new("min_n", DataType::Utf8, tracker.clone());
-    assert_eq!(
-        state
+    crate::exec::expr::agg::functions::common::assert_collection_refusal::<
+        allocator_api2::collections::TryReserveError,
+    >(
+        &(state
             .update(Arc::new(StringArray::from(vec!["ab"])), limits(2, 1))
-            .unwrap_err(),
-        "ResourceExhausted: reserve aggregate byte value: aggregate allocation was rejected by memory tracker legacy-n-value-oom or the system allocator"
+            .unwrap_err()),
+        "reserve aggregate byte value",
     );
     assert!(state.initialized());
     assert_eq!(state.limit(), 2);
     assert_eq!(tracker.current(), 0);
     assert_eq!(
-        state
+        (state
             .update(new_null_array(&DataType::Utf8, 1), limits(3, 1))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "min_n/max_n limit mismatch while merging states: 2 vs 3"
     );
     state
@@ -405,41 +425,40 @@ fn legacy_n_nested_and_binary_single_output_exists_but_original_codec_refuses() 
         state.update(values, limits(2, 1)).unwrap();
         assert!(!state.output(false).unwrap().is_null(0));
         let error = state.output(true).unwrap_err();
-        assert!(error.starts_with("min_n/max_n does not support serialized value "));
-        assert!(error.contains(marker));
+        assert!(
+            error
+                .to_string()
+                .starts_with("min_n/max_n does not support serialized value ")
+        );
+        assert!(error.to_string().contains(marker));
         drop(state);
         assert_eq!(tracker.current(), 0);
     }
 }
 
 #[test]
-fn legacy_n_usize_limit_wire_truncation_is_preserved_without_new_overflow_rejection() {
+fn n_partial_wire_limit_refuses_truncation_without_changing_the_retained_values() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
     for name in ["min_n", "max_n"] {
-        for (limit, expected) in [
-            (1i64 << 32, Vec::<Option<i64>>::new()),
-            (
-                (1i64 << 32) + 1,
-                vec![Some(if name == "min_n" { 1 } else { 3 })],
-            ),
-        ] {
-            let tracker = MemTracker::new_root("legacy-n-wide-limit");
+        for limit in [1i64 << 32, (1i64 << 32) + 1] {
+            let tracker = MemTracker::new_root("n-wide-wire-limit");
             let mut source = LegacyState::new(name, DataType::Int64, tracker.clone());
             source
                 .update(ints(vec![Some(3), Some(1), Some(2)]), limits(limit, 3))
                 .unwrap();
             assert_eq!(int_output(&mut source), vec![Some(1), Some(2), Some(3)]);
-            let partial = source.output(true).unwrap();
-            let bytes = partial
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap()
-                .value(0);
-            assert_eq!(&bytes[..4], &(limit as u32).to_le_bytes());
-            let mut destination = LegacyState::new(name, DataType::Int64, tracker.clone());
-            destination.merge(partial).unwrap();
-            assert_eq!(int_output(&mut destination), expected);
+            let refusal = source.output(true).unwrap_err();
+            let fact = refusal.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Representation);
+            assert_eq!(fact.reason().code(), 332);
+            assert!(fact.resource().is_none());
+            let representation = fact.representation().unwrap();
+            assert_eq!(representation.boundary, RepresentationBoundary::MinimumUnit);
+            assert_eq!(representation.required, Some(limit as u64));
+            assert_eq!(representation.extent_limit, Some(u32::MAX as u64));
+            assert_eq!(representation.representable_prefix, None);
+            assert_eq!(int_output(&mut source), vec![Some(1), Some(2), Some(3)]);
             drop(source);
-            drop(destination);
             assert_eq!(tracker.current(), 0);
         }
     }

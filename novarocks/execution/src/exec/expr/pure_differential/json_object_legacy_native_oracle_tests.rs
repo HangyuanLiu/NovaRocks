@@ -298,8 +298,11 @@ fn original_query(query: usize, rows: &[usize]) -> Value {
             json!({"kind":"success", "physical_type":format!("{:?}", values.data_type()), "values":(0..values.len()).map(|i| (!values.is_null(i)).then(|| strings.value(i))).collect::<Vec<_>>()})
         }
         Err(error) => {
-            assert_eq!(error, "json_object key does not support complex type");
-            json!({"kind":"whole_data", "message":error})
+            assert_eq!(
+                (error).to_string(),
+                "json_object key does not support complex type"
+            );
+            json!({"kind":"whole_data", "message":error.to_string()})
         }
     };
     json!({"query":query, "rows":rows, "ids":rows.iter().map(|r| r + 1).collect::<Vec<_>>(), "selected_result_type":type_metadata(&result_type), "selected_argument_types":spec.arguments.iter().map(|a| type_metadata(a.value_type())).collect::<Vec<_>>(), "children":children, "outcome":outcome})

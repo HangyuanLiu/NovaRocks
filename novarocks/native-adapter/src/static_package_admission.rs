@@ -122,7 +122,7 @@ fn package_refusal(path: FieldPath, error: ResourceModelError) -> ProtocolError 
     match error {
         ResourceModelError::Control(cause) => ProtocolError::new(
             path,
-            ProtocolErrorKind::CompileControl(cause),
+            ProtocolErrorKind::CompileControl(cause.clone()),
             cause.to_string(),
         ),
         // A schema refusal is fail-closed rather than waved through: the

@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 //! Same-host loans around the sole original Mann-Whitney core and full Data.
 //! Opaque successful output has a separate custody path; it cannot escape here.
 
@@ -22,7 +23,8 @@ use super::aggregate_mann_whitney_resources::MannSourceParams;
 use crate::aggregate_format::AggregateFailureStage;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
@@ -51,20 +53,21 @@ impl MannDataDomain<'_> {
     }
     fn diagnostic(
         &self,
-        message: &str,
+        message: &super::aggregate_mann_whitney_core::MannValueFailure,
         stage: AggregateFailureStage,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<InvocationData, KernelFailure> {
         let diagnostic = HostDiagnostic::prepare(self.allocator, work, |writer| {
             write!(writer, "{}", stage.message(message))
         })?;
-        InvocationData::prepare_aggregate(
+        InvocationData::prepare_aggregate_with_reason(
             self.allocator,
             Arc::clone(self.contract),
             self.phase,
             self.selection,
             self.mapping,
             diagnostic,
+            message.reason(),
             work,
         )
     }
@@ -122,15 +125,7 @@ impl MannResources for BoundMannResources<'_> {
         event: MannResourceEvent<'_>,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), KernelFailure> {
-        match work.flush() {
-            Ok(()) => {}
-            Err(ScalarStateError::Kernel(cause)) => return Err(cause),
-            Err(_) => {
-                return Err(internal(
-                    "Mann-Whitney work flush returned a non-control failure",
-                ));
-            }
-        }
+        work.flush()?;
         let facts = self.source.event_facts(event, self.control)?;
         self.loans.reserve(self.charge, facts.peak)
     }
@@ -150,7 +145,7 @@ fn call<T: LoanFreeSuccess>(
     operation: impl FnOnce(
         &mut ScalarWork<'_, '_>,
         &mut BoundMannResources<'_>,
-    ) -> Result<T, ScalarStateError>,
+    ) -> Result<T, MannFailure>,
 ) -> Result<T, EvaluationFailure> {
     // This outer scope outlives body locals, the returned original String,
     // partial Data construction and the single inner checkpoint cache.
@@ -179,11 +174,11 @@ fn call<T: LoanFreeSuccess>(
             checkpoints.finish()?;
             Ok(value)
         }
-        Err(ScalarStateError::Kernel(cause)) => {
+        Err(MannFailure::Kernel(cause)) => {
             drop(checkpoints);
             Err(cause.into())
         }
-        Err(ScalarStateError::Legacy(message)) => {
+        Err(MannFailure::Value(message)) => {
             let converted = domain.diagnostic(&message, stage, &mut checkpoints);
             drop(message);
             drop(checkpoints);
@@ -191,11 +186,6 @@ fn call<T: LoanFreeSuccess>(
                 Ok(data) => Err(EvaluationFailure::InvocationData(data)),
                 Err(cause) => Err(cause.into()),
             }
-        }
-        Err(ScalarStateError::OutputAllocation(message)) => {
-            drop(message);
-            drop(checkpoints);
-            Err(KernelFailure::ResourceExhausted.into())
         }
     }
 }
@@ -208,7 +198,7 @@ pub(super) fn call_unit(
     operation: impl FnOnce(
         &mut ScalarWork<'_, '_>,
         &mut BoundMannResources<'_>,
-    ) -> Result<(), ScalarStateError>,
+    ) -> Result<(), MannFailure>,
 ) -> Result<(), EvaluationFailure> {
     call(source, charge, domain, control, operation)
 }
@@ -221,7 +211,7 @@ pub(super) fn call_input<'input>(
     operation: impl FnOnce(
         &mut ScalarWork<'_, '_>,
         &mut BoundMannResources<'_>,
-    ) -> Result<MannWhitneyInput<'input>, ScalarStateError>,
+    ) -> Result<MannWhitneyInput<'input>, MannFailure>,
 ) -> Result<MannWhitneyInput<'input>, EvaluationFailure> {
     call(source, charge, domain, control, operation)
 }

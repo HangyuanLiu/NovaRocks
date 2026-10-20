@@ -19,6 +19,8 @@
 
 use std::fmt;
 
+use novarocks_execution_contract::operation::DomainFailureOutcome;
+
 use novarocks_execution_contract::{
     DomainProgression, OperationOutcome, TaskDescriptor, TaskDomainReceipt, TaskDomainUpdate,
     TaskFailureCategory, TaskOperationId,
@@ -30,53 +32,86 @@ use crate::{
     validate_task_domain_membership,
 };
 
-/// The typed operation outcome for a task-domain policy refusal.
+/// An operation verdict and its actual local refusal. The verdict controls
+/// replay policy; it never stands in for the failure's domain facts/source.
 #[derive(Clone, Debug)]
 pub struct DomainExecutionRejection {
-    outcome: OperationOutcome,
-    detail: String,
-    category: TaskFailureCategory,
+    outcome: DomainFailureOutcome,
+    cause: DomainExecutionCause,
 }
-
+#[derive(Clone, Debug)]
+enum DomainExecutionCause {
+    Policy(DomainPolicyRejection),
+    Host(HostRejection),
+}
 impl DomainExecutionRejection {
-    fn new(
-        outcome: OperationOutcome,
-        category: TaskFailureCategory,
-        detail: impl Into<String>,
-    ) -> Self {
-        Self {
-            outcome,
-            detail: detail.into(),
-            category,
-        }
-    }
-
     pub const fn outcome(&self) -> OperationOutcome {
+        self.outcome.outcome()
+    }
+    pub(crate) const fn domain_failure_outcome(&self) -> DomainFailureOutcome {
         self.outcome
     }
-
     pub fn detail(&self) -> &str {
-        &self.detail
+        match &self.cause {
+            DomainExecutionCause::Policy(policy) => policy.detail(),
+            DomainExecutionCause::Host(host) => host.detail().as_str(),
+        }
     }
-
     pub const fn category(&self) -> TaskFailureCategory {
-        self.category
+        match &self.cause {
+            DomainExecutionCause::Policy(_) => TaskFailureCategory::Protocol,
+            DomainExecutionCause::Host(host) => host.category(),
+        }
+    }
+    pub(crate) fn operation_failure(
+        &self,
+    ) -> novarocks_execution_contract::operation::OperationDomainFailure {
+        match &self.cause {
+            DomainExecutionCause::Host(host) => host.operation_failure(),
+            DomainExecutionCause::Policy(policy) => {
+                novarocks_execution_contract::operation::OperationDomainFailure::new(
+                    novarocks_execution_contract::failure::FailureProjection::failure_fact(policy),
+                    novarocks_execution_contract::SafeDetail::truncating(policy.detail()),
+                )
+            }
+        }
+    }
+    /// Preparation transfers the original host refusal into the Task owner.
+    /// Worker policy diagnostics contain frozen kinds/identities/tokens only;
+    /// no split payload or credential material is rendered into this context.
+    pub(crate) fn into_host(self) -> HostRejection {
+        match self.cause {
+            DomainExecutionCause::Host(host) => host,
+            DomainExecutionCause::Policy(policy) => {
+                let detail = novarocks_execution_contract::SafeDetail::truncating(policy.detail());
+                HostRejection::from_domain_with_detail(
+                    TaskFailureCategory::Protocol,
+                    policy,
+                    detail,
+                )
+            }
+        }
     }
 }
-
 impl fmt::Display for DomainExecutionRejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.detail)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.detail())
     }
 }
-
+impl std::error::Error for DomainExecutionRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match &self.cause {
+            DomainExecutionCause::Policy(policy) => policy,
+            DomainExecutionCause::Host(host) => host,
+        })
+    }
+}
 impl From<DomainPolicyRejection> for DomainExecutionRejection {
-    fn from(rejection: DomainPolicyRejection) -> Self {
-        Self::new(
-            OperationOutcome::DomainConflict,
-            TaskFailureCategory::Protocol,
-            rejection.detail(),
-        )
+    fn from(policy: DomainPolicyRejection) -> Self {
+        Self {
+            outcome: DomainFailureOutcome::DomainConflict,
+            cause: DomainExecutionCause::Policy(policy),
+        }
     }
 }
 
@@ -149,12 +184,56 @@ pub fn apply_planned_task_domain_updates(
 
 fn rejection_from_host(rejection: HostRejection) -> DomainExecutionRejection {
     let outcome = match rejection.category() {
-        TaskFailureCategory::ResourceExhausted => OperationOutcome::ResourceExhausted,
+        TaskFailureCategory::ResourceExhausted => DomainFailureOutcome::ResourceExhausted,
         TaskFailureCategory::Protocol
         | TaskFailureCategory::Unsupported
         | TaskFailureCategory::Exchange
         | TaskFailureCategory::Execution
-        | TaskFailureCategory::Internal => OperationOutcome::InvalidStateOrRequest,
+        | TaskFailureCategory::Internal => DomainFailureOutcome::InvalidStateOrRequest,
     };
-    DomainExecutionRejection::new(outcome, rejection.category(), rejection.detail().as_str())
+    DomainExecutionRejection {
+        outcome,
+        cause: DomainExecutionCause::Host(rejection),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn domain_projection_execution_host_source_survives_the_domain_boundary() {
+        use novarocks_execution::runtime::fragment::ExecutionFailure;
+        use novarocks_execution_contract::{OperationOutcome, TaskFailureCategory};
+        use std::error::Error;
+        let original =
+            ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
+        let host =
+            crate::HostRejection::from_domain(TaskFailureCategory::ResourceExhausted, original);
+        let original_pointer = host
+            .source()
+            .unwrap()
+            .downcast_ref::<ExecutionFailure>()
+            .unwrap()
+            .cause() as *const _;
+        let rejected = super::rejection_from_host(host);
+        assert_eq!(rejected.outcome(), OperationOutcome::ResourceExhausted);
+        assert!(
+            rejected
+                .source()
+                .unwrap()
+                .downcast_ref::<crate::HostRejection>()
+                .is_some()
+        );
+        let returned = rejected.into_host();
+        assert_eq!(returned.category(), TaskFailureCategory::ResourceExhausted);
+        let actual_pointer = returned
+            .source()
+            .unwrap()
+            .downcast_ref::<ExecutionFailure>()
+            .unwrap()
+            .cause() as *const _;
+        assert_eq!(
+            actual_pointer, original_pointer,
+            "same retained source, not a diagnostic reconstruction"
+        );
+    }
 }

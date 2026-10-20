@@ -174,7 +174,6 @@ pub(super) fn hash_array_selected(
     row: usize,
     seed: u32,
     work: &mut EvaluationCheckpoints<'_>,
-    error_boundary: Option<&dyn Fn(&str) -> Result<(), KernelFailure>>,
 ) -> Result<Option<u32>, KernelFailure> {
     if super::string_extended::murmur_supported_carrier(array.data_type())
         || matches!(array.data_type(), DataType::Timestamp(..))
@@ -187,31 +186,18 @@ pub(super) fn hash_array_selected(
         safe: false,
         format_options: FormatOptions::default(),
     };
-    let casted = cast_with_options(array.as_ref(), &DataType::Utf8, &options).map_err(|error| {
-        let message = format!("cast to Utf8 failed for murmur_hash3_32: {error}");
-        project_legacy_error(&message, error_boundary)
-    })?;
+    let casted = cast_with_options(array.as_ref(), &DataType::Utf8, &options)
+        .map_err(super::string_failure::murmur_cast)?;
     work.flush()?;
     let strings = casted
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| project_legacy_error("cast result is not StringArray", error_boundary))?;
+        .ok_or_else(|| internal("Murmur3 cast result is not StringArray"))?;
     if strings.is_null(row) {
         Ok(None)
     } else {
         hash(strings.value(row).as_bytes(), seed, work).map(Some)
     }
-}
-fn project_legacy_error(
-    message: &str,
-    boundary: Option<&dyn Fn(&str) -> Result<(), KernelFailure>>,
-) -> KernelFailure {
-    if let Some(boundary) = boundary
-        && let Err(error) = boundary(message)
-    {
-        return error;
-    }
-    KernelFailure::Operational(crate::KernelDiagnostic::new(message))
 }
 
 fn hash(
@@ -448,7 +434,7 @@ mod tests {
 
 /// The v1 test adapter enters the same observed byte computation.
 pub fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
-    let mut work = EvaluationCheckpoints::new(&super::string_extended::LegacyStringControl);
+    let mut work = EvaluationCheckpoints::new(&super::string_extended::DirectStringControl);
     let value = hash(data, seed, &mut work).expect("unrestricted legacy Murmur3 control");
     work.finish().expect("unrestricted legacy Murmur3 control");
     value

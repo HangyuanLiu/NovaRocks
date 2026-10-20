@@ -89,7 +89,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         s.trace.push((phase, units));
-        match s.stop {
+        match s.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -884,7 +884,7 @@ fn prefixes(c: &Control, action: impl Fn() -> Result<(), Error>) {
     assert!(baseline_result.is_ok() || matches!(baseline_result, Err(Error::InvalidShape(_))));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             assert!(matches!(action(),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(c.trace(), baseline[..=at]);
         }
@@ -926,9 +926,9 @@ fn aggregate_wide_actual_inner_lists_observe_quantum_and_numeric_first_refusal()
     Fixture::new().with(&n,&c,|v,e,d,a|{
         c.arm(None);let (w,_)=encode_aggregate_node(&n,v,e,SOURCE,limits()).unwrap();let baseline=c.trace();
         let quantum=baseline.iter().position(|(_,u)|*u==256).expect("actual 320 argument walk must reach quantum");
-        for at in [0,quantum,baseline.len()-1]{for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(encode_aggregate_node(&n,v,e,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),baseline[..=at]);}}
+        for at in [0,quantum,baseline.len()-1]{for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(encode_aggregate_node(&n,v,e,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),baseline[..=at]);}}
         c.arm(None);let own=decode_aggregate_node(&w,d,a,SOURCE,limits()).unwrap().0;assert_eq!(own,n);let read_trace=c.trace();let quantum=read_trace.iter().position(|(_,u)|*u==256).unwrap();
-        for at in [0,quantum,read_trace.len()-1]{for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(decode_aggregate_node(&w,d,a,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),read_trace[..=at]);}}
+        for at in [0,quantum,read_trace.len()-1]{for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(decode_aggregate_node(&w,d,a,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),read_trace[..=at]);}}
         let mut l=limits();l.node.max_work=2048;
         for cause in CAUSES{c.arm(Some((1,cause)));assert!(matches!(encode_aggregate_node(&n,v,e,SOURCE,l),Err(Error::Control(CompileControlError::ResourceExhausted))));assert_eq!(c.trace(),vec![(CompilePhase::Encode,0)]);}
         c.disarm();
@@ -995,7 +995,7 @@ fn aggregate_real_signature_and_lambda_collections_obey_tighter_parent_before_wa
             let mut samples=vec![0,trace.len()-1];
             if let Some(at)=trace.iter().position(|(_,units)|*units==256){samples.push(at);}
             for at in samples {for cause in CAUSES {
-                c.arm(Some((at,cause)));
+                c.arm(Some((at,cause.clone())));
                 assert!(matches!(prepare_aggregate_node_decode(&wire,d,a,4*SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));
                 assert_eq!(c.trace(),trace[..=at]);
             }}
@@ -1022,7 +1022,7 @@ fn aggregate_real_signature_and_lambda_collections_obey_tighter_parent_before_wa
             let emit=c.trace();
             for at in [0,emit.len()-1] {for cause in CAUSES {
                 c.disarm();let prepared=prepare_aggregate_node_decode(&wire,d,a,4*SOURCE,tight).unwrap();
-                c.arm(Some((at,cause)));
+                c.arm(Some((at,cause.clone())));
                 assert!(matches!(prepared.emit(),Err(Error::Control(actual)) if actual==cause));
                 assert_eq!(c.trace(),emit[..=at]);
             }}
@@ -1865,7 +1865,7 @@ fn aggregate_caller_owned_actual320_signatures_and_lambda_copy_preserve_source_p
             }
             for at in samples {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(
                         matches!(decode(limits()),Err(Error::Control(actual)) if actual==cause)
                     );

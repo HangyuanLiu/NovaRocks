@@ -30,7 +30,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-#[cfg(test)]
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -785,24 +785,36 @@ impl EventScheduler {
     /// straight back to a worker to complete.
     pub(crate) fn add_pending_finish(
         self: &Arc<Self>,
-        mut task: DriverTask,
-    ) -> Result<(), Box<DriverTask>> {
-        let Some(wait) = task.refresh_pending_finish_wait() else {
+        slot: &mut Option<DriverTask>,
+    ) -> Result<bool, crate::runtime::observable::ObservableCapacityError> {
+        let task = slot.as_mut().expect("original pending-finish slot");
+        let Some(wait) = task.refresh_pending_finish_wait()? else {
+            // No foreign observation follows this check before the pure move.
+            let Some(shared) = self.shared.get() else {
+                return Ok(false);
+            };
+            let mut queue = shared.queue.lock().expect("global executor queue lock");
+            let mut task = slot.take().expect("one ready handoff");
             task.set_ready();
-            self.enqueue_ready(task);
-            return Ok(());
+            task.mark_queued();
+            queue.push_back(task);
+            shared.cv.notify_one();
+            return Ok(true);
         };
         let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        self.register_finish_observer(&task, Arc::clone(&wait.observable));
+        self.register_finish_observer(task, Arc::clone(&wait.observable))?;
         let wake_now = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
-            if self.shutdown.load(Ordering::Acquire) {
-                return Err(Box::new(task));
+            if self.shutdown.load(Ordering::Acquire) || blocked.contains_key(&key) {
+                return Ok(false);
             }
+            // Every preceding call only borrowed the original slot. The map
+            // becomes its unique owner at this one pure move.
+            let task = slot.take().expect("one blocked handoff");
             blocked.insert(
                 key,
                 BlockedTask {
@@ -848,7 +860,7 @@ impl EventScheduler {
                 wait.observable.generation(),
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     fn park_blocked(
@@ -1010,9 +1022,13 @@ impl EventScheduler {
 
     /// Watches a driver's finish observable while it waits in `PendingFinish`.
     /// Registration is once per driver and observable identity.
-    fn register_finish_observer(self: &Arc<Self>, task: &DriverTask, observable: Arc<Observable>) {
+    fn register_finish_observer(
+        self: &Arc<Self>,
+        task: &DriverTask,
+        observable: Arc<Observable>,
+    ) -> Result<(), crate::runtime::observable::ObservableCapacityError> {
         if !task.try_mark_finish_observer_registered(&observable) {
-            return;
+            return Ok(());
         }
         let observer = Arc::new(PipelineObserver::new(
             Arc::downgrade(self),
@@ -1021,7 +1037,7 @@ impl EventScheduler {
             task.driver_id(),
             task.fragment_instance_id(),
         ));
-        self.add_observer(observable, observer, ObserverKind::Finish);
+        self.try_add_observer(observable, observer, ObserverKind::Finish)
     }
 
     /// Watches a terminal operator's early-finish observable for a parked
@@ -1079,6 +1095,15 @@ impl EventScheduler {
         observer: Arc<PipelineObserver>,
         kind: ObserverKind,
     ) {
+        self.try_add_observer(observable, observer, kind)
+            .expect("observable registration capacity");
+    }
+    fn try_add_observer(
+        &self,
+        observable: Arc<Observable>,
+        observer: Arc<PipelineObserver>,
+        kind: ObserverKind,
+    ) -> Result<(), crate::runtime::observable::ObservableCapacityError> {
         let callback: Arc<dyn Fn() + Send + Sync + 'static> = match kind {
             ObserverKind::Source => {
                 let observer = Arc::clone(&observer);
@@ -1093,7 +1118,7 @@ impl EventScheduler {
                 Arc::new(move || observer.finish_trigger())
             }
         };
-        observable.add_observer(callback);
+        observable.try_add_observer(callback)
     }
 
     fn notify_dispatcher(&self) {
@@ -1279,7 +1304,15 @@ mod tests {
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
-    use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator};
+    use crate::exec::pipeline::input::{PreparedInput, RawInput};
+    use crate::exec::pipeline::operator::{
+        ExitProgress, FinishWatch, InputEncodingPolicy, Operator,
+    };
+    use crate::exec::pipeline::shape::{
+        SinkKernel, SinkStep, Source, SourceKernel, Transform, TransformStart,
+    };
+    use crate::exec::pipeline::step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason};
+    use crate::exec::pipeline::step_context::StepContext;
     use crate::runtime::runtime_state::RuntimeState;
     use std::sync::atomic::AtomicUsize;
 
@@ -1345,55 +1378,38 @@ mod tests {
         second_observable: Arc<Observable>,
     }
 
-    impl Operator for ControlledDynamicSource {
+    impl OperatorLifecycle for ControlledDynamicSource {
         fn name(&self) -> &str {
             "CONTROLLED_DYNAMIC_SOURCE"
         }
-
-        fn is_finished(&self) -> bool {
-            false
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for ControlledDynamicSource {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
+    impl SourceKernel for ControlledDynamicSource {
+        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             assert!(
                 !self.poll_forbidden.load(Ordering::Acquire),
                 "scheduler thread must not poll source readiness"
             );
-            self.ready.load(Ordering::Acquire)
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn source_observable(&self) -> Option<Arc<Observable>> {
-            if self.use_second_observable.load(Ordering::Acquire) {
-                Some(Arc::clone(&self.second_observable))
+            let event = if self.use_second_observable.load(Ordering::Acquire) {
+                self.second_observable.clone()
             } else {
-                Some(Arc::clone(&self.first_observable))
-            }
+                self.first_observable.clone()
+            };
+            let generation = event.generation();
+            Ok(if self.ready.load(Ordering::Acquire) {
+                StepResult::new(Some(one_row_chunk()), NextStep::Runnable, 1)
+            } else {
+                StepResult::new(
+                    None,
+                    NextStep::Wait(WaitFact {
+                        reason: WaitReason::Input,
+                        observable: event,
+                        observed_generation: generation,
+                        deadline: None,
+                    }),
+                    0,
+                )
+            })
         }
     }
 
@@ -1408,135 +1424,98 @@ mod tests {
         deadline: Arc<Mutex<Option<DriverBlockDeadline>>>,
     }
 
-    impl Operator for DeadlineSource {
+    impl OperatorLifecycle for DeadlineSource {
         fn name(&self) -> &str {
             "DEADLINE_SOURCE"
         }
+    }
 
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+    impl SourceKernel for DeadlineSource {
+        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            let generation = self.observable.generation();
+            Ok(if self.ready.load(Ordering::Acquire) {
+                StepResult::new(Some(one_row_chunk()), NextStep::Runnable, 1)
+            } else {
+                StepResult::new(
+                    None,
+                    NextStep::Wait(WaitFact {
+                        reason: WaitReason::Input,
+                        observable: self.observable.clone(),
+                        observed_generation: generation,
+                        deadline: *self.deadline.lock().expect("test deadline lock"),
+                    }),
+                    0,
+                )
+            })
         }
     }
 
-    impl ProcessorOperator for DeadlineSource {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
-            self.ready.load(Ordering::Acquire)
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn source_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
-        }
-
-        fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
-            *self.deadline.lock().expect("test deadline lock")
-        }
-    }
-
-    impl Operator for ControlledTerminalSink {
+    impl OperatorLifecycle for ControlledTerminalSink {
         fn name(&self) -> &str {
             "CONTROLLED_TERMINAL_SINK"
         }
+    }
 
-        fn is_finished(&self) -> bool {
-            false
+    impl InputEncodingPolicy for ControlledTerminalSink {}
+    impl SinkKernel for ControlledTerminalSink {
+        fn admission(
+            &self,
+            _: &mut StepContext<'_>,
+            _: &RawInput,
+        ) -> ExecutionResult<Option<AdmissionNext>> {
+            let generation = self.observable.generation();
+            Ok((!self.ready.load(Ordering::Acquire)).then(|| {
+                AdmissionNext::Wait(WaitFact {
+                    reason: WaitReason::Output,
+                    observable: self.observable.clone(),
+                    observed_generation: generation,
+                    deadline: None,
+                })
+            }))
         }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+        fn consume(
+            &mut self,
+            _: &mut StepContext<'_>,
+            input: PreparedInput,
+        ) -> ExecutionResult<SinkStep> {
+            let chunk = input.into_uncovered_chunk()?;
+            Ok(SinkStep::new(NextStep::NeedInput, chunk.len() as u64))
         }
     }
 
-    impl ProcessorOperator for ControlledTerminalSink {
-        fn need_input(&self) -> bool {
-            self.ready.load(Ordering::Acquire)
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
-        }
-    }
-
-    impl Operator for FinishTransitionSink {
+    impl OperatorLifecycle for FinishTransitionSink {
         fn name(&self) -> &str {
             "FINISH_TRANSITION_SINK"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished.load(Ordering::Acquire)
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for FinishTransitionSink {
-        fn need_input(&self) -> bool {
-            false
+    impl InputEncodingPolicy for FinishTransitionSink {}
+    impl SinkKernel for FinishTransitionSink {
+        fn start(&self) -> TransformStart {
+            TransformStart::Ready
         }
-
-        fn has_output(&self) -> bool {
-            true
+        fn consume(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<SinkStep> {
+            panic!("finish transition fixture owns no input edge")
         }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            (!self.is_finished()).then(|| Arc::clone(&self.observable))
+        fn poll(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+            let generation = self.observable.generation();
+            Ok(SinkStep::new(
+                if self.finished.load(Ordering::Acquire) {
+                    NextStep::Finished
+                } else {
+                    NextStep::Wait(WaitFact {
+                        reason: WaitReason::Output,
+                        observable: self.observable.clone(),
+                        observed_generation: generation,
+                        deadline: None,
+                    })
+                },
+                0,
+            ))
         }
     }
 
@@ -1547,10 +1526,10 @@ mod tests {
         let runtime_state = Arc::new(RuntimeState::default());
         let mut driver = PipelineDriver::new(
             3,
-            vec![Box::new(FinishTransitionSink {
+            vec![Box::new(Transform::hydrating(FinishTransitionSink {
                 finished: Arc::clone(&finished),
                 observable: Arc::clone(&observable),
-            })],
+            }))],
             None,
             Vec::new(),
             Arc::clone(&runtime_state),
@@ -1572,7 +1551,7 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1);
+        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
         let task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared::new());
@@ -1603,59 +1582,52 @@ mod tests {
         );
     }
 
-    /// A terminal sink that can finish without a turn of its own driver, as a
-    /// local-exchange sink does when all of its consumers leave.
+    /// An independently signaled demand withdrawal. No data step is needed
+    /// to learn it, and scheduler notification callbacks cannot poll it.
     struct EarlyFinishSink {
         finished: Arc<AtomicBool>,
-        capacity: Arc<Observable>,
         early_finish: Arc<Observable>,
     }
-
-    impl Operator for EarlyFinishSink {
+    impl OperatorLifecycle for EarlyFinishSink {
         fn name(&self) -> &str {
             "EARLY_FINISH_SINK"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished.load(Ordering::Acquire)
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
-
-    impl ProcessorOperator for EarlyFinishSink {
-        fn need_input(&self) -> bool {
-            !self.is_finished()
+    impl crate::exec::pipeline::shape::StepOperator for EarlyFinishSink {
+        fn initial_step(&self) -> crate::exec::pipeline::step::NextStep {
+            crate::exec::pipeline::step::NextStep::NeedInput
         }
-
-        fn has_output(&self) -> bool {
-            false
+        fn poll_control(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::ControlStep> {
+            Ok(if self.finished.load(Ordering::Acquire) {
+                crate::exec::pipeline::shape::ControlStep::Withdrawn
+            } else {
+                crate::exec::pipeline::shape::ControlStep::Active
+            })
         }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        fn control_observable(&self) -> Option<Arc<Observable>> {
+            Some(self.early_finish.clone())
+        }
+        fn try_push(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: crate::exec::pipeline::input::RawInput,
+        ) -> crate::exec::pipeline::step::InputResult {
+            panic!("control-only fixture must not receive input")
+        }
+        fn drive(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            panic!("control withdrawal must not need a data step")
+        }
+        fn finish(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<()> {
             Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.capacity))
-        }
-
-        fn early_finish_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.early_finish))
         }
     }
 
@@ -1677,16 +1649,15 @@ mod tests {
         let mut driver = PipelineDriver::new(
             5,
             vec![
-                Box::new(ControlledDynamicSource {
+                Box::new(Source::new(ControlledDynamicSource {
                     ready: Arc::new(AtomicBool::new(false)),
                     poll_forbidden: Arc::new(AtomicBool::new(false)),
                     use_second_observable: Arc::new(AtomicBool::new(false)),
                     first_observable: Arc::clone(&source_observable),
                     second_observable: Arc::new(Observable::new()),
-                }),
+                })),
                 Box::new(EarlyFinishSink {
                     finished: Arc::clone(&finished),
-                    capacity: Arc::new(Observable::new()),
                     early_finish: Arc::clone(&early_finish),
                 }),
             ],
@@ -1725,7 +1696,7 @@ mod tests {
             ));
             let task = DriverTask::new(
                 self.driver.take().expect("driver"),
-                FragmentCompletion::new(1),
+                FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state()),
                 fragment_ctx,
                 Duration::from_millis(10),
             );
@@ -1827,167 +1798,107 @@ mod tests {
     }
 
     struct DrainedSource;
-
-    impl Operator for DrainedSource {
+    impl OperatorLifecycle for DrainedSource {
         fn name(&self) -> &str {
             "DRAINED_SOURCE"
         }
-
-        fn is_finished(&self) -> bool {
-            true
+    }
+    impl crate::exec::pipeline::shape::SourceKernel for DrainedSource {
+        fn start(&self) -> crate::exec::pipeline::shape::SourceStart {
+            crate::exec::pipeline::shape::SourceStart::Finished
         }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+        fn poll_output(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            unreachable!("a drained source has no work")
         }
     }
-
-    impl ProcessorOperator for DrainedSource {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Err("a source accepts no input".to_string().into())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-    }
-
-    /// A processor whose finishing runs asynchronously and then owes one
-    /// output chunk, like a table writer publishing its commit row.
     struct OwingAfterFinishProcessor {
-        finishing: bool,
         pending: Arc<AtomicBool>,
         observable: Arc<Observable>,
         owed: Option<Chunk>,
     }
-
-    impl Operator for OwingAfterFinishProcessor {
+    impl OperatorLifecycle for OwingAfterFinishProcessor {
         fn name(&self) -> &str {
             "OWING_AFTER_FINISH"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finishing && !self.pending.load(Ordering::Acquire) && self.owed.is_none()
-        }
-
-        fn pending_finish(&self) -> Option<FinishWatch> {
-            (self.finishing && self.pending.load(Ordering::Acquire))
-                .then(|| FinishWatch::Notify(Arc::clone(&self.observable)))
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
-
-    impl ProcessorOperator for OwingAfterFinishProcessor {
-        fn need_input(&self) -> bool {
-            !self.finishing
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for OwingAfterFinishProcessor {}
+    impl crate::exec::pipeline::shape::TransformKernel for OwingAfterFinishProcessor {
+        fn apply(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            unreachable!("this fixture starts with exhausted input")
         }
-
-        fn has_output(&self) -> bool {
-            !self.pending.load(Ordering::Acquire) && self.owed.is_some()
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        fn drive(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
+            let generation = self.observable.generation();
             if self.pending.load(Ordering::Acquire) {
-                return Ok(None);
+                Ok(StepResult::new(
+                    None,
+                    NextStep::Wait(WaitFact {
+                        reason: WaitReason::Finish,
+                        observable: self.observable.clone(),
+                        observed_generation: generation,
+                        deadline: None,
+                    }),
+                    0,
+                ))
+            } else {
+                Ok(StepResult::new(self.owed.take(), NextStep::Finished, 0))
             }
-            Ok(self.owed.take())
         }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            self.finishing = true;
-            Ok(())
-        }
-
-        fn source_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+        fn finish(
+            &mut self,
+            ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            self.drive(ctx)
         }
     }
-
     struct CountingSink {
         rows: Arc<AtomicUsize>,
-        finished: bool,
-        observable: Arc<Observable>,
+        exit: Option<(Arc<AtomicBool>, Arc<Observable>)>,
     }
-
-    impl Operator for CountingSink {
+    impl OperatorLifecycle for CountingSink {
         fn name(&self) -> &str {
             "COUNTING_SINK"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+        fn observe_exit(&mut self) -> crate::exec::pipeline::operator::ExitObservation {
+            use crate::exec::pipeline::operator::ExitProgress;
+            match &self.exit {
+                Some((pending, event)) if pending.load(Ordering::Acquire) => {
+                    crate::exec::pipeline::operator::ExitObservation::pending(FinishWatch::Notify(
+                        event.clone(),
+                    ))
+                }
+                _ => crate::exec::pipeline::operator::ExitObservation::exited(),
+            }
         }
     }
-
-    impl ProcessorOperator for CountingSink {
-        fn need_input(&self) -> bool {
-            !self.finished
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-            self.rows.fetch_add(chunk.len(), Ordering::AcqRel);
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            self.finished = true;
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for CountingSink {}
+    impl crate::exec::pipeline::shape::SinkKernel for CountingSink {
+        fn consume(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            input: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            let rows = input.into_uncovered_chunk()?.len();
+            self.rows.fetch_add(rows, Ordering::AcqRel);
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                crate::exec::pipeline::step::NextStep::NeedInput,
+                rows as u64,
+            ))
         }
     }
 
     #[test]
-    fn output_owed_after_pending_finish_reaches_the_sink_before_the_driver_ends() {
+    fn owed_output_after_a_work_wait_reaches_the_sink_before_the_driver_ends() {
         let pending = Arc::new(AtomicBool::new(true));
         let owner = Arc::new(Observable::new());
         let rows = Arc::new(AtomicUsize::new(0));
@@ -1995,18 +1906,20 @@ mod tests {
         let mut driver = PipelineDriver::new(
             7,
             vec![
-                Box::new(DrainedSource),
-                Box::new(OwingAfterFinishProcessor {
-                    finishing: false,
-                    pending: Arc::clone(&pending),
-                    observable: Arc::clone(&owner),
-                    owed: Some(one_row_chunk()),
-                }),
-                Box::new(CountingSink {
-                    rows: Arc::clone(&rows),
-                    finished: false,
-                    observable: Arc::new(Observable::new()),
-                }),
+                Box::new(crate::exec::pipeline::shape::Source::new(DrainedSource)),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    OwingAfterFinishProcessor {
+                        pending: Arc::clone(&pending),
+                        observable: Arc::clone(&owner),
+                        owed: Some(one_row_chunk()),
+                    },
+                )),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CountingSink {
+                        rows: Arc::clone(&rows),
+                        exit: None,
+                    },
+                )),
             ],
             None,
             Vec::new(),
@@ -2015,7 +1928,7 @@ mod tests {
         );
         assert!(matches!(
             driver.process(Duration::from_millis(10)),
-            DriverState::PendingFinish
+            DriverState::Blocked(BlockedReason::OutputFull)
         ));
 
         let scheduler = Arc::new(EventScheduler::new());
@@ -2031,11 +1944,15 @@ mod tests {
         ));
         let task = DriverTask::new(
             driver,
-            FragmentCompletion::new(1),
+            FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state()),
             fragment_ctx,
             Duration::from_millis(10),
         );
-        assert!(scheduler.add_pending_finish(task).is_ok());
+        assert!(
+            scheduler
+                .add_blocked(task, BlockedReason::OutputFull)
+                .is_ok()
+        );
         let queued = |scheduler: &EventScheduler| {
             scheduler
                 .reschedule_queue
@@ -2077,39 +1994,19 @@ mod tests {
 
     struct EndlessSource;
 
-    impl Operator for EndlessSource {
+    impl OperatorLifecycle for EndlessSource {
         fn name(&self) -> &str {
             "ENDLESS_SOURCE"
         }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for EndlessSource {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
-            true
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Err("a source accepts no input".to_string().into())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(Some(one_row_chunk()))
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
+    impl SourceKernel for EndlessSource {
+        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            Ok(StepResult::new(
+                Some(one_row_chunk()),
+                NextStep::Runnable,
+                1,
+            ))
         }
     }
 
@@ -2121,53 +2018,40 @@ mod tests {
         observable: Arc<Observable>,
     }
 
-    impl Operator for FlushingLimitSink {
+    impl OperatorLifecycle for FlushingLimitSink {
         fn name(&self) -> &str {
             "FLUSHING_LIMIT_SINK"
         }
-
-        fn is_finished(&self) -> bool {
-            self.rows.load(Ordering::Acquire) >= self.limit
-        }
-
-        fn pending_finish(&self) -> Option<FinishWatch> {
-            (self.is_finished() && self.flushing.load(Ordering::Acquire))
-                .then(|| FinishWatch::Notify(Arc::clone(&self.observable)))
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+        fn observe_exit(&mut self) -> crate::exec::pipeline::operator::ExitObservation {
+            if self.rows.load(Ordering::Acquire) >= self.limit
+                && self.flushing.load(Ordering::Acquire)
+            {
+                crate::exec::pipeline::operator::ExitObservation::pending(FinishWatch::Notify(
+                    self.observable.clone(),
+                ))
+            } else {
+                crate::exec::pipeline::operator::ExitObservation::exited()
+            }
         }
     }
 
-    impl ProcessorOperator for FlushingLimitSink {
-        fn need_input(&self) -> bool {
-            !self.is_finished()
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-            self.rows.fetch_add(chunk.len(), Ordering::AcqRel);
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+    impl InputEncodingPolicy for FlushingLimitSink {}
+    impl SinkKernel for FlushingLimitSink {
+        fn consume(
+            &mut self,
+            _: &mut StepContext<'_>,
+            input: PreparedInput,
+        ) -> ExecutionResult<SinkStep> {
+            let chunk = input.into_uncovered_chunk()?;
+            let rows = self.rows.fetch_add(chunk.len(), Ordering::AcqRel) + chunk.len();
+            Ok(SinkStep::new(
+                if rows >= self.limit {
+                    NextStep::Finished
+                } else {
+                    NextStep::NeedInput
+                },
+                chunk.len() as u64,
+            ))
         }
     }
 
@@ -2178,13 +2062,13 @@ mod tests {
         let mut driver = PipelineDriver::new(
             9,
             vec![
-                Box::new(EndlessSource),
-                Box::new(FlushingLimitSink {
+                Box::new(Source::new(EndlessSource)),
+                Box::new(Transform::hydrating(FlushingLimitSink {
                     rows: Arc::clone(&rows),
                     limit: 3,
                     flushing: Arc::clone(&flushing),
                     observable: Arc::new(Observable::new()),
-                }),
+                })),
             ],
             None,
             Vec::new(),
@@ -2199,10 +2083,10 @@ mod tests {
             DriverState::PendingFinish
         ));
         assert_eq!(rows.load(Ordering::Acquire), 3);
-        assert!(driver.pending_finish_wait_on_worker().is_some());
+        assert!(driver.pending_finish_wait_on_worker().unwrap().is_some());
 
         flushing.store(false, Ordering::Release);
-        assert!(driver.pending_finish_wait_on_worker().is_none());
+        assert!(driver.pending_finish_wait_on_worker().unwrap().is_none());
         assert!(matches!(
             driver.process(Duration::from_secs(5)),
             DriverState::Finished
@@ -2218,18 +2102,13 @@ mod tests {
         let mut driver = PipelineDriver::new(
             8,
             vec![
-                Box::new(DrainedSource),
-                Box::new(OwingAfterFinishProcessor {
-                    finishing: false,
-                    pending: Arc::clone(&pending),
-                    observable: Arc::new(Observable::new()),
-                    owed: None,
-                }),
-                Box::new(CountingSink {
-                    rows,
-                    finished: false,
-                    observable: Arc::new(Observable::new()),
-                }),
+                Box::new(crate::exec::pipeline::shape::Source::new(DrainedSource)),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CountingSink {
+                        rows,
+                        exit: Some((pending.clone(), Arc::new(Observable::new()))),
+                    },
+                )),
             ],
             None,
             Vec::new(),
@@ -2249,7 +2128,7 @@ mod tests {
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
         let task = DriverTask::new(
             driver,
-            FragmentCompletion::new(1),
+            FragmentCompletion::new(1, runtime_state.error_state()),
             Arc::new(FragmentContext::new(
                 None,
                 runtime_state,
@@ -2260,7 +2139,9 @@ mod tests {
             )),
             Duration::from_millis(10),
         );
-        assert!(scheduler.add_pending_finish(task).is_ok());
+        let mut slot = Some(task);
+        assert!(scheduler.add_pending_finish(&mut slot).unwrap());
+        assert!(slot.is_none(), "the original scheduler took the task");
         assert!(scheduler.blocked.lock().expect("blocked lock").is_empty());
         let mut task = executor
             .queue
@@ -2279,25 +2160,25 @@ mod tests {
         let source_ready = Arc::new(AtomicBool::new(false));
         let poll_forbidden = Arc::new(AtomicBool::new(false));
         let use_second_observable = Arc::new(AtomicBool::new(false));
-        let first_observable = Arc::new(Observable::new());
-        let second_observable = Arc::new(Observable::new());
+        let first_observable = Arc::new(Observable::try_bounded(1).unwrap());
+        let second_observable = Arc::new(Observable::try_bounded(1).unwrap());
         let terminal_ready = Arc::new(AtomicBool::new(true));
         let terminal_observable = Arc::new(Observable::new());
         let runtime_state = Arc::new(RuntimeState::default());
         let driver = PipelineDriver::new(
             8,
             vec![
-                Box::new(ControlledDynamicSource {
+                Box::new(Source::new(ControlledDynamicSource {
                     ready: Arc::clone(&source_ready),
                     poll_forbidden: Arc::clone(&poll_forbidden),
                     use_second_observable: Arc::clone(&use_second_observable),
                     first_observable: Arc::clone(&first_observable),
                     second_observable: Arc::clone(&second_observable),
-                }),
-                Box::new(ControlledTerminalSink {
+                })),
+                Box::new(Transform::hydrating(ControlledTerminalSink {
                     ready: terminal_ready,
                     observable: terminal_observable,
-                }),
+                })),
             ],
             None,
             Vec::new(),
@@ -2312,7 +2193,7 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1);
+        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
         let mut task = DriverTask::new(
             driver,
             Arc::clone(&completion),
@@ -2331,8 +2212,14 @@ mod tests {
             scheduler.add_blocked(task, reason).is_ok(),
             "frozen source observable is registrable"
         );
-        assert_eq!(first_observable.num_observers(), 1);
-        assert_eq!(second_observable.num_observers(), 0);
+        assert!(
+            first_observable.try_subscribe(Arc::new(|| {})).is_err(),
+            "the active source owns the bounded subscription slot"
+        );
+        assert!(
+            second_observable.try_subscribe(Arc::new(|| {})).is_ok(),
+            "an inactive source has no subscription"
+        );
         assert!(
             scheduler
                 .reschedule_queue
@@ -2408,14 +2295,18 @@ mod tests {
             DriverState::Blocked(reason @ BlockedReason::InputEmpty) => reason,
             state => panic!("expected second input-empty block, got {state:?}"),
         };
+        let (driver_event, consumed_generation, _) = task.blocked_observable_snapshot().unwrap();
         assert!(scheduler.add_blocked(task, reason).is_ok());
-        assert_eq!(second_observable.num_observers(), 1);
-
-        scheduler.enqueue_observable(
-            key,
-            &Arc::downgrade(&second_observable),
-            second_observable.generation(),
+        assert!(
+            first_observable.try_subscribe(Arc::new(|| {})).is_ok(),
+            "switching source releases the old bounded slot"
         );
+        assert!(
+            second_observable.try_subscribe(Arc::new(|| {})).is_err(),
+            "the current source has exactly one scoped subscription"
+        );
+
+        scheduler.enqueue_observable(key, &Arc::downgrade(&driver_event), consumed_generation);
         assert!(
             scheduler
                 .reschedule_queue
@@ -2464,15 +2355,15 @@ mod tests {
         let driver = PipelineDriver::new(
             19,
             vec![
-                Box::new(DeadlineSource {
+                Box::new(Source::new(DeadlineSource {
                     ready: Arc::clone(&source_ready),
                     observable: Arc::clone(&source_observable),
                     deadline: source_deadline,
-                }),
-                Box::new(ControlledTerminalSink {
+                })),
+                Box::new(Transform::hydrating(ControlledTerminalSink {
                     ready: Arc::clone(&terminal_ready),
                     observable: terminal_observable,
-                }),
+                })),
             ],
             None,
             Vec::new(),
@@ -2487,7 +2378,7 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1);
+        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
         let mut task = DriverTask::new(
             driver,
             Arc::clone(&completion),
@@ -2596,14 +2487,14 @@ mod tests {
         let runtime_state = Arc::new(RuntimeState::default());
         let driver = PipelineDriver::new(
             20,
-            vec![Box::new(DeadlineSource {
+            vec![Box::new(Source::new(DeadlineSource {
                 ready: source_ready,
                 observable: Arc::new(Observable::new()),
                 deadline: Arc::new(Mutex::new(Some(DriverBlockDeadline::new(
                     Instant::now() + Duration::from_secs(30),
                     1,
                 )))),
-            })],
+            }))],
             None,
             Vec::new(),
             Arc::clone(&runtime_state),
@@ -2617,7 +2508,7 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1);
+        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
         let mut task = DriverTask::new(
             driver,
             Arc::clone(&completion),

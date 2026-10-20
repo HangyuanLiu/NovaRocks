@@ -31,7 +31,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push(units);
-        if let Some((index, cause)) = self.stop
+        if let Some((index, cause)) = self.stop.clone()
             && at == index
         {
             return Err(cause);
@@ -289,7 +289,7 @@ fn borrowed_read_small_success_and_ordinary_failures_preserve_every_control_pref
             ] {
                 let control = Control {
                     trace: Mutex::new(vec![]),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 let result = invoke(
                     &schema,
@@ -395,7 +395,7 @@ fn borrowed_read_wide_real_string_copy_observes_quantum_without_schema_retagging
         ] {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             let result = invoke(
                 &schema,

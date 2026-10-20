@@ -60,7 +60,7 @@ impl PureCompileControl for ConstructionControl {
         Ok(())
     }
 }
-fn refusals() -> [KernelFailure; 7] {
+fn refusals() -> [KernelFailure; 8] {
     [
         KernelFailure::Cancelled,
         KernelFailure::DeadlineExceeded,
@@ -69,6 +69,9 @@ fn refusals() -> [KernelFailure; 7] {
         KernelFailure::Internal(KernelDiagnostic::new("original internal refusal")),
         KernelFailure::Operational(KernelDiagnostic::new("original operational refusal")),
         KernelFailure::InstanceFailed,
+        KernelFailure::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+        ),
     ]
 }
 
@@ -119,7 +122,9 @@ fn public_provider_work_scope_preserves_quantum_and_every_originating_refusal() 
         let body: Result<(), KernelFailure> = Err(KernelFailure::Internal(KernelDiagnostic::new(
             "ordinary body failure",
         )));
-        assert_eq!(work.finish_result(body), Err(failure));
+        // The actual enclosing observation owner, rather than a new
+        // checkpoint, retains the refusal it observed before this body error.
+        assert_eq!(observer.finish(work.finish_result(body)), Err(failure));
         assert_eq!(*nested.checks.lock().unwrap(), [0]);
     }
 
@@ -130,13 +135,9 @@ fn public_provider_work_scope_preserves_quantum_and_every_originating_refusal() 
         "ordinary lifecycle data failure",
     )));
     assert_eq!(work.finish_result(body.clone()), body);
-    assert_eq!(*ordinary.checks.lock().unwrap(), [1]);
+    assert!(ordinary.checks.lock().unwrap().is_empty());
 
-    for failure in [
-        KernelFailure::Cancelled,
-        KernelFailure::DeadlineExceeded,
-        KernelFailure::ResourceExhausted,
-    ] {
+    for failure in refusals() {
         let control = Control {
             refusal: Some((
                 0,
@@ -310,7 +311,7 @@ fn selected_error_nulls_can_be_inspected_but_cannot_enter_ordinary_kernel_argume
             &FunctionValueType::new(DataType::Int64, true),
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let wrong = Selection::try_sparse(10, &[1, 5, 8]).unwrap();
     let mut visits = 0;
@@ -319,7 +320,7 @@ fn selected_error_nulls_can_be_inspected_but_cannot_enter_ordinary_kernel_argume
             visits += 1;
             Ok(())
         }),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     assert_eq!(visits, 0);
 }
@@ -386,7 +387,7 @@ fn original_controls_refuse_entry_quantum_and_completed_tail_without_retry() {
 }
 
 #[test]
-fn ordinary_shape_rejection_observes_completed_comparison_tail() {
+fn ordinary_shape_rejection_is_primary_without_a_comparison_footer() {
     let selection = Selection::try_sparse(10, &[1, 4, 8]).unwrap();
     let wrong = Selection::try_sparse(10, &[1, 5, 8]).unwrap();
     let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
@@ -407,7 +408,7 @@ fn ordinary_shape_rejection_observes_completed_comparison_tail() {
         Err(KernelFailure::InvalidProgram(_))
     ));
     assert_eq!(visits, 0);
-    assert_eq!(*baseline.checks.lock().unwrap(), [0, 2]);
+    assert_eq!(*baseline.checks.lock().unwrap(), [0]);
     for refusal in refusals() {
         let control = Control {
             checks: Mutex::default(),
@@ -419,16 +420,15 @@ fn ordinary_shape_rejection_observes_completed_comparison_tail() {
             &control,
             |_, _, _| panic!("shape rejection must precede any visitor"),
         );
-        assert_eq!(result, Err(refusal));
-        assert_eq!(*control.checks.lock().unwrap(), [0, 2]);
+        assert!(matches!(result, Err(KernelFailure::InvalidProgram(_))));
+        assert_eq!(*control.checks.lock().unwrap(), [0]);
     }
 }
 
 #[test]
-fn ordinary_address_rejection_observes_nested_work_tail() {
-    // Valid Arrow dictionaries can exceed the kernel's checked addressing depth.
-    // The inspector must observe this ordinary internal rejection, not return
-    // early merely because it has the same category as a control callback.
+fn ordinary_address_rejection_preserves_the_typed_source_without_a_footer() {
+    // Valid Arrow dictionaries can exceed the kernel's checked addressing
+    // depth. Preserve that original domain's refusal before a later callback.
     let mut values: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     for _ in 0..novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
         values = Arc::new(
@@ -436,63 +436,73 @@ fn ordinary_address_rejection_observes_nested_work_tail() {
         );
     }
     let baseline = Control::default();
-    assert!(matches!(
-        visit_selected_nulls(
-            EvaluatedArgument::Column(&values),
-            Selection::all(1),
-            &baseline,
-            |_, _, _| panic!("invalid depth cannot reach visitor")
-        ),
-        Err(KernelFailure::Internal(_))
-    ));
-    let tail = u32::try_from(novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1).unwrap();
-    assert_eq!(*baseline.checks.lock().unwrap(), [0, tail]);
+    let failure = visit_selected_nulls(
+        EvaluatedArgument::Column(&values),
+        Selection::all(1),
+        &baseline,
+        |_, _, _| panic!("invalid depth cannot reach visitor"),
+    )
+    .unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let fact = failure.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Invariant);
+    assert_eq!(
+        fact.reason().domain(),
+        novarocks_failure_contract::domain::KERNEL.get()
+    );
+    assert_eq!(fact.reason().code(), 160);
+    let KernelFailure::Source(source) = failure else {
+        panic!("expected original addressing cause")
+    };
+    assert_eq!(
+        std::error::Error::source(&source)
+            .unwrap()
+            .downcast_ref::<crate::logical_null::NullAddressViolation>(),
+        Some(&crate::logical_null::NullAddressViolation::NestedAddress)
+    );
+    assert_eq!(*baseline.checks.lock().unwrap(), [0]);
     for refusal in refusals() {
         let control = Control {
             checks: Mutex::default(),
             refusal: Some((1, refusal.clone())),
         };
+        let failure = visit_selected_nulls(
+            EvaluatedArgument::Column(&values),
+            Selection::all(1),
+            &control,
+            |_, _, _| panic!("invalid depth cannot reach visitor"),
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact(), fact);
+        let KernelFailure::Source(source) = failure else {
+            panic!("expected original addressing cause")
+        };
         assert_eq!(
-            visit_selected_nulls(
-                EvaluatedArgument::Column(&values),
-                Selection::all(1),
-                &control,
-                |_, _, _| panic!("invalid depth cannot reach visitor")
-            ),
-            Err(refusal)
+            std::error::Error::source(&source)
+                .unwrap()
+                .downcast_ref::<crate::logical_null::NullAddressViolation>(),
+            Some(&crate::logical_null::NullAddressViolation::NestedAddress)
         );
-        assert_eq!(*control.checks.lock().unwrap(), [0, tail]);
+        assert_eq!(*control.checks.lock().unwrap(), [0]);
     }
 }
 
 #[test]
-fn ordinary_length_rejection_observes_zero_completed_tail() {
+fn ordinary_length_rejection_is_primary_without_a_zero_work_footer() {
     let values: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     let baseline = Control::default();
-    assert!(matches!(
-        visit_selected_nulls(
-            EvaluatedArgument::Column(&values),
-            Selection::all(2),
-            &baseline,
-            |_, _, _| panic!("invalid length cannot reach visitor")
-        ),
-        Err(KernelFailure::InvalidProgram(_))
-    ));
-    assert_eq!(*baseline.checks.lock().unwrap(), [0, 0]);
+    assert!(
+        matches!(visit_selected_nulls(EvaluatedArgument::Column(&values), Selection::all(2), &baseline, |_, _, _| panic!("invalid length cannot reach visitor")), Err(ref cause) if crate::kernel_control::test_contract::input(cause))
+    );
+    assert_eq!(*baseline.checks.lock().unwrap(), [0]);
     let control = Control {
         checks: Mutex::default(),
         refusal: Some((1, KernelFailure::DeadlineExceeded)),
     };
-    assert_eq!(
-        visit_selected_nulls(
-            EvaluatedArgument::Column(&values),
-            Selection::all(2),
-            &control,
-            |_, _, _| panic!("invalid length cannot reach visitor")
-        ),
-        Err(KernelFailure::DeadlineExceeded)
+    assert!(
+        matches!(visit_selected_nulls(EvaluatedArgument::Column(&values), Selection::all(2), &control, |_, _, _| panic!("invalid length cannot reach visitor")), Err(ref cause) if crate::kernel_control::test_contract::input(cause))
     );
-    assert_eq!(*control.checks.lock().unwrap(), [0, 0]);
+    assert_eq!(*control.checks.lock().unwrap(), [0]);
 }
 
 #[test]

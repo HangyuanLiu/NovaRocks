@@ -36,7 +36,7 @@ use std::time::Duration;
 struct CompileControl(Option<CompileControlError>);
 impl PureCompileControl for CompileControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-        self.0.map_or(Ok(()), Err)
+        self.0.clone().map_or(Ok(()), Err)
     }
 }
 struct EvaluationControl(Option<KernelFailure>);
@@ -250,7 +250,7 @@ fn aggregate(
 }
 fn invalid_program<T: std::fmt::Debug>(result: Result<T, KernelFailure>) {
     assert!(
-        matches!(result, Err(KernelFailure::InvalidProgram(_))),
+        matches!(result, Err(ref cause) if crate::kernel_control::test_contract::input(cause)),
         "{result:?}"
     );
 }
@@ -799,10 +799,10 @@ fn outer_control_failures_propagate_from_phase_preparation_update_and_merge() {
                     false,
                     keys(0),
                     state,
-                    &CompileControl(Some(compile_error))
+                    &CompileControl(Some(compile_error.clone()))
                 )
                 .unwrap_err(),
-                kernel_error
+                KernelFailure::CompileControl(compile_error.clone())
             );
         }
         let control = EvaluationControl(Some(kernel_error.clone()));
@@ -954,7 +954,7 @@ impl PureCompileControl for ThresholdCompileControl {
         let mut work = self.work.lock().unwrap();
         work.push(units);
         if work.iter().sum::<u32>() >= self.fail_at {
-            Err(self.failure)
+            Err(self.failure.clone())
         } else {
             Ok(())
         }
@@ -1027,7 +1027,7 @@ fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
                     &control
                 )
                 .unwrap_err(),
-                expected
+                KernelFailure::CompileControl(control.failure.clone())
             );
             let work = control.work.lock().unwrap();
             assert_eq!(work.first(), Some(&0));

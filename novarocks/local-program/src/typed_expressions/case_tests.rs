@@ -700,7 +700,7 @@ impl PureCompileControl for Trace {
         let at = seen.len();
         seen.push(work);
         if self.at == Some(at) {
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -740,7 +740,7 @@ fn wide_actual_case_keeps_original_control_at_entry_positive_quantum_and_publica
         for at in [0, quantum, expected.len() - 1] {
             let control = Trace {
                 at: Some(at),
-                cause,
+                cause: cause.clone(),
                 seen: Mutex::new(Vec::new()),
             };
             assert!(

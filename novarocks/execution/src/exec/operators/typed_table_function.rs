@@ -84,7 +84,8 @@ fn binding_fits(
             Failure::Source(cause) => ConstructionFailure::InvalidSource(cause.to_string()).into(),
         })
 }
-impl TableFunctionFixtureOperator {
+#[cfg(test)]
+impl TableFunctionFixtureKernel {
     pub(super) fn validate_typed_declarations(
         &self,
         owner: &dyn InputConstructionOwner,
@@ -347,7 +348,7 @@ impl TableFunctionFixtureOperator {
             &self.fn_result_slots,
         )?;
         let mut events = |event: TableFunctionConstructionStep<'_>| scopes.observe(event);
-        let mut generated = self.build_output_columns::<ExecutionFailure>(
+        let mut generated = self.build_output_columns(
             chunk,
             &mut |count| reserve_columns(count, owner.as_ref()),
             &mut TableFunctionConstruction {
@@ -404,7 +405,7 @@ impl TableFunctionFixtureOperator {
             &self.fn_result_slots,
         )?;
         let mut events = |event: TableFunctionConstructionStep<'_>| scopes.observe(event);
-        let generated = self.empty_output_columns::<ExecutionFailure>(
+        let generated = self.empty_output_columns(
             &mut |count| reserve_columns(count, owner.as_ref()),
             &mut TableFunctionConstruction {
                 observe: Some(&mut events),

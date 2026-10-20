@@ -17,10 +17,10 @@
 
 //! Original owned renderer. The legacy path preserves its original allocation
 //! order; the selected path admits the same opaque operation before execution.
-use crate::bitmap_value::{BitmapDecodePort, LegacyBitmapPort};
+use crate::bitmap_value::{BitmapDecodePort, TypedBitmapPort};
 
-pub fn render(bytes: &[u8]) -> Result<String, String> {
-    render_with_port(bytes, &mut LegacyBitmapPort)
+pub fn render(bytes: &[u8]) -> Result<String, crate::bitmap_value::BitmapValueFailure> {
+    render_with_port(bytes, &mut TypedBitmapPort)
 }
 pub fn render_with_port<P: BitmapDecodePort>(
     bytes: &[u8],

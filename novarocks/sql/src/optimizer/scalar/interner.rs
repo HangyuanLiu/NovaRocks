@@ -546,7 +546,7 @@ fn intern_inner(
         Ok((fingerprint, None))
     })();
     if let Err(InternerError::Control(error)) = &result {
-        return Err((*error).into());
+        return Err(error.clone().into());
     }
     if matches!(
         &result,

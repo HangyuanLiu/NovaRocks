@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(after_context.len(), 1);
         assert!(Arc::ptr_eq(&after_context[0], &from_context));
 
-        let _state = RuntimeState::new(
+        let _state = RuntimeState::for_local_execution(
             None,
             None,
             Some(query_id),

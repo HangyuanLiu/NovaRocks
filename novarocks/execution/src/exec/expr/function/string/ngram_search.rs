@@ -20,7 +20,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float64Array, StringArray};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 
 use super::common::downcast_int_arg_array;
 
@@ -74,8 +76,8 @@ fn ngram_similarity(
 fn extract_const_string<'a>(
     arr: &'a StringArray,
     rows: usize,
-    err_msg: &str,
-) -> Result<Option<&'a str>, String> {
+    parameter: NgramParameter,
+) -> ExecutionResult<Option<&'a str>> {
     if arr.len() == 1 {
         return if arr.is_null(0) {
             Ok(None)
@@ -84,7 +86,9 @@ fn extract_const_string<'a>(
         };
     }
     if arr.len() != rows {
-        return Err(err_msg.to_string());
+        return Err(ExecutionFailure::from_domain(NgramFailure::NonConstant(
+            parameter,
+        )));
     }
     if arr.is_empty() {
         return Ok(None);
@@ -95,21 +99,25 @@ fn extract_const_string<'a>(
         if (1..arr.len()).all(|idx| arr.is_null(idx)) {
             return Ok(None);
         }
-        return Err(err_msg.to_string());
+        return Err(ExecutionFailure::from_domain(NgramFailure::NonConstant(
+            parameter,
+        )));
     }
     let first = arr.value(0);
     if (1..arr.len()).all(|idx| !arr.is_null(idx) && arr.value(idx) == first) {
         Ok(Some(first))
     } else {
-        Err(err_msg.to_string())
+        Err(ExecutionFailure::from_domain(NgramFailure::NonConstant(
+            parameter,
+        )))
     }
 }
 
 fn extract_const_i64(
     arr: &super::common::IntArgArray<'_>,
     rows: usize,
-    err_msg: &str,
-) -> Result<Option<i64>, String> {
+    parameter: NgramParameter,
+) -> ExecutionResult<Option<i64>> {
     if arr.len() == 1 {
         return if arr.is_null(0) {
             Ok(None)
@@ -118,7 +126,9 @@ fn extract_const_i64(
         };
     }
     if arr.len() != rows {
-        return Err(err_msg.to_string());
+        return Err(ExecutionFailure::from_domain(NgramFailure::NonConstant(
+            parameter,
+        )));
     }
     if arr.len() == 0 {
         return Ok(None);
@@ -129,13 +139,17 @@ fn extract_const_i64(
         if (1..arr.len()).all(|idx| arr.is_null(idx)) {
             return Ok(None);
         }
-        return Err(err_msg.to_string());
+        return Err(ExecutionFailure::from_domain(NgramFailure::NonConstant(
+            parameter,
+        )));
     }
     let first = arr.value(0);
     if (1..arr.len()).all(|idx| !arr.is_null(idx) && arr.value(idx) == first) {
         Ok(Some(first))
     } else {
-        Err(err_msg.to_string())
+        Err(ExecutionFailure::from_domain(NgramFailure::NonConstant(
+            parameter,
+        )))
     }
 }
 
@@ -145,7 +159,12 @@ fn eval_ngram_search_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     chunk: &Chunk,
     case_insensitive: bool,
     fn_name: &str,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 3 {
+        return Err(expression_contract(
+            "ngram search requires three prepared arguments",
+        ));
+    }
     let haystack_arr = arena.eval(args[0], chunk)?;
     let needle_arr = arena.eval(args[1], chunk)?;
     let gram_num_arr = arena.eval(args[2], chunk)?;
@@ -153,11 +172,11 @@ fn eval_ngram_search_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let haystack_arr = haystack_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("{fn_name} expects string"))?;
+        .ok_or_else(|| expression_contract(format_args!("{fn_name} expects string")))?;
     let needle_arr = needle_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("{fn_name} expects string"))?;
+        .ok_or_else(|| expression_contract(format_args!("{fn_name} expects string")))?;
     let gram_num_arr = downcast_int_arg_array(&gram_num_arr, fn_name)?;
 
     let rows = haystack_arr.len().max(chunk.len());
@@ -165,36 +184,29 @@ fn eval_ngram_search_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         return Ok(Arc::new(Float64Array::from(Vec::<Option<f64>>::new())) as ArrayRef);
     }
     if haystack_arr.len() != 1 && haystack_arr.len() != rows {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "{fn_name} haystack length mismatch: {} vs {rows}",
             haystack_arr.len()
-        ))
-        .into());
+        )));
     }
-    let needle = extract_const_string(
-        needle_arr,
-        rows,
-        "ngram search's second parameter must be const",
-    )?;
-    let gram_num_i64 = extract_const_i64(
-        &gram_num_arr,
-        rows,
-        "ngram search's third parameter must be const",
-    )?;
+    let needle = extract_const_string(needle_arr, rows, NgramParameter::Needle)?;
+    let gram_num_i64 = extract_const_i64(&gram_num_arr, rows, NgramParameter::Gram)?;
 
     let (Some(needle), Some(gram_num_i64)) = (needle, gram_num_i64) else {
         return Ok(Arc::new(Float64Array::from(vec![None; rows])) as ArrayRef);
     };
     if gram_num_i64 <= 0 {
-        return Err(
-            ("ngram search's third parameter must be a positive number".to_string()).into(),
-        );
+        return Err(ExecutionFailure::from_domain(NgramFailure::NonPositive(
+            gram_num_i64,
+        )));
     }
     let gram_num = usize::try_from(gram_num_i64)
-        .map_err(|_| "ngram search's third parameter must be a positive number".to_string())?;
+        .map_err(|source| ExecutionFailure::from_domain(NgramFailure::IndexNarrow(source)))?;
 
     if needle.len() > MAX_STRING_SIZE {
-        return Err(("ngram function's second parameter is larger than 2^15".to_string()).into());
+        return Err(ExecutionFailure::from_domain(NgramFailure::NeedleTooLong(
+            needle.len(),
+        )));
     }
 
     let normalized_needle = normalize_ascii_case(needle, case_insensitive);
@@ -229,8 +241,8 @@ pub fn eval_ngram_search<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_ngram_search_impl(arena, args, chunk, false, "ngram_search"))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_ngram_search_impl(arena, args, chunk, false, "ngram_search")
 }
 
 pub fn eval_ngram_search_case_insensitive<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -238,6 +250,94 @@ pub fn eval_ngram_search_case_insensitive<__Eval: crate::exec::expr::ExprEvaluat
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_ngram_search_impl(arena, args, chunk, true, "ngram_search_case_insensitive"))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_ngram_search_impl(arena, args, chunk, true, "ngram_search_case_insensitive")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NgramParameter {
+    Needle,
+    Gram,
+}
+#[derive(Debug)]
+enum NgramFailure {
+    NonConstant(NgramParameter),
+    NonPositive(i64),
+    NeedleTooLong(usize),
+    IndexNarrow(std::num::TryFromIntError),
+}
+impl std::fmt::Display for NgramFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonConstant(NgramParameter::Needle) => {
+                f.write_str("ngram search's second parameter must be const")
+            }
+            Self::NonConstant(NgramParameter::Gram) => {
+                f.write_str("ngram search's third parameter must be const")
+            }
+            Self::NonPositive(value) => {
+                let _ = value;
+                f.write_str("ngram search's third parameter must be a positive number")
+            }
+            Self::NeedleTooLong(bytes) => {
+                let _ = bytes;
+                f.write_str("ngram function's second parameter is larger than 2^15")
+            }
+            Self::IndexNarrow(_) => {
+                f.write_str("ngram search's third parameter must be a positive number")
+            }
+        }
+    }
+}
+impl std::error::Error for NgramFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IndexNarrow(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl FailureProjection for NgramFailure {
+    fn failure_fact(&self) -> FailureFact {
+        match self {
+            Self::IndexNarrow(_) => {
+                novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+            }
+            _ => FailureFact::new(
+                FailureClass::Data,
+                ExecutionReason::StringNgramParameter.reason(),
+            ),
+        }
+    }
+}
+#[cfg(test)]
+mod source_properties {
+    use super::*;
+    use std::error::Error;
+    #[test]
+    fn actual_nonconstant_needle_is_data_and_does_not_retain_its_carrier() {
+        let input = Arc::new(StringArray::from(vec!["ResourceExhausted", "Cancelled"]));
+        let weak = Arc::downgrade(&input);
+        let failure = extract_const_string(&input, 2, NgramParameter::Needle).unwrap_err();
+        drop(input);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 517);
+        assert!(
+            failure
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<NgramFailure>()
+        );
+        let needle = b"aaaa";
+        let grams = build_gram_count_map(needle, 2);
+        assert_eq!(ngram_similarity(b"aaaaaa", 3, 2, &grams), 1.0);
+        assert_eq!(
+            ngram_similarity(b"aa", 3, 2, &grams),
+            (1.0_f32 - 2.0_f32 / 3.0_f32) as f64
+        );
+        assert_eq!(normalize_ascii_case("İABC", true), "İabc".as_bytes());
+    }
 }

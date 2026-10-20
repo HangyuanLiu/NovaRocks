@@ -30,7 +30,7 @@ use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-use std::{alloc::Layout, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StringCaseOp {
@@ -42,8 +42,8 @@ fn mapped_length(
     op: StringCaseOp,
     text: &str,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<usize, KernelFailure> {
-    let mut length = 0usize;
+) -> Result<u128, KernelFailure> {
+    let mut length = 0u128;
     for ch in text.chars() {
         // UTF-8 decoding consumes at most four bytes per scalar. The Unicode
         // mapping iterators hold at most three chars and allocate no backing.
@@ -51,17 +51,13 @@ fn mapped_length(
         match op {
             StringCaseOp::Lower => {
                 for mapped in ch.to_lowercase() {
-                    length = length
-                        .checked_add(mapped.len_utf8())
-                        .ok_or(KernelFailure::ResourceExhausted)?;
+                    length += mapped.len_utf8() as u128;
                     work.step()?;
                 }
             }
             StringCaseOp::Upper => {
                 for mapped in ch.to_uppercase() {
-                    length = length
-                        .checked_add(mapped.len_utf8())
-                        .ok_or(KernelFailure::ResourceExhausted)?;
+                    length += mapped.len_utf8() as u128;
                     work.step()?;
                 }
             }
@@ -90,25 +86,22 @@ fn temporary_layout(input_bytes: usize, output_bytes: usize) -> Result<(), Kerne
                 .ok_or(KernelFailure::ResourceExhausted)?,
         )
         .ok_or(KernelFailure::ResourceExhausted)?;
-    Layout::array::<u8>(input_bytes.max(next)).map_err(|_| KernelFailure::ResourceExhausted)?;
+    super::string_failure::array_layout::<u8>(input_bytes.max(next))?;
     // Historical request totals are arithmetic, not one allocation layout.
     let _ = cumulative;
     Ok(())
 }
-fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
-    i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+fn output_layout(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     let offsets = rows
         .checked_add(1)
         .ok_or(KernelFailure::ResourceExhausted)?;
-    let offsets = Layout::array::<i32>(offsets)
-        .map_err(|_| KernelFailure::ResourceExhausted)?
-        .size();
+    let offsets = super::string_failure::array_layout::<i32>(offsets)?.size();
     let bitmap = rows
         .checked_add(63)
         .map(|bits| bits / 64)
         .and_then(|words| words.checked_mul(8))
         .ok_or(KernelFailure::ResourceExhausted)?;
-    Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
+    super::string_failure::array_layout::<u8>(bitmap)?;
     bytes
         .checked_add(offsets)
         .and_then(|value| value.checked_add(bitmap))
@@ -143,94 +136,8 @@ pub(super) fn evaluate_string_case<'a>(
                 "string case conversion differs from its exact installed profile",
             ));
         }
-        let values = argument
-            .array()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| internal("string case conversion selected carrier is not Utf8"))?;
         let selection = input.selection();
-        output_capacity(selection.len(), 0)?;
-        let mut output_bytes = 0usize;
-        for (ordinal, batch_row) in selection.iter().enumerate() {
-            let row = argument.value_row(ordinal, batch_row);
-            work.step()?;
-            if row >= values.len() {
-                return Err(internal(
-                    "string case conversion selected row is outside its carrier",
-                ));
-            }
-            if values.is_null(row) {
-                if !source.nullable() {
-                    return Err(internal(
-                        "string case conversion non-null source contains selected SQL NULL",
-                    ));
-                }
-                continue;
-            }
-            let text = values.value(row);
-            let length = mapped_length(op, text, &mut work)?;
-            temporary_layout(text.len(), length)?;
-            output_bytes = output_bytes
-                .checked_add(length)
-                .ok_or(KernelFailure::ResourceExhausted)?;
-        }
-        output_capacity(selection.len(), output_bytes)?;
-        work.flush()?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(output_bytes)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        work.flush()?;
-        let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(selection.len() + 1)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        work.flush()?;
-        let mut validity = BooleanBufferBuilder::new(selection.len());
-        work.flush()?;
-        offsets.push(0i32);
-        let mut has_null = false;
-        walk_case_values(
-            op,
-            *argument,
-            selection,
-            source.nullable(),
-            &mut work,
-            |converted, work| {
-                if let Some(converted) = converted {
-                    if converted.len() > output_bytes - bytes.len() {
-                        return Err(internal(
-                            "string case conversion exceeded its measured output extent",
-                        ));
-                    }
-                    for byte in converted.bytes() {
-                        bytes.push(byte);
-                        work.step()?;
-                    }
-                    validity.append(true);
-                } else {
-                    has_null = true;
-                    validity.append(false);
-                }
-                offsets.push(
-                    i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?,
-                );
-                work.step()?;
-                Ok(())
-            },
-        )?;
-        if bytes.len() != output_bytes {
-            return Err(internal(
-                "string case conversion differs from its measured output extent",
-            ));
-        }
-        work.flush()?;
-        let array = Arc::new(StringArray::new(
-            OffsetBuffer::new(offsets.into()),
-            Buffer::from(bytes),
-            has_null.then(|| NullBuffer::new(validity.finish())),
-        )) as ArrayRef;
-        work.flush()?;
+        let array = build_case_array(op, *argument, selection, source.nullable(), &mut work)?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
             target.data_type(),
@@ -239,21 +146,109 @@ pub(super) fn evaluate_string_case<'a>(
             || work.step(),
         )
     })();
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result)
 }
 
 /// One original whole-string calculation walk for both value boundaries.
 /// The per-char pass above only measures output; final sigma still depends on
 /// its complete input string in Rust's original Unicode implementation.
+fn build_case_array(
+    op: StringCaseOp,
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    source_nullable: bool,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let values = argument
+        .array()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| internal("string case conversion selected carrier is not Utf8"))?;
+    output_layout(selection.len(), 0)?;
+    let mut output_extent = 0i32;
+    for (ordinal, batch_row) in selection.iter().enumerate() {
+        let row = argument.value_row(ordinal, batch_row);
+        work.step()?;
+        if row >= values.len() {
+            return Err(internal(
+                "string case conversion selected row is outside its carrier",
+            ));
+        }
+        if values.is_null(row) {
+            if !source_nullable {
+                return Err(internal(
+                    "string case conversion non-null source contains selected SQL NULL",
+                ));
+            }
+            continue;
+        }
+        let text = values.value(row);
+        let length = value_extent(mapped_length(op, text, work)?)?;
+        temporary_layout(text.len(), length)?;
+        output_extent = crate::aggregate_scalar::checked_utf8_output_offset(output_extent, length)?;
+    }
+    let output_bytes = output_extent as usize;
+    output_layout(selection.len(), output_bytes)?;
+    work.flush()?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(output_bytes)
+        .map_err(|source| super::string_failure::reservation::<u8>(output_bytes, source))?;
+    work.flush()?;
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve_exact(selection.len() + 1)
+        .map_err(|source| super::string_failure::reservation::<i32>(selection.len() + 1, source))?;
+    work.flush()?;
+    let mut validity = BooleanBufferBuilder::new(selection.len());
+    work.flush()?;
+    offsets.push(0i32);
+    let mut has_null = false;
+    walk_case_values(
+        op,
+        argument,
+        selection,
+        source_nullable,
+        work,
+        |converted, work| {
+            if let Some(converted) = converted {
+                if converted.len() > output_bytes - bytes.len() {
+                    return Err(internal(
+                        "string case conversion exceeded its measured output extent",
+                    ));
+                }
+                for byte in converted.bytes() {
+                    bytes.push(byte);
+                    work.step()?;
+                }
+                validity.append(true);
+            } else {
+                has_null = true;
+                validity.append(false);
+            }
+            offsets.push(
+                i32::try_from(bytes.len())
+                    .map_err(|_| internal("validated string case output extent drifted"))?,
+            );
+            work.step()?;
+            Ok(())
+        },
+    )?;
+    if bytes.len() != output_bytes {
+        return Err(internal(
+            "string case conversion differs from its measured output extent",
+        ));
+    }
+    work.flush()?;
+    let array = Arc::new(StringArray::new(
+        OffsetBuffer::new(offsets.into()),
+        Buffer::from(bytes),
+        has_null.then(|| NullBuffer::new(validity.finish())),
+    )) as ArrayRef;
+    work.flush()?;
+    Ok(array)
+}
+
 fn walk_case_values(
     op: StringCaseOp,
     argument: EvaluatedArgument<'_>,
@@ -295,50 +290,30 @@ fn walk_case_values(
     }
     Ok(())
 }
-/// V1 owns child evaluation and calls the same calculation on all input rows.
-/// Keep its original carrier diagnostics and original Arrow assembly sink;
-/// unsupported carriers are not coerced and output metadata is not applied.
-/// Its Vec/StringArray allocation and offset panic behavior remains unchanged.
-pub fn evaluate_legacy_case(op: StringCaseOp, input: &ArrayRef) -> Result<ArrayRef, String> {
+/// Arguments are already evaluated. Both entry points share Unicode conversion,
+/// per-value representation planning and the final Arrow output author.
+pub fn evaluate_required_case(
+    op: StringCaseOp,
+    input: &ArrayRef,
+) -> Result<ArrayRef, KernelFailure> {
     let values = input
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            match op {
-                StringCaseOp::Lower => "lower expects string",
-                StringCaseOp::Upper => "upper: argument must be a string array",
-            }
-            .to_string()
-        })?;
-    let mut output = Vec::with_capacity(values.len());
-    let mut work = EvaluationCheckpoints::new(&LegacyControl);
-    walk_case_values(
+        .ok_or_else(|| KernelFailure::from_domain(CaseFailure::Carrier(op)))?;
+    let mut work = EvaluationCheckpoints::new(&DirectCaseControl);
+    let result = build_case_array(
         op,
         EvaluatedArgument::Column(input),
         Selection::all(values.len()),
         true,
         &mut work,
-        |converted, _| {
-            output.push(converted);
-            Ok(())
-        },
-    )
-    .map_err(|failure| match failure {
-        KernelFailure::InvalidProgram(message)
-        | KernelFailure::Internal(message)
-        | KernelFailure::Operational(message) => message.message().to_string(),
-        other => other.to_string(),
-    })?;
-    let output = match op {
-        StringCaseOp::Lower => StringArray::from(output),
-        StringCaseOp::Upper => StringArray::from_iter(output),
-    };
-    Ok(Arc::new(output))
+    );
+    work.finish_result(result)
 }
-struct LegacyControl;
-impl KernelEvaluationControl for LegacyControl {
+struct DirectCaseControl;
+impl KernelEvaluationControl for DirectCaseControl {
     fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
-        panic!("pure scalar calculation never waits")
+        Err(internal("direct string case calculation must not wait"))
     }
 
     fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
@@ -349,3 +324,60 @@ impl KernelEvaluationControl for LegacyControl {
 #[cfg(test)]
 #[path = "string_case_tests.rs"]
 mod tests;
+
+#[derive(Debug)]
+enum CaseFailure {
+    Carrier(StringCaseOp),
+    ValueExtent { required: u128 },
+}
+impl std::fmt::Display for CaseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Carrier(StringCaseOp::Lower) => f.write_str("lower expects string"),
+            Self::Carrier(StringCaseOp::Upper) => {
+                f.write_str("upper: argument must be a string array")
+            }
+            Self::ValueExtent { required } => write!(
+                f,
+                "Unicode case value requires {required} UTF-8 bytes, exceeding i32 offsets"
+            ),
+        }
+    }
+}
+impl std::error::Error for CaseFailure {}
+impl novarocks_failure_contract::FailureProjection for CaseFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let reason =
+            |code| FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap());
+        match self {
+            Self::Carrier(_) => FailureFact::new(FailureClass::Invariant, reason(359)),
+            Self::ValueExtent { required } => {
+                FailureFact::new(FailureClass::Representation, reason(358)).with_representation(
+                    RepresentationFacts {
+                        boundary: RepresentationBoundary::MinimumUnit,
+                        layout: RepresentationLayout {
+                            domain: domain::KERNEL,
+                            code: std::num::NonZeroU16::new(60).unwrap(),
+                        },
+                        required: u64::try_from(*required).ok(),
+                        extent_limit: Some(i32::MAX as u64),
+                        representable_prefix: None,
+                    },
+                )
+            }
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for CaseFailure {}
+fn value_extent(required: u128) -> Result<usize, KernelFailure> {
+    if required > i32::MAX as u128 {
+        return Err(KernelFailure::from_domain(CaseFailure::ValueExtent {
+            required,
+        }));
+    }
+    Ok(required as usize)
+}

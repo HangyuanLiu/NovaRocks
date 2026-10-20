@@ -101,13 +101,14 @@ fn original_largeint_text_types_and_actual_arena_physical_and_nominal_fields() {
 #[test]
 fn original_largeint_reader_keeps_complete_error_text_and_byte_order() {
     assert_eq!(
-        novarocks_types::largeint::i128_from_be_bytes(&[0; 15]).unwrap_err(),
+        (novarocks_types::largeint::i128_from_be_bytes(&[0; 15]).unwrap_err()).to_string(),
         "invalid LARGEINT byte length: expected 16, got 15"
     );
     let wrong: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1]));
     assert_eq!(
-        novarocks_types::largeint::as_fixed_size_binary_array(&wrong, "cast LARGEINT to VARCHAR")
-            .unwrap_err(),
+        (novarocks_types::largeint::as_fixed_size_binary_array(&wrong, "cast LARGEINT to VARCHAR")
+            .unwrap_err())
+        .to_string(),
         "cast LARGEINT to VARCHAR: expected FixedSizeBinaryArray"
     );
     let wrong: ArrayRef = Arc::new(
@@ -118,8 +119,9 @@ fn original_largeint_reader_keeps_complete_error_text_and_byte_order() {
         .unwrap(),
     );
     assert_eq!(
-        novarocks_types::largeint::as_fixed_size_binary_array(&wrong, "cast LARGEINT to VARCHAR")
-            .unwrap_err(),
+        (novarocks_types::largeint::as_fixed_size_binary_array(&wrong, "cast LARGEINT to VARCHAR")
+            .unwrap_err())
+        .to_string(),
         "cast LARGEINT to VARCHAR: expected FixedSizeBinary(16), got FixedSizeBinary(15)"
     );
     assert_eq!(

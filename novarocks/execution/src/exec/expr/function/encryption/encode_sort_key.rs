@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Date32Array, Decimal128Array,
-    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use novarocks_types::largeint;
 use std::sync::Arc;
@@ -33,14 +33,14 @@ const SLICE_ESCAPE_BYTE: u8 = 0x00;
 const SLICE_ESCAPE_SUFFIX: u8 = 0x01;
 
 #[inline]
-fn check_arg_len(arg_len: usize, rows: usize, arg_idx: usize) -> Result<(), String> {
+fn check_arg_len(arg_len: usize, rows: usize, arg_idx: usize) -> ExecutionResult<()> {
     if arg_len == rows || arg_len == 1 {
         return Ok(());
     }
-    Err(format!(
+    Err(expression_contract(format_args!(
         "encode_sort_key: arg{} length mismatch: expected {} or 1, got {}",
         arg_idx, rows, arg_len
-    ))
+    )))
 }
 
 #[inline]
@@ -137,7 +137,7 @@ fn encode_column(
     is_last_field: bool,
     rows: usize,
     out: &mut [Vec<u8>],
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     check_arg_len(arg.len(), rows, arg_idx)?;
 
     match arg.data_type() {
@@ -147,10 +147,9 @@ fn encode_column(
             }
         }
         DataType::Boolean => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast BooleanArray".to_string())?;
+            let arr = arg.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast BooleanArray")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -162,10 +161,9 @@ fn encode_column(
             }
         }
         DataType::Int8 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Int8Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast Int8Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -177,10 +175,9 @@ fn encode_column(
             }
         }
         DataType::UInt8 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast UInt8Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast UInt8Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -192,10 +189,9 @@ fn encode_column(
             }
         }
         DataType::Int16 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Int16Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast Int16Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -207,10 +203,9 @@ fn encode_column(
             }
         }
         DataType::UInt16 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast UInt16Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast UInt16Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -222,10 +217,9 @@ fn encode_column(
             }
         }
         DataType::Int32 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Int32Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast Int32Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -237,10 +231,9 @@ fn encode_column(
             }
         }
         DataType::UInt32 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast UInt32Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast UInt32Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -252,10 +245,9 @@ fn encode_column(
             }
         }
         DataType::Date32 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Date32Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast Date32Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -267,10 +259,9 @@ fn encode_column(
             }
         }
         DataType::Int64 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Int64Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast Int64Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -282,10 +273,9 @@ fn encode_column(
             }
         }
         DataType::UInt64 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast UInt64Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast UInt64Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -297,10 +287,9 @@ fn encode_column(
             }
         }
         DataType::Float32 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Float32Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast Float32Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -312,10 +301,9 @@ fn encode_column(
             }
         }
         DataType::Float64 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Float64Array".to_string())?;
+            let arr = arg.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast Float64Array")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -327,14 +315,7 @@ fn encode_column(
             }
         }
         DataType::Timestamp(_, _) => {
-            let casted = cast(arg, &DataType::Int64)
-                .map_err(|e| format!("encode_sort_key: failed to cast TIMESTAMP to BIGINT: {e}"))?;
-            let arr = casted
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    "encode_sort_key: failed to downcast timestamp cast result".to_string()
-                })?;
+            let arr = super::common::timestamp_as_i64(arg, "encode_sort_key")?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -346,10 +327,9 @@ fn encode_column(
             }
         }
         DataType::Utf8 => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast StringArray".to_string())?;
+            let arr = arg.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast StringArray")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -361,10 +341,9 @@ fn encode_column(
             }
         }
         DataType::Binary => {
-            let arr = arg
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast BinaryArray".to_string())?;
+            let arr = arg.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                expression_contract("encode_sort_key: failed to downcast BinaryArray")
+            })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -379,7 +358,9 @@ fn encode_column(
             let arr = arg
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "encode_sort_key: failed to downcast Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    expression_contract("encode_sort_key: failed to downcast Decimal128Array")
+                })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
                 if arr.is_null(idx) {
@@ -395,7 +376,7 @@ fn encode_column(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| {
-                    "encode_sort_key: failed to downcast FixedSizeBinaryArray".to_string()
+                    expression_contract("encode_sort_key: failed to downcast FixedSizeBinaryArray")
                 })?;
             for (row, buffer) in out.iter_mut().enumerate().take(rows) {
                 let idx = arg_row_index(arr.len(), row);
@@ -409,10 +390,10 @@ fn encode_column(
             }
         }
         other => {
-            return Err(format!(
+            return Err(expression_contract(format_args!(
                 "encode_sort_key: unsupported argument type: {:?}",
                 other
-            ));
+            )));
         }
     }
 
@@ -429,9 +410,11 @@ pub fn eval_encode_sort_key<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.is_empty() {
-        return Err(("encode_sort_key requires at least 1 argument".to_string()).into());
+        return Err(expression_contract(
+            "encode_sort_key requires at least 1 argument",
+        ));
     }
 
     let rows = chunk.len();
@@ -451,10 +434,11 @@ pub fn eval_encode_sort_key<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         )?;
     }
 
-    let mut builder = BinaryBuilder::new();
+    let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
     for value in encoded {
-        builder.append_value(value);
+        builder.append_value(value)?;
     }
-    let out = Arc::new(builder.finish()) as ArrayRef;
-    Ok((super::common::cast_output(out, arena.data_type(expr), "encode_sort_key"))?)
+    let out = Arc::new(builder.finish()?) as ArrayRef;
+    super::common::cast_output(out, arena.data_type(expr), "encode_sort_key")
+        .map_err(ExecutionFailure::from)
 }

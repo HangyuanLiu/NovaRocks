@@ -28,7 +28,7 @@ use std::{
 
 use novarocks_functions::{
     CallEffectInput, ConstantError, ConstantPolicy, ConstantValue, FunctionBindingError,
-    FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure, KernelFailure,
+    FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure,
     PureCallPreparation, PureCallSpecialization, PureEngineFunctionCatalog,
     ScopedExpressionEffects,
 };
@@ -61,6 +61,13 @@ pub(crate) struct LoweredExpressions {
 
 #[derive(Debug)]
 pub(crate) enum ExpressionLoweringError {
+    Construction(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    Publication(
+        novarocks_local_program::ProgramCreationFailure<
+            std::convert::Infallible,
+            std::convert::Infallible,
+        >,
+    ),
     Control(CompileControlError),
     Constant(ConstantError),
     Reference(ConstantReferenceError),
@@ -93,6 +100,8 @@ impl ExpressionLoweringError {
 impl fmt::Display for ExpressionLoweringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Construction(source) => source.fmt(f),
+            Self::Publication(source) => source.fmt(f),
             Self::Control(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
             Self::Reference(e) => e.fmt(f),
@@ -115,6 +124,8 @@ impl fmt::Display for ExpressionLoweringError {
 impl Error for ExpressionLoweringError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Construction(source) => Some(source),
+            Self::Publication(source) => Some(source),
             Self::Control(e) => Some(e),
             Self::Constant(e) => Some(e),
             Self::Reference(e) => Some(e),
@@ -132,28 +143,34 @@ impl Error for ExpressionLoweringError {
 }
 impl From<novarocks_functions::ArithmeticPrepareError> for ExpressionLoweringError {
     fn from(value: novarocks_functions::ArithmeticPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Arithmetic(value)
+        match value {
+            novarocks_functions::ArithmeticPrepareError::Control(cause)
+            | novarocks_functions::ArithmeticPrepareError::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(cause),
+            ) => Self::Control(cause),
+            original => Self::Arithmetic(original),
         }
     }
 }
 impl From<novarocks_functions::CastPrepareError> for ExpressionLoweringError {
     fn from(value: novarocks_functions::CastPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Cast(value)
+        match value {
+            novarocks_functions::CastPrepareError::Control(cause)
+            | novarocks_functions::CastPrepareError::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(cause),
+            ) => Self::Control(cause),
+            original => Self::Cast(original),
         }
     }
 }
 impl From<novarocks_functions::ComparisonPrepareError> for ExpressionLoweringError {
     fn from(value: novarocks_functions::ComparisonPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Comparison(value)
+        match value {
+            novarocks_functions::ComparisonPrepareError::Control(cause)
+            | novarocks_functions::ComparisonPrepareError::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(cause),
+            ) => Self::Control(cause),
+            original => Self::Comparison(original),
         }
     }
 }
@@ -176,9 +193,6 @@ impl From<ConstantReferenceError> for ExpressionLoweringError {
             ConstantReferenceError::Control(cause)
             | ConstantReferenceError::Constant(ConstantError::Control(cause)) => {
                 Self::Control(cause)
-            }
-            ConstantReferenceError::Constant(ConstantError::Limit(_)) => {
-                Self::Control(CompileControlError::ResourceExhausted)
             }
             other => Self::Reference(other),
         }
@@ -213,16 +227,11 @@ impl From<EffectContractError> for ExpressionLoweringError {
 impl From<FunctionSpecializationFailure> for ExpressionLoweringError {
     fn from(e: FunctionSpecializationFailure) -> Self {
         match e {
-            FunctionSpecializationFailure::Control(e) => Self::Control(e),
-            FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
-                Self::Control(CompileControlError::Cancelled)
-            }
-            FunctionSpecializationFailure::Kernel(KernelFailure::DeadlineExceeded) => {
-                Self::Control(CompileControlError::DeadlineExceeded)
-            }
-            FunctionSpecializationFailure::Kernel(KernelFailure::ResourceExhausted) => {
-                Self::Control(CompileControlError::ResourceExhausted)
-            }
+            FunctionSpecializationFailure::Control(e)
+            | FunctionSpecializationFailure::Binding(FunctionBindingError::Control(e))
+            | FunctionSpecializationFailure::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(e),
+            ) => Self::Control(e),
             other => Self::Specialization(other),
         }
     }
@@ -232,7 +241,16 @@ fn finish<T>(
     result: Result<T, ExpressionLoweringError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<T, ExpressionLoweringError> {
-    if matches!(&result, Err(ExpressionLoweringError::Control(_))) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    // The refusal already happened inside its original owner. A later
+    // footer observes pending work only after ordinary validation failures.
+    if result.as_ref().is_err_and(|cause| {
+        matches!(cause, ExpressionLoweringError::Control(_))
+            || matches!(
+                cause.failure_fact().class(),
+                FailureClass::Resource | FailureClass::Control
+            )
+    }) {
         return result;
     }
     work.flush()?;
@@ -542,9 +560,7 @@ impl ExpressionCreationFailure<std::convert::Infallible> {
         match self {
             Self::Control(c) => ExpressionLoweringError::Control(c),
             Self::Creator(never) => match never {},
-            Self::Resource(_) => {
-                ExpressionLoweringError::Control(CompileControlError::ResourceExhausted)
-            }
+            Self::Resource(source) => ExpressionLoweringError::Construction(source),
             Self::Owner(e) => e,
         }
     }
@@ -1276,8 +1292,10 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             Failure::Control(c) => ExpressionCreationFailure::Control(c),
             Failure::Creator(c) => ExpressionCreationFailure::Creator(c),
             Failure::Resource(c) => ExpressionCreationFailure::Resource(c),
-            Failure::Capacity(_) => {
-                ExpressionCreationFailure::Control(CompileControlError::ResourceExhausted)
+            Failure::Capacity(source) => {
+                ExpressionCreationFailure::Owner(ExpressionLoweringError::Publication(
+                    novarocks_local_program::ProgramCreationFailure::Capacity(source),
+                ))
             }
             Failure::Owner(never) => match never {},
         }
@@ -2801,3 +2819,191 @@ fn arithmetic_operator(
 #[cfg(test)]
 #[path = "checked_reference_tests.rs"]
 pub(crate) mod checked_reference_tests;
+
+#[cfg(test)]
+mod primary_cause_footer_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_functions::KernelFailure;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FooterControl(AtomicUsize);
+    impl PureCompileControl for FooterControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(CompileControlError::Cancelled)
+            }
+        }
+    }
+    fn refuses() -> Vec<(
+        ExpressionLoweringError,
+        novarocks_failure_contract::FailureFact,
+    )> {
+        fn original<E: FailureProjection + Into<ExpressionLoweringError>>(
+            source: E,
+        ) -> (
+            ExpressionLoweringError,
+            novarocks_failure_contract::FailureFact,
+        ) {
+            let expected = source.failure_fact();
+            (source.into(), expected)
+        }
+        let allocation = Vec::<u64>::new().try_reserve_exact(usize::MAX).unwrap_err();
+        let publication = novarocks_local_program::ProgramCreationFailure::<
+            std::convert::Infallible,
+            std::convert::Infallible,
+        >::Capacity(allocation);
+        let publication_fact = publication.failure_fact();
+        let geometry =
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic;
+        vec![
+            (
+                ExpressionLoweringError::Publication(publication),
+                publication_fact,
+            ),
+            (
+                ExpressionLoweringError::Construction(geometry),
+                geometry.failure_fact(),
+            ),
+            original(ConstantReferenceError::Constant(ConstantError::Limit(
+                "original constant extent",
+            ))),
+            original(novarocks_functions::ArithmeticPrepareError::Kernel(
+                KernelFailure::ResourceExhausted,
+            )),
+            original(novarocks_functions::CastPrepareError::Kernel(
+                KernelFailure::DeadlineExceeded,
+            )),
+            original(novarocks_functions::ComparisonPrepareError::Kernel(
+                KernelFailure::Cancelled,
+            )),
+            original(FunctionSpecializationFailure::Kernel(
+                KernelFailure::ResourceExhausted,
+            )),
+        ]
+    }
+    #[test]
+    fn pure_and_created_expression_refusals_keep_source_before_later_footer_control() {
+        for (original, expected) in refuses() {
+            assert_eq!(original.failure_fact(), expected);
+            assert!(
+                !matches!(original, ExpressionLoweringError::Control(_)),
+                "the original domain source must survive conversion"
+            );
+            assert!(std::error::Error::source(&original).is_some());
+            let control = FooterControl(AtomicUsize::new(0));
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization)
+                    .unwrap();
+            work.step().unwrap();
+            let result: Result<(), _> = finish(Err(original), &mut work);
+            assert_eq!(result.unwrap_err().failure_fact(), expected);
+            assert_eq!(
+                control.0.load(Ordering::SeqCst),
+                1,
+                "no footer callback after an owner's refusal"
+            );
+        }
+        for (original, expected) in refuses() {
+            assert_eq!(original.failure_fact(), expected);
+            let control = FooterControl(AtomicUsize::new(0));
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization)
+                    .unwrap();
+            work.step().unwrap();
+            let error: crate::FragmentCreationError<std::convert::Infallible> = original.into();
+            let result: Result<(), _> = crate::creation::finish_attempt(Err(error), work);
+            assert_eq!(result.unwrap_err().failure_fact(), expected);
+            assert_eq!(control.0.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[test]
+    fn invariant_compile_interruption_survives_each_function_and_both_footer_paths() {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let raw = LayoutResourceError::SourceModel;
+        let expected = raw.failure_fact();
+        let cause = CompileControlError::from_domain(raw);
+        let converted: Vec<ExpressionLoweringError> = vec![
+            cause.clone().into(),
+            novarocks_functions::ArithmeticPrepareError::Kernel(KernelFailure::CompileControl(
+                cause.clone(),
+            ))
+            .into(),
+            novarocks_functions::CastPrepareError::Kernel(KernelFailure::CompileControl(
+                cause.clone(),
+            ))
+            .into(),
+            novarocks_functions::ComparisonPrepareError::Kernel(KernelFailure::CompileControl(
+                cause.clone(),
+            ))
+            .into(),
+            FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(cause.clone()))
+                .into(),
+            FunctionSpecializationFailure::Binding(FunctionBindingError::Control(cause.clone()))
+                .into(),
+        ];
+        for original in converted {
+            assert_eq!(original.failure_fact(), expected);
+            let ExpressionLoweringError::Control(actual) = &original else {
+                panic!("interruption role")
+            };
+            assert_eq!(actual, &cause);
+            let control = FooterControl(AtomicUsize::new(0));
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization)
+                    .unwrap();
+            work.step().unwrap();
+            let result: Result<(), _> = finish(Err(original), &mut work);
+            let original = result.unwrap_err();
+            assert_eq!(original.failure_fact(), expected);
+            assert_eq!(control.0.load(Ordering::SeqCst), 1);
+            let control = FooterControl(AtomicUsize::new(0));
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization)
+                    .unwrap();
+            work.step().unwrap();
+            let created: crate::FragmentCreationError<std::convert::Infallible> = original.into();
+            let result: Result<(), _> = crate::creation::finish_attempt(Err(created), work);
+            let crate::FragmentCreationError::Control(actual) = result.unwrap_err() else {
+                panic!("interruption role")
+            };
+            assert_eq!(actual, cause);
+            assert_eq!(actual.failure_fact(), expected);
+            assert_eq!(control.0.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn ordinary_expression_validation_still_observes_pending_footer() {
+        let control = FooterControl(AtomicUsize::new(0));
+        let mut work =
+            CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
+        work.step().unwrap();
+        let result: Result<(), _> = finish(
+            Err(ExpressionLoweringError::Invalid("ordinary validation")),
+            &mut work,
+        );
+        assert!(matches!(
+            result,
+            Err(ExpressionLoweringError::Control(
+                CompileControlError::Cancelled
+            ))
+        ));
+        assert_eq!(control.0.load(Ordering::SeqCst), 2);
+        let control = FooterControl(AtomicUsize::new(0));
+        let mut work =
+            CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
+        work.step().unwrap();
+        let original: crate::FragmentCreationError<std::convert::Infallible> =
+            ExpressionLoweringError::Invalid("ordinary validation").into();
+        let result: Result<(), _> = crate::creation::finish_attempt(Err(original), work);
+        assert!(matches!(
+            result,
+            Err(crate::FragmentCreationError::Control(
+                CompileControlError::Cancelled
+            ))
+        ));
+        assert_eq!(control.0.load(Ordering::SeqCst), 2);
+    }
+}
