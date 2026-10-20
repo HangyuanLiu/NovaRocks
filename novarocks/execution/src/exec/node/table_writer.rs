@@ -253,6 +253,7 @@ mod runtime_projection_tests {
                 errors.clone(),
             );
         let mut runtime = projection.create();
+        runtime.set_mem_tracker(tracker.clone());
         runtime.prepare(Some(&factory)).unwrap();
         let source_schema = factory.create_compiled_chunk_schema(&input_layout).unwrap();
         assert!(source_schema.is_typed());
@@ -335,11 +336,14 @@ mod runtime_projection_tests {
                 provider_schema,
                 sibling,
             );
+        let tracker = MemTracker::new_root("writer projection runtime fixture");
         let factory=crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),MemTracker::new_root("writer projection runtime fixture"),Arc::new(RuntimeErrorState::default()),
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),tracker.clone(),Arc::new(RuntimeErrorState::default()),
         ).unwrap();
         let mut projection = projection.create();
         let mut sibling_projection = sibling_projection.create();
+        projection.set_mem_tracker(tracker.clone());
+        sibling_projection.set_mem_tracker(tracker);
         projection.prepare(Some(&factory)).unwrap();
         sibling_projection.prepare(Some(&factory)).unwrap();
         let batch = arrow::record_batch::RecordBatch::try_new(

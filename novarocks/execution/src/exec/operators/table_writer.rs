@@ -1694,9 +1694,15 @@ pub(crate) mod tests {
     }
 
     fn install_construction(operator: &mut dyn Operator, state: &RuntimeState) {
+        let tracker = state
+            .mem_tracker()
+            .unwrap_or_else(|| MemTracker::new_root("writer input construction fixture"));
+        // Bind the actual allocation host used by compiled finite-input
+        // custody, on the same tracker as this operation's construction owner.
+        operator.set_mem_tracker(tracker.clone());
         let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().expect("actual runtime construction profile"),
-            MemTracker::new_root("writer input construction fixture"), state.error_state(),
+            tracker, state.error_state(),
         ).expect("actual construction factory");
         operator.set_construction_factory(construction);
     }
@@ -2641,16 +2647,39 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        let literal = match ty.data_type() {
-            DataType::Boolean => LiteralValue::Boolean(true),
-            DataType::Int32 | DataType::Int64 => LiteralValue::Int64(1),
-            DataType::Utf8 => LiteralValue::Utf8("{}".into()),
+        // The physical Int64 literal vocabulary cannot stand in for Int32
+        // or a nominal JSON source. Admit the exact declared carrier/type as
+        // a checked pool, preserving the real WriterProjection slot author.
+        let array: ArrayRef = match ty.data_type() {
+            DataType::Boolean => Arc::new(arrow::array::BooleanArray::from(vec![true])),
+            DataType::Int32 => Arc::new(Int32Array::from(vec![1])),
+            DataType::Int64 => Arc::new(Int64Array::from(vec![1])),
+            DataType::Utf8 => Arc::new(arrow::array::StringArray::from(vec!["{}"])),
             _ => panic!(
                 "the writer lifecycle fixture declares only its original scalar source types"
             ),
         };
+        let pool_id = ConstantPoolId::new(0);
+        let pool = novarocks_functions::ConstantPool::try_new(
+            Arc::new(ty.try_to_field("writer_fixture_cell").unwrap()),
+            ty.clone(),
+            array.to_data(),
+            crate::exec::expr::test_support::constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let mut constants = ConstantPools::empty();
+        constants.insert(pool_id, pool).unwrap();
         let cell = builder
-            .add_expression(source, ty.clone(), ExprKind::Literal(literal))
+            .add_expression(
+                source,
+                ty.clone(),
+                ExprKind::Constant(ConstantReference {
+                    pool: pool_id,
+                    ordinal: 0,
+                }),
+            )
             .unwrap();
         builder
             .add_values(source, Box::from([Box::from([cell])]), Box::from([value]))
@@ -2846,7 +2875,7 @@ pub(crate) mod tests {
         };
         let package = FragmentPackage::try_new(
             FragmentPackageInput {
-                constants: ConstantPools::empty(),
+                constants,
                 version: PlanVersionId::try_new([71; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 expression_uses: uses,
@@ -3306,6 +3335,7 @@ pub(crate) mod tests {
                 },
             )));
 
+        install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");

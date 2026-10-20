@@ -23,8 +23,6 @@ use arrow::array::Decimal128Array;
 
 const OVERFLOW: &str =
     "Expr evaluate meet error: The numeric type cast involving decimal overflows";
-const SCALE_38_TO_MINUS_38: &str = "CAST failed: from Decimal128(38, 38) to Decimal128(38, -38): decimal scale overflow while casting DECIMAL";
-const SCALE_MINUS_38_TO_38: &str = "CAST failed: from Decimal128(1, -38) to Decimal128(38, 38): decimal scale overflow while casting DECIMAL";
 
 // Pure data constructors and inspectors are local to this retained test. They
 // do not invoke a CAST or calculate a decimal result.
@@ -56,9 +54,6 @@ enum Expected {
     SourceNull,
     // Finite conversion overflow: NULL only in OutputNull/allow=false.
     Overflow,
-    // A scale factor outside the Decimal128 contract is a row error in all
-    // modes; it is distinct from per-value overflow and source NULL.
-    ScaleError(&'static str),
 }
 impl Expected {
     // Materialize only the frozen policy response to a handwritten flag.
@@ -73,11 +68,10 @@ impl Expected {
             Self::SourceNull => (None, None),
             Self::Overflow if policy == DecimalOverflowPolicy::OutputNull && !allow => (None, None),
             Self::Overflow => (None, Some(OVERFLOW)),
-            Self::ScaleError(message) => (None, Some(message)),
         }
     }
 }
-use Expected::{Overflow as O, ScaleError as E, SourceNull as N, Value as V};
+use Expected::{Overflow as O, SourceNull as N, Value as V};
 
 fn batch(program: &LocalProgram, source: ArrayRef) -> RecordBatch {
     let n = source.len();
@@ -247,8 +241,10 @@ fn decimal128_rescale_actual_compiler_full_rescale_rounding_overflow_scale_and_n
     // These are fixed tables, not a second converter. Precision p accepts
     // absolute raw magnitude < 10^p; downscale uses nearest with half ties
     // away from zero. All large-carrier outcomes are justified per row below.
-    // The Decimal128 contract bounds a nonidentity scale factor to signed
-    // i128: 10^38 fits, while 10^76 does not. Source NULL does not request it.
+    // A scale difference does not require materializing a power of ten.
+    // Every i128 magnitude is below 10^39 / 2, so division by 10^76
+    // rounds to zero. Multiplication by 10^76 overflows for any nonzero
+    // i128; zero remains exactly zero. These are mathematical value proofs.
     for (p, s, tp, ts, expected, constant) in [
         // x10: MIN/MAX cannot fit the output carrier/precision. The three
         // small raw values become 31850, -31850 and 10.
@@ -271,39 +267,11 @@ fn decimal128_rescale_actual_compiler_full_rescale_rounding_overflow_scale_and_n
         // /10^38: MIN/MAX have magnitude 1.7014118346..., hence -2/+2.
         // All three small values round to 0 and fit precision38.
         (38, 0, 38, -38, [V(-2), V(2), N, V(0), V(0), V(0)], V(0)),
-        // Delta76 requests an unrepresentable signed-i128 factor. This is
-        // the explicit factor error for each active non-NULL value in all
-        // modes, rather than a policy-dependent per-value overflow.
-        (
-            38,
-            38,
-            38,
-            -38,
-            [
-                E(SCALE_38_TO_MINUS_38),
-                E(SCALE_38_TO_MINUS_38),
-                N,
-                E(SCALE_38_TO_MINUS_38),
-                E(SCALE_38_TO_MINUS_38),
-                E(SCALE_38_TO_MINUS_38),
-            ],
-            E(SCALE_38_TO_MINUS_38),
-        ),
-        (
-            1,
-            -38,
-            38,
-            38,
-            [
-                E(SCALE_MINUS_38_TO_38),
-                E(SCALE_MINUS_38_TO_38),
-                N,
-                E(SCALE_MINUS_38_TO_38),
-                E(SCALE_MINUS_38_TO_38),
-                E(SCALE_MINUS_38_TO_38),
-            ],
-            E(SCALE_MINUS_38_TO_38),
-        ),
+        // /10^76 rounds every physical carrier value to zero.
+        (38, 38, 38, -38, [V(0), V(0), N, V(0), V(0), V(0)], V(0)),
+        // x10^76 overflows for every nonzero corpus value, with the
+        // original numeric-overflow policy rather than a factor error.
+        (1, -38, 38, 38, [O, O, N, O, O, O], O),
     ] {
         compare(
             p,
@@ -314,6 +282,16 @@ fn decimal128_rescale_actual_compiler_full_rescale_rounding_overflow_scale_and_n
             constant,
         );
     }
+    // Zero is not an overflow when scaling up; source NULL stays separate.
+    // Keep this boundary alongside the nonzero full-carrier table above.
+    compare(
+        1,
+        -38,
+        DataType::Decimal128(38, 38),
+        vec![Some(0), None, Some(1)],
+        &[V(0), N, O],
+        O,
+    );
 }
 
 #[test]

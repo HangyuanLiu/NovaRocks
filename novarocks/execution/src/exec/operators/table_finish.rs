@@ -2645,8 +2645,10 @@ mod tests {
         );
     }
 
-    /// The saved program is the sole author of every final slot and complete
-    /// result declaration used by scripted child-output probes.
+    /// The checked program owns every final slot and complete result type
+    /// used by scripted child-output probes. Two-target cases compose real
+    /// single-writer programs for a direct factory component test; they do not
+    /// assert that the physical compiler admits a multi-writer union.
     struct CompositeFactory {
         inner: TableFinishOperatorFactory,
         program: Arc<novarocks_local_program::LocalProgram>,
@@ -5083,10 +5085,15 @@ mod tests {
         }
 
         fn constants() -> ConstantPolicy {
+            const MAX_FIXTURE_ROWS: u64 = 4096;
             ConstantPolicy {
-                max_rows: 4096,
+                max_rows: MAX_FIXTURE_ROWS,
                 max_array_nodes: 128,
-                max_logical_elements: 16_384,
+                // List CV admission conservatively bounds each selected row
+                // by the entire child extent, not by this fixture's offsets.
+                // Cover the declared 4096-row parent/child envelope, including
+                // the unchanged 1001-channel streaming/lifetime stimulus.
+                max_logical_elements: MAX_FIXTURE_ROWS * (MAX_FIXTURE_ROWS + 1),
                 max_retained_buffer_bytes: 1 << 20,
                 max_type_depth: 64,
                 max_type_nodes: 4096,
@@ -5374,6 +5381,7 @@ mod tests {
             target_count: usize,
             channel_count: usize,
             max_output_rows: usize,
+            first_target: usize,
         ) -> (
             PhysicalPlan,
             BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
@@ -5385,10 +5393,11 @@ mod tests {
             let mut receivers = Vec::new();
             let mut received_fields = Vec::<Box<[WriterRelationField]>>::new();
             let mut drafts = BTreeMap::new();
-            for target_index in 0..target_count {
+            for local_index in 0..target_count {
+                let target_index = first_target + local_index;
                 let ordinal = target(target_index as u32);
-                let edge = EdgeId::new(target_index as u32 + 1);
-                let fragment_id = FragmentId::new(target_index as u32 + 1);
+                let edge = EdgeId::new(local_index as u32 + 1);
+                let fragment_id = FragmentId::new(local_index as u32 + 1);
                 let mut producer = FragmentBuilder::new(fragment_id);
                 let source = producer.reserve_node_id().unwrap();
                 let input = (0..channel_count)
@@ -5654,7 +5663,7 @@ mod tests {
                 )
                 .unwrap();
             let mut mappings = Vec::new();
-            for target_index in 0..target_count {
+            for target_index in first_target..first_target + target_count {
                 for channel in 0..channel_count {
                     let blob = consumer
                         .add_expression(
@@ -5680,7 +5689,7 @@ mod tests {
                     });
                 }
             }
-            let ordinals = (0..target_count)
+            let ordinals = (first_target..first_target + target_count)
                 .map(|index| target(index as u32))
                 .collect::<Box<[_]>>();
             let grouping_input = input_fields[1].value;
@@ -5740,7 +5749,7 @@ mod tests {
             );
             let consumer_id = consumer.id();
             plan.add_fragment(consumer).unwrap();
-            for (id, pool) in pools(target_count * channel_count) {
+            for (id, pool) in pools((first_target + target_count) * channel_count) {
                 plan.insert_constant_pool(id, pool).unwrap();
             }
             plan.set_result_port(ResultPort {
@@ -5768,13 +5777,276 @@ mod tests {
                 drafts,
             )
         }
+        /// The two-target cases exercise the finish factory component. The
+        /// physical compiler deliberately rejects a multi-writer union; this
+        /// checked local composition does not claim whole-plan admission.
         pub(super) fn compile(
             target_count: usize,
             channel_count: usize,
             max_output_rows: usize,
         ) -> Arc<LocalProgram> {
+            use novarocks_local_program as lp;
+            let first = compile_single_target(0, channel_count, max_output_rows);
+            if target_count == 1 {
+                return first;
+            }
+            assert_eq!(
+                target_count, 2,
+                "the retained component cases have two targets"
+            );
+            // Compile the second ordinal independently, including its original
+            // offset constant-pool rows (N+1..2N), through the real codec and
+            // LocalCompiler. Neither call nor constant results are calculated
+            // by this fixture.
+            let second = compile_single_target(1, channel_count, max_output_rows);
+            let graph = first.graph();
+            let node = graph.root();
+            let mut kind = graph.nodes()[node.index()].kind().clone();
+            let lp::ProgramNodeKind::TableFinish {
+                expected_targets,
+                final_aggregates,
+                ..
+            } = &mut kind
+            else {
+                panic!("real compiler produces TableFinish")
+            };
+            let lp::ProgramNodeKind::TableFinish {
+                expected_targets: second_targets,
+                final_aggregates: second_final,
+                ..
+            } = second.graph().nodes()[second.graph().root().index()].kind()
+            else {
+                panic!("real second compiler produces TableFinish")
+            };
+            assert_eq!(expected_targets.as_slice(), &[target(0)]);
+            assert_eq!(second_targets.as_slice(), &[target(1)]);
+            assert_eq!(final_aggregates.calls.len(), second_final.calls.len());
+            assert_eq!(node, second.graph().root());
+            assert_eq!(
+                graph.nodes()[node.index()].output_layout().schema(),
+                second.graph().nodes()[node.index()]
+                    .output_layout()
+                    .schema()
+            );
+            for call in 0..final_aggregates.calls.len() {
+                let site = lp::ProgramCallSite::WriterFinal {
+                    node,
+                    call: call as u32,
+                };
+                let (
+                    Some(lp::ProgramStateTemplate::Aggregate { kernel: left, .. }),
+                    Some(lp::ProgramStateTemplate::Aggregate { kernel: right, .. }),
+                ) = (first.state_template(site), second.state_template(site))
+                else {
+                    panic!("both actual programs prepare the same final call family")
+                };
+                assert_eq!(
+                    left.contract().intermediate_type(),
+                    right.contract().intermediate_type()
+                );
+                assert_eq!(left.contract().final_type(), right.contract().final_type());
+                assert_eq!(
+                    left.contract().state_format(),
+                    right.contract().state_format()
+                );
+            }
+            for (left, right) in final_aggregates.calls.iter().zip(&second_final.calls) {
+                assert_eq!(
+                    left.intermediate_input_slot_id,
+                    right.intermediate_input_slot_id
+                );
+                assert_eq!(left.final_output_slot_id, right.final_output_slot_id);
+            }
+            expected_targets.extend_from_slice(second_targets);
+            let unpivot = final_aggregates.unpivot.as_mut().unwrap();
+            let other = second_final.unpivot.as_ref().unwrap();
+            assert_eq!(unpivot.grouping_input_slot_id, other.grouping_input_slot_id);
+            assert_eq!(
+                unpivot.grouping_output_slot_id,
+                other.grouping_output_slot_id
+            );
+            assert_eq!(
+                unpivot.literal_output_slot_ids,
+                other.literal_output_slot_ids
+            );
+            let original_count = unpivot.mappings.len();
+            assert_eq!(original_count, channel_count);
+            let checked = first.checked();
+            let channels = checked.channels();
+            let expressions = channels.expressions();
+            let resolved = expressions.resolved_calls();
+            let snapshot = resolved.snapshot();
+            let mut bindings = snapshot
+                .bindings()
+                .iter()
+                .map(|(&site, &use_id)| lp::ProgramRootUseBinding { site, use_id })
+                .collect::<Vec<_>>();
+            let main = snapshot
+                .flows()
+                .get(&lp::ProgramExpressionArena::Main)
+                .unwrap();
+            let mut uses = main.uses().values().cloned().collect::<Vec<_>>();
+            let mut next_use = uses
+                .iter()
+                .map(|item| item.context.use_id.get())
+                .max()
+                .unwrap()
+                + 1;
+            for (channel, source) in other.mappings.iter().enumerate() {
+                assert_eq!(source.grouping_key, 1);
+                let mut mapping = source.clone();
+                assert_eq!(
+                    mapping.input_value_slot_id,
+                    unpivot.mappings[channel].input_value_slot_id
+                );
+                for (constant, value) in mapping.constants.iter_mut().enumerate() {
+                    let lp::UnpivotConstant::Scalar { expr_id, nullable } = value else {
+                        continue;
+                    };
+                    let lp::UnpivotConstant::Scalar {
+                        expr_id: first_id,
+                        nullable: first_nullable,
+                    } = &unpivot.mappings[channel].constants[constant]
+                    else {
+                        panic!("compiled scalar literal positions agree")
+                    };
+                    // Explicitly map the second program's scalar definition to
+                    // the first one's checked identical BLOB literal. Foreign
+                    // expression IDs are never copied by numeric coincidence.
+                    let left = graph.expressions().node(*first_id).unwrap();
+                    let right = second.graph().expressions().node(*expr_id).unwrap();
+                    assert_eq!(left.value_type(), right.value_type());
+                    assert_eq!(*nullable, *first_nullable);
+                    assert!(matches!((left.kind(), right.kind()),
+                        (lp::StaticExprKind::Literal(lp::StaticLiteral::Utf8(a)),
+                         lp::StaticExprKind::Literal(lp::StaticLiteral::Utf8(b)))
+                            if a == b && a.as_ref() == BLOB_TYPE));
+                    *expr_id = *first_id;
+                    let role = |mapping| lp::ProgramExpressionRootSite::Node {
+                        node,
+                        role: lp::ProgramNodeExpressionRole::FinishUnpivotConstant {
+                            mapping: mapping as u32,
+                            constant: constant as u32,
+                        },
+                    };
+                    let original_use = snapshot.bindings()[&role(channel)];
+                    let mut invocation = main.uses()[&original_use].clone();
+                    let use_id = ExpressionUseId::new(next_use);
+                    next_use += 1;
+                    invocation.context.use_id = use_id;
+                    uses.push(invocation);
+                    bindings.push(lp::ProgramRootUseBinding {
+                        site: role(original_count + channel),
+                        use_id,
+                    });
+                }
+                // Array/map constants retain the values admitted by the second
+                // program's actual frozen ConstantReferences without retagging.
+                unpivot.mappings.push(mapping);
+            }
+            let mut nodes = graph.nodes().to_vec();
+            let original = &nodes[node.index()];
+            nodes[node.index()] = lp::ProgramNode::new_local(
+                node,
+                original.physical_sources().to_vec(),
+                kind,
+                original.output_layout().clone(),
+            );
+            let graph = lp::LocalProgramGraph::try_new_with_sink_for_compile(
+                nodes,
+                node,
+                Arc::clone(graph.expressions()),
+                graph.profile(),
+                graph.requirements().clone(),
+                graph.sink().cloned(),
+                &FixtureControl,
+            )
+            .expect("component graph validates without changing compiler capability");
+            let mut flows = snapshot.flows().clone();
+            flows.insert(
+                lp::ProgramExpressionArena::Main,
+                lp::ProgramControlFlow::try_new(
+                    main.domains().values().cloned().collect(),
+                    uses,
+                    graph.expressions().nodes().len(),
+                    &FixtureControl,
+                )
+                .unwrap(),
+            );
+            let roots =
+                lp::ProgramRootControlBindings::try_new(graph, flows, bindings, &FixtureControl)
+                    .unwrap();
+            let calls = lp::ProgramResolvedCalls::try_new(
+                roots,
+                resolved
+                    .calls()
+                    .iter()
+                    .map(|(&site, call)| (site, call.specialization().clone()))
+                    .collect(),
+                &FixtureControl,
+            )
+            .unwrap();
+            let types = lp::ProgramTypedExpressions::try_new_guarded(
+                calls,
+                expressions.types().clone(),
+                &FixtureControl,
+            )
+            .unwrap();
+            let channels = lp::ProgramTypedChannels::try_new(
+                types,
+                channels
+                    .channels()
+                    .iter()
+                    .map(|(&site, ty)| (site, ty.clone()))
+                    .collect(),
+                &FixtureControl,
+            )
+            .unwrap();
+            let lexical = lp::ProgramLexicalBindings::try_new(
+                channels,
+                checked.lambdas().values().cloned().collect(),
+                checked
+                    .slots()
+                    .iter()
+                    .map(|(&occurrence, &source)| lp::ProgramSlotBinding { occurrence, source })
+                    .collect(),
+                &FixtureControl,
+            )
+            .unwrap();
+            let operators = first
+                .provenance()
+                .operators()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let sources = operators
+                .iter()
+                .flat_map(|item| item.sources.iter().copied())
+                .collect();
+            Arc::new(
+                lp::LocalProgram::try_new(
+                    lexical,
+                    operators,
+                    &sources,
+                    lp::CompiledProgramFacts {
+                        writes: first.write_recipes().clone(),
+                        exchange_inputs: first.exchange_inputs().clone(),
+                        scan_inputs: first.scan_inputs().clone(),
+                        aggregates: first.aggregates().clone(),
+                    },
+                    &FixtureControl,
+                )
+                .expect("factory component retains checked call, type, source and binding owners"),
+            )
+        }
+        fn compile_single_target(
+            first_target: usize,
+            channel_count: usize,
+            max_output_rows: usize,
+        ) -> Arc<LocalProgram> {
             let catalog = catalog();
-            let (plan, drafts) = plan(target_count, channel_count, max_output_rows);
+            let target_count = 1;
+            let (plan, drafts) = plan(target_count, channel_count, max_output_rows, first_target);
             let mut uses = BTreeMap::new();
             let mut calls = BTreeMap::new();
             let mut pruning = BTreeMap::new();

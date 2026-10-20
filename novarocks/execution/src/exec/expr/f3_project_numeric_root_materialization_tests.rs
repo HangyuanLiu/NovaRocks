@@ -137,6 +137,10 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
                     if let ProgramNodeKind::Project { input, exprs, .. } = node.kind() {
                         let parent = program.graph().nodes()[input.index()].output_layout();
                         if exprs.len() == 1
+                            && matches!(
+                                program.graph().nodes()[input.index()].kind(),
+                                ProgramNodeKind::Scan { .. }
+                            )
                             && parent.schema().fields().len() == 2
                             && node.output_layout().schema().fields().len() == 1
                         {
@@ -172,16 +176,22 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
             } else {
                 Arc::new(Int64Array::from(vec![Some(6), Some(2), Some(5), None]))
             };
-            let columns = layout
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| match field.name().as_str() {
-                    "count_all" => left.clone(),
-                    "count_distinct" => right.clone(),
-                    other => panic!("unexpected frozen input field {other}"),
-                })
-                .collect();
+            // The actual provider recipe keeps relation declaration order;
+            // its frozen transport names are not the SQL column labels.
+            // compiler_results_with_declared_read_fields checks each original
+            // relation field against fields[ordinal] before freezing the scan.
+            assert_eq!(layout.schema().fields().len(), fields.len());
+            for (ordinal, declared) in fields.iter().enumerate() {
+                assert_eq!(
+                    layout.schema().field(ordinal).data_type(),
+                    declared.data_type()
+                );
+                assert_eq!(
+                    layout.schema().field(ordinal).is_nullable(),
+                    declared.is_nullable()
+                );
+            }
+            let columns = vec![left, right];
             let input = Chunk::try_new_with_chunk_schema(
                 RecordBatch::try_new(layout.schema().clone(), columns).unwrap(),
                 ChunkSchema::from_compiled_layout(layout).unwrap(),
@@ -306,10 +316,13 @@ fn identity_fixture() -> (Arc<LocalProgram>, ProgramNodeId, Chunk) {
     for program in programs.values() {
         for node in program.graph().nodes() {
             if let ProgramNodeKind::Project { input, exprs, .. } = node.kind() {
-                let layout = program.graph().nodes()[input.index()].output_layout();
+                let input_node = &program.graph().nodes()[input.index()];
+                let layout = input_node.output_layout();
                 if exprs.len() == 1
-                    && layout.schema().fields().len() == 1
-                    && layout.schema().field(0).name() == "k"
+                    && matches!(input_node.kind(), ProgramNodeKind::Scan { .. })
+                    && layout.schema().fields().len() == fields.len()
+                    && layout.schema().field(0).data_type() == fields[0].data_type()
+                    && layout.schema().field(0).is_nullable() == fields[0].is_nullable()
                 {
                     producers.push((program.clone(), node.local_id().unwrap(), *input));
                 }

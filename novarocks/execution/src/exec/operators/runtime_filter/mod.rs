@@ -1176,23 +1176,52 @@ mod tests {
     fn compiled_consumers(
         error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> CompiledFixture {
-        use crate::exec::pipeline::builder::{
-            compile_family_fixture, family_package_with_sink, family_values,
-        };
+        use crate::exec::pipeline::builder::{compile_family_fixture, family_package_with_sink};
         use novarocks_physical_plan::{
-            ConstantPools, ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue,
-            NodeId, ValueOrigin,
+            ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
+            FragmentId, FragmentSink, NodeId, ValueOrigin,
         };
         let mut builder = FragmentBuilder::new(FragmentId::new(19));
         let source = NodeId::new(18);
         let project = NodeId::new(19);
         let declared = FunctionValueType::new(DataType::Int32, false);
-        let input_values = family_values(
-            &mut builder,
-            source,
-            &[declared.clone()],
-            &[vec![LiteralValue::Int64(1)]],
-        );
+        // Physical Int64 literals have an exact Int64 carrier. Preserve the
+        // original Int32 input through its checked immutable backing instead.
+        let pool_id = ConstantPoolId::new(0);
+        let pool = novarocks_functions::ConstantPool::try_new(
+            Arc::new(declared.try_to_field("rf_key").unwrap()),
+            declared.clone(),
+            Int32Array::from(vec![1]).to_data(),
+            crate::exec::expr::test_support::constant_policy(),
+            CompilePhase::Validate,
+            &NoControl,
+        )
+        .unwrap();
+        let cell = builder
+            .add_expression(
+                source,
+                declared.clone(),
+                ExprKind::Constant(ConstantReference {
+                    pool: pool_id,
+                    ordinal: 0,
+                }),
+            )
+            .unwrap();
+        let input = builder
+            .add_value(
+                declared.clone(),
+                ValueOrigin::NodeOutput {
+                    node: source,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .add_values(source, Box::from([Box::from([cell])]), Box::from([input]))
+            .unwrap();
+        let input_values = [input];
+        let mut constants = ConstantPools::empty();
+        constants.insert(pool_id, pool).unwrap();
         let expression = builder
             .add_expression(project, declared.clone(), ExprKind::Value(input_values[0]))
             .unwrap();
@@ -1214,13 +1243,7 @@ mod tests {
             )
             .unwrap();
         let base = compile_family_fixture(
-            family_package_with_sink(
-                builder,
-                project,
-                ConstantPools::empty(),
-                1,
-                FragmentSink::Result,
-            ),
+            family_package_with_sink(builder, project, constants, 1, FragmentSink::Result),
             1,
         );
         let graph = base.graph();
