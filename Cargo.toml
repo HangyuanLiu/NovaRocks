@@ -149,7 +149,7 @@ novarocks-query-application = { path = "novarocks/query-application", version = 
 novarocks-result-contract = { path = "novarocks/result-contract", version = "0.1.0" }
 novarocks-result-render = { path = "novarocks/result-render", version = "0.1.0" }
 novarocks-secret = { path = "novarocks/secret", version = "0.1.0" }
-novarocks-server-application = { path = "novarocks-server/library", version = "0.1.0" }
+novarocks-server-application = { path = "novarocks-server/library", version = "0.1.0", default-features = false }
 novarocks-spi = { path = "novarocks/spi", version = "0.1.0" }
 novarocks-sql = { path = "novarocks/sql", version = "0.1.0" }
 novarocks-mv-application = { path = "novarocks/mv-application", version = "0.1.0" }

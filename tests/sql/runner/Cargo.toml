@@ -15,7 +15,7 @@ path = "src/bin/novarocks-sql-test.rs"
 
 [dependencies]
 anyhow.workspace = true
-novarocks-sql-test-library = { path = "library" }
+novarocks-sql-test-library = { path = "library", version = "0.1.0" }
 
 [package.metadata.novarocks.test]
 runtime-inputs = ["target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
