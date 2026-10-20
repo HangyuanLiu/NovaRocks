@@ -1,3 +1,11 @@
 # LNP-3C is an explicit product-topology acceptance suite. It owns an FE
 # restart and must never run in all-in-one mode.
 explicit_only = true
+heavy = { reason = "cost", detail = "Native 1FE+3BE acceptance of runtime-state cut across an FE restart; run serially." }
+
+[impact]
+paths = ["novarocks/frontend-application/src/state_family/**"]
+
+[reuse]
+scope = "suite"
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

@@ -1,1 +1,8 @@
 explicit_only = false
+
+[impact]
+paths = ["novarocks/worker/src/task_registry.rs", "novarocks/frontend-application/src/task_execution/**"]
+
+[reuse]
+scope = "suite"
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

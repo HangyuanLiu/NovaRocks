@@ -38,6 +38,15 @@ pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
 struct ConcurrentResults;
 
 impl Scenario for ConcurrentResults {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery_concurrency",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "result-delivery/concurrent-results-drain"
     }

@@ -105,6 +105,15 @@ fn read_data_sqls() -> Vec<String> {
 }
 
 impl Scenario for PaimonReadData {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "paimon",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/paimon-read-data"
     }
@@ -224,6 +233,15 @@ struct PaimonSnapshotAndSchema {
 }
 
 impl Scenario for PaimonSnapshotAndSchema {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "paimon",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/paimon-snapshot-and-schema"
     }
@@ -372,6 +390,15 @@ impl Scenario for PaimonSnapshotAndSchema {
 struct PaimonMergeFilterCorrectness;
 
 impl Scenario for PaimonMergeFilterCorrectness {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "paimon",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/paimon-merge-filter-correctness"
     }
@@ -471,6 +498,15 @@ struct PaimonCancelAndBudget {
 }
 
 impl Scenario for PaimonCancelAndBudget {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "paimon",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/paimon-cancel-and-budget"
     }
@@ -559,6 +595,15 @@ impl Scenario for PaimonCancelAndBudget {
 struct PaimonUnsupportedAndBinding;
 
 impl Scenario for PaimonUnsupportedAndBinding {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "paimon",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/paimon-unsupported-and-binding"
     }
@@ -675,6 +720,15 @@ fn cross_provider_sql() -> String {
 }
 
 impl Scenario for IcebergPaimonRead {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "paimon",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/iceberg-paimon-read"
     }

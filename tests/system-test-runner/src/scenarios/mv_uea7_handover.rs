@@ -36,6 +36,15 @@ pub(super) struct MvOwnerHandover {
 }
 
 impl Scenario for MvOwnerHandover {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_uea7_handover",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/owner-handover"
     }

@@ -615,6 +615,15 @@ fn seed_delay_source_files(
 struct DistributedWriterDataflow;
 
 impl Scenario for DistributedWriterDataflow {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "distributed_writer",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/distributed-writer-dataflow"
     }
@@ -781,6 +790,15 @@ impl Scenario for DistributedWriterDataflow {
 struct DistributedStatisticsDataflow;
 
 impl Scenario for DistributedStatisticsDataflow {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "distributed_writer",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "statistics/native-aggregate-and-collect-on-write"
     }
@@ -1442,6 +1460,15 @@ fn assert_every_backend_accepted_task(
 struct DistributedWriterOverwrite;
 
 impl Scenario for DistributedWriterOverwrite {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "distributed_writer",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/distributed-writer-overwrite"
     }
@@ -1590,6 +1617,15 @@ impl Scenario for DistributedWriterOverwrite {
 struct DistributedWriterRowLevel;
 
 impl Scenario for DistributedWriterRowLevel {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "distributed_writer",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/distributed-writer-row-level"
     }
@@ -2201,6 +2237,15 @@ struct DistributedWriterFaults {
 }
 
 impl Scenario for DistributedWriterFaults {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "distributed_writer",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/distributed-writer-faults"
     }

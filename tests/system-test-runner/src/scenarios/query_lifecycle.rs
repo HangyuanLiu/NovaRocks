@@ -81,6 +81,15 @@ struct LiveBackendPartition {
 }
 
 impl Scenario for LiveBackendPartition {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/live-backend-partition"
     }
@@ -404,6 +413,15 @@ impl DistributedBaseline {
 }
 
 impl Scenario for DistributedBaseline {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/distributed-baseline"
     }
@@ -504,6 +522,15 @@ impl Scenario for DistributedBaseline {
 struct MysqlDisconnect;
 
 impl Scenario for MysqlDisconnect {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/mysql-disconnect"
     }
@@ -533,6 +560,15 @@ impl Scenario for MysqlDisconnect {
 struct QueryTimeout;
 
 impl Scenario for QueryTimeout {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/query-timeout"
     }
@@ -582,6 +618,15 @@ struct NoEffectReadAfterBackendExit {
 }
 
 impl Scenario for NoEffectReadAfterBackendExit {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/no-effect-read-after-backend-exit"
     }
@@ -744,6 +789,15 @@ struct Nid2CreateRejected {
 }
 
 impl Scenario for Nid2CreateRejected {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/nid-2-create-rejected"
     }
@@ -822,6 +876,15 @@ struct Nid2CreateReceiptForeignTask {
 }
 
 impl Scenario for Nid2CreateReceiptForeignTask {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/nid-2-create-receipt-foreign-task"
     }
@@ -896,6 +959,15 @@ struct Nid2ForeignStatusProcess {
 }
 
 impl Scenario for Nid2ForeignStatusProcess {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/nid-2-foreign-status-process"
     }

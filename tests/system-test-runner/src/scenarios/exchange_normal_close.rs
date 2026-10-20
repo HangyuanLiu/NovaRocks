@@ -48,6 +48,15 @@ struct SameProducerNormalClose {
 }
 
 impl Scenario for SameProducerNormalClose {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "exchange_normal_close",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         if self.multicast {
             "task-execution/multicast-normal-close-keeps-sibling"

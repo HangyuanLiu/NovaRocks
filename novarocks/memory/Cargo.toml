@@ -39,3 +39,7 @@ loom = "0.7.2"
 [dev-dependencies]
 hashbrown.workspace = true
 allocator-api2.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

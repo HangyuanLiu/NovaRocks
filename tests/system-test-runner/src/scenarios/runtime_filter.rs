@@ -111,6 +111,15 @@ struct AcceptedAfterAckDrop {
 }
 
 impl Scenario for AcceptedAfterAckDrop {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "runtime_filter",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "runtime-filter/accepted-after-ack-drop"
     }
@@ -143,6 +152,15 @@ struct CancelWithTerminalAckReplay {
 }
 
 impl Scenario for CancelWithTerminalAckReplay {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "runtime_filter",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "runtime-filter/cancel-terminal-ack-replay"
     }
@@ -172,6 +190,15 @@ impl Scenario for CancelWithTerminalAckReplay {
 struct Ncp5PartitionedFeedbackPruning;
 
 impl Scenario for Ncp5PartitionedFeedbackPruning {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "runtime_filter",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "runtime-filter/ncp-5-partitioned-feedback-pruning"
     }
@@ -187,6 +214,15 @@ struct Ncp5FeedbackContractDigestCorrupt {
 }
 
 impl Scenario for Ncp5FeedbackContractDigestCorrupt {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "runtime_filter",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "runtime-filter/ncp-5-feedback-contract-digest-corrupt"
     }
@@ -221,6 +257,15 @@ struct Ncp5FeedbackUnavailable {
 }
 
 impl Scenario for Ncp5FeedbackUnavailable {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "runtime_filter",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "runtime-filter/ncp-5-feedback-unavailable"
     }
@@ -253,6 +298,15 @@ struct Nid2ForeignAttemptRejection {
 }
 
 impl Scenario for Nid2ForeignAttemptRejection {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "runtime_filter",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "runtime-filter/nid-2-foreign-attempt-rejection"
     }
@@ -286,6 +340,15 @@ struct NativeTrustDirectional {
 }
 
 impl Scenario for NativeTrustDirectional {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "runtime_filter",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }

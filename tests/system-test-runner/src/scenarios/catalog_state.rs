@@ -12,6 +12,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 struct CatalogAttachmentRestart;
 
 impl Scenario for CatalogAttachmentRestart {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "catalog_state",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "catalog-state/catalog-attachment-restart"
     }

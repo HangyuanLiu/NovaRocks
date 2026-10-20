@@ -17,29 +17,98 @@
 
 use crate::types::SuiteConfig;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 /// Native static suite facts. Dataset inputs are resolved only when running;
 /// cluster mode and cardinality remain runner CLI concerns.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SuiteManifest {
     pub explicit_only: bool,
     pub disabled_reason: Option<String>,
     pub prepared_dataset: Option<PreparedDatasetRequirement>,
+    pub heavy: Option<HeavyDeclaration>,
+    pub impact: ImpactDeclaration,
+    pub reuse: ReuseDeclaration,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeavyDeclaration {
+    pub reason: HeavyReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum HeavyReason {
+    Fixture,
+    VariantBinary,
+    Dataset,
+    Toolchain,
+    Cost,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImpactDeclaration {
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReuseScope {
+    Suite,
+    Case,
+}
+impl Default for ReuseScope {
+    fn default() -> Self {
+        Self::Suite
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InitialState {
+    Isolated,
+    Reset,
+    Immutable,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReuseDeclaration {
+    pub scope: ReuseScope,
+    pub initial_state: Option<InitialState>,
+    pub basis: Option<String>,
+    pub env_inputs: Option<Vec<EnvInput>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvInput {
+    pub name: String,
+    pub kind: EnvInputKind,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvInputKind {
+    Value,
+    FileContent,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedDatasetRequirement {
     pub dataset: DatasetName,
     pub scale: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum DatasetName {
     #[serde(rename = "ssb")]
     Ssb,
@@ -82,6 +151,30 @@ impl SuiteManifest {
                 requirement.dataset.golden_scale()
             );
         }
+        if let Some(heavy) = &manifest.heavy {
+            anyhow::ensure!(
+                !heavy.detail.trim().is_empty(),
+                "heavy declaration requires detail"
+            );
+        }
+        if manifest.reuse.initial_state.is_some() {
+            anyhow::ensure!(
+                manifest
+                    .reuse
+                    .basis
+                    .as_ref()
+                    .is_some_and(|v| !v.trim().is_empty()),
+                "initial state requires a basis"
+            );
+            anyhow::ensure!(
+                manifest.reuse.env_inputs.is_some(),
+                "initial state requires env_inputs"
+            );
+        }
+        anyhow::ensure!(
+            !manifest.explicit_only || manifest.heavy.is_some(),
+            "explicit SQL suites require a heavy declaration"
+        );
         Ok(manifest)
     }
 
@@ -142,7 +235,8 @@ mod tests {
     use super::{SuiteManifest, select_suite_names};
     use crate::types::SuiteConfig;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     fn fixture_suites<const N: usize>(entries: [(&str, bool); N]) -> BTreeMap<String, SuiteConfig> {
         entries
@@ -176,16 +270,24 @@ mod tests {
     #[test]
     fn manifest_accepts_static_declarations_and_rejects_runtime_fields() {
         assert!(
-            SuiteManifest::parse("explicit_only = true\n")
-                .unwrap()
-                .explicit_only
+            SuiteManifest::parse(
+                r#"explicit_only = true
+heavy = { reason = "cost", detail = "Exhaustive native matrix" }
+"#
+            )
+            .unwrap()
+            .explicit_only
         );
         assert!(SuiteManifest::parse("cluster_size = 3\n").is_err());
     }
 
     #[test]
     fn dataset_manifest_fixes_the_golden_scale() {
-        let prefix = "explicit_only = true\n[prepared_dataset]\ndataset = \"ssb\"\n";
+        let prefix = r#"explicit_only = true
+heavy = { reason = "dataset", detail = "Requires READY SSB scale 1" }
+[prepared_dataset]
+dataset = "ssb"
+"#;
         assert!(SuiteManifest::parse(&format!("{prefix}scale = \"1\"\n")).is_ok());
         assert!(SuiteManifest::parse(&format!("{prefix}scale = \"10\"\n")).is_err());
         assert!(
@@ -211,6 +313,49 @@ mod tests {
         assert_eq!(select_suite_names("all", &suites).unwrap(), vec!["filter"]);
         let error = select_suite_names("suspended", &suites).unwrap_err();
         assert!(error.to_string().contains("is disabled: pending design"));
+    }
+
+    #[test]
+    fn explicit_suites_require_a_nonempty_heavy_basis() {
+        assert!(SuiteManifest::parse("explicit_only = true\n").is_err());
+        assert!(
+            SuiteManifest::parse(
+                r#"explicit_only = true
+heavy = { reason = "cost", detail = "" }
+"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn corpus_manifests_declare_impact_and_heavy_requirements() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(4)
+            .expect("SQL runner library is inside the repository");
+        let root = repository.join("tests/sql/correctness");
+        let mut found = false;
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.join("sql").is_dir() {
+                continue;
+            }
+            found = true;
+            let manifest_path = path.join("suite.toml");
+            assert!(
+                manifest_path.is_file(),
+                "missing {}",
+                manifest_path.display()
+            );
+            let manifest = SuiteManifest::load(&manifest_path).unwrap();
+            assert!(
+                !manifest.impact.paths.is_empty(),
+                "missing impact paths in {}",
+                manifest_path.display()
+            );
+        }
+        assert!(found, "the SQL correctness corpus must be discoverable");
     }
 
     #[test]

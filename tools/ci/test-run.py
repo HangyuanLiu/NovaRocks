@@ -41,6 +41,9 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
+import identity_snapshot
+
 REPO = Path(__file__).resolve().parents[2]
 ARTIFACTS = REPO / "tools/ci/cargo-artifacts.py"
 CANCEL = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
@@ -608,6 +611,15 @@ def execute_domain(executor, root, argv, adapter, environment, before=None):
         os.close(pin)
 
 
+def confirm_domain_identity(path, record, inputs, environment, domain):
+    try:
+        scopes = identity_snapshot.rust_snapshot(REPO, inputs, environment, domain)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        record["confirmation_error"] = str(error)
+        scopes = {}
+    identity_snapshot.confirm(path, record, scopes)
+
+
 def batch(root, arguments):
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -618,6 +630,7 @@ def batch(root, arguments):
     executor = Executor()
     executor.install()
     code = 2
+    identity_root = root / "identity"
     try:
         # Validation is capability based, including the filesystem actually holding
         # this attempt. No Python release or inherited global environment dump.
@@ -628,6 +641,7 @@ def batch(root, arguments):
             local_filesystem(directory)
         finally:
             os.close(directory)
+        identity_snapshot.atomic_json(identity_root / "source-start.json", identity_snapshot.source_snapshot(REPO))
         git = subprocess.run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True, text=True, check=True)
         index["source"] = dict(commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), dirty=bool(git.stdout), status=git.stdout)
         preparation = executor.execute(root / "prepare", [sys.executable, str(Path(__file__).resolve()), "prepare",
@@ -660,6 +674,8 @@ def batch(root, arguments):
             raise RuntimeError("SQL error manifest precondition failed")
         executor.deadline = None
         environment["NOVAROCKS_TEST_RUN_ROOT"] = str(root / "rust-run")
+        nextest_identity = identity_snapshot.begin(identity_root / "nextest.json", "nextest",
+            identity_snapshot.rust_snapshot(REPO, inputs, environment, "nextest"))
         rust, collected, closing_deadline = execute_domain(executor, root / "rust-run", prepared["run_argv"],
             "nextest", environment, before=lambda: verify_prepared(inputs))
         index["stages"]["nextest"] = rust
@@ -676,6 +692,9 @@ def batch(root, arguments):
         except (OSError, ET.ParseError) as error:
             report.update(complete=False, error=str(error))
         index["materials"]["junit"] = report
+        confirm_domain_identity(identity_root / "nextest.json", nextest_identity, inputs, environment, "nextest")
+        index["materials"]["nextest_identity"] = reference(root, identity_root / "nextest.json", "novarocks-execution-identity-v1")
+        write_json(root / "execution-index.json", index)
         executor.observe_idle()
         # Nextest's ordinary assertion-failure exit is 100. Other nonzero exits
         # denote preconditions, execution errors or cancellation and gate doctest.
@@ -684,11 +703,16 @@ def batch(root, arguments):
             raise RuntimeError("nextest cancellation, environment, report or cleanup failure gates doctest")
         executor.deadline = None
         environment["NOVAROCKS_TEST_RUN_ROOT"] = str(root / "doctest-run")
+        doctest_identity = identity_snapshot.begin(identity_root / "doctest.json", "doctest",
+            identity_snapshot.rust_snapshot(REPO, inputs, environment, "doctest"))
         doctest, doc_cleanup, _ = execute_domain(executor, root / "doctest-run",
             ["cargo", "test", "--workspace", "--doc", "--profile", "dev", "--locked", "--target-dir",
              str(REPO / "target"), "--no-fail-fast"], "cargo", environment)
         index["stages"]["doctest"] = doctest
         index["materials"]["doctest_cleanup"] = reference(root, root / "doctest-run/cleanup-summary.json", "novarocks-cleanup-summary-v1")
+        confirm_domain_identity(identity_root / "doctest.json", doctest_identity, inputs, environment, "doctest")
+        index["materials"]["doctest_identity"] = reference(root, identity_root / "doctest.json", "novarocks-execution-identity-v1")
+        write_json(root / "execution-index.json", index)
         executor.observe_idle()
         # Cargo doctests can relink real programs: refresh from a new joint build,
         # never recollect hashes from an older compiler-artifact stream.
@@ -712,6 +736,11 @@ def batch(root, arguments):
         index["cancelled"] = executor.cancelled
         for name in ("nextest", "doctest", "final_prepare"):
             index["stages"].setdefault(name, dict(started=False, returncode=None, reason=index.get("error", "earlier domain gated this stage")))
+        try:
+            identity_snapshot.atomic_json(identity_root / "source-end.json", identity_snapshot.source_snapshot(REPO))
+        except (OSError, subprocess.SubprocessError) as error:
+            index["source_end_error"] = str(error)
+        executor.observe_idle()
         index["exit_code"] = 128 + executor.cancelled[0] if executor.cancelled else code
         write_json(root / "execution-index.json", index)
         executor.restore()

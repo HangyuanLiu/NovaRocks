@@ -1,3 +1,13 @@
 # LNP-3D is a product-topology acceptance suite. It owns a destructive
 # Accelerator wipe and an FE restart, so all-in-one must never select it.
 explicit_only = true
+heavy = { reason = "fixture", detail = "Requires private REST Catalog and MinIO, Accelerator wipe/restart/isolation, native 1FE+3BE and serial execution." }
+
+[impact]
+paths = ["novarocks/mv-application/**", "novarocks/catalog-application/**"]
+
+[reuse]
+scope = "suite"
+initial_state = "isolated"
+basis = "The SQL runner starts and shuts down a private REST Catalog and MinIO for this suite; its Server and fixture lifecycle is recorded."
+env_inputs = []

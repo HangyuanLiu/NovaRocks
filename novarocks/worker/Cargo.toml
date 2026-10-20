@@ -32,3 +32,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 novarocks-functions.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

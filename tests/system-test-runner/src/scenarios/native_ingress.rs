@@ -109,6 +109,15 @@ struct PaddedControls {
 }
 
 impl Scenario for OuterPreflightRejection {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_ingress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-ingress/outer-preflight-rejection"
     }
@@ -215,6 +224,15 @@ impl Scenario for OuterPreflightRejection {
 }
 
 impl Scenario for QueryMessageBounds {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_ingress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-ingress/query-message-bounds"
     }
@@ -359,6 +377,15 @@ impl Scenario for QueryMessageBounds {
 }
 
 impl Scenario for CurrentGateObservation {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_ingress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-ingress/current-gate-observation"
     }
@@ -501,6 +528,15 @@ impl Scenario for CurrentGateObservation {
 }
 
 impl Scenario for BlockingSaturationControl {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_ingress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-ingress/blocking-saturation-control"
     }
@@ -723,6 +759,15 @@ impl Scenario for BlockingSaturationControl {
 }
 
 impl Scenario for AsyncSchedulingPressure {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_ingress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-ingress/async-scheduling-pressure"
     }
@@ -849,6 +894,15 @@ impl Scenario for AsyncSchedulingPressure {
 }
 
 impl Scenario for PartialBodyDeadline {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_ingress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-ingress/partial-body-deadline"
     }
@@ -906,6 +960,15 @@ impl Scenario for PartialBodyDeadline {
 }
 
 impl Scenario for RegistryContentionControl {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_ingress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-ingress/registry-contention-control"
     }

@@ -179,6 +179,15 @@ async fn negative_client(
 }
 
 impl Scenario for NativeRootReplyRefusal {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery_root_reply",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         match self.0 {
             Case::Profile => "result-delivery/native-root-reply-profile-refusal",

@@ -16,3 +16,7 @@ bytes.workspace = true
 novarocks-state-store-api.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 uuid = { workspace = true, features = ["serde", "v7"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

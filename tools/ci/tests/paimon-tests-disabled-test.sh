@@ -23,8 +23,14 @@ source "$REPO_ROOT/tools/ci/local-full-ci.sh" --source-only
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 
-if ci_load_stable_suites "$STABLE_SUITES_FILE" | grep -Fx paimon; then
-  echo "disabled Paimon suite must not join stable CI" >&2
+ci_bound_binary() { printf '%s\n' "$test_root/sql-runner"; }
+cat >"$test_root/sql-runner" <<'RUNNER'
+#!/usr/bin/env bash
+printf '%s\n' filter optimizer
+RUNNER
+chmod +x "$test_root/sql-runner"
+if ci_discover_sql_suites "$REPO_ROOT" default | grep -Fx paimon; then
+  echo "disabled Paimon suite must not join default CI" >&2
   exit 1
 fi
 

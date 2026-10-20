@@ -140,6 +140,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 struct BackendSelfRegistration;
 
 impl Scenario for BackendSelfRegistration {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "backend_membership",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "membership/self-registration"
     }
@@ -242,6 +251,15 @@ fn query_one(context: &mut ScenarioContext, phase: &str) -> Result<()> {
 struct PreReadyReplan;
 
 impl Scenario for PreReadyReplan {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "backend_membership",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "membership/pre-ready-replan"
     }
@@ -429,6 +447,15 @@ fn bound_replan_attempt(
 struct PreReadyDmlNoRecovery;
 
 impl Scenario for PreReadyDmlNoRecovery {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "backend_membership",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "membership/pre-ready-dml-no-recovery"
     }

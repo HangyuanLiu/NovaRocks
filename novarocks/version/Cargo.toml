@@ -18,3 +18,7 @@ native-compatibility-test-fixture = []
 novarocks-proto-models.workspace = true
 novarocks-types.workspace = true
 sha2.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

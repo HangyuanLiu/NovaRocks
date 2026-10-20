@@ -66,6 +66,15 @@ struct PublicationScenario {
     fixture: Mutex<Option<PublicationFixture>>,
 }
 impl Scenario for PublicationScenario {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "catalog_publication",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         match self.property {
             Property::LateCommit => "catalog-publication/late-commit-observation",

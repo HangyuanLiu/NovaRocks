@@ -8,6 +8,7 @@ pub struct Cli {
     pub list_default: bool,
     pub list_compatibility: bool,
     pub list_binary_requirements: bool,
+    pub list_declarations: bool,
     pub only: Vec<String>,
     pub binary: Option<PathBuf>,
     pub compatible_binary: Option<PathBuf>,
@@ -39,6 +40,7 @@ impl Cli {
             list_default: false,
             list_compatibility: false,
             list_binary_requirements: false,
+            list_declarations: false,
             only: Vec::new(),
             binary: None,
             compatible_binary: None,
@@ -63,6 +65,7 @@ impl Cli {
             };
             match argument.as_str() {
                 "--list" => cli.list = true,
+                "--list-declarations" => cli.list_declarations = true,
                 "--list-default" => cli.list_default = true,
                 "--list-compatibility" => cli.list_compatibility = true,
                 "--list-binary-requirements" => cli.list_binary_requirements = true,
@@ -136,6 +139,7 @@ impl Cli {
                 || cli.list_default
                 || cli.list_compatibility
                 || cli.list_binary_requirements
+                || cli.list_declarations
                 || !cli.only.is_empty()
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
@@ -156,6 +160,7 @@ impl Cli {
                 || cli.list_default
                 || cli.list_compatibility
                 || cli.list_binary_requirements
+                || cli.list_declarations
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
                 || cli.exact_mysql_execution_binding.is_some()
@@ -173,6 +178,7 @@ impl Cli {
                 || cli.list_default
                 || cli.list_compatibility
                 || cli.list_binary_requirements
+                || cli.list_declarations
                 || !cli.only.is_empty()
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
@@ -185,6 +191,7 @@ impl Cli {
                 || cli.list_default
                 || cli.list_compatibility
                 || cli.list_binary_requirements
+                || cli.list_declarations
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
                 || cli.launch_profile != LaunchProfile::FaultScenario
@@ -199,6 +206,7 @@ impl Cli {
             cli.list_default,
             cli.list_compatibility,
             cli.list_binary_requirements,
+            cli.list_declarations,
         ]
         .into_iter()
         .filter(|value| *value)
@@ -218,7 +226,7 @@ impl Cli {
 
     pub const fn usage() -> &'static str {
         concat!(
-            "usage: novarocks-system-tests [--list | --list-default | --list-compatibility | --list-binary-requirements] [--only <exact-name>]... ",
+            "usage: novarocks-system-tests [--list | --list-default | --list-compatibility | --list-binary-requirements | --list-declarations] [--only <exact-name>]... ",
             "[--binary <path> [--compatible-binary <path>] ",
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
@@ -458,5 +466,30 @@ mod hms_preflight_cli_tests {
             ])
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+    #[test]
+    fn declarations_need_no_runtime_inputs_and_are_exclusive_with_existing_list_modes() {
+        let cli = Cli::parse([
+            "--list-declarations".into(),
+            "--only".into(),
+            "paused/scenario".into(),
+        ])
+        .unwrap();
+        assert!(cli.list_declarations);
+        assert_eq!(cli.only, ["paused/scenario"]);
+        for flag in [
+            "--list",
+            "--list-default",
+            "--list-compatibility",
+            "--list-binary-requirements",
+        ] {
+            assert!(Cli::parse([flag.into(), "--list-declarations".into()]).is_err());
+            assert!(!Cli::parse([flag.into()]).unwrap().list_declarations);
+        }
     }
 }

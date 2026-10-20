@@ -16,7 +16,34 @@
 # specific language governing permissions and limitations
 # under the License.
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build_capabilities.sh"
+CI_INVOCATION_LIBRARY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$CI_INVOCATION_LIBRARY_DIR/build_capabilities.sh"
+
+# Persist the invocation before launching, retaining the wrapped command's exit.
+ci_invocation_start() {
+  local kind="$1" name="$2"; shift 2
+  local spec_args=() unit_args=()
+  [ "$kind" = sql-suite ] || unit_args=(--unit "$kind:$name")
+  [ -z "${CI_INVOCATION_SPEC:-}" ] || spec_args=(--spec "$CI_INVOCATION_SPEC")
+  python3 "$CI_INVOCATION_LIBRARY_DIR/invocation_record.py" start \
+    --root "$CI_RUN_DIR" --repo "$REPO_ROOT" --kind "$kind" --name "$name" \
+    "${unit_args[@]}" "${spec_args[@]}" -- "$@"
+}
+
+ci_invocation_finish() {
+  local record="$1" code="$2" log="$3" materials="$4"
+  python3 "$CI_INVOCATION_LIBRARY_DIR/invocation_record.py" finish \
+    --record "$record" --code "$code" --log "$log" --materials "$materials" >/dev/null
+}
+
+ci_run_recorded_logged() {
+  local log="$1" kind="$2" name="$3" materials="$4"; shift 4
+  local record code=0
+  record="$(ci_invocation_start "$kind" "$name" "$@")" || return $?
+  ci_run_logged "$log" "$@" || code=$?
+  ci_invocation_finish "$record" "$code" "$log" "$materials" || return $?
+  return "$code"
+}
 
 # Native 1FE+NBE System Scenario stage.
 #
@@ -151,21 +178,18 @@ ci_run_system_scenarios() {
     return 1
   fi
 
-  local needs_file="$CI_RUN_DIR/system/selected-requirements.txt" needs_args=() requirement required_binary
-  for scenario in "${scenarios[@]}"; do needs_args+=(--only "$scenario"); done
-  "$runner" --list-binary-requirements "${needs_args[@]}" >"$needs_file" || return $?
-  while IFS= read -r requirement; do
-    case "$requirement" in
-      primary) required_binary="$binary" ;;
-      compatible) required_binary="$compatible_binary" ;;
-      other-island) required_binary="$other_island_binary" ;;
-      *) echo "error: unknown selected program requirement: $requirement" >&2; return 2 ;;
-    esac
-    [ -n "$required_binary" ] && [ -x "$required_binary" ] || { echo "error: selected scenario is missing $requirement program" >&2; return 1; }
-    if [ "$requirement" != primary ]; then
-      python3 "${REPO_ROOT:-$PWD}/tools/ci/cargo-artifacts.py" verify-copy "$required_binary.binding.json" "$required_binary" || return $?
-    fi
-  done <"$needs_file"
+  python3 - "$CI_INVOCATION_LIBRARY_DIR" "$CI_RUN_DIR/selection.json" "${scenarios[@]}" <<'SELECTION'
+import json, sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from identity_snapshot import atomic_json
+path=Path(sys.argv[2])
+value=json.loads(path.read_text()) if path.is_file() else {"schema":1,"units":[]}
+for name in sys.argv[3:]:
+    unit={"kind":"system-scenario","id":name,"mode":"default"}
+    if unit not in value["units"]: value["units"].append(unit)
+atomic_json(path,value)
+SELECTION
 
   local slug
   local log_path
@@ -180,26 +204,61 @@ ci_run_system_scenarios() {
     artifact_dir="$artifact_root/$slug"
     mkdir -p "$artifact_dir"
 
-    ci_bound_binary novarocks >/dev/null || return $?
-    ci_bound_binary novarocks-system-tests >/dev/null || return $?
-    for required_binary in "$compatible_binary" "$other_island_binary"; do
-      [ -z "$required_binary" ] || python3 "${REPO_ROOT:-$PWD}/tools/ci/cargo-artifacts.py" verify-copy "$required_binary.binding.json" "$required_binary" || return $?
-    done
     primary_binary="$binary"
     local variant_args=()
     [ -z "$compatible_binary" ] || variant_args+=(--compatible-binary "$compatible_binary")
     [ -z "$other_island_binary" ] || variant_args+=(--other-island-binary "$other_island_binary")
     start="$(ci_epoch)"
-    ci_run_logged "$log_path" \
-      "$runner" \
-      --binary "$primary_binary" \
-      "${variant_args[@]}" \
-      --config "$base_config" \
-      --artifact-root "$artifact_dir" \
-      --cluster-size "$cluster_size" \
-      --timeout-secs "$timeout_secs" \
-      --only "$scenario"
-    code=$?
+    local scenario_materials
+    scenario_materials="$(python3 - "$artifact_dir/$slug" <<'MATERIALS'
+import json, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+print(json.dumps({"evidence":str(root/'scenario-evidence.json'),"teardown":str(root/'scenario-teardown.json')}))
+MATERIALS
+)"
+    local declaration_file="$CI_RUN_DIR/system/$slug.declaration.json" spec_file="$CI_RUN_DIR/system/$slug.inputs.json"
+    local record needs_file="$CI_RUN_DIR/system/$slug.requirements.txt" requirement required_binary
+    "$runner" --list-declarations --only "$scenario" >"$declaration_file" || return $?
+    python3 - "$declaration_file" "$spec_file" "$scenario" <<'INPUTS'
+import json, sys
+value=json.load(open(sys.argv[1]))
+selected=[s for s in value['scenarios'] if s['name']==sys.argv[3]]
+if len(selected)!=1: raise ValueError('scenario declaration must identify one selected scenario')
+declaration=selected[0]['declaration']
+with open(sys.argv[2], 'w') as stream:
+    json.dump({'inputs':[], 'env_inputs':declaration['env_inputs'] or [], 'declaration':declaration, 'declared':declaration['env_inputs'] is not None},stream)
+INPUTS
+    local invocation_args=("$runner" --binary "$primary_binary" "${variant_args[@]}" --config "$base_config"
+      --artifact-root "$artifact_dir" --cluster-size "$cluster_size" --timeout-secs "$timeout_secs" --only "$scenario")
+    record="$(CI_INVOCATION_SPEC="$spec_file" ci_invocation_start system-scenario "$scenario" "${invocation_args[@]}")" || return $?
+    code=0
+    "$runner" --list-binary-requirements --only "$scenario" >"$needs_file" 2>"$log_path" || code=$?
+    if [ "$code" -eq 0 ]; then
+      while IFS= read -r requirement; do
+        case "$requirement" in
+          primary) required_binary="$binary" ;;
+          compatible) required_binary="$compatible_binary" ;;
+          other-island) required_binary="$other_island_binary" ;;
+          *) echo "error: unknown selected program requirement: $requirement" >>"$log_path"; code=2; break ;;
+        esac
+        if [ -z "$required_binary" ] || [ ! -x "$required_binary" ]; then
+          echo "error: selected scenario is missing $requirement program" >>"$log_path"
+          code=1; break
+        fi
+        if [ "$requirement" != primary ]; then
+          python3 "${REPO_ROOT}/tools/ci/cargo-artifacts.py" verify-copy "$required_binary.binding.json" "$required_binary" >>"$log_path" 2>&1 || { code=$?; break; }
+        fi
+      done <"$needs_file"
+    fi
+    if [ "$code" -eq 0 ]; then
+      ci_bound_binary novarocks >>"$log_path" 2>&1 || code=$?
+      ci_bound_binary novarocks-system-tests >>"$log_path" 2>&1 || code=$?
+    fi
+    if [ "$code" -eq 0 ]; then
+      ci_run_logged "$log_path" "${invocation_args[@]}" || code=$?
+    fi
+    ci_invocation_finish "$record" "$code" "$log_path" "$scenario_materials" || return $?
     duration=$(($(ci_epoch) - start))
 
     if [ "$code" -ne 0 ]; then

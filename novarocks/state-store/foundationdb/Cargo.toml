@@ -41,3 +41,12 @@ bench = false
 foundationdb-provider = ["dep:foundationdb"]
 state-store-test-hooks = ["foundationdb-provider"]
 provider-internal-tests = ["foundationdb-provider"]
+
+[package.metadata.novarocks.test]
+runtime-inputs = ["target/debug/state-store-foundationdb-helper"]
+env-inputs = [{ name = "NOVAROCKS_FDB_CLUSTER_FILE", kind = "file-content" },{ name = "NOVAROCKS_FDB_KEYSPACE_ID", kind = "value" }]
+ignored = [
+  { filter = "test(=foundationdb::runtime::tests::running_runtime_drop_child)", class = "helper", reason = "exec helper used by running_runtime_drop_fails_fast" },
+  { filter = "test(=foundationdb::runtime::tests::failed_runtime_with_running_thread_drop_child)", class = "helper", reason = "exec helper used by failed_runtime_with_running_thread_drop_fails_fast" },
+  { filter = "test(=runtime_child_boot)", class = "helper", reason = "exec helper used by foundationdb_runtime_lifecycle" },
+]

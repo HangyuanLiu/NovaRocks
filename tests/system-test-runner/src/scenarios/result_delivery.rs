@@ -138,6 +138,15 @@ fn refusal_request(
 struct RootReadRefusal;
 
 impl Scenario for RootReadRefusal {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "result-delivery/root-read-profile-kind-refusal"
     }
@@ -250,6 +259,15 @@ impl Scenario for RootReadRefusal {
 struct WireBoundary(&'static str);
 
 impl Scenario for WireBoundary {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         self.0
     }
@@ -461,6 +479,15 @@ enum RootProtocolMode {
 struct ContextRootRetention(RootProtocolMode);
 
 impl Scenario for ContextRootRetention {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         match self.0 {
             RootProtocolMode::None => "result-delivery/producer-exit-context-retention",

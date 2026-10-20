@@ -47,6 +47,15 @@ pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
 }
 
 impl Scenario for ResponseDeadline {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery_deadline",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         match self.0 {
             Mode::ProducerWait => "result-delivery/producer-wait-query-deadline-separation",

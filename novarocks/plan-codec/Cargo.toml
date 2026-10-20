@@ -51,3 +51,7 @@ sha2.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

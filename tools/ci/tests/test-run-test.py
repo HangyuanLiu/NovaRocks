@@ -312,6 +312,71 @@ class Materials(unittest.TestCase):
             with self.subTest(option=option), self.assertRaises(ValueError):
                 run.native_options([option, "other"])
 
+    def identity_inputs(self, root, prepared):
+        inputs = root / "inputs"
+        for name, value in {
+            "cargo-metadata.json": {"workspace_members":["fixture"],"packages":[{"id":"fixture","metadata":{"novarocks":{"test":{"runtime-inputs":[],"env-inputs":[{"name":"NOVAROCKS_BIN","kind":"file-content"}]}}}}]},
+            "prepared.json": prepared,
+            "test-artifacts.json": {"binaries":{"fixture":{"package-id":"fixture","path":sys.executable}}},
+            "selected-tests.json": {"rust-suites":{"fixture":{"testcases":{"case":{"filter-match":{"status":"matches"}}}}}}
+        }.items():
+            (inputs / name).write_text(json.dumps(value))
+        (inputs / "nextest.toml").write_text("[profile.default]\n")
+
+    def identity_batch(self, root, server, during_doctest=None):
+        prepared = dict(profile="default", run_argv=["native-nextest"], nextest_version="fixture",
+                        junit=str(root / "nextest/default/junit.xml"))
+        def fake_execute(executor, stage, argv, adapter, environment=None):
+            stage.mkdir(parents=True, exist_ok=True)
+            if stage.name == "prepare":
+                (root / "inputs").mkdir()
+                (root / "inputs/artifacts.json").write_text(json.dumps({
+                    "novarocks": dict(path=str(server)),
+                    "novarocks-error-manifest": dict(path=sys.executable)}))
+                self.identity_inputs(root, prepared)
+                (root / "inputs/tool-config.toml").write_text('[store]\ndir = ' + json.dumps(str(root / "store")) + '\n')
+            elif stage.name == "rust-run":
+                self.assertEqual(environment["NOVAROCKS_BIN"], str(server))
+                junit = Path(prepared["junit"])
+                junit.parent.mkdir(parents=True)
+                junit.write_text("<testsuites/>")
+            elif stage.name == "doctest-run":
+                self.assertEqual(environment["NOVAROCKS_BIN"], str(server))
+                self.assertIn("--doc", argv)
+                if during_doctest:
+                    during_doctest()
+            return dict(started=True, returncode=0, errors=[])
+        with mock.patch.object(run.Executor, "execute", fake_execute), mock.patch.object(run, "verify_prepared", return_value=prepared):
+            self.assertEqual(run.batch(root, []), 0)
+        return {domain: json.loads((root / "identity" / (domain + ".json")).read_text())["scopes"]
+                for domain in ("nextest", "doctest")}
+
+    def test_doctest_binary_rewrite_preserves_its_own_identity_confirmation(self):
+        server = self.root / "prepared-server"
+        server.write_bytes(b"before-doctest")
+        original = run.identity_snapshot.digest(server)
+        facts = self.identity_batch(self.root / "rewrite-batch", server,
+                                    during_doctest=lambda: server.write_bytes(b"after-doctest"))
+        self.assertNotEqual(run.identity_snapshot.digest(server), original)
+        nextest = facts["nextest"]["fixture::case"]
+        self.assertTrue(nextest["inputs_stable"])
+        self.assertEqual(nextest["inputs_start"]["env"]["NOVAROCKS_BIN"], original)
+        self.assertEqual(nextest["inputs_start"], nextest["inputs_end"])
+        doctest = facts["doctest"]["workspace"]
+        self.assertTrue(doctest["inputs_stable"])
+        self.assertEqual(doctest["inputs_start"], doctest["inputs_end"])
+        self.assertNotIn("NOVAROCKS_BIN", doctest["inputs_start"]["env"])
+
+    def test_batch_output_roots_do_not_change_either_execution_domain_identity(self):
+        server = self.root / "same-server"
+        server.write_bytes(b"same-native-program")
+        first = self.identity_batch(self.root / "first-output", server)
+        second = self.identity_batch(self.root / "second-output", server)
+        for domain in ("nextest", "doctest"):
+            with self.subTest(domain=domain):
+                self.assertEqual(first[domain], second[domain])
+                self.assertTrue(all(scope["inputs_stable"] for scope in first[domain].values()))
+
     def test_assertion_failure_continues_doctest_and_other_failures_gate(self):
         for exit_code in (0, 100, 101, -signal.SIGTERM):
             with self.subTest(exit_code=exit_code):
@@ -324,7 +389,8 @@ class Materials(unittest.TestCase):
                     stage.mkdir(parents=True, exist_ok=True)
                     if stage.name == "prepare":
                         (root / "inputs").mkdir()
-                        (root / "inputs/artifacts.json").write_text(json.dumps({name: dict(path="/bin/true") for name in ("novarocks", "novarocks-error-manifest")}))
+                        (root / "inputs/artifacts.json").write_text(json.dumps({name: dict(path=sys.executable) for name in ("novarocks", "novarocks-error-manifest")}))
+                        self.identity_inputs(root, prepared)
                     if stage.name == "rust-run":
                         junit = Path(prepared["junit"])
                         junit.parent.mkdir(parents=True)
@@ -352,7 +418,8 @@ class Materials(unittest.TestCase):
                     result = dict(started=True, returncode=0, errors=[])
                     if stage.name == "prepare":
                         (root / "inputs").mkdir()
-                        (root / "inputs/artifacts.json").write_text(json.dumps({name: dict(path="/bin/true") for name in ("novarocks", "novarocks-error-manifest")}))
+                        (root / "inputs/artifacts.json").write_text(json.dumps({name: dict(path=sys.executable) for name in ("novarocks", "novarocks-error-manifest")}))
+                        self.identity_inputs(root, prepared)
                     elif stage.name == "rust-run":
                         junit = Path(prepared["junit"])
                         junit.parent.mkdir(parents=True)
@@ -385,7 +452,8 @@ class Materials(unittest.TestCase):
                     stage.mkdir(parents=True, exist_ok=True)
                     if stage.name == "prepare":
                         (root / "inputs").mkdir()
-                        (root / "inputs/artifacts.json").write_text(json.dumps({name: dict(path="/bin/true") for name in ("novarocks", "novarocks-error-manifest")}))
+                        (root / "inputs/artifacts.json").write_text(json.dumps({name: dict(path=sys.executable) for name in ("novarocks", "novarocks-error-manifest")}))
+                        self.identity_inputs(root, prepared)
                     elif stage.name == "rust-run":
                         junit = Path(prepared["junit"])
                         junit.parent.mkdir(parents=True)
@@ -401,6 +469,75 @@ class Materials(unittest.TestCase):
                 name = "nextest" if failed_stage == "rust-run" else "doctest"
                 self.assertFalse(index["stages"][name]["started"])
                 self.assertIn("controlled pre-spawn", index["stages"][name]["primary_error"]["message"])
+
+    def test_hard_kill_doctest_retains_confirmed_nextest_checkpoint(self):
+        # The fake executors avoid Cargo and external resources. The batch process
+        # is killed in the doctest domain, so its finally block cannot help.
+        evidence = Path(os.environ.get("NOVA_CI_TEST_EVIDENCE_ROOT", tempfile.gettempdir()))
+        evidence.mkdir(parents=True, exist_ok=True)
+        retained = Path(tempfile.mkdtemp(prefix="g15-hard-kill-", dir=evidence)).resolve()
+        script = retained / "fake-batch.py"
+        script.write_text("""import importlib.util,json,os,sys,time
+from pathlib import Path
+module_path,root_path=sys.argv[1:]
+spec=importlib.util.spec_from_file_location('test_run',module_path)
+run=importlib.util.module_from_spec(spec);spec.loader.exec_module(run)
+root=Path(root_path)
+prepared=dict(schema=1,profile='default',run_argv=['fake-nextest'],nextest_version='fixture',junit=str(root/'nextest/default/junit.xml'))
+def execute(executor,stage,argv,adapter,environment=None):
+    stage.mkdir(parents=True,exist_ok=True)
+    if stage.name=='prepare':
+        inputs=root/'inputs';inputs.mkdir()
+        values={
+          'artifacts.json':{name:{'path':sys.executable} for name in ('novarocks','novarocks-error-manifest')},
+          'cargo-metadata.json':{'workspace_members':['p'],'packages':[{'id':'p','metadata':{'novarocks':{'test':{'runtime-inputs':[],'env-inputs':[{'name':'NOVAROCKS_BIN','kind':'file-content'}]}}}}]},
+          'prepared.json':prepared,
+          'test-artifacts.json':{'schema':1,'binaries':{'p':{'package-id':'p','path':sys.executable}}},
+          'selected-tests.json':{'rust-suites':{'p':{'testcases':{'case':{'filter-match':{'status':'matches'}}}}}}}
+        (inputs/'nextest.toml').write_text('[profile.default]')
+        (inputs/'tool-config.toml').write_text('[store]'+chr(10)+'dir = '+json.dumps(str(root/'nextest'))+chr(10))
+        prepared['config_sha256']=run.digest(inputs/'nextest.toml')
+        values['test-artifacts.json']['binaries']['p']['sha256']=run.digest(sys.executable)
+        for name,value in values.items():(inputs/name).write_text(json.dumps(value))
+    elif stage.name=='rust-run':
+        junit=Path(prepared['junit']);junit.parent.mkdir(parents=True);junit.write_text('<testsuites><testsuite name="p"><testcase name="case" classname="p" time="0"/></testsuite></testsuites>')
+    elif stage.name=='doctest-run':
+        (root/'doctest-ready').write_text('ready')
+        while True:time.sleep(.05)
+    return dict(started=True,returncode=0,errors=[])
+run.Executor.execute=execute
+run.verify_prepared=lambda _:prepared
+sys.exit(run.batch(root,[]))
+""")
+        attempt = retained / "attempt"
+        child = subprocess.Popen([sys.executable, str(script), str(REPO / "tools/ci/test-run.py"), str(attempt)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 15
+            while not (attempt / "doctest-ready").exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue((attempt / "doctest-ready").is_file(), child.stderr.read() if child.poll() is not None else "doctest did not start")
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=5)
+            index = json.loads((attempt / "execution-index.json").read_text())
+            self.assertFalse(index["complete"])
+            self.assertNotIn("exit_code", index)
+            self.assertEqual(index["stages"]["nextest"]["returncode"],0)
+            self.assertTrue(index["materials"]["junit"]["complete"])
+            self.assertTrue(index["materials"]["rust_cleanup"]["exists"])
+            scopes=json.loads((attempt/"identity/nextest.json").read_text())["scopes"]
+            self.assertTrue(scopes["p::case"]["inputs_stable"])
+            expected=run.digest(sys.executable)
+            self.assertEqual(scopes["p::case"]["inputs_start"]["env"]["NOVAROCKS_BIN"],expected)
+            doctest=json.loads((attempt/"identity/doctest.json").read_text())
+            self.assertFalse(doctest["scopes"]["workspace"]["inputs_stable"])
+            self.assertFalse((attempt/"identity/source-end.json").exists())
+            print("hard-kill retained attempt: " + str(attempt))
+        finally:
+            if child.poll() is None:
+                os.killpg(child.pid,signal.SIGKILL)
+                child.wait(timeout=5)
+            child.stderr.close()
 
     def test_pre_spawn_primary_and_cleanup_failure_both_survive(self):
         executor = run.Executor()
@@ -425,7 +562,7 @@ class NativeNextest(unittest.TestCase):
         fixture = self.root / "fixture"
         (fixture / "src").mkdir(parents=True)
         (fixture / "tools/ci/lib").mkdir(parents=True)
-        for relative in ("test-run.py", "cargo-artifacts.py", "lib/build_capabilities.sh"):
+        for relative in ("test-run.py", "cargo-artifacts.py", "lib/build_capabilities.sh", "lib/identity_snapshot.py"):
             shutil.copy2(REPO / "tools/ci" / relative, fixture / "tools/ci" / relative)
         (fixture / ".config").mkdir()
         configuration = (REPO / ".config/nextest.toml").read_text().split("[test-groups.")[0]
@@ -478,6 +615,9 @@ fn leak() {
 }
 ''')
         subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=fixture, check=True)
+        subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+        subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "fixture"], cwd=fixture, check=True)
+        (fixture / ".gitignore").write_text("target/\n")
         output = self.root / "prepared"
         with mock.patch.object(run, "REPO", fixture), mock.patch.dict(os.environ, {"NOVA_CI_NEXTEST_BIN": self.nextest}):
             prepared = run.prepare(output, [], self.root / "native-store")

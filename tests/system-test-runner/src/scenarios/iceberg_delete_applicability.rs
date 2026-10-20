@@ -205,6 +205,15 @@ pub(super) async fn immutable_artifacts(
 }
 
 impl Scenario for IcebergDeleteApplicability {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "iceberg_delete_applicability",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/iceberg-delete-applicability"
     }

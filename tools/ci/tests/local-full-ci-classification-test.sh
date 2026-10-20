@@ -17,818 +17,110 @@
 # under the License.
 
 set -euo pipefail
-
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-
 source "$REPO_ROOT/tools/ci/local-full-ci.sh" --source-only
-
-tmpdir="$(mktemp -d)"
-tmpdir="$(cd "$tmpdir" && pwd -P)"
-trap 'rm -rf "$tmpdir"' EXIT
-
-if (
-  parse_args --cargo-only --suite filter
-) >/dev/null 2>&1; then
-  echo "--cargo-only must reject SQL and runtime options" >&2
-  exit 1
-fi
-
-cargo_only_capture="$tmpdir/cargo-only-main"
-(
-  init_run_dir() {
-    CI_RUN_DIR="$tmpdir/cargo-only-run"
-    CI_SUMMARY="$CI_RUN_DIR/summary.md"
-    mkdir -p "$CI_RUN_DIR"
-  }
-  validate_explicit_suites_early() {
-    printf '%s\n' "validate" >>"$cargo_only_capture"
-  }
-  run_cargo_gates() {
-    printf '%s\n' "cargo" >>"$cargo_only_capture"
-  }
-  prepare_runtime() {
-    printf '%s\n' "runtime" >>"$cargo_only_capture"
-    return 97
-  }
-  run_system_scenarios_stage() {
-    printf '%s\n' "system" >>"$cargo_only_capture"
-    return 97
-  }
-  run_sql_suites() {
-    printf '%s\n' "sql" >>"$cargo_only_capture"
-    return 97
-  }
-  ci_render_summary() { :; }
-
-  main --cargo-only >/dev/null
-)
-
-if [ "$(tr '\n' ' ' <"$cargo_only_capture")" != "validate cargo " ]; then
-  echo "--cargo-only must run validation and Cargo gates without runtime or SQL stages" >&2
-  cat "$cargo_only_capture" >&2
-  exit 1
-fi
-
-blocked_run="$tmpdir/blocked-run"
-blocked_capture="$tmpdir/blocked-cargo"
-blocked_code=0
-(
-  init_run_dir() {
-    CI_RUN_DIR="$blocked_run"
-    CI_SUMMARY="$CI_RUN_DIR/summary.md"
-    mkdir -p "$CI_RUN_DIR"
-    ci_init_summary_state
-    ci_set_repo_context "$REPO_ROOT" test test
-    ci_render_summary "RUNNING"
-  }
-  verify_fixture_inputs() {
-    printf '%s\n' "verify" >"$blocked_run/verify-called"
-    return 75
-  }
-  run_cargo_gates() {
-    printf '%s\n' "cargo" >"$blocked_capture"
-  }
-
-  main --tier smoke >/dev/null
-) || blocked_code=$?
-if [ "$blocked_code" -ne 75 ]; then
-  echo "missing fixture BOM must preserve exit 75 and stop CI as BLOCKED" >&2
-  exit 1
-fi
-
-grep -Fx -- '- Status: BLOCKED' "$blocked_run/summary.md" >/dev/null
-grep -F '| fixture prerequisites | BLOCKED |' "$blocked_run/summary.md" >/dev/null
-grep -F '| fixture input BOM missing or invalid | env.log |' "$blocked_run/summary.md" >/dev/null
-[[ -f "$blocked_run/verify-called" ]]
-if [[ -e "$blocked_capture" ]]; then
-  echo "BLOCKED fixture preflight must run before Cargo gates" >&2
-  exit 1
-fi
-
-for owner_error in PortUnavailable RuntimeIdentityMismatch ExternalAttachmentsPresent; do
-  runtime_failed_run="$tmpdir/runtime-failed-$owner_error"
-  runtime_failed_capture="$tmpdir/runtime-failed-cargo-$owner_error"
-  runtime_failed_code=0
-  (
-    init_run_dir() {
-      CI_RUN_DIR="$runtime_failed_run"
-      CI_SUMMARY="$CI_RUN_DIR/summary.md"
-      mkdir -p "$CI_RUN_DIR"
-      ci_init_summary_state
-      ci_set_repo_context "$REPO_ROOT" test test
-      ci_render_summary "RUNNING"
-    }
-    verify_fixture_inputs() { return 0; }
-    function docker/iceberg-rest/up.sh {
-      echo "error: $owner_error: synthetic owner failure" >&2
-      return 1
-    }
-    run_cargo_gates() {
-      printf '%s\n' "cargo" >"$runtime_failed_capture"
-    }
-
-    main --tier smoke >/dev/null
-  ) || runtime_failed_code=$?
-  if [ "$runtime_failed_code" -ne 1 ]; then
-    echo "owner errors must preserve their failure exit code" >&2
-    exit 1
-  fi
-  grep -Fx -- '- Status: VERIFY FAILED' "$runtime_failed_run/summary.md" >/dev/null
-  grep -F '| prepare runtime | VERIFY FAILED |' "$runtime_failed_run/summary.md" >/dev/null
-  grep -F "$owner_error" "$runtime_failed_run/env.log" >/dev/null
-  if grep -F '| fixture prerequisites | BLOCKED |' "$runtime_failed_run/summary.md" >/dev/null; then
-    echo "owner errors must not be classified as fixture BLOCKED" >&2
-    exit 1
-  fi
-  if [[ -e "$runtime_failed_capture" ]]; then
-    echo "VERIFY FAILED runtime setup must run before Cargo gates" >&2
-    exit 1
-  fi
-done
-
-publication_a="$tmpdir/publications/a"
-publication_b="$tmpdir/publications/b"
-mkdir -p "$publication_a" "$publication_b" "$tmpdir/entry"
-cat >"$publication_a/env.sh" <<EOF
-export NOVA_ENV_REST_ENV_FILE='$publication_a/env.sh'
-export NOVA_ENV_MANIFEST='$publication_a/manifest.json'
-export NOVA_ENV_RUNTIME_DIR='$tmpdir/stable-runtime'
-export NOVAROCKS_FE_CONFIG='$publication_a/fe.toml'
-export NOVAROCKS_BE_CONFIG='$publication_a/be.toml'
-export NOVAROCKS_SQL_TEST_CONFIG='$publication_a/sql-test.toml'
-export NOVA_ENV_MYSQL_PORT='9030'
-export NOVA_ENV_OBJECT_STORE_RUNTIME='os-test'
-export NOVA_ENV_CATALOG_RUNTIME='cat-test'
-export AWS_S3_ENDPOINT='http://127.0.0.1:28000'
-export NOVAROCKS_ICEBERG_REST_URI='http://127.0.0.1:28002'
-export NOVAROCKS_ICEBERG_REST_MV_URI='http://127.0.0.1:28003'
-EOF
-printf '%s\n' 'return 96' >"$publication_b/env.sh"
-ln -s "$publication_a" "$tmpdir/entry/published"
-ln -s published/env.sh "$tmpdir/entry/env.sh"
-(
-  load_fixture_publication "$tmpdir/entry/env.sh"
-  rm "$tmpdir/entry/published"
-  ln -s "$publication_b" "$tmpdir/entry/published"
-  record_fixture_runtime >"$tmpdir/runtime-receipt.log"
-  [ "$NOVA_ENV_REST_ENV_FILE" = "$publication_a/env.sh" ]
-  [ "$NOVA_ENV_RUNTIME_DIR" = "$tmpdir/stable-runtime" ]
-)
-for receipt in \
-  'NOVA_ENV_OBJECT_STORE_RUNTIME=os-test' \
-  'NOVA_ENV_CATALOG_RUNTIME=cat-test' \
-  "NOVA_ENV_PUBLICATION_DIR=$publication_a" \
-  'AWS_S3_ENDPOINT=http://127.0.0.1:28000' \
-  'NOVAROCKS_ICEBERG_REST_URI=http://127.0.0.1:28002' \
-  'NOVAROCKS_ICEBERG_REST_MV_URI=http://127.0.0.1:28003'; do
-  grep -Fx "$receipt" "$tmpdir/runtime-receipt.log" >/dev/null
-done
-
-for mv_failure in contract environment missing-uri missing-manifest; do
-  mv_failed_run="$tmpdir/mv-failed-$mv_failure"
-  mv_failed_code=0
-  mv_expected_code=1
-  if [ "$mv_failure" = "environment" ]; then
-    mv_expected_code=2
-  fi
-  (
-    init_run_dir() {
-      CI_RUN_DIR="$mv_failed_run"
-      CI_SUMMARY="$CI_RUN_DIR/summary.md"
-      mkdir -p "$CI_RUN_DIR"
-      ci_init_summary_state
-      ci_set_repo_context "$REPO_ROOT" test test
-      ci_render_summary "RUNNING"
-    }
-    verify_fixture_inputs() { return 0; }
-    function docker/iceberg-rest/up.sh { return 0; }
-    load_fixture_publication() {
-      source "$publication_a/env.sh"
-      case "$mv_failure" in
-        missing-uri) unset NOVAROCKS_ICEBERG_REST_MV_URI ;;
-        missing-manifest) unset NOVA_ENV_MANIFEST ;;
-      esac
-      return 0
-    }
-    python3() {
-      if [ "$1" = "docker/iceberg-rest/rest-mv/probe.py" ]; then
-        printf '%s\n' "$@" >"$mv_failed_run/probe.args"
-        echo "rest-mv: synthetic $mv_failure failure" >&2
-        return "$mv_expected_code"
-      fi
-      command python3 "$@"
-    }
-    function docker/paimon-read/prepare.sh {
-      touch "$mv_failed_run/paimon-called"
-      return 0
-    }
-    run_cargo_gates() { touch "$mv_failed_run/cargo-called"; }
-
-    main --tier smoke >/dev/null
-  ) || mv_failed_code=$?
-  if [ "$mv_failed_code" -ne "$mv_expected_code" ]; then
-    echo "rest-mv preparation must preserve its failure exit code" >&2
-    exit 1
-  fi
-  grep -Fx -- '- Status: VERIFY FAILED' "$mv_failed_run/summary.md" >/dev/null
-  grep -F '| prepare runtime | VERIFY FAILED |' "$mv_failed_run/summary.md" >/dev/null
-  if [[ -e "$mv_failed_run/paimon-called" || -e "$mv_failed_run/cargo-called" ]]; then
-    echo "rest-mv preparation failure must stop before Paimon and Cargo" >&2
-    exit 1
-  fi
-  case "$mv_failure" in
-    contract|environment)
-      grep -Fx 'NOVAROCKS_ICEBERG_REST_MV_URI=http://127.0.0.1:28003' "$mv_failed_run/env.log" >/dev/null
-      expected_probe_args="$(printf '%s\n' docker/iceberg-rest/rest-mv/probe.py contract --manifest "$publication_a/manifest.json")"
-      if [ "$(cat "$mv_failed_run/probe.args")" != "$expected_probe_args" ]; then
-        echo "rest-mv probe must use the selected publication manifest" >&2
-        exit 1
-      fi
-      ;;
-    missing-uri|missing-manifest)
-      grep -F 'missing required runtime variable:' "$mv_failed_run/env.log" >/dev/null
-      if [[ -e "$mv_failed_run/probe.args" ]]; then
-        echo "incomplete publication must fail before the rest-mv probe" >&2
-        exit 1
-      fi
-      ;;
-  esac
-done
-
-# Capture the actual CI graph without compiling product code.
-ci_bound_binary() { printf '%s/target/debug/%s\n' "$REPO_ROOT" "$1"; }
-stage_capture="$tmpdir/cargo-gates"
-(
-  CI_RUN_DIR="$tmpdir/cargo-gate-run"
-  SKIP_CARGO_TEST=true
-  run_fail_fast_stage() { printf '%s|%s|' "$1" "$2" >>"$stage_capture"; shift 2; printf '%s\n' "$*" >>"$stage_capture"; }
-  ci_record_stage() { :; }
-  ci_render_summary() { :; }
-  run_cargo_gates
-)
-grep -Fx 'locked Cargo metadata|cargo-metadata.log|cargo metadata --locked --format-version 1' "$stage_capture" >/dev/null
-grep -Fx 'joint tests and binaries preparation|cargo-prepare.log|ci_prepare_main '"$tmpdir/cargo-gate-run/rust/final-prepare/artifacts.json" "$stage_capture" >/dev/null
-[ "$(rg -c '^joint tests and binaries preparation\|' "$stage_capture")" = 1 ]
-if rg 'test-control owner tests|base controls build|cargo build --workspace' "$stage_capture"; then
-  echo 'duplicate graph preparation in daily CI' >&2; exit 1
-fi
-
-full_stage_capture="$tmpdir/full-cargo-gates"
-(
-  CI_RUN_DIR="$tmpdir/full-cargo-gate-run"
-  SKIP_CARGO_TEST=false
-  run_fail_fast_stage() { printf '%s|' "$1" >>"$full_stage_capture"; shift 2; printf '%s\n' "$*" >>"$full_stage_capture"; }
-  ci_collect_artifacts() { :; }
-  ci_capture_main_builds() { :; }
-  run_rust_batch_stage() { printf 'workspace nextest and doctests|python3 tools/ci/test-run.py batch --output %s/rust\n' "$CI_RUN_DIR" >>"$full_stage_capture"; }
-  run_cargo_gates
-)
-grep -Fx 'workspace nextest and doctests|python3 tools/ci/test-run.py batch --output '"$tmpdir/full-cargo-gate-run/rust" "$full_stage_capture" >/dev/null
-if rg 'ci_main_cargo test|test-threads=1|joint tests and binaries preparation' "$full_stage_capture"; then
-  echo 'formal Rust graph and independent doctest must be owned by the batch' >&2; exit 1
-fi
-
-# The formal wrapper already retains raw outputs. Its display must reach the
-# inherited destination instead of being swallowed by ci_run_logged.
-(
-  CI_RUN_DIR="$tmpdir/live-rust-stage"
-  mkdir -p "$CI_RUN_DIR"
-  python3() { printf 'incremental Rust display\n'; }
-  ci_record_stage() { :; }
-  ci_render_summary() { :; }
-  run_rust_batch_stage >"$tmpdir/inherited-rust-display"
-  grep -Fx 'incremental Rust display' "$tmpdir/inherited-rust-display" >/dev/null
-  if grep -F 'incremental Rust display' "$CI_RUN_DIR/rust-batch.log"; then
-    echo 'Rust display was redirected away from its inherited terminal' >&2; exit 1
-  fi
-)
-
-baseline="$tmpdir/known-failures.toml"
-run_dir="$tmpdir/run"
-mkdir -p "$run_dir/sql"
-
-cat >"$baseline" <<'EOF'
-[[failure]]
-tier = "full"
-suite = "tpc-ds"
-case = "q93"
-error_code = "QueryTimeout"
-reason = "synthetic timeout"
-
-[[failure]]
-tier = "full"
-suite = "tpc-ds"
-case = "q94"
-error_code = "CommitUnknown"
-reason = "synthetic commit unknown"
-
-[[failure]]
-tier = "full"
-suite = "typed-refusals"
-case = "sql-refusal"
-error_code = "sql.analyze.unavailable_implementation"
-reason = "synthetic SQL refusal"
-
-[[failure]]
-tier = "full"
-suite = "typed-refusals"
-case = "engine-refusal"
-error_code = "Unsupported"
-reason = "synthetic engine refusal"
-EOF
-
-cat >"$run_dir/sql/tpc-ds.log" <<'EOF'
-[novarocks-sql-test] suite=tpc-ds mode=verify
-  [tpc-ds] q94 (steps=1)
-    engine_error_code=CommitUnknown target execute failed: ERROR 1105 (HY000): [CommitUnknown] commit outcome unavailable
-case timings (all):
-  [tpc-ds] q93 PASS 0.01s
-  [tpc-ds] q94 FAIL 0.01s
-FAIL: total=2 pass=1 fail=1
-EOF
-
-CI_TIER="full"
-KNOWN_FAILURES_FILE="$baseline"
-CI_KNOWN_FAILURE_ROWS=""
-CI_FAILURE_TAIL=""
-
-cat >"$run_dir/sql/typed-refusals.log" <<'EOF'
-[novarocks-sql-test] suite=typed-refusals mode=verify
-  [typed-refusals] expected-error (steps=1)
-    PASS (expected error: engine_error_code=QueryTimeout)
-    PASS (expected error: sql_error_code=sql.analyze.unknown_code)
-  [typed-refusals] sql-refusal (steps=1)
-    sql_error_code=sql.analyze.unavailable_implementation target execute failed: ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] unavailable
-    sql_error_code=sql.analyze.unavailable_implementation target execute failed: repeated summary
-  [typed-refusals] engine-refusal (steps=1)
-    engine_error_code=Unsupported target execute failed: ERROR 1105 (HY000): [Unsupported] unsupported
-  [typed-refusals] timing-pass (steps=1)
-    sql_error_code=sql.analyze.unknown_code ignored because this case passed
-case timings (all):
-  [typed-refusals] expected-error PASS 0.01s
-  [typed-refusals] sql-refusal FAIL 0.01s
-  [typed-refusals] engine-refusal FAIL 0.01s
-  [typed-refusals] timing-pass PASS 0.01s
-FAIL: total=4 pass=2 fail=2
-EOF
-
-ci_classify_sql_log "typed-refusals" "$run_dir/sql/typed-refusals.log" true
-if [ "$(printf '%s\n' "$CI_KNOWN_FAILURE_ROWS" | rg -c 'KNOWN_FAIL')" != "2" ]; then
-  echo "both error-code tags must match exactly once for failed cases only" >&2
-  exit 1
-fi
-grep -F 'sql.analyze.unavailable_implementation' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-grep -F 'Unsupported' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-
-for unknown_code in sql.analyze.unavailable_implementation.extra UnknownEngineCode; do
-  unknown_tag="sql_error_code"
-  if [ "$unknown_code" = UnknownEngineCode ]; then unknown_tag="engine_error_code"; fi
-  cat >"$tmpdir/unknown-code.log" <<EOF
-  [typed-refusals] sql-refusal (steps=1)
-    $unknown_tag=$unknown_code target execute failed
-case timings (all):
-  [typed-refusals] sql-refusal FAIL 0.01s
-EOF
+test_root="$(mktemp -d)"
+trap 'rm -rf "$test_root"' EXIT
+python3 - "$test_root" <<'FIXTURES'
+import copy,json,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+def records(status='pass',code=0):
+    return [
+      {'kind':'run','schema':1,'mode':'verify','verification':{'verify_enabled':True,'record_from':'reference'},'platform':{'system':'fixture','machine':'fixture','release':'fixture'}},
+      {'kind':'selection','suites':[{'suite':'s','inputs_sha256':'inputs','verify_enabled':True,'query_timeout_secs':60,'declaration':{'scope':'suite','initial_state':'isolated','env_inputs':[]},'cases':[{'case':'a'}]}]},
+      {'kind':'case','suite':'s','case':'a','lifecycle_id':'L','status':status,'oracle':{'required':[{'step':1,'kind':'result_set'}],'executed':[]} if status=='fail' else {'required':[{'step':1,'kind':'expected_error'}],'executed':[{'step':1,'kind':'expected_error','outcome':'pass','policy':{}}]},'failure':{'class':'error_code','error_code':'NR-FAIL','statement_index':1,'actual_digest':None} if status=='fail' else None},
+      {'kind':'suite','suite':'s','lifecycle_id':'L','inputs_end_sha256':'inputs','inputs_stable':True,'executed_cases':['a'],'cleanup':{'status':'ok'}},
+      {'kind':'server','cleanup':{'status':'ok'}},{'kind':'fixture','shutdown':{'status':'ok'},'resources':[]},
+      {'kind':'end','completed':True,'exit_code':code}]
+def put(name,rows):
+    (root/(name+'.results.jsonl')).write_text(''.join(json.dumps(row)+'\n' for row in rows))
+put('pass',records());put('fail',records('fail',1));put('truncated',records()[:-1])
+violation=records();violation[4]['cleanup']['status']='failed';put('cleanup',violation)
+# Port upstream strict-refusal cases as independent native records. Code text
+# in a diagnostic or expected PASS never supplies a failure feature.
+negative=records('fail',1);negative[2]['oracle']={'required':[{'step':1,'kind':'expected_error'}],'executed':[{'step':1,'kind':'expected_error','outcome':'fail'}]};put('negative',negative)
+verify=records('fail',1);verify[2]['failure'].update({'class':'mismatch','actual_digest':'actual'});put('verify',verify)
+diagnostic=records('fail',1);diagnostic[2]['failure']['class']='error';diagnostic[2]['reason']='VERIFY FAILED: expected PASS NR-FAIL';put('diagnostic',diagnostic)
+for name,additional in [('case-cleanup',[{'class':'error','phase':'case_cleanup','error':'database busy'}]), ('multiple-refusals',[{'class':'error_code','error_code':'NR-OTHER','statement_index':2}])]:
+    aggregate=records('fail',1)
+    primary=copy.deepcopy(aggregate[2]['failure'])
+    aggregate[2]['failure']={'class':'error','primary_failure':primary,'additional_failures':additional}
+    put(name,aggregate)
+for code in ('NR-FAIL.extra','UnknownEngineCode'):
+    unknown=records('fail',1);unknown[2]['failure']['error_code']=code;put(code,unknown)
+expected=records();expected[2]['reason']='expected error matched: UnknownEngineCode NR-FAIL';put('expected',expected)
+direct=records('fail',1);direct[2]['reason']='target execute failed; diagnostic quotes PASS and UnknownEngineCode';put('direct',direct)
+secondary=records('fail',1)
+secondary[2]['oracle']={'required':[{'step':1,'kind':'result_set'},{'step':2,'kind':'expected_error'}], 'executed':[{'step':2,'kind':'expected_error','outcome':'fail'}]}
+put('secondary',secondary)
+for phase in ('init','cleanup'):
+    hook=records('fail',1);hook[3][phase]={'status':'failed','errors':['suite hook failed']};put('suite-'+phase,hook)
+empty={'schema':1,'known_failures':[],'quarantine':[]}
+(root/'empty.json').write_text(json.dumps(empty))
+known=copy.deepcopy(empty);known['known_failures']=[{'unit':'sql-case:s/a','failure':{'class':'error_code','code':'NR-FAIL'},'reason':'independent failing fixture','owner':'test owner','expires':'9999-12-31'}]
+(root/'known.json').write_text(json.dumps(known));known['known_failures'][0]['expires']='2000-01-01';(root/'expired.json').write_text(json.dumps(known))
+FIXTURES
+ci_init_summary_state
+check() {
+  local file="$1" dispositions="$2" expected="$3" expected_code="$4" code=0
   CI_KNOWN_FAILURE_ROWS=""
-  if ci_classify_sql_log "typed-refusals" "$tmpdir/unknown-code.log" true; then
-    echo "an unknown code must remain a hard failure: $unknown_code" >&2
-    exit 1
-  fi
-  grep -F 'NEW_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-  grep -F "$unknown_code" <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+  DISPOSITIONS_FILE="$test_root/$dispositions.json"
+  ci_classify_sql_results s "$test_root/$file.results.jsonl" || code=$?
+  test "$CI_SQL_RESULT_STATUS" = "$expected"
+  test "$code" -eq "$expected_code"
+}
+check pass empty PASS 0
+ci_sql_native_exit_acceptable 0
+if ci_sql_native_exit_acceptable 1; then echo 'unexplained invocation exit accepted' >&2; exit 1; fi
+check fail known KNOWN_FAIL 0
+ci_sql_native_exit_acceptable 1
+if ci_sql_native_exit_acceptable 0; then echo 'contradictory invocation exit accepted' >&2; exit 1; fi
+if ci_sql_native_exit_acceptable 143; then echo 'cancelled invocation accepted' >&2; exit 1; fi
+check fail expired FAIL 1
+[[ "$CI_KNOWN_FAILURE_ROWS" == *EXPIRED_KNOWN_FAILURE* ]]
+check fail empty FAIL 1
+[[ "$CI_KNOWN_FAILURE_ROWS" == *NEW_FAILURE* ]]
+check pass known UNEXPECTED_PASS 1
+[[ "$CI_KNOWN_FAILURE_ROWS" == *STALE_KNOWN_FAILURE* ]]
+check cleanup empty FAIL 1
+check truncated empty FAIL 1
+check expected empty PASS 0
+check direct known KNOWN_FAIL 0
+test "$(printf '%s\n' "$CI_KNOWN_FAILURE_ROWS" | rg -c KNOWN_FAIL)" = 1
+for fixture in negative verify diagnostic NR-FAIL.extra UnknownEngineCode case-cleanup multiple-refusals; do
+  check "$fixture" known FAIL 1
+  [[ "$CI_KNOWN_FAILURE_ROWS" != *KNOWN_FAIL* ]]
+done
+check secondary known FAIL 1
+[[ "$CI_KNOWN_FAILURE_ROWS" == *NEW_FAILURE* ]]
+for fixture in suite-init suite-cleanup; do
+  check "$fixture" known FAIL 1
+  [[ "$CI_KNOWN_FAILURE_ROWS" == *KNOWN_FAIL* ]]
 done
 
-cat >"$tmpdir/expected-errors.log" <<'EOF'
-  [typed-refusals] expected-error (steps=1)
-    PASS (expected error: engine_error_code=UnknownEngineCode)
-    PASS (expected error: sql_error_code=sql.analyze.unknown_code)
-EOF
-CI_KNOWN_FAILURE_ROWS=""
-ci_classify_sql_log "typed-refusals" "$tmpdir/expected-errors.log"
-if [ -n "$CI_KNOWN_FAILURE_ROWS" ]; then
-  echo "expected-error PASS lines without timing rows must remain unclassified" >&2
-  exit 1
-fi
+# Terminal text is deliberately false. Reclassification must use native records.
+mkdir -p "$test_root/reclassify/sql"
+cp "$test_root/pass.results.jsonl" "$test_root/reclassify/sql/s.results.jsonl"
+printf 'fail=99\n    [s] a FAIL 1s\n' >"$test_root/reclassify/sql/s.log"
+DISPOSITIONS_FILE="$test_root/empty.json"
+CI_FROM_RUN_DIR="$test_root/reclassify"
+raw_before="$(shasum -a 256 "$test_root/reclassify/sql/s.results.jsonl")"
+reclassify_existing_run >"$test_root/reclassify.log"
+grep -F '| s | PASS |' "$test_root/reclassify/summary.md" >/dev/null
+test "$raw_before" = "$(shasum -a 256 "$test_root/reclassify/sql/s.results.jsonl")"
 
-cat >"$tmpdir/unclassified-failure.log" <<'EOF'
-  [typed-refusals] sql-refusal (steps=1)
-    sql_error_code=sql.analyze.unavailable_implementation target execute failed
-  [typed-refusals] missing-code (steps=1)
-    target execute failed: no error code
-case timings (all):
-  [typed-refusals] sql-refusal FAIL 0.01s
-  [typed-refusals] missing-code FAIL 0.01s
-EOF
-CI_KNOWN_FAILURE_ROWS=""
-if ci_classify_sql_log "typed-refusals" "$tmpdir/unclassified-failure.log" true; then
-  echo "a registered SQL refusal must not hide an unclassified failed case" >&2
-  exit 1
-fi
-
-# Real runner failure markers must not be hidden by an earlier registered
-# refusal in the same failed case. Preserve that refusal as a separate fact.
-for secondary_failure in \
-  '    ❌ target execute failed: materialized view does not exist' \
-  '    ❌ failed to cleanup target case database: database is busy' \
-  '    ❌ sql_error_code=sql.analyze.unavailable_implementation expected error containing timeout, got: unavailable' \
-  '[typed-refusals] ❌ suite init failed: unavailable fixture'; do
-  cat >"$tmpdir/secondary-failure.log" <<EOF_LOG
-  [typed-refusals] sql-refusal (steps=2)
-    ❌ sql_error_code=sql.analyze.unavailable_implementation target execute failed: unavailable
-$secondary_failure
-case timings (all):
-  [typed-refusals] sql-refusal FAIL 0.01s
-EOF_LOG
-  CI_KNOWN_FAILURE_ROWS=""
-  if ci_classify_sql_log "typed-refusals" "$tmpdir/secondary-failure.log" true; then
-    echo "a registered refusal must not hide another runner failure: $secondary_failure" >&2
-    exit 1
-  fi
-  grep -F 'KNOWN_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+# The default tier delegates to native default discovery.
+cat >"$test_root/sql-runner" <<'RUNNER'
+#!/usr/bin/env bash
+[ "$1" = --list-suites ] && [ "$2" = --suite ] && [ "$3" = all ] || exit 2
+printf '%s\n' analytic decimal iceberg-mv-scheduler mv-rewrite runtime-filter-distributed sql-reject subquery
+RUNNER
+chmod +x "$test_root/sql-runner"
+ci_bound_binary() { printf '%s\n' "$test_root/sql-runner"; }
+defaults="$(ci_tier_suites full "$REPO_ROOT")"
+for name in decimal iceberg-mv-scheduler mv-rewrite runtime-filter-distributed sql-reject subquery; do
+  grep -Fx "$name" <<<"$defaults" >/dev/null
 done
 
-# Suite cleanup errors have their own summary section, without a failure emoji
-# or error-code annotation on each entry.
-cat >"$tmpdir/suite-cleanup-failure.log" <<'EOF_LOG'
-  [typed-refusals] sql-refusal (steps=1)
-    ❌ sql_error_code=sql.analyze.unavailable_implementation target execute failed: unavailable
-case timings (all):
-  [typed-refusals] sql-refusal FAIL 0.01s
-cleanup errors:
-  [typed-refusals] target suite hook failed: /fixture/cleanup.sql: database is busy
-EOF_LOG
-CI_KNOWN_FAILURE_ROWS=""
-if ci_classify_sql_log "typed-refusals" "$tmpdir/suite-cleanup-failure.log" true; then
-  echo "a registered refusal must not hide the suite cleanup error section" >&2
-  exit 1
-fi
-grep -F 'KNOWN_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-
-# A typed label describes the actual error, but the runner's failed assertion
-# is still NEW_FAIL when the negative oracle or VERIFY contract did not match.
-for failed_assertion in \
-  'expected error containing "query timed out after 1000 ms", got: unavailable' \
-  'VERIFY FAILED: expected rows differ'; do
-  cat >"$tmpdir/coded-assertion-failure.log" <<EOF_LOG
-  [typed-refusals] sql-refusal (steps=1)
-    ❌ sql_error_code=sql.analyze.unavailable_implementation $failed_assertion
-case timings (all):
-  [typed-refusals] sql-refusal FAIL 0.01s
-EOF_LOG
-  CI_KNOWN_FAILURE_ROWS=""
-  if ci_classify_sql_log "typed-refusals" "$tmpdir/coded-assertion-failure.log" true; then
-    echo "a failed runner assertion must not inherit a registered refusal" >&2
-    exit 1
-  fi
-  grep -F 'NEW_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-  grep -F 'sql.analyze.unavailable_implementation' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-  if grep -F 'KNOWN_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null; then
-    echo "a failed runner assertion was classified as a known refusal" >&2
-    exit 1
-  fi
-done
-
-cat >"$tmpdir/diagnostic-code.log" <<'EOF_LOG'
-  [typed-refusals] sql-refusal (steps=1)
-    ❌ VERIFY FAILED: expected PASS sql_error_code=sql.analyze.unavailable_implementation
-case timings (all):
-  [typed-refusals] sql-refusal FAIL 0.01s
-EOF_LOG
-CI_KNOWN_FAILURE_ROWS=""
-if ci_classify_sql_log "typed-refusals" "$tmpdir/diagnostic-code.log" true; then
-  echo "a diagnostic containing a registered code and PASS must remain a failure" >&2
-  exit 1
-fi
-if [ -n "$CI_KNOWN_FAILURE_ROWS" ]; then
-  echo "error codes in diagnostic text must not create refusal classification rows" >&2
-  exit 1
-fi
-
-cat >"$tmpdir/direct-refusal.log" <<'EOF_LOG'
-  [typed-refusals] expected-error (steps=1)
-    ✅ PASS (expected error matched): error contains timeout engine_error_code=UnknownEngineCode sql_error_code=sql.analyze.unknown_code
-  [typed-refusals] sql-refusal (steps=1)
-    result text quotes ❌ without a runner failure marker
-    ❌ sql_error_code=sql.analyze.unavailable_implementation target execute failed: message quotes PASS and engine_error_code=UnknownEngineCode
-case timings (all):
-  [typed-refusals] expected-error PASS 0.01s
-  [typed-refusals] sql-refusal FAIL 0.01s
-EOF_LOG
-CI_KNOWN_FAILURE_ROWS=""
-ci_classify_sql_log "typed-refusals" "$tmpdir/direct-refusal.log" true
-if [ "$(printf '%s\n' "$CI_KNOWN_FAILURE_ROWS" | rg -c 'KNOWN_FAIL')" != "1" ]; then
-  echo "a direct registered refusal must classify once using only its leading label" >&2
-  exit 1
-fi
-if grep -F 'UnknownEngineCode' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null; then
-  echo "expected-error PASS or diagnostic codes leaked into refusal classification" >&2
-  exit 1
-fi
-
-cat >"$tmpdir/sql-refusal-xpass.log" <<'EOF'
-case timings (all):
-  [typed-refusals] sql-refusal PASS 0.01s
-EOF
-CI_KNOWN_FAILURE_ROWS=""
-if ci_classify_unexpected_passes "typed-refusals" "$tmpdir/sql-refusal-xpass.log"; then
-  echo "a registered SQL refusal that passes must remain an unexpected pass" >&2
-  exit 1
-fi
-grep -F 'UNEXPECTED_PASS' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-grep -F 'sql.analyze.unavailable_implementation' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
-CI_KNOWN_FAILURE_ROWS=""
-
-if ci_classify_unexpected_passes "tpc-ds" "$run_dir/sql/tpc-ds.log"; then
-  echo "expected mixed pass/fail known-failure log to report an unexpected pass" >&2
-  exit 1
-fi
-
-grep -q "UNEXPECTED_PASS" <<<"$CI_KNOWN_FAILURE_ROWS"
-
-if (
-  CI_FROM_RUN_DIR="$run_dir"
-  CI_TIER="full"
-  KNOWN_FAILURES_FILE="$baseline"
-  reclassify_existing_run >/dev/null
-); then
-  echo "expected --from reclassification to fail on mixed unexpected pass" >&2
-  exit 1
-fi
-
-grep -q "UNEXPECTED_PASS" "$run_dir/summary.md"
-
-targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-correctness-suites.txt")"
-grep -qx "optimizer-dist" <<<"$targeted_suites"
-
-ci_suite_exists "$REPO_ROOT" ssb
-for suite in ssb tpc-h tpc-ds; do
-  if ci_tier_suites full "$STABLE_SUITES_FILE" | grep -qx "$suite"; then
-    echo "explicit dataset entered default stable tier: $suite" >&2
-    exit 1
-  fi
-done
-if ! ci_suite_exists "$REPO_ROOT" filter; then
-  echo "correctness suite must remain selectable" >&2
-  exit 1
-fi
-
-if [ "$SQL_CLUSTER_MODE" != "cross-process" ]; then
-  echo "default SQL cluster mode must be cross-process" >&2
-  exit 1
-fi
-if [ "$SQL_CLUSTER_SIZE" != "3" ]; then
-  echo "default SQL cluster size must be 3 BEs" >&2
-  exit 1
-fi
-if [ "$(ci_suite_cluster_mode optimizer)" != "cross-process" ]; then
-  echo "ordinary suites must default to cross-process mode" >&2
-  exit 1
-fi
-if [ "$(ci_suite_cluster_size optimizer)" != "3" ]; then
-  echo "ordinary suites must default to a 3-BE cluster" >&2
-  exit 1
-fi
-if [ "$(ci_suite_cluster_mode distributed-resilience)" != "cross-process" ]; then
-  echo "distributed-resilience must run in cross-process mode" >&2
-  exit 1
-fi
-if [ "$(ci_suite_cluster_size distributed-resilience)" != "3" ]; then
-  echo "distributed-resilience must run with 3 BEs" >&2
-  exit 1
-fi
-if ! grep -qx 'distributed-resilience' "$REPO_ROOT/tools/ci/suites/stable-correctness-suites.txt"; then
-  echo "distributed-resilience must be part of the stable SQL suite set" >&2
-  exit 1
-fi
-if ci_native_cross_process_enabled; then
-  echo "the duplicate native cross-process matrix must be disabled by default" >&2
-  exit 1
-fi
-
-if ! (
-  unset SQL_CLUSTER_MODE SQL_CLUSTER_SIZE
-  source "$REPO_ROOT/tools/ci/local-full-ci.sh" --source-only
-  parse_args --cluster-mode all-in-one
-  [ "$SQL_CLUSTER_MODE" = "all-in-one" ] && [ "$SQL_CLUSTER_SIZE" = "1" ]
-); then
-  echo "explicit all-in-one mode without a size must infer cluster size 1" >&2
-  exit 1
-fi
-
-SQL_CLUSTER_MODE="all-in-one"
-SQL_CLUSTER_SIZE="1"
-if [ "$(ci_suite_cluster_mode optimizer-dist)" != "cross-process" ]; then
-  echo "optimizer-dist must force cross-process cluster mode" >&2
-  exit 1
-fi
-if [ "$(ci_suite_cluster_size optimizer-dist)" != "3" ]; then
-  echo "optimizer-dist must force a 3-BE cluster" >&2
-  exit 1
-fi
-if [ "$(ci_suite_cluster_mode optimizer)" != "all-in-one" ]; then
-  echo "ordinary suites should keep the global cluster mode" >&2
-  exit 1
-fi
-if [ "$(ci_suite_cluster_size optimizer)" != "1" ]; then
-  echo "ordinary suites should keep the global cluster size" >&2
-  exit 1
-fi
-
-native_cross_process_core_suites="$(ci_native_cross_process_core_suites)"
-expected_native_cross_process_core_suites="$(printf "%s\n" join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)"
-if [ "$native_cross_process_core_suites" != "$expected_native_cross_process_core_suites" ]; then
-  echo "native cross-process core suites do not match the required matrix" >&2
-  printf "expected:\n%s\nactual:\n%s\n" "$expected_native_cross_process_core_suites" "$native_cross_process_core_suites" >&2
-  exit 1
-fi
-
-NOVA_CI_NATIVE_CROSS_PROCESS_CORE="1"
-if ! ci_native_cross_process_enabled; then
-  echo "explicit NOVA_CI_NATIVE_CROSS_PROCESS_CORE=1 should enable the native cross-process matrix" >&2
-  exit 1
-fi
-
-if [ "$(ci_native_cross_process_suites | tr '\n' ' ')" != "$(printf "%s " join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)" ]; then
-  echo "explicit native cross-process core matrix should use the core suites" >&2
-  exit 1
-fi
-
-NOVA_CI_NATIVE_CROSS_PROCESS_CORE="0"
-NOVA_CI_NATIVE_CROSS_PROCESS_FULL="0"
-if ci_native_cross_process_enabled; then
-  echo "explicit NOVA_CI_NATIVE_CROSS_PROCESS_CORE=0 should disable the native cross-process matrix when full coverage is off" >&2
-  exit 1
-fi
-
-NOVA_CI_NATIVE_CROSS_PROCESS_FULL="1"
-if ! ci_native_cross_process_enabled; then
-  echo "NOVA_CI_NATIVE_CROSS_PROCESS_FULL=1 should enable the matrix even when core coverage is off" >&2
-  exit 1
-fi
-if ! ci_native_cross_process_suites | grep -qx "optimizer-dist"; then
-  echo "native cross-process full matrix should include stable full suites" >&2
-  exit 1
-fi
-
-SQL_CLUSTER_MODE="all-in-one"
-SQL_CLUSTER_SIZE="1"
-if [ "$(ci_native_cross_process_suite_cluster_mode join)" != "cross-process" ]; then
-  echo "native cross-process suites must force cross-process cluster mode" >&2
-  exit 1
-fi
-if [ "$(ci_native_cross_process_suite_cluster_size join)" != "3" ]; then
-  echo "native cross-process suites must force a 3-BE cluster" >&2
-  exit 1
-fi
-
-launcher_capture="$tmpdir/sql-runner-launcher.args"
-(
-  REPO_ROOT="$tmpdir/current-worktree"
-  CI_RUN_DIR="$tmpdir/sql-runner-launcher"
-  NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
-  NOVA_ENV_RUNTIME_DIR="$tmpdir/stable-runtime"
-  NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
-  RUN_MODE="explicit"
-  mkdir -p "$CI_RUN_DIR/sql"
-
-  resolve_suites() {
-    SUITES=(iceberg-dml)
-  }
-  ci_run_logged() {
-    printf '%s\n' "$@" >"$launcher_capture"
-    return 0
-  }
-  ci_record_sql_suite() { :; }
-  ci_render_summary() { :; }
-
-  run_sql_suites
-)
-
-if ! grep -Fx "NOVAROCKS_WORKSPACE_ROOT=$tmpdir/current-worktree" "$launcher_capture" >/dev/null; then
-  echo "SQL runner must receive the current CI worktree root" >&2
-  exit 1
-fi
-
-if ! grep -Fx "NOVA_ENV_REST_ENV_FILE=$publication_a/env.sh" "$launcher_capture" >/dev/null; then
-  echo "SQL runner must receive the exact prepared Iceberg REST environment" >&2
-  exit 1
-fi
-
-if grep -Fx -- "--query-timeout" "$launcher_capture" >/dev/null; then
-  echo "iceberg-dml must use the SQL runner's suite timeout when CI has no explicit override" >&2
-  exit 1
-fi
-
-native_launcher_capture="$tmpdir/native-sql-runner-launcher.args"
-(
-  REPO_ROOT="$tmpdir/current-worktree"
-  CI_RUN_DIR="$tmpdir/native-sql-runner-launcher"
-  NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
-  NOVA_ENV_RUNTIME_DIR="$tmpdir/stable-runtime"
-  NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
-  SQL_CLUSTER_MODE="cross-process"
-  NOVA_CI_NATIVE_CROSS_PROCESS_FULL="1"
-
-  ci_native_cross_process_suites() {
-    printf '%s\n' iceberg-dml
-  }
-  ci_suite_exists() { return 0; }
-  ci_run_logged() {
-    printf '%s\n' "$@" >"$native_launcher_capture"
-    return 0
-  }
-  ci_record_sql_suite() { :; }
-  ci_render_summary() { :; }
-
-  run_native_cross_process_sql_suites
-)
-
-if ! grep -Fx "NOVA_ENV_REST_ENV_FILE=$publication_a/env.sh" "$native_launcher_capture" >/dev/null; then
-  echo "native SQL runner must receive the exact prepared publication" >&2
-  exit 1
-fi
-
-if grep -Fx -- "--query-timeout" "$native_launcher_capture" >/dev/null; then
-  echo "native iceberg-dml must use the SQL runner's suite timeout when CI has no explicit override" >&2
-  exit 1
-fi
-
-override_capture="$tmpdir/sql-runner-timeout-override.args"
-(
-  REPO_ROOT="$tmpdir/current-worktree"
-  CI_RUN_DIR="$tmpdir/sql-runner-timeout-override"
-  NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
-  NOVA_ENV_RUNTIME_DIR="$tmpdir/stable-runtime"
-  NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
-  RUN_MODE="explicit"
-  SQL_QUERY_TIMEOUT_SECONDS="75"
-  mkdir -p "$CI_RUN_DIR/sql"
-
-  resolve_suites() {
-    SUITES=(iceberg-dml)
-  }
-  ci_run_logged() {
-    printf '%s\n' "$@" >"$override_capture"
-    return 0
-  }
-  ci_record_sql_suite() { :; }
-  ci_render_summary() { :; }
-
-  run_sql_suites
-)
-
-if ! awk '
-  previous == "--query-timeout" && $0 == "75" { found = 1 }
-  { previous = $0 }
-  END { exit(found ? 0 : 1) }
-' "$override_capture"; then
-  echo "SQL_QUERY_TIMEOUT_SECONDS must override the iceberg-dml suite timeout" >&2
-  exit 1
-fi
-
-# The caller's clean profile and functional timeout reach both real launcher
-# paths; no dataset name changes the profile or default timeout implicitly.
-for round in primary additional; do
-  capture="$tmpdir/profile-$round.args"
-  (
-    REPO_ROOT="$tmpdir/current-worktree"
-    CI_RUN_DIR="$tmpdir/profile-$round"
-    NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
-    NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
-    SQL_CLUSTER_MODE="cross-process"
-    SQL_CLUSTER_SIZE="3"
-    SQL_CLUSTER_LAUNCH_PROFILE="performance"
-    SQL_QUERY_TIMEOUT_SECONDS="120"
-    NOVA_CI_NATIVE_CROSS_PROCESS_FULL="1"
-    RUN_MODE="explicit"
-    mkdir -p "$CI_RUN_DIR/sql"
-    resolve_suites() { SUITES=(ssb); }
-    ci_native_cross_process_suites() { printf '%s\n' ssb; }
-    ci_suite_exists() { return 0; }
-    ci_run_logged() { printf '%s\n' "$@" >"$capture"; return 0; }
-    ci_record_sql_suite() { :; }
-    ci_render_summary() { :; }
-    if [ "$round" = primary ]; then run_sql_suites; else run_native_cross_process_sql_suites; fi
-  )
-  for pair in '--cluster-launch-profile performance' '--query-timeout 120'; do
-    read -r option value <<<"$pair"
-    if ! awk -v option="$option" -v value="$value" '
-      previous == option && $0 == value { found = 1 }
-      { previous = $0 }
-      END { exit(found ? 0 : 1) }
-    ' "$capture"; then
-      echo "$round SQL launcher lost $pair" >&2
-      exit 1
-    fi
-  done
-done
-
-for capture in "$launcher_capture" "$native_launcher_capture"; do
-  grep -Fx "NOVAROCKS_BIN=$tmpdir/current-worktree/target/debug/novarocks" "$capture" >/dev/null
-  grep -Fx "$tmpdir/current-worktree/target/debug/novarocks-sql-test" "$capture" >/dev/null
-  if grep -E 'NOVAROCKS_TEST_CONTROL_BIN|NOVAROCKS_BUILD_PROFILE|^cargo$' "$capture"; then
-    echo 'SQL must execute the prepared single program graph' >&2; exit 1
-  fi
-done
-
-echo "local-full-ci-classification-test: PASS"
+echo 'local-full-ci-classification-test: PASS'

@@ -25,3 +25,7 @@ socket2 = { version = "0.6.5" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

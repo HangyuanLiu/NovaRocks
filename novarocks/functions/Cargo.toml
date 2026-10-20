@@ -66,3 +66,7 @@ sha2.workspace = true
 sm3.workspace = true
 
 twox-hash.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

@@ -43,6 +43,15 @@ struct MaintenanceIntent {
 }
 
 impl Scenario for OptimizeTargetReplacement {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "table_maintenance",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "table-maintenance/target-replacement"
     }

@@ -25,12 +25,10 @@ source "$SCRIPT_DIR/lib/logging.sh"
 source "$SCRIPT_DIR/lib/command.sh"
 source "$SCRIPT_DIR/lib/build_capabilities.sh"
 source "$SCRIPT_DIR/lib/sql_suites.sh"
-source "$SCRIPT_DIR/lib/known_failures.sh"
 source "$SCRIPT_DIR/lib/server.sh"
 source "$SCRIPT_DIR/lib/system_scenarios.sh"
 
-STABLE_SUITES_FILE="$SCRIPT_DIR/suites/stable-correctness-suites.txt"
-KNOWN_FAILURES_FILE="$SCRIPT_DIR/baselines/known-failures.toml"
+DISPOSITIONS_FILE="$SCRIPT_DIR/baselines/dispositions.json"
 RUN_MODE="stable"
 CI_TIER="full"
 CI_FROM_RUN_DIR=""
@@ -64,6 +62,71 @@ fi
 NOVA_CI_NATIVE_CROSS_PROCESS_CORE="${NOVA_CI_NATIVE_CROSS_PROCESS_CORE:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_FULL="${NOVA_CI_NATIVE_CROSS_PROCESS_FULL:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED="${NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED:-0}"
+
+ci_list_stages() {
+  cat <<'STAGES'
+{
+  "schema": 1,
+  "stages": [
+    {"name": "CI build inputs", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "locked Cargo metadata", "tier": "admission", "domain": ["**"]},
+    {"name": "Cargo dependency policy", "tier": "admission", "domain": ["**"]},
+    {"name": "generated artifact hygiene", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "JSONObject resource profiles", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "JSONObject resource profile mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "DataSketches resolved source", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "DataSketches source mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "native wire dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "native wire dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "application domain dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "application domain dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "native trust dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "native trust dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "connector role binding boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "connector role binding boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "Iceberg provider dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "Iceberg provider dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "StateStore dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "StateStore dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "SPI dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "SPI dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "memory dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "memory dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "physical plan dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "physical plan dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "local program dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "local program dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "NCP-8 statistics boundary", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "NCP-8 statistics boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "legacy branding", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "legacy branding tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "system scenario stage tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "Rust executor regression tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "SQL helper environment binding", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "shared benchmark environment guard", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "isolated fixture current link", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "shared benchmark fixture lifecycle", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "shared benchmark fixture contract", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "cargo fmt", "tier": "admission", "domain": ["**"]},
+    {"name": "cargo clippy", "tier": "admission", "domain": ["**"]},
+    {"name": "joint tests and binaries preparation", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "main binary build information", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "SQL error manifest freshness", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "functional default scenario selection", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "selected system program preparation", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "workspace nextest and doctests", "tier": "admission", "domain": ["**"]},
+    {"name": "identity snapshot tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "invocation record tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "verification composition tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "local CI classification tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "disabled SQL suite tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "memory-model:loom", "tier": "full", "domain": ["novarocks/memory/**", "tools/ci/memory-model-checks.sh"]},
+    {"name": "memory-model:miri", "tier": "full", "domain": ["novarocks/memory/**", "tools/ci/memory-model-checks.sh"]},
+    {"name": "native-compatibility", "tier": "full", "domain": ["tools/ci/**"]}
+  ]
+}
+STAGES
+}
 
 usage() {
   cat <<'EOF'
@@ -319,10 +382,12 @@ init_run_dir() {
     "$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || echo HEAD)" \
     "$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   ci_render_summary "RUNNING"
+  python3 "$SCRIPT_DIR/lib/identity_snapshot.py" source --repo "$REPO_ROOT" --output "$CI_RUN_DIR/identity/source-start.json"
 }
 
 cleanup() {
   local status=$?
+  python3 "$SCRIPT_DIR/lib/identity_snapshot.py" source --repo "$REPO_ROOT" --output "$CI_RUN_DIR/identity/source-end.json" || status=1
   ci_stop_all_in_one_server || true
 
   if [ "$CI_RUNTIME_PREPARED" = "true" ] && [ "$KEEP_RUNTIME" != "true" ]; then
@@ -464,18 +529,34 @@ reset_frontend_state_store_stage() {
   ci_render_summary "RUNNING"
 }
 
+# Describe at the actual command boundary; no second stage command registry.
+ci_stage_native_command() {
+  local name="$1"; shift
+  if [ "${CI_DESCRIBE_STAGE:-false}" = true ]; then
+    python3 "$SCRIPT_DIR/lib/invocation_record.py" describe-stage --name "$name" -- "$@"
+    exit $?
+  fi
+  "$@"
+}
+
 run_fail_fast_stage() {
   local name="$1"
   local log_name="$2"
   shift 2
 
+  if [ -n "${CI_SELECTED_STAGE:-}" ]; then
+    [ "$CI_SELECTED_STAGE" = "$name" ] || return 0
+    CI_STAGE_EXECUTED=true
+    ci_stage_native_command "$name" "$@"
+    exit $?
+  fi
   local log_path="$CI_RUN_DIR/$log_name"
   local start
   local code
   local duration
 
   start="$(ci_epoch)"
-  ci_run_logged "$log_path" "$@"
+  ci_run_recorded_logged "$log_path" stage "$name" '{}' "$@"
   code=$?
   duration=$(($(ci_epoch) - start))
 
@@ -497,8 +578,18 @@ run_rust_batch_stage() {
   # test-run.py already owns exclusive raw logs and bounded display writers.
   # Preserve the inherited terminal here; another redirect/tee would either
   # swallow its real-time display or introduce a second blocking output owner.
+  local record materials
+  materials="$(python3 - "$CI_RUN_DIR/rust" <<'MATERIALS'
+import json, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+print(json.dumps({"execution_index":str(root/'execution-index.json'),"execution_identity":[str(root/'identity/nextest.json'),str(root/'identity/doctest.json')]}))
+MATERIALS
+)"
+  record="$(ci_invocation_start stage "workspace nextest and doctests" python3 tools/ci/test-run.py batch --output "$CI_RUN_DIR/rust")" || return $?
   python3 tools/ci/test-run.py batch --output "$CI_RUN_DIR/rust"
   code=$?
+  ci_invocation_finish "$record" "$code" "$log_path" "$materials" || return $?
   duration=$(($(ci_epoch) - start))
   printf 'wrapper_exit=%s\n' "$code" >>"$log_path"
   if [ "$code" -ne 0 ]; then
@@ -516,7 +607,7 @@ run_cargo_gates() {
     ci_validate_build_inputs "$NOVA_CI_CARGO_PROFILE"
   local main_target
   main_target="$(ci_target_directory main)" || return $?
-  NOVA_CI_ARTIFACT_RECEIPT="$CI_RUN_DIR/rust/final-prepare/artifacts.json"
+  if [ -z "${CI_SELECTED_STAGE:-}" ]; then NOVA_CI_ARTIFACT_RECEIPT="$CI_RUN_DIR/rust/final-prepare/artifacts.json"; fi
   export NOVA_CI_ARTIFACT_RECEIPT
   run_fail_fast_stage "locked Cargo metadata" "cargo-metadata.log" \
     cargo metadata --locked --format-version 1
@@ -582,7 +673,15 @@ run_cargo_gates() {
     tools/ci/tests/legacy-branding-test.sh
   run_fail_fast_stage "system scenario stage tests" "system-scenarios-stage-test.log" \
     tools/ci/tests/system-scenarios-stage-test.sh
-  run_fail_fast_stage "Rust executor regression tests" "test-run-test.log" \
+  run_fail_fast_stage "verification composition tests" "verification-composition-tests.log" \
+    bash -c 'for t in tools/ci/tests/verification-*-test.py; do python3 "$t" || exit $?; done'
+  run_fail_fast_stage "local CI classification tests" "local-full-ci-classification-test.log" \
+    bash tools/ci/tests/local-full-ci-classification-test.sh
+  run_fail_fast_stage "disabled SQL suite tests" "paimon-tests-disabled-test.log" \
+    bash tools/ci/tests/paimon-tests-disabled-test.sh
+  run_fail_fast_stage "identity snapshot tests" "identity-snapshot-test.log" python3 tools/ci/tests/identity-snapshot-test.py
+  run_fail_fast_stage "invocation record tests" "invocation-record-test.log" python3 tools/ci/tests/invocation-record-test.py
+  CI_STAGE_OUTPUT_ARGS=1 run_fail_fast_stage "Rust executor regression tests" "test-run-test.log" \
     env NOVA_CI_TEST_EVIDENCE_ROOT="$CI_RUN_DIR/executor-regression" \
     python3 tools/ci/tests/test-run-test.py
   run_fail_fast_stage "SQL helper environment binding" "sql-helper-env-file.log" \
@@ -606,9 +705,9 @@ run_cargo_gates() {
   # The manifest path keeps the entry point explicit while Cargo resolves the
   # package through the repository workspace, profile, and committed lock.
   if [ "$SKIP_CARGO_TEST" = true ]; then
-    run_fail_fast_stage "joint tests and binaries preparation" "cargo-prepare.log" \
+    CI_STAGE_OUTPUT_ARGS=1 run_fail_fast_stage "joint tests and binaries preparation" "cargo-prepare.log" \
       ci_prepare_main "$NOVA_CI_ARTIFACT_RECEIPT"
-    run_fail_fast_stage "main binary build information" "main-build-info.log" \
+    CI_STAGE_INPUT_ARGS=1 CI_STAGE_OUTPUT_ARGS=2 run_fail_fast_stage "main binary build information" "main-build-info.log" \
       ci_capture_main_builds "$NOVA_CI_ARTIFACT_RECEIPT" "$CI_RUN_DIR/build-info/main"
     local error_manifest
     error_manifest="$(ci_bound_binary novarocks-error-manifest)" || return $?
@@ -630,11 +729,11 @@ run_system_scenario_fixture_stage() {
   local runner binary
   runner="$(ci_bound_binary novarocks-system-tests)" || return $?
   binary="$(ci_bound_binary novarocks)" || return $?
-  mkdir -p "$CI_RUN_DIR/system"
+  if [ "${CI_DESCRIBE_STAGE:-false}" != true ]; then mkdir -p "$CI_RUN_DIR/system"; fi
   SYSTEM_SCENARIO_SELECTION="$CI_RUN_DIR/system/selected.txt"
-  run_fail_fast_stage "functional default scenario selection" "system-selection.log" \
+  CI_STAGE_OUTPUT_ARGS=3,4 run_fail_fast_stage "functional default scenario selection" "system-selection.log" \
     ci_select_system_scenarios "$runner" functional "$SYSTEM_SCENARIO_SELECTION" "$CI_RUN_DIR/system/requirements.txt"
-  run_fail_fast_stage "selected system program preparation" "system-preparation.log" \
+  CI_STAGE_INPUT_ARGS=6 CI_STAGE_OUTPUT_ARGS=3,5 run_fail_fast_stage "selected system program preparation" "system-preparation.log" \
     ci_prepare_system_scenario_binaries "$binary" dev "$CI_RUN_DIR/system/fixtures" "${CI_COMMIT_SHA:0:12}" \
     "$CI_RUN_DIR/system-scenario-fixtures.log" "$CI_RUN_DIR/system/requirements.txt"
 }
@@ -726,7 +825,7 @@ resolve_suites() {
     return 0
   fi
 
-  if ! suites_output="$(ci_tier_suites "$CI_TIER" "$STABLE_SUITES_FILE")"; then
+  if ! suites_output="$(ci_tier_suites "$CI_TIER" "$REPO_ROOT")"; then
     echo "error: unknown CI tier: $CI_TIER" >&2
     exit 2
   fi
@@ -763,66 +862,6 @@ validate_explicit_suites_early() {
       exit 2
     fi
   done
-}
-
-ci_sql_failed_case_keys() {
-  local log_path="$1"
-  ci_sql_case_keys_by_status "$log_path" "FAIL"
-}
-
-ci_sql_passed_case_keys() {
-  local log_path="$1"
-  ci_sql_case_keys_by_status "$log_path" "PASS"
-}
-
-ci_sql_case_keys_by_status() {
-  local log_path="$1"
-  local want_status="$2"
-  local line
-  local suite_name
-  local case_id
-  local case_status
-
-  [ -f "$log_path" ] || return 0
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^[[:space:]]+\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+([A-Z]+)[[:space:]] ]]; then
-      suite_name="${BASH_REMATCH[1]}"
-      case_id="${BASH_REMATCH[2]}"
-      case_status="${BASH_REMATCH[3]}"
-      if [ "$case_status" = "$want_status" ]; then
-        printf "|%s|%s|\n" "$suite_name" "$case_id"
-      fi
-    fi
-  done <"$log_path"
-}
-
-ci_case_key_contains() {
-  local keys="$1"
-  local suite="$2"
-  local case_name="$3"
-
-  case "$keys" in
-    *"|${suite}|${case_name}|"*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-ci_case_key_count() {
-  local keys="$1"
-  local count=0
-  local line
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -n "$line" ] || continue
-    count=$((count + 1))
-  done <<<"$keys"
-
-  printf "%s\n" "$count"
 }
 
 ci_suite_cluster_mode() {
@@ -865,188 +904,20 @@ ci_native_cross_process_suite_cluster_size() {
   printf "3\n"
 }
 
-ci_classify_sql_log() {
-  local suite="$1"
-  local log_path="$2"
-  local require_known_only="${3:-false}"
-  local failed_case_keys
-  local failed_case_count
-  local classified_failed_case_count=0
-  local classified_failed_case_keys=""
-  local line
-  local current_suite="$suite"
-  local current_case=""
-  local row_suite
-  local row_case
-  local remaining
-  local error_tag
-  local error_code
-  local status_line
-  local status
-  local reason
-  local expires
-  local classification_count=0
-  local hard_failure=0
-  local seen_keys=""
-  local seen_key
-  local direct_target_failure
-  local code_prefix='^[[:space:]]*(❌[[:space:]]+)?((engine_error_code|sql_error_code)=[A-Za-z0-9_.]+[[:space:]]+)+'
-  local target_failure_prefix="${code_prefix}target execute failed(:|$)"
-  local expected_pass_prefix='^[[:space:]]*(✅[[:space:]]+PASS \(expected error matched\):|PASS \(expected error:)'
-  local cleanup_heading='^[[:space:]]*cleanup errors:[[:space:]]*$'
-  local failure_marker='^[[:space:]]*(\[[^]]+\][[:space:]]+)?❌[[:space:]]+'
-
-  [ -f "$log_path" ] || return 1
-
-  # Expected-error PASS lines can include either error-code tag, so prefer
-  # case timing FAIL rows when the runner emitted them.
-  failed_case_keys="$(ci_sql_failed_case_keys "$log_path")"
-  failed_case_count="$(ci_case_key_count "$failed_case_keys")"
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^[[:space:]]*\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+\(steps= ]]; then
-      current_suite="${BASH_REMATCH[1]}"
-      current_case="${BASH_REMATCH[2]}"
-    elif [[ "$line" =~ (^|[[:space:]])case:[[:space:]]*([A-Za-z0-9_.+-]+) ]]; then
-      current_case="${BASH_REMATCH[2]}"
-    fi
-
-    if [[ "$line" =~ $expected_pass_prefix ]]; then
-      continue
-    fi
-    if [[ "$line" =~ $cleanup_heading ]]; then
-      hard_failure=1
-      continue
-    fi
-
-    # Only the runner's leading labels describe this failure. Diagnostic text
-    # can quote unrelated codes or PASS output and is not classification input.
-    if [[ "$line" =~ $code_prefix ]]; then
-      remaining="${BASH_REMATCH[0]}"
-    else
-      if [[ "$line" =~ $failure_marker ]]; then
-        hard_failure=1
-      fi
-      continue
-    fi
-    direct_target_failure=false
-    if [[ "$line" =~ $target_failure_prefix ]]; then
-      direct_target_failure=true
-    fi
-    while [[ "$remaining" =~ (engine_error_code|sql_error_code)=([A-Za-z0-9_.]+) ]]; do
-      error_tag="${BASH_REMATCH[1]}"
-      error_code="${BASH_REMATCH[2]}"
-      remaining="${remaining#*"$error_tag=$error_code"}"
-      row_suite="${current_suite:-$suite}"
-      row_case="${current_case:-unknown}"
-
-      if [ -n "$failed_case_keys" ] && ! ci_case_key_contains "$failed_case_keys" "$row_suite" "$row_case"; then
-        continue
-      fi
-
-      # Expected-error mismatches, VERIFY failures and cleanup failures cannot
-      # inherit a registered refusal just because they carry the same code.
-      if [ "$direct_target_failure" != true ]; then
-        hard_failure=1
-      fi
-      seen_key="|${row_suite}|${row_case}|${error_code}|${direct_target_failure}|"
-      case "$seen_keys" in
-        *"$seen_key"*)
-          continue
-          ;;
-      esac
-      seen_keys="${seen_keys}${seen_key}
-"
-      if [ -n "$failed_case_keys" ] && ! ci_case_key_contains "$classified_failed_case_keys" "$row_suite" "$row_case"; then
-        classified_failed_case_keys="${classified_failed_case_keys}|${row_suite}|${row_case}|
-"
-        classified_failed_case_count=$((classified_failed_case_count + 1))
-      fi
-
-      if [ "$direct_target_failure" = true ]; then
-        status_line="$(ci_known_failure_status "$KNOWN_FAILURES_FILE" "$CI_TIER" "$row_suite" "$row_case" "$error_code")"
-        IFS='|' read -r status reason expires <<EOF
-$status_line
-EOF
-      else
-        status="NEW_FAIL"
-        reason="runner failure is not a direct target execution refusal"
-      fi
-      ci_record_sql_classification "$row_suite" "$row_case" "$status" "$error_code" "$reason"
-      classification_count=$((classification_count + 1))
-      if [ "$status" != "KNOWN_FAIL" ]; then
-        hard_failure=1
-      fi
-    done
-  done <"$log_path"
-
-  if [ "$require_known_only" = "true" ]; then
-    [ "$classification_count" -gt 0 ] \
-      && [ "$hard_failure" -eq 0 ] \
-      && [ "$failed_case_count" -eq "$classified_failed_case_count" ]
-    return $?
-  fi
-
-  return 0
-}
-
-ci_classify_unexpected_passes() {
-  local suite="$1"
-  local log_path="$2"
-  local passed_case_keys
-  local row
-  local row_case
-  local error_code
-  local reason
-  local expires
-  local unexpected=0
-
-  [ -f "$log_path" ] || return 0
-
-  passed_case_keys="$(ci_sql_passed_case_keys "$log_path")"
-  [ -n "$passed_case_keys" ] || return 0
-
-  while IFS='|' read -r row_case error_code reason expires || [ -n "$row_case" ]; do
-    [ -n "$row_case" ] || continue
-    if ci_case_key_contains "$passed_case_keys" "$suite" "$row_case"; then
-      ci_record_sql_classification "$suite" "$row_case" "UNEXPECTED_PASS" "$error_code" "$reason"
-      unexpected=1
-    fi
-  done < <(ci_known_failure_rows_for_suite "$KNOWN_FAILURES_FILE" "$CI_TIER" "$suite")
-
-  [ "$unexpected" -eq 0 ]
-}
-
-ci_sql_suite_status_from_log() {
-  local log_path="$1"
-  local line
-
-  [ -f "$log_path" ] || {
-    printf "FAIL\n"
-    return 0
-  }
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^(exit_code|exit_status)=([0-9]+)$ ]]; then
-      if [ "${BASH_REMATCH[2]}" -ne 0 ]; then
-        printf "FAIL\n"
-        return 0
-      fi
-    elif [[ "$line" =~ ^fail=([0-9]+)$ ]]; then
-      if [ "${BASH_REMATCH[1]}" -ne 0 ]; then
-        printf "FAIL\n"
-        return 0
-      fi
-    elif [[ "$line" =~ ^[[:space:]]+\[[^]]+\][[:space:]]+[^[:space:]]+[[:space:]]+FAIL[[:space:]] ]]; then
-      printf "FAIL\n"
-      return 0
-    elif [ "$line" = "failed cases:" ]; then
-      printf "FAIL\n"
-      return 0
-    fi
-  done <"$log_path"
-
-  printf "PASS\n"
+ci_classify_sql_results() {
+  local suite="$1" results="$2" output code=0
+  output="$(cd "$SCRIPT_DIR" && python3 -m verification.classification --results "$results" --dispositions "$DISPOSITIONS_FILE" --admission-membership)" || code=$?
+  [ -n "$output" ] || { CI_SQL_RESULT_STATUS=FAIL; return 1; }
+  local rows row_suite row_case row_status row_code row_reason
+  rows="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join("|".join([r["suite"],r["case"],r["status"],str((r.get("failure") or {}).get("error_code") or ""),""]) for r in d["rows"]))' <<<"$output")"
+  while IFS='|' read -r row_suite row_case row_status row_code row_reason; do
+    [ -n "$row_suite" ] || continue
+    [ "$row_status" = PASS ] || ci_record_sql_classification "$row_suite" "$row_case" "$row_status" "$row_code" "$row_reason"
+  done <<<"$rows"
+  CI_SQL_RESULT_STATUS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<<"$output")"
+  CI_SQL_ACCEPTS_CASE_FAILURE="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print("true" if d["status"]=="KNOWN_FAIL" or (d["status"]=="PASS" and d["membership"]["excluded"]) else "false")' <<<"$output")"
+  CI_SQL_RECORDED_EXIT_CODE="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("native_exit_code"))' <<<"$output")"
+  return "$code"
 }
 
 ci_should_use_runner_suite_timeout() {
@@ -1056,6 +927,11 @@ ci_should_use_runner_suite_timeout() {
   # files and can run for roughly 90 seconds. Keep the runner's suite default
   # authoritative unless the caller explicitly requests a CI-wide override.
   [ "$suite" = "iceberg-dml" ] && [ -z "${SQL_QUERY_TIMEOUT_SECONDS:-}" ]
+}
+
+ci_sql_native_exit_acceptable() {
+  [ "$1" = "$CI_SQL_RECORDED_EXIT_CODE" ] || return 1
+  [ "$1" -eq 0 ] || { [ "$1" -eq 1 ] && [ "$CI_SQL_ACCEPTS_CASE_FAILURE" = true ]; }
 }
 
 run_sql_suites() {
@@ -1106,14 +982,15 @@ run_sql_suites() {
     if ! ci_should_use_runner_suite_timeout "$suite"; then
       suite_query_timeout_args=(--query-timeout "$query_timeout")
     fi
-    if [ "$suite" = "analytic" ] && [ "$RUN_MODE" != "explicit" ]; then
-      # Keep the default stable run focused. These migrated window matrices
-      # remain available in direct analytic suite runs.
-      suite_extra_args=(--skip "analytic_test_basic_window_function,analytic_test_basic_window_function_2")
-    fi
     novarocks_bin="$(ci_bound_binary novarocks)" || return $?
     sql_runner="$(ci_bound_binary novarocks-sql-test)" || return $?
-    ci_run_logged "$log_path" \
+    local results_file="${log_path%.log}.results.jsonl" sql_materials
+    sql_materials="$(python3 - "$results_file" <<'MATERIALS'
+import json, sys
+print(json.dumps({"sql_results":sys.argv[1]}))
+MATERIALS
+)"
+    ci_run_recorded_logged "$log_path" sql-suite "$suite" "$sql_materials" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
       NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
@@ -1122,6 +999,7 @@ run_sql_suites() {
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \
+        --results-file "$results_file" \
         "${suite_query_timeout_args[@]}" \
         --cluster-mode "$suite_cluster_mode" \
         --cluster-size "$suite_cluster_size" \
@@ -1131,25 +1009,15 @@ run_sql_suites() {
     code=$?
     duration=$(($(ci_epoch) - start))
 
-    if ! ci_classify_unexpected_passes "$suite" "$log_path"; then
-      if [ "$code" -ne 0 ]; then
-        ci_classify_sql_log "$suite" "$log_path" "false" >/dev/null || true
-      fi
+    local status classification_code=0
+    ci_classify_sql_results "$suite" "$results_file" || classification_code=$?
+    status="$CI_SQL_RESULT_STATUS"
+    # Preserve a raw invocation failure even if its selected case records pass.
+    if ! ci_sql_native_exit_acceptable "$code"; then status=FAIL; classification_code=1; fi
+    ci_record_sql_suite "$suite" "$status" "$duration" "$log_path"
+    if [ "$classification_code" -ne 0 ]; then
       failed=1
-      ci_record_sql_suite "$suite" "UNEXPECTED_PASS" "$duration" "$log_path"
-      if [ -z "$CI_FAILURE_TAIL" ]; then
-        ci_mark_failure_tail "SQL suite has unexpected known-failure passes: $suite" "$log_path"
-      fi
-    elif [ "$code" -eq 0 ]; then
-      ci_record_sql_suite "$suite" "PASS" "$duration" "$log_path"
-    elif ci_classify_sql_log "$suite" "$log_path" "true"; then
-      ci_record_sql_suite "$suite" "KNOWN_FAIL" "$duration" "$log_path"
-    else
-      failed=1
-      ci_record_sql_suite "$suite" "FAIL" "$duration" "$log_path"
-      if [ -z "$CI_FAILURE_TAIL" ]; then
-        ci_mark_failure_tail "SQL suite failed: $suite" "$log_path"
-      fi
+      if [ -z "$CI_FAILURE_TAIL" ]; then ci_mark_failure_tail "SQL suite requires attention: $suite" "$log_path"; fi
     fi
     ci_render_summary "RUNNING"
   done
@@ -1259,7 +1127,13 @@ run_native_cross_process_sql_suites() {
 
     novarocks_bin="$(ci_bound_binary novarocks)" || return $?
     sql_runner="$(ci_bound_binary novarocks-sql-test)" || return $?
-    ci_run_logged "$log_path" \
+    local results_file="${log_path%.log}.results.jsonl" sql_materials
+    sql_materials="$(python3 - "$results_file" <<'MATERIALS'
+import json, sys
+print(json.dumps({"sql_results":sys.argv[1]}))
+MATERIALS
+)"
+    ci_run_recorded_logged "$log_path" sql-suite "$suite" "$sql_materials" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
       NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
@@ -1268,6 +1142,7 @@ run_native_cross_process_sql_suites() {
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \
+        --results-file "$results_file" \
         "${suite_query_timeout_args[@]}" \
         --cluster-mode "$suite_cluster_mode" \
         --cluster-size "$suite_cluster_size" \
@@ -1276,11 +1151,14 @@ run_native_cross_process_sql_suites() {
     code=$?
     duration=$(($(ci_epoch) - start))
 
-    if [ "$code" -eq 0 ]; then
-      ci_record_sql_suite "native-cross-process:$suite" "PASS" "$duration" "$log_path"
+    local status classification_code=0
+    ci_classify_sql_results "$suite" "$results_file" || classification_code=$?
+    status="$CI_SQL_RESULT_STATUS"
+    if ! ci_sql_native_exit_acceptable "$code"; then status=FAIL; classification_code=1; fi
+    if [ "$classification_code" -eq 0 ]; then
+      ci_record_sql_suite "native-cross-process:$suite" "$status" "$duration" "$log_path"
     else
       failed=1
-      ci_classify_sql_log "$suite" "$log_path" "false" >/dev/null || true
       if [ "$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED" = "1" ]; then
         ci_record_sql_suite "native-cross-process:$suite" "FAIL" "$duration" "$log_path"
         if [ -z "$CI_FAILURE_TAIL" ]; then
@@ -1308,33 +1186,17 @@ reclassify_existing_run() {
 
   init_from_run_dir
 
-  for log_path in "$CI_RUN_DIR"/sql/*.log; do
-    [ -f "$log_path" ] || continue
+  local results_file classification_code
+  for results_file in "$CI_RUN_DIR"/sql/*.results.jsonl; do
+    [ -f "$results_file" ] || continue
     any_logs=1
-    suite="${log_path##*/}"
-    suite="${suite%.log}"
-    status="$(ci_sql_suite_status_from_log "$log_path")"
-
-    if ! ci_classify_unexpected_passes "$suite" "$log_path"; then
-      if [ "$status" != "PASS" ]; then
-        ci_classify_sql_log "$suite" "$log_path" "false" >/dev/null || true
-      fi
-      failed=1
-      ci_record_sql_suite "$suite" "UNEXPECTED_PASS" "0" "$log_path"
-      if [ -z "$CI_FAILURE_TAIL" ]; then
-        ci_mark_failure_tail "SQL suite has unexpected known-failure passes: $suite" "$log_path"
-      fi
-    elif [ "$status" = "PASS" ]; then
-      ci_record_sql_suite "$suite" "PASS" "0" "$log_path"
-    elif ci_classify_sql_log "$suite" "$log_path" "true"; then
-      ci_record_sql_suite "$suite" "KNOWN_FAIL" "0" "$log_path"
-    else
-      failed=1
-      ci_record_sql_suite "$suite" "FAIL" "0" "$log_path"
-      if [ -z "$CI_FAILURE_TAIL" ]; then
-        ci_mark_failure_tail "SQL suite failed: $suite" "$log_path"
-      fi
-    fi
+    suite="${results_file##*/}"; suite="${suite%.results.jsonl}"
+    log_path="${results_file%.results.jsonl}.log"
+    classification_code=0
+    ci_classify_sql_results "$suite" "$results_file" || classification_code=$?
+    status="$CI_SQL_RESULT_STATUS"
+    ci_record_sql_suite "$suite" "$status" "0" "$log_path"
+    if [ "$classification_code" -ne 0 ]; then failed=1; fi
   done
 
   if [ "$any_logs" -eq 0 ]; then
@@ -1343,7 +1205,7 @@ reclassify_existing_run() {
 ### reclassification failed
 
 \`\`\`text
-no sql/*.log files found under $CI_RUN_DIR
+no sql/*.results.jsonl files found under $CI_RUN_DIR
 \`\`\`
 EOF
 )"
@@ -1359,7 +1221,44 @@ EOF
   echo "PASS: $CI_SUMMARY"
 }
 
+# Development selection delegates to the same native stage commands. This
+# dispatcher executes one declared stage and creates no parallel command map.
+ci_execute_selected_stage() (
+  CI_SELECTED_STAGE="$1"
+  NOVA_CI_ARTIFACT_RECEIPT="$2"
+  CI_RUN_DIR="$3"
+  CI_SUMMARY="$CI_RUN_DIR/summary.md"
+  CI_STAGE_EXECUTED=false
+  CI_COMMIT_SHA="${CI_COMMIT_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  SKIP_CARGO_TEST=true
+  ci_init_summary_state
+  case "$CI_SELECTED_STAGE" in
+    'workspace nextest and doctests')
+      ci_stage_native_command "$CI_SELECTED_STAGE" python3 "$SCRIPT_DIR/test-run.py" batch --output "$CI_RUN_DIR/rust-stage"
+      return $? ;;
+    memory-model:loom) ci_stage_native_command "$CI_SELECTED_STAGE" bash "$SCRIPT_DIR/memory-model-checks.sh" --loom; return $? ;;
+    memory-model:miri) ci_stage_native_command "$CI_SELECTED_STAGE" bash "$SCRIPT_DIR/memory-model-checks.sh" --miri; return $? ;;
+    native-compatibility) ci_stage_native_command "$CI_SELECTED_STAGE" bash "$SCRIPT_DIR/native-compatibility-ci.sh"; return $? ;;
+    'functional default scenario selection'|'selected system program preparation')
+      run_system_scenario_fixture_stage ;;
+    *) run_cargo_gates ;;
+  esac
+  [ "$CI_STAGE_EXECUTED" = true ] || { echo "error: stage has no native command: $CI_SELECTED_STAGE" >&2; return 2; }
+)
+
 main() {
+  if [ "${1:-}" = --describe-stage ]; then
+    [ "$#" -eq 4 ] || { echo "usage: local-full-ci.sh --describe-stage <name> <artifact-receipt> <output>" >&2; return 2; }
+    CI_DESCRIBE_STAGE=true
+    ci_execute_selected_stage "$2" "$3" "$4"
+    return $?
+  fi
+  if [ "${1:-}" = --run-stage ]; then
+    [ "$#" -eq 4 ] || { echo "usage: local-full-ci.sh --run-stage <name> <artifact-receipt> <output>" >&2; return 2; }
+    ci_execute_selected_stage "$2" "$3" "$4"
+    return $?
+  fi
+  if [ "${1:-}" = --list-stages ]; then ci_list_stages; return 0; fi
   parse_args "$@"
   cd "$REPO_ROOT" || exit 1
 
@@ -1369,6 +1268,7 @@ main() {
   fi
 
   init_run_dir
+  trap cleanup EXIT
   validate_explicit_suites_early
 
   if [ "$CARGO_ONLY" = "true" ]; then

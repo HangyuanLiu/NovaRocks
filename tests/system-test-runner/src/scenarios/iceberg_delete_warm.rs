@@ -142,6 +142,15 @@ struct IcebergDeleteWarmConcurrent {
     fixture: Mutex<Option<WarmFixture>>,
 }
 impl Scenario for IcebergDeleteWarmConcurrent {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "iceberg_delete_warm",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/iceberg-delete-warm-concurrent"
     }

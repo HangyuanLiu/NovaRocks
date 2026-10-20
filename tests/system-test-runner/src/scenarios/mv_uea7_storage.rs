@@ -42,6 +42,15 @@ pub(super) struct MvStorageContract {
 }
 
 impl Scenario for MvStorageContract {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_uea7_storage",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/storage-contract"
     }

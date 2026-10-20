@@ -79,6 +79,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 struct CancelRows(&'static str);
 
 impl Scenario for CancelRows {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery_closing",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         self.0
     }

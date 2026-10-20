@@ -13,3 +13,7 @@ doctest = false
 [dependencies]
 novarocks-result-contract.workspace = true
 arrow-schema.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

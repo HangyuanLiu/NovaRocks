@@ -35,6 +35,11 @@ pub struct ScenarioBinaryLayout {
 pub trait Scenario: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Owner-declared impact and initial-state facts; absent contracts disable reuse.
+    fn declaration(&self) -> ScenarioDeclaration {
+        ScenarioDeclaration::default()
+    }
+
     /// Validates runner-wide inputs before any selected scenario launches a
     /// process. Scenarios with special profiles fail here.
     fn validate_runner_inputs(&self, _launch_profile: LaunchProfile) -> Result<()> {
@@ -119,6 +124,32 @@ pub trait Scenario: Send + Sync {
     fn teardown(&self) -> Result<()> {
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ScenarioDeclaration {
+    pub impact: ScenarioImpact,
+    pub env_inputs: Vec<ScenarioEnvironmentInput>,
+    pub initial_state: Option<&'static str>,
+    pub basis: Option<&'static str>,
+    pub heavy: Option<ScenarioHeavyReason>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ScenarioImpact {
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScenarioEnvironmentInput {
+    pub name: &'static str,
+    pub kind: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScenarioHeavyReason {
+    pub reason: &'static str,
+    pub detail: &'static str,
 }
 
 #[derive(Debug, Clone)]

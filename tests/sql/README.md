@@ -43,13 +43,21 @@ sql_runner="$(ci_bound_binary novarocks-sql-test)"
   --cluster-mode cross-process --cluster-size 3 -j 1
 ```
 
-`--list-suites` 列出所有注册套件，包括 explicit-only；`--suite all` 按 suite manifest 排除 explicit-only。`--list-extensions` 不启动集群。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
+`--list-suites` 列出所有注册套件，包括 explicit-only；`--list-declarations` 输出 schema 1 的 suite impact、环境输入、reuse 初始状态/范围、重项依据与 case 清单，不启动集群。`--suite all` 按 suite manifest 排除 explicit-only 和 DISABLED，构成常规 SQL 集合的原生来源。`--list-extensions` 不启动集群。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
 
 能力需求来自 merge/过滤后真正选中的有限步骤、已有指令与原生 capability tag；普通 SQL 仍使用同一主产物，内部断言不能因缺测试产物而跳过。feature 编入、profile、suite 名或旧环境不授予控制，裸测试 CALL 也没有自动权限。`test-capability:mv-document-observation` 只声明非破坏观察，不授予 wipe；未知 `test-capability:` 值明确拒绝。`mv_storage_contract_shared_document_revisions.sql` query 5/6 已就近声明此 tag，并保留原六个普通标签；两步只请求非破坏观察，SQL/expected/oracle 不变。G2 的完整 storage-contract 十个 case 已通过，验证范围与未运行项见 [G2 验证记录](../../docs/guides/development/tst-g2-validation-status.md)。
 
 每次 FE/BE launch/restart 在 spawn 前读真实产物自报，保存原双流、实际退出和角色映射；会话绑定实际 Native process 与准确 statement/动作目标。自报的 profile 声明、binary cfg、package 局部事实及 null/unknown 分列，明确不作发布认证。缺授权、错误产物、原期限到期和实际资源/进程清理失败都保留原始失败，不能用未命中注入的正常结果代替通过。
 
 LNP-3A/LNP-3D 与 `mv-storage-contract` 保留原 SQL、`.result` 和独立文档图，旧 CALL/directive 禁止扩展。当前 whole-family wipe 必须是显式 FE launch/family 授权、一次认领、隔离串行且 MV owner 停止 admission/实际 join 后台；普通裸 CALL 不授予擦除权。唯一后续迁移责任见 [correctness map](correctness/README.md#mv-受控过渡与后续迁移)，不在本次新增恢复或擦除 API。
+
+## 开发选择与逐 case 证据
+
+开发阶段用 `tools/ci/dev-verify.sh plan|run|resume|compose` 消费原生声明和已准备产物，见 [层规则与入口](../../docs/guides/development/test-governance.md#三层验证与证据组合)。本地完整入口的 SQL 集合来自原生默认发现，已知失败和不稳定在 [dispositions.json](../../tools/ci/baselines/dispositions.json) 中显式处置。`explicit_only` 表示重项；它与暂停、不稳定及已知失败是不同状态。相关重项仍是作者义务。正式准入与合入后全量由 G17 运行，本地结果不能自行成为正式来源。
+
+加 `--results-file /absolute/local/new-attempt/sql.results.jsonl` 写出独占 schema 1 JSONL。开始前写 run 和全部 selection（含加载失败项），逐个 case 终结后立即追加 case，suite 写 init/cleanup/输入确认，最终 end 写 Server/fixture 收束与完成事实。原 SQL golden、断言、原始日志和退出码保持权威；case 记录包含声明与实际执行的 oracle、断言策略、有效 verify 开关、输入摘要、失败特征与快照引用。缺 end、坏记录、缺 case 终态和未验证不能补成通过。
+
+共享生命周期默认以整个 suite 为复用范围，只有原生 owner 声明 case 范围及 `isolated/reset/immutable` 初始状态后开发工具才可拆 case；当前 corpus 仍以 suite 为范围。直接 `--only` 可用于定位，它不能自动得到可复用的独立范围。`--no-verify`、record/update、自定义 epsilon、关闭 oracle 或改变断言策略的结果保留为诊断，不满足默认验证义务。结束确认输入改变、旧失败、新失败、取消和清理违约分别保留；一次定向通过不能覆盖旧反例。
 
 ## 受管进程与原始双流
 

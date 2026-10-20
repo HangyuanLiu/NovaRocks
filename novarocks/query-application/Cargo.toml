@@ -35,3 +35,7 @@ novarocks-connector-contract.workspace = true
 novarocks-sql = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

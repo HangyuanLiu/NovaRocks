@@ -36,3 +36,7 @@ path = "src/bin/generate_rust_fixtures.rs"
 [[bin]]
 name = "fixture-facts"
 path = "src/bin/fixture_facts.rs"
+
+[package.metadata.novarocks.test]
+runtime-inputs = ["tests/datasketches-tck/fixtures/**"]
+env-inputs = []

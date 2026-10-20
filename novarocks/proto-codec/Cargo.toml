@@ -26,3 +26,7 @@ novarocks-type-contract.workspace = true
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

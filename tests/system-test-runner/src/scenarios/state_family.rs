@@ -29,6 +29,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 struct WipeStartRebuild;
 
 impl Scenario for WipeStartRebuild {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "state_family",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "state-family/wipe-start-rebuild"
     }

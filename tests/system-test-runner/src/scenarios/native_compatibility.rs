@@ -59,6 +59,15 @@ struct MixedBuildSameIsland {
 }
 
 impl Scenario for MixedBuildSameIsland {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_compatibility",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn is_explicit_stage(&self) -> bool {
         true
     }
@@ -176,6 +185,15 @@ struct TargetIslandCutover {
 }
 
 impl Scenario for RawEstablishCompatibilityAdmission {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_compatibility",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn is_explicit_stage(&self) -> bool {
         true
     }
@@ -501,6 +519,15 @@ fn admission_reservation_used(client: &reqwest::blocking::Client, port: u16) -> 
 }
 
 impl Scenario for OtherIslandHardCut {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_compatibility",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn is_explicit_stage(&self) -> bool {
         true
     }
@@ -613,6 +640,15 @@ impl Scenario for OtherIslandHardCut {
 }
 
 impl Scenario for TargetIslandCutover {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_compatibility",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn is_explicit_stage(&self) -> bool {
         true
     }
@@ -762,6 +798,15 @@ impl Scenario for TargetIslandCutover {
 }
 
 impl Scenario for IslandDrainAndReplacement {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_compatibility",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn is_explicit_stage(&self) -> bool {
         true
     }

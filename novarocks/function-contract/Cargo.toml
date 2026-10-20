@@ -34,3 +34,7 @@ novarocks-constant-contract.workspace = true
 [dev-dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

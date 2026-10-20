@@ -337,6 +337,15 @@ impl RangeFunctional {
 }
 
 impl Scenario for RangeFunctional {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_range_reads",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         if self.short {
             "connector/iceberg-short-range-concurrent"

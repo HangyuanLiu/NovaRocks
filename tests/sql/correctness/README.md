@@ -27,63 +27,84 @@ separate compatibility spreadsheet.
 
 Pick suites by the engine area a change touches; do not run the whole corpus to
 verify one fix. `--suite all` excludes suites whose manifest declares `explicit_only`;
-these must be named. Ask
+these must be named. For machine-readable impact, cost and reuse declarations,
+use the prepared runner's `--list-declarations`. Ask
 `cargo run --locked --profile dev --target-dir target --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- --list-suites` for the
 authoritative current list.
 
 列表不启动产品或建立会话。规范入口先联合准备 workspace tests/bins，再直接运行已绑定的 SQL runner。实际运行仅显式设置主 `NOVAROCKS_BIN`，普通与有限控制步骤使用同一 dev 程序；主缓存属于当前 worktree 的 `target/`，兼容变体按需独立复制最终程序，详见 [SQL 入口](../README.md) 和 [构建选择](../../../docs/guides/development/test-governance.md#构建选择与控制授权)。每个实际角色读取自己的 `--build-info`，保留已知/unknown 与实际退出；路径、profile、feature 编入都不是授权或发布认证。
 
-| Suite | Engine area it exercises | Typical change entry | Extra requirement |
+<!-- sql-suite-map:start -->
+| Suite | Impact paths | Tier and prerequisites | Reuse scope and initial state |
 |---|---|---|---|
-| `aggregate` | Aggregation operators, aggregate functions, two-phase aggregation, GROUPING SETS / CUBE / ROLLUP | `novarocks/execution/src/exec/operators/aggregate/**`, `novarocks/execution/src/exec/expr/agg/**` | — |
-| `analytic` | Window functions, frames, window TopN | `novarocks/execution/src/exec/operators/analytic_*.rs` | — |
-| `complex-type` | ARRAY / MAP / STRUCT / JSON values, comparison and grouping over them | `novarocks/execution/src/exec/expr/{array_expr,struct_expr}.rs`, `novarocks/execution/src/exec/expr/function/array/**` | — |
-| `cte` | CTE binding, inlining, recursive CTE | `novarocks/sql/src/analysis/cte.rs`, `novarocks/sql/src/optimizer/cte_rewrite.rs` | — |
-| `decimal` | DECIMAL256 arithmetic, cast, overflow, predicates | `novarocks/execution/src/exec/expr/decimal.rs`, `novarocks/sql/src/semantic/**` | — |
-| `distributed-resilience` | BE loss, FE crash, query control and cleanup under real process failure | `novarocks/worker/src/task_registry.rs`, `novarocks/frontend-application/src/task_execution/**` | `--cluster-mode cross-process --cluster-size 3` |
-| `filter` | Predicate evaluation, type coercion in predicates, filter pushdown | `novarocks/execution/src/exec/operators/filter_processor.rs`, `novarocks/execution/src/exec/expr/comparison.rs` | — |
-| `function` | Scalar, bitmap, HLL and binary functions, signature resolution | `novarocks/execution/src/exec/expr/function/**`, `novarocks/sql/src/functions/registry.rs` | — |
-| `iceberg` | Iceberg read path, metadata tables, branches and tags | `novarocks/connector/iceberg/**` | — |
-| `iceberg-compatibility` | Cross-engine reads of tables Spark wrote through REST Catalog | `novarocks/connector/iceberg/**` | provisioned REST Catalog + Spark fixture |
-| `iceberg-compatibility` / `spark_rest_delete_applicability` | 同提交 position/DV/equality 的序号边界与独立 Java 行袋 | `novarocks/connector/iceberg/src/delete_semantics/**`、`typed_read/**` | 真实 Java writer + manifest 闭包；native 1FE+3BE |
-| `iceberg-ddl` | Iceberg DDL, schema evolution, CREATE TABLE LIKE | `novarocks/connector/iceberg/**`, `novarocks/sql/src/planning/**` | — |
-| `iceberg-dml` | INSERT / DELETE / UPDATE / MERGE against Iceberg, type round-trips | `novarocks/connector/iceberg/**`, `novarocks/execution/src/exec/operators/table_writer.rs` | — |
-| `iceberg-hms` | Spark-written HMS read compatibility and refusal integrity for every reachable mutation family | `novarocks/connector/iceberg/src/{catalog,catalog_control,commit}/**`, table-job admission | `explicit_only`; cross-process, 3 BE, `-j 1`; start `docker/iceberg-hive/`; Spark owns writes/cleanup and paginated inventory evidence |
-| `iceberg-ivm` | Incremental MV maintenance over Iceberg (COW / MOR, projections, PK) | `novarocks/mv-application/**`, `novarocks/execution/src/exec/mv/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
-| `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
-| `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
-| `iceberg-rest` | NovaRocks-only REST Catalog end-to-end write and read | `novarocks/connector/iceberg/**` | REST Catalog |
-| `join` | Hash / nested-loop joins, join order, outer-join nullability, bucket shuffle | `novarocks/execution/src/exec/operators/{hashjoin,nljoin}/**`, `novarocks/sql/src/optimizer/**` | — |
-| `lake-publication` | Native lake publication gate under a publication-catalog fault fixture | `novarocks/frontend-application/src/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
-| `limit` | LIMIT / OFFSET, global limit across fragments | `novarocks/execution/src/exec/operators/limit_processor.rs` | — |
-| `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
-| `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
-| `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**`, `novarocks/catalog-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
-| `mv-storage-contract` | MV storage-contract product gate: inline keyed documents, compact publications, slot snapshots, DV logical rows, external cleanup, lake-only recovery and operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
-| `mv-storage-physical-occ` | External target commit wins against a frozen MV publication without an MV P attachment | `novarocks/frontend-application/src/mv/**`, `tests/fixtures/iceberg-rest-publication/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; separate private REST Catalog and MinIO |
-| `mv-publication-v11` | Both MV/external commit orders inside REST after requirement validation, including full, incremental append, metadata-only, and repartition MV publications | `novarocks/frontend-application/src/mv/**`, `tests/fixtures/iceberg-rest-publication/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner builds the checked-in hook image and uses private REST and MinIO |
-| `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
-| `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
-| `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | isolated REST Catalog and MinIO |
-| `optimizer` | Plan-shape goldens: rules, pushdown, broadcast risk, EXPLAIN output | `novarocks/sql/src/optimizer/**`, `novarocks/sql/src/explain/**` | — |
-| `optimizer-dist` | The same plan-shape facts as they appear under a distributed plan | `novarocks/sql/src/optimizer/**` | — |
-| `paimon` | Read-only Paimon append-only and `deduplicate` PK reads | `novarocks/connector/paimon/**` | **DISABLED** pending detailed connector design; cases and external fixture retained |
-| `project` | Projection, cast semantics, arithmetic and string expression edges | `novarocks/execution/src/exec/operators/project_processor.rs`, `novarocks/execution/src/exec/expr/cast.rs` | — |
-| `runtime-filter` | Runtime filter build / probe, bitset filters, value domains | `novarocks/execution/src/runtime_filter/**`, `novarocks/execution/src/exec/operators/runtime_filter/**` | — |
-| `runtime-filter-distributed` | Runtime filters that cross the process boundary | the same paths plus `novarocks/worker/src/**` | 内部 statement/native 断言步骤需实际 test-controls 产物与有限观察授权 |
-| `session` | Session and client-compatibility statements | `novarocks/mysql-adapter/**`, `novarocks/query-application/src/**` | — |
-| `set-op` | UNION / INTERSECT / EXCEPT, including NULL and cast behavior | `novarocks/execution/src/exec/operators/setop/**` | — |
-| `sort` | Sort, TopN, ranking, NULL and non-finite float ordering | `novarocks/execution/src/exec/operators/sort/**` | — |
-| `sql-reject` | Statements NovaRocks must reject, SQL error codes and phases | `novarocks/sql/src/admission.rs`, `novarocks/user-error/**` | — |
-| `statistics` | ANALYZE, NDV, min/max, Puffin statistics round-trip | `novarocks/statistics-application/**`, `novarocks/connector/iceberg/**` | REST Catalog |
-| [`ssb`](ssb/README.md) | 完整数据查询与结果正确性 | SQL planner/operators及输入绑定 | explicit-only；READY scale 1；1FE+3BE、-j1、clean performance launch |
-| [`tpc-h`](tpc-h/README.md) | 完整数据查询与结果正确性 | 同上 | explicit-only；READY scale 1；同上 |
-| [`tpc-ds`](tpc-ds/README.md) | 完整数据查询与结果正确性 | 同上 | explicit-only；READY scale 1GB；同上 |
-| `subquery` | Scalar subquery semantics and unnesting | `novarocks/sql/src/optimizer/**` | — |
-| `table-function` | UNNEST and table-function join shapes | `novarocks/execution/src/exec/operators/table_function_processor.rs` | — |
+| `aggregate` | `novarocks/execution/src/exec/operators/aggregate/**`<br>`novarocks/execution/src/exec/expr/agg/**` | admission | suite; undeclared |
+| `analytic` | `novarocks/execution/src/exec/operators/analytic_*.rs` | admission | suite; undeclared |
+| `analytic-exhaustive` | `novarocks/execution/src/exec/operators/analytic_*.rs` | full<br>cost: Two exhaustive window frame matrices; run serially on native 1FE+3BE. | suite; undeclared |
+| `complex-type` | `novarocks/execution/src/exec/expr/array_expr.rs`<br>`novarocks/execution/src/exec/expr/struct_expr.rs`<br>`novarocks/execution/src/exec/expr/function/array/**` | admission | suite; undeclared |
+| `cte` | `novarocks/sql/src/analysis/cte.rs`<br>`novarocks/sql/src/optimizer/cte_rewrite.rs` | admission | suite; undeclared |
+| `decimal` | `novarocks/execution/src/exec/expr/decimal.rs`<br>`novarocks/sql/src/semantic/**` | admission | suite; undeclared |
+| `distributed-resilience` | `novarocks/worker/src/task_registry.rs`<br>`novarocks/frontend-application/src/task_execution/**` | admission | suite; undeclared |
+| `filter` | `novarocks/execution/src/exec/operators/filter_processor.rs`<br>`novarocks/execution/src/exec/expr/comparison.rs` | admission | suite; undeclared |
+| `function` | `novarocks/execution/src/exec/expr/function/**`<br>`novarocks/sql/src/functions/registry.rs` | admission | suite; undeclared |
+| `iceberg` | `novarocks/connector/iceberg/**` | admission | suite; undeclared |
+| `iceberg-compatibility` | `novarocks/connector/iceberg/**` | admission | suite; undeclared |
+| `iceberg-ddl` | `novarocks/connector/iceberg/**`<br>`novarocks/sql/src/planning/**` | admission | suite; undeclared |
+| `iceberg-dml` | `novarocks/connector/iceberg/**`<br>`novarocks/execution/src/exec/operators/table_writer.rs` | admission | suite; undeclared |
+| `iceberg-hms` | `novarocks/connector/iceberg/src/catalog/**`<br>`novarocks/connector/iceberg/src/catalog_control/**`<br>`novarocks/connector/iceberg/src/commit/**`<br>`novarocks/frontend-application/src/query_execution/**` | full<br>fixture: Requires docker/iceberg-hive, Spark-authored HMS inputs, native 1FE+3BE and serial execution; Spark owns writes and cleanup. | suite; undeclared |
+| `iceberg-ivm` | `novarocks/mv-application/**`<br>`novarocks/execution/src/exec/mv/**`<br>`docker/iceberg-rest/spark-sql.sh`<br>`docker/iceberg-rest/spark-shell.sh` | admission | suite; undeclared |
+| `iceberg-mv-apply` | `novarocks/mv-application/**` | admission | suite; isolated |
+| `iceberg-mv-scheduler` | `novarocks/mv-application/**` | admission | suite; isolated |
+| `iceberg-rest` | `novarocks/connector/iceberg/**` | admission | suite; undeclared |
+| `join` | `novarocks/execution/src/exec/operators/hashjoin/**`<br>`novarocks/execution/src/exec/operators/nljoin/**`<br>`novarocks/sql/src/optimizer/**` | admission | suite; undeclared |
+| `lake-publication` | `novarocks/frontend-application/src/**` | full<br>fixture: Requires a controlled publication Catalog fault fixture, native 1FE+3BE and serial execution. | suite; undeclared |
+| `limit` | `novarocks/execution/src/exec/operators/limit_processor.rs` | admission | suite; undeclared |
+| `lnp-3a-mv-rebuild` | `novarocks/mv-application/**` | full<br>fixture: Requires private REST Catalog and MinIO, destructive lake wipe/rebuild, native 1FE+3BE and serial execution. | suite; isolated |
+| `lnp-3c-runtime-cut` | `novarocks/frontend-application/src/state_family/**` | full<br>cost: Native 1FE+3BE acceptance of runtime-state cut across an FE restart; run serially. | suite; undeclared |
+| `lnp-3d-mv-accelerator` | `novarocks/mv-application/**`<br>`novarocks/catalog-application/**` | full<br>fixture: Requires private REST Catalog and MinIO, Accelerator wipe/restart/isolation, native 1FE+3BE and serial execution. | suite; isolated |
+| `low-cardinality` | `novarocks/execution/src/exec/dict_encode.rs`<br>`novarocks/execution/src/exec/expr/dict_decode.rs`<br>`novarocks/execution/src/exec/expr/dict_peel.rs` | admission | suite; undeclared |
+| `materialized-view` | `novarocks/mv-application/**` | admission | suite; undeclared |
+| `mv-publication-v11` | `novarocks/frontend-application/src/mv/**`<br>`tests/fixtures/iceberg-rest-publication/**`<br>`docker/iceberg-rest/spark-sql.sh`<br>`docker/iceberg-rest/spark-shell.sh` | full<br>fixture: Builds the checked-in REST publication-hook image on provisioned base inputs; requires private REST and MinIO, native 1FE+3BE and serial execution. | suite; undeclared |
+| `mv-rewrite` | `novarocks/sql/src/optimizer/**` | admission | suite; isolated |
+| `mv-storage-contract` | `novarocks/mv-application/**`<br>`novarocks/frontend-application/src/mv/**`<br>`docker/iceberg-rest/spark-sql.sh`<br>`docker/iceberg-rest/spark-shell.sh` | full<br>fixture: Requires private REST Catalog and MinIO, native 1FE+3BE and serial execution; covers MV document/storage recovery and operator continuation. | suite; undeclared |
+| `mv-storage-physical-occ` | `novarocks/frontend-application/src/mv/**`<br>`tests/fixtures/iceberg-rest-publication/**`<br>`docker/iceberg-rest/spark-sql.sh`<br>`docker/iceberg-rest/spark-shell.sh` | full<br>fixture: Requires private REST Catalog and MinIO with an external target writer, native 1FE+3BE and serial execution. | suite; undeclared |
+| `optimizer` | `novarocks/sql/src/optimizer/**`<br>`novarocks/sql/src/explain/**` | admission | suite; undeclared |
+| `optimizer-dist` | `novarocks/sql/src/optimizer/**` | admission | suite; undeclared |
+| `paimon` | `novarocks/connector/paimon/**` | full<br>fixture: Requires external Spark/Paimon-authored append-only and primary-key fixtures; suite remains suspended pending detailed connector design.<br>DISABLED: Paimon tests are suspended pending detailed connector design | suite; undeclared |
+| `project` | `novarocks/execution/src/exec/operators/project_processor.rs`<br>`novarocks/execution/src/exec/expr/cast.rs` | admission | suite; undeclared |
+| `runtime-filter` | `novarocks/execution/src/runtime_filter/**`<br>`novarocks/execution/src/exec/operators/runtime_filter/**` | admission | suite; undeclared |
+| `runtime-filter-distributed` | `novarocks/execution/src/runtime_filter/**`<br>`novarocks/execution/src/exec/operators/runtime_filter/**`<br>`novarocks/worker/src/**` | admission | suite; undeclared |
+| `session` | `novarocks/mysql-adapter/**`<br>`novarocks/query-application/src/**` | admission | suite; undeclared |
+| `set-op` | `novarocks/execution/src/exec/operators/setop/**` | admission | suite; undeclared |
+| `sort` | `novarocks/execution/src/exec/operators/sort/**` | admission | suite; undeclared |
+| `sql-reject` | `novarocks/sql/src/admission.rs`<br>`novarocks/user-error/**` | admission | suite; undeclared |
+| `ssb` | `novarocks/sql/**`<br>`novarocks/execution/**` | full<br>dataset: Requires a READY scale 1 SSB dataset, native 1FE+3BE, serial execution and a clean performance launch. | suite; undeclared |
+| `statistics` | `novarocks/statistics-application/**`<br>`novarocks/connector/iceberg/**` | admission | suite; undeclared |
+| `subquery` | `novarocks/sql/src/optimizer/**` | admission | suite; undeclared |
+| `table-function` | `novarocks/execution/src/exec/operators/table_function_processor.rs` | admission | suite; undeclared |
+| `tpc-ds` | `novarocks/sql/**`<br>`novarocks/execution/**` | full<br>dataset: Requires a READY scale 1GB TPC-DS dataset, native 1FE+3BE, serial execution and a clean performance launch. | suite; undeclared |
+| `tpc-h` | `novarocks/sql/**`<br>`novarocks/execution/**` | full<br>dataset: Requires a READY scale 1 TPC-H dataset, native 1FE+3BE, serial execution and a clean performance launch. | suite; undeclared |
+<!-- sql-suite-map:end -->
 
-Iceberg suites that create an external catalog need the object store; the suites
-marked "REST Catalog" also need the REST service. `docker/iceberg-rest/up.sh`
+The table is generated from the native runner's `--list-declarations` output by
+`tools/ci/sql-suite-map.py`; after joint preparation, run it with `--check` to
+check the table against `NOVA_CI_ARTIFACT_RECEIPT`. `admission` denotes regular
+coverage and `full` explicit coverage. These are cost tiers; paused, known-failure
+and quarantine dispositions are separate states. The native default collection,
+minus paused items, defines regular SQL coverage; dispositions do not create a
+second suite list. An undeclared initial state grants no historical reuse. Scope
+remains suite-wide for the current corpus, including direct `--only` diagnostic
+runs. Actual oracle execution and shared lifecycle cleanup must be confirmed
+before any result can satisfy a composition. See [SQL evidence](../README.md#开发选择与逐-case-证据).
+
+`analytic-exhaustive` owns the two exhaustive window-frame matrices formerly
+in `analytic`; its SQL and expected results are unchanged.
+`iceberg-compatibility/spark_rest_delete_applicability` protects same-commit
+position/DV/equality sequence boundaries with independent Java row bags and
+a real writer/manifest closure on native 1FE+3BE.
+
+Iceberg suites that create an external catalog need the object store.
+`iceberg-compatibility`, `iceberg-rest`, `materialized-view` and `statistics`
+also need REST; the suites declaring isolated reuse start private REST and MinIO. `docker/iceberg-rest/up.sh`
 provides both, while `iceberg-hms` additionally needs `docker/iceberg-hive/up.sh`.
 Suites with their own `README.md` keep the authority on their internals; this
 table only routes a change to the right suite.
@@ -107,9 +128,12 @@ LNP-3A/LNP-3D、`mv-storage-contract` 及现有 system MV 场景保留原 SQL、
 
 每个 owner 按自己的 accepted spec/approved plan 取得替代保护后逐项退役，最后消费者退出再删共享载体；不统一推迟到 7B5。G2 只收敛当前控制边界，不新增启动期缓存缺失或管理/擦除 API，不表示这些产品任务已完成。历史私有 exact/held/HMS 完整矩阵缺原输入时标 `NOT_RUN`，不得伪造历史资格；领域变更必跑当前必要保护、显式高成本组由维护者每周手工轮次，默认 dataset/performance 策略保持原有选择。
 
-When a change does not map onto any row, that is a signal about the change, not
-about the table: either it has no SQL-visible behavior (verify it with the
-owning crate's Rust tests) or the corpus has a gap worth filling.
+An unmapped change creates an explicit impact-analysis gap. If its owner is
+bounded, expand to that domain and its heavy units; if unbounded, request broad
+coverage. Fix the declaration rather than silently treating the gap as no SQL
+impact. Development may defer unaffected regular units to admission; author
+obligations for selected heavy units require execution or a recorded reason.
+Native declarations are the mapping authority; this generated table is a view.
 
 ### Suites that get their own REST Catalog
 

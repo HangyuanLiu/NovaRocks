@@ -35,6 +35,7 @@ main() {
   done
   cd "$REPO_ROOT"
   CI_RUN_DIR="$(mktemp -d "$REPO_ROOT/logs/native-compatibility-XXXXXXXX")"
+  python3 "$SCRIPT_DIR/lib/identity_snapshot.py" source --repo "$REPO_ROOT" --output "$CI_RUN_DIR/identity/source-start.json"
   CI_SUMMARY="$CI_RUN_DIR/summary.md"
   ci_init_summary_state
   ci_set_repo_context "$REPO_ROOT" "$(git symbolic-ref --short -q HEAD || echo HEAD)" "$(git rev-parse HEAD)"
@@ -66,6 +67,7 @@ main() {
       fi
     fi
   fi
+  python3 "$SCRIPT_DIR/lib/identity_snapshot.py" source --repo "$REPO_ROOT" --output "$CI_RUN_DIR/identity/source-end.json" || code=1
   printf '%s\n' "$code" >"$CI_RUN_DIR/exit"
   if [ "$code" -eq 0 ]; then ci_render_summary PASS; else ci_render_summary FAIL; fi
   echo "compatibility result: $CI_SUMMARY"

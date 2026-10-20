@@ -158,6 +158,15 @@ struct Uea5dDopObservation {
 }
 
 impl Scenario for Uea5dMultiSplitDop {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/uea5d-multi-split-dop"
     }
@@ -310,6 +319,15 @@ struct TypedReadData {
 }
 
 impl Scenario for TypedReadData {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/iceberg-typed-read-data"
     }
@@ -467,6 +485,15 @@ struct DistributedReaderCancel {
 }
 
 impl Scenario for DistributedReaderCancel {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/distributed-reader-cancel"
     }
@@ -589,6 +616,15 @@ struct DistributedReaderKillConnection {
 }
 
 impl Scenario for DistributedReaderKillConnection {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/distributed-reader-kill-connection"
     }
@@ -731,6 +767,15 @@ struct CatalogReadyLifecycle {
 }
 
 impl Scenario for CatalogReadyLifecycle {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/catalog-ready-lifecycle"
     }
@@ -1135,6 +1180,15 @@ struct CatalogReadWriteRuntime {
 }
 
 impl Scenario for CatalogReadWriteRuntime {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/catalog-read-write-runtime"
     }
@@ -1287,6 +1341,15 @@ struct VendedRestSystemFixture {
 }
 
 impl Scenario for VendedRestReadWritePem {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/vended-credential-read-write"
     }
@@ -1534,6 +1597,15 @@ struct VendedRestWriteOutcomePem {
 }
 
 impl Scenario for VendedRestWriteOutcomePem {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/vended-credential-write-outcome"
     }
@@ -1785,6 +1857,15 @@ impl VendedRestPostPublishAnswerPem {
 }
 
 impl Scenario for VendedRestPostPublishAnswerPem {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         self.case.name()
     }
@@ -2116,6 +2197,15 @@ struct VendedRestRefreshPem {
 }
 
 impl Scenario for VendedRestRefreshPem {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/vended-credential-refresh"
     }
@@ -2585,6 +2675,15 @@ impl VendedCredentialFaultPem {
 }
 
 impl Scenario for VendedCredentialFaultPem {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         match self.kind {
             VendedCredentialFault::TargetedDeadline => {
@@ -3251,6 +3350,15 @@ struct CatalogFeRestartCache {
 }
 
 impl Scenario for CatalogFeRestartCache {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/catalog-fe-restart-cache"
     }
@@ -3453,6 +3561,15 @@ const COLLISION_TABLE: &str = "cache_domain_data";
 const COLLISION_WAREHOUSE: &str = "s3://cca-cache-domain-collision/warehouse";
 
 impl Scenario for StaticCredentialGeneration {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/static-credential-generation"
     }
@@ -3506,6 +3623,15 @@ impl Scenario for StaticCredentialGeneration {
 }
 
 impl Scenario for AccessDomainCacheIsolation {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/access-domain-cache-isolation"
     }
@@ -4011,6 +4137,15 @@ fn rewrite_fixed_width_paths(
 struct PredicatePageIndexPruning;
 
 impl Scenario for PredicatePageIndexPruning {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/predicate-page-index-pruning"
     }
@@ -4080,6 +4215,15 @@ impl Scenario for PredicatePageIndexPruning {
 }
 
 impl Scenario for CatalogVersionDrain {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "connector",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "connector/catalog-version-drain"
     }

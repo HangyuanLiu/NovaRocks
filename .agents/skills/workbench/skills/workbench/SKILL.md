@@ -66,7 +66,7 @@ description: "Route engineering work through explicit stages, and maintain a dur
 ```text
 discussion --设计被明确接受--> spec --spec 已确认--> plan drafting + persistence
 persisted plan --plan 被明确批准--> goal execution
-goal execution --验收证据充分--> verified
+goal execution --目标提交组合记录满足开发验证与计划必需项--> verified
 verified --用户另行明确授权发布--> PR + archive
 ```
 

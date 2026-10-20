@@ -55,3 +55,7 @@ uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
 novarocks-connector-iceberg-functions.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

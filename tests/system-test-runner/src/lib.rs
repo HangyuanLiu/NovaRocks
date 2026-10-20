@@ -27,6 +27,7 @@ mod exact_native_admission;
 mod held_live_source_fence;
 mod runner;
 pub mod scenario;
+mod scenario_settlement;
 mod scenarios;
 
 pub fn run(build: build_information::BuildInformation) {

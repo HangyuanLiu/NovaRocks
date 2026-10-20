@@ -24,3 +24,7 @@ novarocks-type-contract.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

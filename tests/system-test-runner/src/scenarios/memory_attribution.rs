@@ -44,6 +44,15 @@ struct ObservationFamilies {
     intent: SqlIntentOwner,
 }
 impl Scenario for ObservationFamilies {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "memory_attribution",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "memory-attribution/observation-families"
     }

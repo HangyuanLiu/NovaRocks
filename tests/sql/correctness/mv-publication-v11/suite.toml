@@ -1,3 +1,12 @@
 # The REST service commit hook is an explicit native acceptance gate. It
 # requires the locally built test image and a private REST Catalog + MinIO.
 explicit_only = true
+heavy = { reason = "fixture", detail = "Builds the checked-in REST publication-hook image on provisioned base inputs; requires private REST and MinIO, native 1FE+3BE and serial execution." }
+
+[impact]
+paths = ["novarocks/frontend-application/src/mv/**", "tests/fixtures/iceberg-rest-publication/**", "docker/iceberg-rest/spark-sql.sh", "docker/iceberg-rest/spark-shell.sh"]
+
+[reuse]
+scope = "suite"
+# The fixture is private, but external Spark scripts and their environment are not fully bound by the current SQL input contract.
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

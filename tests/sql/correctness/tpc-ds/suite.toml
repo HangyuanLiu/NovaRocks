@@ -1,5 +1,13 @@
 explicit_only = true
+heavy = { reason = "dataset", detail = "Requires a READY scale 1GB TPC-DS dataset, native 1FE+3BE, serial execution and a clean performance launch." }
 
 [prepared_dataset]
 dataset = "tpc-ds"
 scale = "1GB"
+
+[impact]
+paths = ["novarocks/sql/**", "novarocks/execution/**"]
+
+[reuse]
+scope = "suite"
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

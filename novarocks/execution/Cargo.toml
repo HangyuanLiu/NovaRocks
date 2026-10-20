@@ -69,3 +69,7 @@ novarocks-connector-iceberg-functions.workspace = true
 novarocks-plan-codec = { workspace = true }
 novarocks-sql = { workspace = true }
 novarocks-parser.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = [{ name = "UEA5E_TIME_OWNERS_DISABLED", kind = "value" },{ name = "C16_PARENT_SCAN", kind = "file-content" }]

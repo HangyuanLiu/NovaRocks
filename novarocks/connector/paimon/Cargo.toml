@@ -55,3 +55,7 @@ tempfile.workspace = true
 [build-dependencies]
 prost-build.workspace = true
 protoc-bin-vendored.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

@@ -19,7 +19,45 @@ under the License.
 
 # 测试准入、尝试材料与证据边界
 
-开发规则由 [workflow-contract](../../../.agents/skills/workbench/skills/workbench/references/workflow-contract.md) §8.5–§8.7 定义；本指南落实 NovaRocks 的位置、操作责任和现有报告解释，不建立第二套运行协议或结果 schema。新资产及实质扩展从规则合入起消费合同；存量按领域迁移，文件存在或一次通过不表示已经合规。当前阶段仅维护功能和数据正确性；SQL 原生入口仅发现 correctness suite，旧常设测量载体已退出。
+开发规则由 [workflow-contract](../../../.agents/skills/workbench/skills/workbench/references/workflow-contract.md) §8.5–§8.8 定义；本指南落实 NovaRocks 的位置、操作责任和现有报告解释，不建立第二套运行协议或结果 schema。新资产及实质扩展从规则合入起消费合同；存量按领域迁移，文件存在或一次通过不表示已经合规。当前阶段仅维护功能和数据正确性；SQL 原生入口仅发现 correctness suite，旧常设测量载体已退出。
+
+## 三层验证与证据组合
+
+| 层 | 必需集合与来源 | 结论边界 |
+|---|---|---|
+| 开发阶段 | 影响图选中的原生单元及必需模式；本轮执行或合格的本地/正式同输入来源 | 改动相关部分已验证；其余常规项明确延后给准入，重项履行作者义务或写明理由 |
+| PR 准入 | 实际合入提交的全部常规单元及其必需模式，含具名静态阶段；本轮正式执行或正式同输入来源 | 常规功能正确性通过；不以影响图减少集合 |
+| 合入后全量 | 全部未暂停单元及全部必需模式，仅认本轮执行 | 登记新失败、仍失败、最近一次通过但未关闭、已关闭与未运行；不阻断合入 |
+
+G15 交付集合派生、证据组合和续跑规则；G17 负责正式运行的信任边界、合入队列/门禁、准入预算与全量调度、登记存储和展示。`local-full-ci.sh` 是本地完整入口，`dev-verify.sh compose --layer admission` 仅作本地准入演练；运行 wrapper、干净 commit、文件名或 `.formal` 进程登记上下文均不能自行将材料升级为正式来源。它们也不证明实际合入的提交已验证。
+
+组合记录把五件事分开：来源是本轮还是历史；原始结果是通过、失败、未知、取消还是未运行；记录/单元/共享清理/整个尝试分别完成到哪一级；输入与验证义务是否适用；本层如何处置。`complete=true` 不等于通过，整个尝试未完成也不必抹掉其中已收束的独立范围。旧材料与所有反例保留，组合只写派生记录。
+
+复用要求声明完整的输入和初始状态合同，开始/结束确认输入稳定，实际执行本单元的默认断言、正确模式与独立 oracle，且同一复用范围的生命周期与必要清理完成。源码 SHA、成功退出、suite 名或一个 hash 不能代替这些事实。SQL 当前默认复用范围是整个 suite；缺少 `isolated/reset/immutable` 初始状态声明时不能沿用历史结果，也不能因只改一个文件就在开发入口拆成 `--only`。同身份一败一过是“不一致”，不能写成已修复。取消后有合格完整执行可补覆盖，但旧取消及未确认清理义务仍保留。
+
+层级与排除状态相互独立。常规项进入准入，重项在全量中运行；重的依据必须是额外程序、fixture、大数据集、nightly 工具链等准入环境外前置，或实测超出准入预算。暂停项由原生 DISABLED/paused 声明排除所有层，保留原因与 owner；不稳定项由处置记录退出准入判定，全量仍运行；已知失败只处置已诊断的具体失败，不删除执行义务。
+
+[dispositions.json](../../../tools/ci/baselines/dispositions.json) 是处置来源。`known_failures` 仅接受 default SQL case，必须有 reason、owner、expires；特征为准确错误码，或语句序号加 actual 摘要的结果 mismatch。Rust 断言、超时、suite 初始化/加载失败、取消、未知、未运行、未执行验证和清理违约不可作为已知失败豁免。`quarantine` 必须有 reason、owner、exit_condition、review_by；过期失效。通过后提示陈旧处置，不自动删除记录或关闭问题。
+
+全量失败只按具体身份、输入、失败特征与来源登记。一次通过更新“最近一次通过但未关闭”；关闭还需关联修复与符合要求的复验。G15 的登记派生接口不创建共享问题库，也不自动关闭或修复任何问题。
+
+## 影响声明、发现与开发入口
+
+Rust 从 Cargo 归属和原生 nextest `rdeps()` 选择，不另造依赖图；运行输入与环境声明在 package metadata，ignored 项区分内部 helper 与需要作者履行的 heavy 测试。SQL 的 `--list-declarations` 是 suite impact、环境输入、reuse 与 explicit-only 的单一来源，[suite map](../../../tests/sql/correctness/README.md) 由其生成。System 同名原生列举给出 default/explicit/compatibility/paused、impact、环境输入、初始状态及重项依据。具名静态检查与 Loom/Miri 保留 owner 的独立 stage 和模式。
+
+影响图只用于开发阶段。未覆盖路径产生可见缺口：可界定 owner 时扩大到该领域及其重项，无法界定时广覆盖；共享类型、wire、持久格式和跨模块公共合同先扩大到已知受影响领域。修补映射，不能长期依赖扩大。重项由作者合入前本地运行或手动派发到 G16，结果或跳过理由写入 PR 验证记录；准入不检查这份作者记录。明确获批的 plan 必跑项仍必须执行。
+
+```bash
+# These commands prepare the canonical graph unless --prepared names validated inputs.
+tools/ci/dev-verify.sh plan --base origin/main --root /absolute/local/task-evidence
+tools/ci/dev-verify.sh run --base origin/main --root /absolute/local/task-evidence
+tools/ci/dev-verify.sh resume --base origin/main --root /absolute/local/task-evidence
+tools/ci/dev-verify.sh compose --base origin/main --root /absolute/local/task-evidence
+```
+
+根保存多个独占 attempt 和 composition；`resume` 重新读取当前声明与输入，重跑不满足或仍有清理义务的范围，不修改旧尝试。开发层保留逐项 Rust 测试与 workspace doctest 义务，原生工作区聚合阶段明确延后到 admission，准入/全量仍要求该阶段；聚合原始失败与未关闭清理事实继续可见。仅当整个待运行目标集合只剩 doctest 时，允许一次正常 native batch 附带重跑一个同身份、已满足的常规 nextest 单元；执行前记录具名例外、重复范围、精确筛选和输出引用，缺少合格单元则保留未运行。重复运行的新失败和旧清理未知照常阻断，不循环重试。首次先读 `plan` 的理由与缺口，使用真实 fixture publication/数据集前置。原生发现/声明校验、材料路径、只观察的 `confirm-cleanup` 和已知入口限制见 [CI README](../../../tools/ci/README.md#development-selection-and-evidence-composition)。基础 Rust 图、原生结果和进程回收的边界见下文[构建选择与控制授权](#构建选择与控制授权)。
+
+新增不随进程退出消失的外部资源 owner，必须在首个副作用前登记，并在所有 shutdown/失败路径写出释放或清理失败；失去 owner、坏记录与未收束保留未完成。登记不是删除权限，复跑不能代替确认旧资源退出。具体 API、现有 binding-only 场景的 G5 缺口见 [System README](../../../tests/system-test-runner/README.md#声明与收束材料)。
 
 ## 准入与领域迁移
 
@@ -98,7 +136,7 @@ PY_CREATE
 | 写出端/材料 | 当前能表达的事实 | 尚不能由它单独证明、后续责任 |
 |---|---|---|
 | system [scenario.rs `write_evidence`](../../../tests/system-test-runner/src/scenario.rs) → 场景根 `scenario-evidence.json` | `scenario`、`command`、开始/结束时间、`source_revision/source_dirty/source_tree_sha256`、runner identity/路径、Cargo.lock hash、平台、`actions/phase_observations`、runtime/binary/config 路径及 config hash、`cluster_size`、`launch_profile`、进程 launch identities、有效配置及 hash、`outcome/exit_code`、失败 diagnostics；当前 schema 5 | `launch_profile` 是 harness 的 `fault-scenario/performance` 配置，不是 Cargo profile。binary 路径与 runner identity 不证明各 FE/BE 实际能力；实际 role-build-information 单独保留。字段不保证每个阶段均被观察或此次已运行，各领域仍须提供性质/退出观察。 |
-| system [runner.rs `run_one`](../../../tests/system-test-runner/src/runner.rs) → stdout/stderr、场景 evidence 与 runtime/log 根 | 选择由 registry/`--only` 决定；失败保留材料、动作、诊断和 rerun 命令。正常路径先检查 cluster shutdown 与 fixture teardown，追加 cleanup action，再写 Passed；失败路径先写 Failed，随后处理 cleanup 错误 | evidence 的 `exit_code` 按 outcome 合成 0/1，不是每个子进程退出码。Failed 写出时尚未完成 cleanup；cleanup 出错或启动失败可能缺最终 evidence，须保留 runner 原始错误与实际退出事实。打印的旧 rerun 根不能直接复用，复跑换新根。现有 G6b/领域链路承接隔离与终态缺口。 |
+| system [runner.rs `run_one`](../../../tests/system-test-runner/src/runner.rs) → stdout/stderr、场景 evidence 与 runtime/log 根 | 选择由 registry/`--only` 决定；失败保留材料、动作、诊断和 rerun 命令。正常路径先检查 cluster shutdown 与 fixture teardown，追加 cleanup action，再写 Passed；失败路径先写 Failed，随后处理 cleanup 错误 | evidence 的 `exit_code` 按 outcome 合成 0/1，不是每个子进程退出码。schema 5 的 Failed 可能先于 cleanup 写出，不能单独证明收束；另读 schema 1 `scenario-teardown.json` 的 fixture/cluster 终态与资源登记。缺收束记录保持未知；部分 cluster 启动由对应 monitor 事实补足。打印的旧 rerun 根不能直接复用，复跑换新根。 |
 | CI [logging.sh `ci_render_summary`](../../../tools/ci/lib/logging.sh) → `CI_SUMMARY` | 外层传入的 Status、开始/结束/耗时、Repo/Branch/Commit/Run dir、runtime/SQL config 与 MySQL port；stage、system scenario、SQL suite/case rows 的原生 status/耗时/log/artifact；可选 blocked、SQL failure classification、failure tail | summary 是外层记录的汇总，未写入的行不能补为通过；Commit 不等于二进制来源或能力，config 路径不证明有效配置。状态不代替实际进程退出/清理日志、不可变判据引用或共享保留。G2 补构建事实；实际 CI/领域 owner 与 G6b 保留运行边界；共享历史服务尚未交付。 |
 
 Native build identity 的来源在薄 CLI build.rs 冻结并注入 Version，不是能力或发布认证。实际产物的 `--build-info` 由 [Server build_information](../../../novarocks-server/library/src/build_information.rs) 与两 runner 各自写出；owner 能力来自实际 crate 的编译事实，binary 的 `actual_cfg` 与 build-script 的 package 局部事实分列。未声明 profile、不可观测的最终 LTO/codegen/dependency overrides/额外 flags 保留 null/unknown；不能从源码 HEAD、target 路径、文件名、identity 或 runner profile 补造。`release_certification` 明确为 `not-certified-by-self-report`，字段存在不证明 G2 全部验收通过。
@@ -142,7 +180,7 @@ Hadoop local fencing 保留普通原生测试，内部 child helper 为 ignored 
 
 `local-full-ci.sh` 只运行原生 `--list-default` 集合，排除所有 `native-compatibility/*` 与其它显式专项；默认结果仅覆盖功能集合，不声称所有注册场景通过，也不准备兼容变体。`tools/ci/native-compatibility-ci.sh` 是独立入口：不传 selector 运行完整兼容集合，重复 `--only <exact>` 运行精确子集；未知、跨套件或空 selector 在 fixture/变体准备前失败。专项只准备和执行自己的程序/场景，不顺带运行 Rust/SQL/普通 System 全量。[手动 workflow](../../../.github/workflows/native-compatibility.yml) 调用同一入口。
 
-身份兼容材料或比较、角色身份传播与准入/切换，或专项的构建、绑定、选择、授权接线发生实现/合同变更时，维护者按影响面选择兼容场景并记录理由；用户或 reviewer 显式要求时也运行。普通业务改动、普通提交仅更新 Git SHA/诊断 identity、来源刷新或重新编译不自动触发。场景性质、完整生命周期程序与 fixture 需求由 [System README](../../../tests/system-test-runner/README.md#兼容专项与程序需求) 说明，shell 只消费原生需求并集。G15 维护统一选择策略，G6b 在容量和前置就绪后消费同一入口安排低频完整运行；本入口没有 schedule、自动 diff 选择器或每个 PR 强制专项。
+身份兼容材料或比较、角色身份传播与准入/切换，或专项的构建、绑定、选择、授权接线发生实现/合同变更时，维护者按影响面选择兼容场景并记录理由；用户或 reviewer 显式要求时也运行。普通业务改动、普通提交仅更新 Git SHA/诊断 identity、来源刷新或重新编译不自动触发。场景性质、完整生命周期程序与 fixture 需求由 [System README](../../../tests/system-test-runner/README.md#兼容专项与程序需求) 说明，shell 只消费原生需求并集。原生场景声明和统一影响选择承接这些触发，开发阶段选中的重场景保留作者义务；G17 在容量和前置就绪后安排全量。独立兼容入口仍不自带 schedule 或 diff 选择，也不要求每个 PR 运行专项。
 
 Compatible 使用主 workspace/tests/bins/dev 图，仅改变薄 Server CLI 的诊断 identity；OtherIsland 默认仅准备 Server binary 和必要 compatibility feature，P05 的原始观察决定是否调整选包，不能凭路径推断成本。两个变体串行复用主 target，各从 Cargo artifact 独立复制到 `target/variants/{compatible,other-island}/novarocks`，只保留最终程序与绑定材料；不用硬链接/软链接、不克隆 Cargo cache。准备后恢复主输入并刷新主图，重新绑定主程序、自报和 hash 后才启动消费者。原始准备失败优先保留，恢复失败另列，不覆盖原退出。
 
@@ -191,7 +229,7 @@ IDE 默认 Cargo/libtest 单例按钮仍可局部调试，并获得库级 monito
 | MV/OPTIMIZE | SQL correctness 的具体 case | publication/maintenance 改动必跑，沿既有 suite |
 | SSB/TPC-H/TPC-DS | 原生 SQL 三套 `explicit_only`；高成本 | runner/输入绑定改动必跑三套；领域 SQL 按相关性选择，每周手工完整数据集轮次 |
 
-这些周期是维护责任，尚无自动调度；没有真实运行就不记录周期通过。完整发现与默认执行分别由 `--list/--list-default`（system）和 `--list-suites`/suite manifest（SQL）定义。`performance` launch profile 只选择干净的原生 harness 配置，支持 release binary 并拒绝 fault 注入，不是性能实验。相关指南见 [system](../../../tests/system-test-runner/README.md) 与 [SQL](../../../tests/sql/README.md)。
+这些周期是手工维护责任，G17 的正式全量调度尚未交付；没有真实运行就不记录周期通过。触发由原生 impact 声明维护，本表说明成本与责任，不是第二份选择清单。完整发现与默认执行分别由 `--list/--list-default`（system）和 `--list-suites`/suite manifest（SQL）定义；机器选择均消费 `--list-declarations`。`performance` launch profile 只选择干净的原生 harness 配置，支持 release binary 并拒绝 fault 注入，不是性能实验。相关指南见 [system](../../../tests/system-test-runner/README.md) 与 [SQL](../../../tests/sql/README.md)。
 
 SSB/TPC 输入 owner 显式供给 READY，消费者仅 check，不在失败后自动 ensure。SQL 正常成功、语句错误、结果 mismatch 和清理失败分别保留原生返回值、case/expected/actual/diff、FE/BE 日志和实际退出；耗时只作普通运行说明，不转成测量 CSV 或比较门。FE preparation 运行级路由和计时钩子退出，独立鉴权的 statement observation 保留功能消费者；这不表示 G2 发布能力门控完成。
 

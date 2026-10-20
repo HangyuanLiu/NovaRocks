@@ -114,3 +114,7 @@ arrow-schema.workspace = true
 mysql.workspace = true
 novarocks-test-support.workspace = true
 tempfile.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = ["target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
+env-inputs = [{ name = "NOVAROCKS_CONFIG", kind = "file-content" },{ name = "NOVAROCKS_NWT1_ENV_REFERENCE_CONFIG", kind = "file-content" },{ name = "NOVAROCKS_NWT1_ENV_REFERENCE_SCENARIO", kind = "value" },{ name = "NOVAROCKS_NWT1_ACCESS_KEY", kind = "value" },{ name = "NOVAROCKS_NWT1_ACCESS_SECRET", kind = "value" }]
