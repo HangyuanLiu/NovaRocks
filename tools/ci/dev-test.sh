@@ -24,6 +24,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/lib/build_capabilities.sh"
 cd "$REPO_ROOT"
 ci_validate_build_environment
+ci_set_default_build_jobs
 action="${1:-test}"
 [ "$#" -eq 0 ] || shift
 case "$action" in
