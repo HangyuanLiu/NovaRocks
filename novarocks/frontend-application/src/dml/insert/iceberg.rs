@@ -192,7 +192,10 @@ mod runtime_identity_tests {
             assert_eq!(error.engine_error_code(), None);
             assert_eq!(
                 error.to_string(),
-                "Executor: native attempt initialization failed in its owning domain",
+                format!(
+                    "Executor: native attempt initialization failed in its owning domain (reason {})",
+                    expected.reason(),
+                ),
             );
         }
     }

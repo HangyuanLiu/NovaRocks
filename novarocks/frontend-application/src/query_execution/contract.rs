@@ -692,9 +692,10 @@ impl DistributedQueryError {
         use novarocks_failure_contract::FailureProjection;
         let input = novarocks_query_application::execution_error::ExecutionFailureInput::new(
             source.failure_fact(),
-            novarocks_execution_contract::SafeDetail::truncating(
-                "native attempt initialization failed in its owning domain",
-            ),
+            novarocks_execution_contract::SafeDetail::truncating_display(format_args!(
+                "native attempt initialization failed in its owning domain (reason {})",
+                source.failure_fact().reason(),
+            )),
             novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
         );
         let mut error = Self::from_execution(input);
@@ -879,7 +880,10 @@ impl DistributedQueryError {
         if let Some(source) = self.domain_source {
             return ExecutionFailureInput::new(
                 source.failure_fact(),
-                SafeDetail::truncating("native attempt initialization failed in its owning domain"),
+                SafeDetail::truncating_display(format_args!(
+                    "native attempt initialization failed in its owning domain (reason {})",
+                    source.failure_fact().reason(),
+                )),
                 site,
             );
         }
@@ -1509,6 +1513,59 @@ mod typed_compile_source_tests {
         FailureClass, FailureProjection, SharedFailureCause,
     };
     use std::error::Error;
+    #[test]
+    fn source_safe_detail_keeps_distinct_dependency_reasons_without_rendering_private_source() {
+        use novarocks_query_application::execution_error::ExecutionFailureSite;
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+        // Identical private text (including a misleading reason) cannot decide
+        // which source-authored fact reaches the public boundary.
+        let private =
+            "private-provider-locator (reason 4:8); Variant history may be related ".repeat(32);
+        for (kind, reason) in [
+            (ConnectorErrorKind::Unavailable, 8),
+            (ConnectorErrorKind::PermissionDenied, 3),
+            (ConnectorErrorKind::NotFound, 2),
+        ] {
+            let source = SharedFailureCause::new(ConnectorError::new(kind, private.clone()));
+            let original_fact = source.failure_fact();
+            let failure = DistributedQueryError::from_source(
+                DistributedQueryErrorKind::Failed,
+                source.clone(),
+            );
+            let carried = failure
+                .source()
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            assert_eq!(carried, &source);
+            assert_eq!(failure.compile_control_error(), None);
+            assert_eq!(failure.pre_ready_topology_outcome(), None);
+            assert!(!failure.requires_pre_ready_topology_observation());
+            let input = failure.into_execution_failure_input();
+            assert_eq!(input.fact(), original_fact);
+            assert_eq!(input.fact().class(), FailureClass::Dependency);
+            assert_eq!(input.fact().reason().domain(), 4);
+            assert_eq!(input.fact().reason().code(), reason);
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                input.detail().as_str(),
+                format!(
+                    "native attempt initialization failed in its owning domain (reason 4:{reason})"
+                )
+            );
+            assert!(
+                input.detail().as_str().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
+            );
+            let public = input.user_error();
+            assert_eq!(public.code().as_str(), "query.execution.dependency");
+            assert_eq!(public.message(), input.detail().as_str());
+            assert!(!public.to_string().contains("private-provider-locator"));
+            assert!(!public.to_string().contains("Variant"));
+            assert_eq!(public.message().contains("(reason 4:8)"), reason == 8);
+        }
+    }
+
     #[test]
     fn typed_compile_source_remains_original_without_forging_control_or_retry_proof() {
         let source = SharedFailureCause::new(novarocks_functions::ConstantError::Limit(

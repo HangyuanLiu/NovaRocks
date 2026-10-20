@@ -701,7 +701,7 @@ mod tests {
         assert_eq!(input.fact(), fact);
         assert_eq!(
             input.detail().as_str(),
-            "native attempt initialization failed in its owning domain"
+            "native attempt initialization failed in its owning domain (reason 4:8)"
         );
         let public = input.user_error();
         assert_eq!(public.code().as_str(), "query.execution.dependency");
