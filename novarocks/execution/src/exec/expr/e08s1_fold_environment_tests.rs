@@ -17,10 +17,7 @@
 //! Permanent same original fold-parent frontier, independent of Task submission.
 use super::e08s1_fold_environment_original_tests::optimize;
 use super::sql_scalar_presence_original_tests::{SERIAL, fold_count, reset};
-use novarocks_sql::{
-    analyze_error::AnalyzeErrorKind,
-    compiler::{SqlCompileError, SqlPhysicalEmissionMode},
-};
+use novarocks_sql::{analyze_error::AnalyzeErrorKind, compiler::SqlCompileError};
 #[test]
 fn e08s1_fold_environment_exact_missing_authors_refuse_parent_before_children() {
     let _serial = SERIAL.lock().unwrap();
@@ -35,12 +32,7 @@ fn e08s1_fold_environment_exact_missing_authors_refuse_parent_before_children() 
         ),
     ] {
         reset();
-        let error = optimize(
-            sql,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            None,
-        )
-        .unwrap_err();
+        let error = optimize(sql, None).unwrap_err();
         let SqlCompileError::Analyze(error) = error else {
             panic!("expected typed Unavailable: {error:?}")
         };
@@ -61,12 +53,7 @@ fn e08s1_fold_environment_exact_original_concat_raw_limits_keep_child_fold() {
     let _serial = SERIAL.lock().unwrap();
     for raw in [-1, 4096] {
         reset();
-        optimize(
-            "SELECT GROUP_CONCAT(REVERSE('abc'))",
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            Some(raw),
-        )
-        .unwrap();
+        optimize("SELECT GROUP_CONCAT(REVERSE('abc'))", Some(raw)).unwrap();
         assert!(
             fold_count() > 0,
             "the original raw limit has a genuine author"

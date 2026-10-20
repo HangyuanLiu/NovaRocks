@@ -55,7 +55,8 @@ use novarocks_spi::connector::write_stack::{
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
-use crate::exec::node::table_finish::TableFinishNode;
+#[cfg(test)]
+use crate::exec::node::table_finish::FinishFixture;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_aggregate::{
     WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
@@ -74,7 +75,8 @@ use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
-use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
+#[cfg(test)]
+use crate::exec::operators::unpivot_processor::UnpivotFixtureFactory;
 use crate::exec::pipeline::operator::{
     FinishWatch, InputConstructionFactory, Operator, ProcessorOperator, forward_observable,
 };
@@ -149,6 +151,7 @@ impl FinishStatisticsCoverage {
         }
     }
 
+    #[cfg(test)]
     fn from_plan(plan: &WriterFinalAggregatePlan) -> Self {
         Self {
             calls: match &plan.prepared {
@@ -218,7 +221,8 @@ pub(crate) trait GroupedUnpivotSource: Send {
 /// Construction state only; type meaning remains in the frozen template.
 #[derive(Clone)]
 enum RootSchemaPreparation {
-    Legacy(RootWriteResultRelationSchema),
+    #[cfg(test)]
+    Fixture(RootWriteResultRelationSchema),
     Compiled {
         template: RootWriteResultRelationTemplate,
         prepared: Option<RootWriteResultRelationSchema>,
@@ -232,7 +236,8 @@ impl RootSchemaPreparation {
 
     fn prepared(&self) -> Option<&RootWriteResultRelationSchema> {
         match self {
-            Self::Legacy(schema) => Some(schema),
+            #[cfg(test)]
+            Self::Fixture(schema) => Some(schema),
             Self::Compiled { prepared, .. } => prepared.as_ref(),
         }
     }
@@ -263,11 +268,13 @@ pub struct TableFinishOperatorFactory {
     root_schema: RootSchemaPreparation,
     /// The plan-tree statistics, built from the process function set and
     /// `arena` when `statistics` is absent.
+    #[cfg(test)]
     final_plan: WriterFinalAggregatePlan,
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    #[cfg(test)]
     arena: Arc<ExprArena>,
 }
 
@@ -276,14 +283,15 @@ impl TableFinishOperatorFactory {
         clippy::too_many_arguments,
         reason = "A local finish joins frozen relation facts and exact Task validation capability"
     )]
+    #[cfg(test)]
     pub(crate) fn new_local(
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
         writer_schema: WriterMultiplexRelationTemplate,
         root_schema: RootWriteResultRelationTemplate,
-        final_plan: WriterFinalAggregatePlan,
+        #[cfg(test)] final_plan: WriterFinalAggregatePlan,
         binding: &TableFinishRuntimeBinding,
-        arena: Arc<ExprArena>,
+        #[cfg(test)] arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
         Self::new_core(
             node_id,
@@ -293,8 +301,10 @@ impl TableFinishOperatorFactory {
                 template: root_schema,
                 prepared: None,
             },
+            #[cfg(test)]
             final_plan,
             binding,
+            #[cfg(test)]
             arena,
         )
     }
@@ -308,9 +318,9 @@ impl TableFinishOperatorFactory {
         expected_targets: Vec<WriteTargetOrdinal>,
         writer_schema: WriterRelationPreparation,
         root_schema: RootSchemaPreparation,
-        final_plan: WriterFinalAggregatePlan,
+        #[cfg(test)] final_plan: WriterFinalAggregatePlan,
         binding: &TableFinishRuntimeBinding,
-        arena: Arc<ExprArena>,
+        #[cfg(test)] arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
         novarocks_spi::connector::write_stack::validate_query_target_ordinals(&expected_targets)
             .map_err(|error| error.to_string())?;
@@ -319,17 +329,23 @@ impl TableFinishOperatorFactory {
         } else {
             "TABLE_FINISH".to_string()
         };
+        #[cfg(test)]
+        let coverage = FinishStatisticsCoverage::from_plan(&final_plan);
+        #[cfg(not(test))]
+        let coverage = FinishStatisticsCoverage::default();
         Ok(Self {
             name,
             expected_targets: Arc::new(expected_targets),
             fragment_validator: Arc::clone(&binding.fragment_validator),
             writer_schema,
             root_schema,
-            coverage: FinishStatisticsCoverage::from_plan(&final_plan),
+            coverage,
+            #[cfg(test)]
             final_plan,
             statistics: None,
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::clone(&binding.aggregate_guard),
+            #[cfg(test)]
             arena,
         })
     }
@@ -354,8 +370,10 @@ impl TableFinishOperatorFactory {
                 template: root_template,
                 prepared: None,
             },
+            #[cfg(test)]
             WriterFinalAggregatePlan::default(),
             binding,
+            #[cfg(test)]
             Arc::new(ExprArena::default()),
         )?;
         if let Some((coverage, statistics)) = statistics {
@@ -367,7 +385,8 @@ impl TableFinishOperatorFactory {
 
     /// Construct the NCP-8 composite with the same immutable expression arena
     /// that decoded the generic Unpivot constants.
-    pub fn new_with_arena(node: &TableFinishNode, arena: Arc<ExprArena>) -> Self {
+    #[cfg(test)]
+    fn for_test_fixture(node: &FinishFixture, arena: Arc<ExprArena>) -> Self {
         let name = if node.node_id >= 0 {
             format!("TABLE_FINISH (id={})", node.node_id)
         } else {
@@ -380,12 +399,13 @@ impl TableFinishOperatorFactory {
             writer_schema: WriterRelationPreparation::Existing(
                 node.writer_multiplex_schema().clone(),
             ),
-            root_schema: RootSchemaPreparation::Legacy(node.root_result_schema().clone()),
+            root_schema: RootSchemaPreparation::Fixture(node.root_result_schema().clone()),
             final_plan: node.final_aggregate_plan().clone(),
             coverage: FinishStatisticsCoverage::from_plan(node.final_aggregate_plan()),
             statistics: None,
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::clone(node.aggregate_guard()),
+            #[cfg(test)]
             arena,
         }
     }
@@ -408,6 +428,7 @@ impl TableFinishOperatorFactory {
             fragment_validator: Arc::clone(&self.fragment_validator),
             writer_schema: self.writer_schema.clone(),
             root_schema: self.root_schema.clone(),
+            #[cfg(test)]
             final_plan: self.final_plan.clone(),
             coverage: self.coverage.clone(),
             statistics: self.statistics.clone(),
@@ -425,6 +446,7 @@ impl TableFinishOperatorFactory {
                         .position(|(input, _)| input == *slot)
                 })
                 .collect(),
+            #[cfg(test)]
             arena: Arc::clone(&self.arena),
             parallelism_error,
             rows: WriteRowCountAccumulator::new(),
@@ -694,12 +716,14 @@ struct TableFinishOperator {
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     writer_schema: WriterRelationPreparation,
     root_schema: RootSchemaPreparation,
+    #[cfg(test)]
     final_plan: WriterFinalAggregatePlan,
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     channel_to_call: Vec<Option<usize>>,
+    #[cfg(test)]
     arena: Arc<ExprArena>,
     parallelism_error: Option<String>,
     rows: WriteRowCountAccumulator,
@@ -994,6 +1018,7 @@ impl TableFinishOperator {
                         crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                     )?),
                 )?,
+                #[cfg(test)]
                 None if self.final_plan.prepared.is_some() => {
                     let factory = Arc::clone(self.construction.as_ref().ok_or(
                         crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
@@ -1013,12 +1038,14 @@ impl TableFinishOperator {
                         state.error_state(),
                     )?
                 }
+                #[cfg(test)]
                 None => {
                     let arena = Arc::clone(&self.arena);
                     let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
                         "table finish final aggregate is missing grouped Unpivot".to_string()
                     })?;
-                    Box::new(GroupedUnpivotDriver::try_new(
+                    Box::new(GroupedUnpivotFixture::try_new(
+                        #[cfg(test)]
                         arena,
                         self.construction.clone(),
                         plan,
@@ -1026,6 +1053,12 @@ impl TableFinishOperator {
                         final_chunk,
                         self.output_tracker.as_ref().map(Arc::clone),
                     )?)
+                }
+                #[cfg(not(test))]
+                None => {
+                    return Err(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
+                    );
                 }
             };
         driver.visit_targets(&mut |target| {
@@ -1100,6 +1133,7 @@ impl TableFinishOperator {
     }
 }
 
+#[cfg(test)]
 fn build_final_aggregate(
     plan: &WriterFinalAggregatePlan,
     arena: &Arc<ExprArena>,
@@ -1164,7 +1198,9 @@ fn build_final_aggregate(
     Ok(factory.create(1, 0))
 }
 
-struct GroupedUnpivotDriver {
+#[cfg(test)]
+struct GroupedUnpivotFixture {
+    #[cfg(test)]
     arena: Arc<ExprArena>,
     construction: Option<Arc<dyn InputConstructionFactory>>,
     plan: WriterGroupedUnpivotPlan,
@@ -1178,9 +1214,10 @@ struct GroupedUnpivotDriver {
     source_observable: Arc<Observable>,
 }
 
-impl GroupedUnpivotDriver {
+#[cfg(test)]
+impl GroupedUnpivotFixture {
     fn try_new(
-        arena: Arc<ExprArena>,
+        #[cfg(test)] arena: Arc<ExprArena>,
         construction: Option<Arc<dyn InputConstructionFactory>>,
         plan: WriterGroupedUnpivotPlan,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
@@ -1232,6 +1269,7 @@ impl GroupedUnpivotDriver {
             }
         }
         Ok(Self {
+            #[cfg(test)]
             arena,
             construction,
             plan,
@@ -1323,7 +1361,7 @@ impl GroupedUnpivotDriver {
                 constants: mapping.constants.clone(),
             })
             .collect();
-        let factory = UnpivotProcessorFactory::new(
+        let factory = UnpivotFixtureFactory::new(
             -1,
             Arc::clone(&self.arena),
             vec![UnpivotPassthroughColumn {
@@ -1382,13 +1420,14 @@ impl GroupedUnpivotDriver {
     }
 }
 
-impl GroupedUnpivotSource for GroupedUnpivotDriver {
+#[cfg(test)]
+impl GroupedUnpivotSource for GroupedUnpivotFixture {
     fn targets(&self) -> Vec<u32> {
         self.rows.iter().map(|(target, _)| *target).collect()
     }
 
     fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        GroupedUnpivotDriver::pull(self, state)
+        GroupedUnpivotFixture::pull(self, state)
     }
 
     fn is_finished(&self) -> bool {
@@ -1796,6 +1835,7 @@ impl Operator for TableFinishOperator {
                     .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
                     .as_ref(),
             )?,
+            #[cfg(test)]
             None if self.final_plan.prepared.is_some() => {
                 let factory = self
                     .construction
@@ -1836,11 +1876,13 @@ impl Operator for TableFinishOperator {
                     owner.as_ref(),
                 )?
             }
+            #[cfg(test)]
             None if self.writer_schema.is_compiled() => {
                 return Err(
                     crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
                 );
             }
+            #[cfg(test)]
             None => {
                 // Explicit legacy expansion fixture route; production prepared
                 // relations never resolve a function name here.
@@ -1853,6 +1895,12 @@ impl Operator for TableFinishOperator {
                             .to_string()
                     })?;
                 build_final_aggregate(&self.final_plan, &arena, function_set, -1)?
+            }
+            #[cfg(not(test))]
+            None => {
+                return Err(
+                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
+                );
             }
         };
         if let Some(tracker) = self.mem_tracker.as_ref() {
@@ -2244,12 +2292,10 @@ mod tests {
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
     use super::*;
-    use crate::exec::node::ExecNode;
     use crate::exec::node::table_write_aggregate::{
         WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
         WriterGroupedUnpivotPlan,
     };
-    use crate::exec::node::values::ValuesNode;
     use crate::exec::operators::table_writer::tests::target;
     use crate::runtime::ExecutionRuntime;
     use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
@@ -2672,31 +2718,20 @@ mod tests {
         }
     }
 
-    /// One writer input. The finish node is n-ary, so tests build a `Vec`; the
-    /// operator's behaviour does not depend on how many inputs converge, only
-    /// on the rows that arrive.
-    fn values_input() -> Vec<ExecNode> {
-        vec![ExecNode {
-            kind: crate::exec::node::ExecNodeKind::Values(ValuesNode {
-                chunk: Chunk::default(),
-                node_id: 1,
-            }),
-        }]
-    }
-
-    fn finish_node(
+    fn finish_fixture(
         targets: usize,
         validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
-    ) -> TableFinishNode {
+    ) -> FinishFixture {
         let expected = (0..targets)
             .map(|value| target(u32::try_from(value).expect("bounded")))
             .collect();
-        TableFinishNode::try_new(values_input(), 3, expected, validator).expect("table finish node")
+        FinishFixture::try_new(3, expected, validator).expect("table finish node")
     }
 
     fn factory(targets: usize) -> TableFinishOperatorFactory {
-        TableFinishOperatorFactory::new_with_arena(
-            &finish_node(targets, Arc::new(AcceptEveryCarrier::default())),
+        TableFinishOperatorFactory::for_test_fixture(
+            &finish_fixture(targets, Arc::new(AcceptEveryCarrier::default())),
+            #[cfg(test)]
             Arc::new(ExprArena::default()),
         )
     }
@@ -2910,19 +2945,19 @@ mod tests {
         let expected = (0..target_count)
             .map(|index| target(u32::try_from(index).expect("target")))
             .collect();
-        let node = TableFinishNode::try_new_with_relations(
-            values_input(),
+        let node = FinishFixture::try_new_with_relations(
             3,
             expected,
             Arc::new(AcceptEveryCarrier::default()),
             writer_schema.clone(),
             root_schema,
+            #[cfg(test)]
             final_plan,
         )
         .expect("composite finish node");
         let state = composite_runtime_state(Arc::clone(&function_set), None);
         (
-            TableFinishOperatorFactory::new_with_arena(&node, Arc::new(arena)),
+            TableFinishOperatorFactory::for_test_fixture(&node, Arc::new(arena)),
             state,
             writer_schema,
         )
@@ -3215,9 +3250,9 @@ mod tests {
 
     #[test]
     fn table_finish_rejects_a_non_canonical_carrier_before_it_enters_the_set() {
-        let node = finish_node(1, Arc::new(RejectEveryCarrier));
+        let node = finish_fixture(1, Arc::new(RejectEveryCarrier));
         let factory =
-            TableFinishOperatorFactory::new_with_arena(&node, Arc::new(ExprArena::default()));
+            TableFinishOperatorFactory::for_test_fixture(&node, Arc::new(ExprArena::default()));
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
@@ -3546,19 +3581,13 @@ mod tests {
     }
 
     #[test]
-    fn table_finish_node_requires_a_non_empty_duplicate_free_target_set() {
+    fn table_finish_requires_a_non_empty_duplicate_free_target_set() {
         assert!(
-            TableFinishNode::try_new(
-                values_input(),
-                3,
-                Vec::new(),
-                Arc::new(AcceptEveryCarrier::default()),
-            )
-            .is_err()
+            FinishFixture::try_new(3, Vec::new(), Arc::new(AcceptEveryCarrier::default()),)
+                .is_err()
         );
         assert!(
-            TableFinishNode::try_new(
-                values_input(),
+            FinishFixture::try_new(
                 3,
                 vec![target(1), target(1)],
                 Arc::new(AcceptEveryCarrier::default()),
@@ -3574,13 +3603,9 @@ mod tests {
     /// to the session's sealed target set, not to any one query.
     #[test]
     fn table_finish_accepts_a_single_writer_query_at_a_non_zero_ordinal() {
-        let node = TableFinishNode::try_new(
-            values_input(),
-            3,
-            vec![target(2)],
-            Arc::new(AcceptEveryCarrier::default()),
-        )
-        .expect("a single-writer query at ordinal 2");
+        let node =
+            FinishFixture::try_new(3, vec![target(2)], Arc::new(AcceptEveryCarrier::default()))
+                .expect("a single-writer query at ordinal 2");
         assert!(node.accepts_target(target(2)));
         // Membership stays exact: a bound check would have admitted every
         // ordinal below the one this query actually feeds.
@@ -3588,7 +3613,7 @@ mod tests {
         assert!(!node.accepts_target(target(1)));
 
         let factory =
-            TableFinishOperatorFactory::new_with_arena(&node, Arc::new(ExprArena::default()));
+            TableFinishOperatorFactory::for_test_fixture(&node, Arc::new(ExprArena::default()));
         let mut operator = factory.create(1, 0);
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
@@ -3967,7 +3992,7 @@ mod tests {
         let (factory, _state, _writer_schema) = composite_fixture(1, 1, 8);
         let final_chunk =
             scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
-        let mut grouped = GroupedUnpivotDriver::try_new(
+        let mut grouped = GroupedUnpivotFixture::try_new(
             Arc::clone(&factory.arena),
             None,
             factory

@@ -85,6 +85,11 @@ class Dispositions:
         if reason in {"suite_init_failed", "load_failed", "aborted"}:
             return None
         failure = observation.failure
+        oracle = observation.detail.get("oracle")
+        if oracle is None:
+            oracle = observation.detail.get("raw", {}).get("oracle", {})
+        failed_oracles = [value for value in oracle.get("executed", [])
+                          if value.get("outcome") == "fail"]
         for unit, expected, expires, entry in self.known_failures:
             if unit != observation.unit or expires < self.today:
                 continue
@@ -95,6 +100,14 @@ class Dispositions:
                            and failure.get("statement_index", failure.get("statement")) == expected["statement"]
                            and failure.get("actual_digest") == expected["actual_digest"])
             if matched:
+                # A primary refusal never disposes an independently failed
+                # assertion. Only the registered result mismatch's own exact
+                # result oracle belongs to that same diagnosed failure.
+                if any(not (expected["class"] == "mismatch"
+                            and value.get("kind") == "result_set"
+                            and value.get("step") == expected["statement"])
+                       for value in failed_oracles):
+                    continue
                 return entry
         return None
 

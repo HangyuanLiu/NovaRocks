@@ -21,9 +21,7 @@ use novarocks_functions::{
     FunctionArgument, FunctionArgumentType, FunctionBindingError, FunctionResultType,
     FunctionValueType, PureCallLifecycle, ResolvedFunctionBinding,
 };
-use novarocks_sql::compiler::{
-    SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
-};
+use novarocks_sql::compiler::{SqlCompileControl, builtin_sql_function_catalog};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
 };
@@ -68,12 +66,9 @@ fn e08s1_string_batch_static_full_families_nullable_axes_and_original_dynamic_ca
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         for index in 0..3 {
-            for (_, binding) in calls(index, mode) {
+            for (_, binding) in calls(index) {
                 scoped
                     .admit_bound_lifecycle_observed(&binding, PureCallLifecycle::Scalar, &control)
                     .unwrap();

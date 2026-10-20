@@ -37,6 +37,7 @@ pub enum ExecutionEffect {
 pub enum AttemptFailureClass {
     RecoverableInfrastructure,
     ExecutionFailure,
+    Unsupported,
     ResourceGovernance,
     ContractViolation,
     Cancelled,
@@ -135,6 +136,17 @@ mod tests {
                 ..recoverable()
             }),
             RecoveryDecision::Refuse(RecoveryRefusal::ExternalEffect)
+        );
+    }
+
+    #[test]
+    fn unsupported_capability_never_restarts_a_remote_attempt() {
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                failure: AttemptFailureClass::Unsupported,
+                ..recoverable()
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::FailureClass)
         );
     }
 

@@ -10,9 +10,6 @@ workspace = true
 [lib]
 doctest = false
 
-[features]
-core-pipeline-integration = []
-
 [dependencies]
 novarocks-failpoint = { workspace = true }
 novarocks-result-contract.workspace = true

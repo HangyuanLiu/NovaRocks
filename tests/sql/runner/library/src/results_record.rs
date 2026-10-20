@@ -355,6 +355,7 @@ pub(crate) struct CaseEvidence {
     pub failure: Option<Value>,
     statement: Option<usize>,
     candidate_failure: Option<Value>,
+    cleanup_step: bool,
 }
 impl CaseEvidence {
     pub fn begin_step(&mut self, statement: usize, previous_failed: bool) {
@@ -363,23 +364,67 @@ impl CaseEvidence {
         }
         self.statement = Some(statement);
         self.candidate_failure = None;
+        self.cleanup_step = false;
     }
     pub fn begin_attempt(&mut self) {
         // Only the last unresolved retry can describe this statement's failure.
         self.candidate_failure = None;
     }
+    pub fn mark_cleanup_step(&mut self) {
+        self.cleanup_step = true;
+    }
     pub fn record_failure(&mut self, mut failure: Value) {
+        if self.cleanup_step {
+            failure["class"] = json!("error");
+            failure["cleanup"] = json!(true);
+        }
         if failure["class"] == "error_code" && failure["error_code"].is_null() {
             failure["class"] = json!("error");
         }
         self.candidate_failure = Some(failure);
     }
+    fn append_failure(&mut self, additional: Value) {
+        self.failure = Some(match self.failure.take() {
+            None => additional,
+            Some(mut primary) if primary.get("additional_failures").is_some() => {
+                primary["additional_failures"]
+                    .as_array_mut()
+                    .expect("failure diagnostics array")
+                    .push(additional);
+                primary
+            }
+            Some(primary) => json!({
+                "class":"error", "error_code":null, "statement_index":null,
+                "actual_digest":null, "primary_failure":primary,
+                "additional_failures":[additional]
+            }),
+        });
+    }
     fn freeze_failure(&mut self) {
-        if self.failure.is_none() {
-            self.failure = Some(self.candidate_failure.take().unwrap_or_else(|| {
-                json!({"class":"error","error_code":null,"statement_index":self.statement,"actual_digest":null})
-            }));
+        if let Some(candidate) = self.candidate_failure.take() {
+            self.append_failure(candidate);
+        } else if self.failure.is_none() {
+            self.failure = Some(json!({"class":"error","error_code":null,
+                "statement_index":self.statement,"actual_digest":null}));
         }
+    }
+    fn record_distinct_failure(&mut self, statement: Option<usize>, error: String, cleanup: bool) {
+        // Preserve unresolved statement facts before recording a distinct failure.
+        if self.candidate_failure.is_some() {
+            self.freeze_failure();
+        }
+        let mut failure = json!({"class":"error", "error_code":null,
+            "statement_index":statement,"actual_digest":null,"error":error});
+        if cleanup {
+            failure["cleanup"] = json!(true);
+        }
+        self.append_failure(failure);
+    }
+    pub fn record_independent_failure(&mut self, statement: Option<usize>, error: String) {
+        self.record_distinct_failure(statement, error, false);
+    }
+    pub fn record_case_cleanup_failure(&mut self, statement: Option<usize>, error: String) {
+        self.record_distinct_failure(statement, error, true);
     }
     pub fn finish_execution(&mut self, failed: bool) {
         if failed {
@@ -648,6 +693,92 @@ mod tests {
         assert_eq!(evidence.failure.unwrap()["class"], "error");
     }
     #[test]
+    fn independent_failure_keeps_both_facts_and_cannot_match_the_first_known_code() {
+        let mut evidence = CaseEvidence::default();
+        evidence.begin_step(1, false);
+        evidence.record_failure(
+            json!({"class":"error_code","error_code":"NR-KNOWN","statement_index":1}),
+        );
+        evidence.begin_step(2, true);
+        evidence.record_failure(
+            json!({"class":"error_code","error_code":"NR-NEW","statement_index":2}),
+        );
+        evidence.finish_execution(true);
+        evidence.finish_case(true);
+        let failure = evidence.failure.unwrap();
+        assert_eq!(failure["class"], "error");
+        assert_eq!(failure["error_code"], Value::Null);
+        assert_eq!(failure["primary_failure"]["error_code"], "NR-KNOWN");
+        assert_eq!(failure["additional_failures"].as_array().unwrap().len(), 1);
+        assert_eq!(failure["additional_failures"][0]["error_code"], "NR-NEW");
+    }
+    #[test]
+    fn case_cleanup_records_the_actual_error_after_a_known_primary_and_pending_failure() {
+        let mut evidence = CaseEvidence::default();
+        evidence.begin_step(1, false);
+        evidence.record_failure(
+            json!({"class":"error_code","error_code":"NR-KNOWN","statement_index":1}),
+        );
+        evidence.begin_step(2, true);
+        evidence.record_failure(
+            json!({"class":"mismatch","statement_index":2,"actual_digest":"changed"}),
+        );
+        evidence.record_case_cleanup_failure(None, "session close failed".into());
+        evidence.finish_execution(true);
+        evidence.finish_case(true);
+        let failure = evidence.failure.unwrap();
+        assert_eq!(failure["class"], "error");
+        assert_eq!(failure["primary_failure"]["error_code"], "NR-KNOWN");
+        let additional = failure["additional_failures"].as_array().unwrap();
+        assert_eq!(additional.len(), 2);
+        assert_eq!(additional[0]["actual_digest"], "changed");
+        assert_eq!(additional[1]["error"], "session close failed");
+        assert_eq!(additional[1]["cleanup"], true);
+        assert_eq!(additional[1]["statement_index"], Value::Null);
+    }
+    #[test]
+    fn independent_control_failure_preserves_primary_without_a_cleanup_label() {
+        let mut evidence = CaseEvidence::default();
+        evidence.begin_step(1, false);
+        evidence.record_failure(
+            json!({"class":"error_code","error_code":"NR-KNOWN","statement_index":1}),
+        );
+        evidence.record_independent_failure(Some(1), "control installation failed".into());
+        evidence.record_case_cleanup_failure(None, "session close failed".into());
+        evidence.finish_execution(true);
+        evidence.finish_case(true);
+        let failure = evidence.failure.unwrap();
+        assert_eq!(failure["class"], "error");
+        assert_eq!(failure["primary_failure"]["error_code"], "NR-KNOWN");
+        let additional = failure["additional_failures"].as_array().unwrap();
+        assert_eq!(additional.len(), 2);
+        assert_eq!(additional[0]["class"], "error");
+        assert_eq!(additional[0]["error"], "control installation failed");
+        assert_eq!(additional[0]["statement_index"], 1);
+        assert!(additional[0].get("cleanup").is_none());
+        assert_eq!(additional[1]["error"], "session close failed");
+        assert_eq!(additional[1]["cleanup"], true);
+    }
+    #[test]
+    fn cleanup_marker_is_per_step_and_cleanup_only_codes_are_diagnostic() {
+        let mut evidence = CaseEvidence::default();
+        evidence.begin_step(1, false);
+        evidence.mark_cleanup_step();
+        evidence.record_failure(json!({"class":"error_code","error_code":"NR-CLEANUP"}));
+        evidence.finish_execution(true);
+        assert_eq!(evidence.failure.as_ref().unwrap()["class"], "error");
+        assert_eq!(
+            evidence.failure.as_ref().unwrap()["error_code"],
+            "NR-CLEANUP"
+        );
+        evidence.begin_step(2, false);
+        evidence.record_failure(json!({"class":"error_code","error_code":"NR-LATER"}));
+        assert_eq!(
+            evidence.candidate_failure.as_ref().unwrap()["class"],
+            "error_code"
+        );
+    }
+    #[test]
     fn expected_error_log_records_only_executed_checks_and_keeps_the_last_result() {
         let step = SqlStep {
             query_number: 1,
@@ -709,17 +840,14 @@ pub(crate) fn run_record(
     let binary = if cli.cluster_mode == crate::ClusterMode::AllInOne || cli.dry_run {
         None
     } else {
-        Some(match &cli.physical_wire_candidate_binary {
-            Some(path) => path.clone(),
-            None => crate::cluster::discover_novarocks_binary(root)?,
-        })
+        Some(crate::cluster::discover_novarocks_binary(root)?)
     };
     Ok(
         json!({"kind":"run","schema":1,"attempt_id":format!("sql-{}-{}",now(),std::process::id()),"started_at":now(),
         "source":{"commit":git(&["rev-parse","HEAD"])?,"dirty":!git(&["status","--porcelain"])?.is_empty()},
         "platform":execution_platform()?,
         "runner":{"path":runner,"sha256":hash_file(&runner)?},
-        "server":{"path":binary,"sha256":binary.as_deref().map(hash_file).transpose()?,"launched":if binary.is_none(){"external"}else if cli.physical_wire_candidate_binary.is_some(){"physical-wire-candidate"}else{"novarocks-bin"}},
+        "server":{"path":binary,"sha256":binary.as_deref().map(hash_file).transpose()?,"launched":if binary.is_none(){"external"}else{"novarocks-bin"}},
         "config":{"path":config,"sha256":optional_hash(config)?},"fixture_root":fixture_root,
         "topology":{"cluster_mode":match cli.cluster_mode {crate::ClusterMode::AllInOne=>"all-in-one",crate::ClusterMode::CrossProcess=>"cross-process"},"cluster_size":cli.cluster_size.unwrap_or(1),"launch_profile":match cli.cluster_launch_profile.unwrap_or(novarocks_cluster_harness::LaunchProfile::FaultScenario){novarocks_cluster_harness::LaunchProfile::FaultScenario=>"fault-scenario",novarocks_cluster_harness::LaunchProfile::Performance=>"performance"}},
         "mode":crate::mode_name(cli.mode),
@@ -866,7 +994,7 @@ mod lifecycle_tests {
             .collect()
     }
     #[test]
-    fn original_failure_survives_a_later_cleanup_statement_failure() {
+    fn cleanup_statement_failure_preserves_primary_without_a_known_failure_feature() {
         let dir = tempfile::tempdir().unwrap();
         let (ps, _) = prepared(dir.path());
         let mut case = ps.cases[0].clone();
@@ -883,6 +1011,7 @@ mod lifecycle_tests {
         evidence.begin_attempt();
         evidence.record_failure(json!({"class":"mismatch","error_code":null,"statement_index":1,"actual_digest":"original-result"}));
         evidence.begin_step(2, true);
+        evidence.mark_cleanup_step();
         evidence.begin_attempt();
         evidence.record_failure(
             json!({"class":"error_code","error_code":"NR-CLEANUP","statement_index":2}),
@@ -900,9 +1029,15 @@ mod lifecycle_tests {
             &evidence,
         );
         let record = &rows(dir.path())[0];
-        assert_eq!(record["failure"]["class"], "mismatch");
-        assert_eq!(record["failure"]["statement_index"], 1);
-        assert_eq!(record["failure"]["actual_digest"], "original-result");
+        assert_eq!(record["failure"]["class"], "error");
+        let primary = &record["failure"]["primary_failure"];
+        assert_eq!(primary["class"], "mismatch");
+        assert_eq!(primary["statement_index"], 1);
+        assert_eq!(primary["actual_digest"], "original-result");
+        let cleanup = &record["failure"]["additional_failures"][0];
+        assert_eq!(cleanup["class"], "error");
+        assert_eq!(cleanup["error_code"], "NR-CLEANUP");
+        assert_eq!(cleanup["cleanup"], true);
     }
     #[test]
     fn recovered_retry_cannot_label_a_later_generic_oracle_failure() {
@@ -1387,29 +1522,40 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn candidate_program_hash_is_the_actual_selection() {
+    fn selected_program_hash_is_the_actual_discovered_binary() {
         use clap::Parser;
-        let dir = tempfile::tempdir().unwrap();
-        let binary = dir.path().join("candidate");
-        fs::write(&binary, b"candidate contents").unwrap();
+        const CHILD: &str = "NOVAROCKS_RESULTS_RECORD_PROGRAM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let binary = dir.path().join("novarocks");
+            fs::write(&binary, b"selected server contents").unwrap();
+            let output = dir.path().join("observed-program.json");
+            // Isolate environment observation from every parallel in-process test.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "results_record::lifecycle_tests::selected_program_hash_is_the_actual_discovered_binary"])
+                .env(CHILD, "1")
+                .env("NOVAROCKS_BIN", &binary)
+                .env("NOVAROCKS_RESULTS_RECORD_PROGRAM_OUTPUT", &output)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let observed: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+            assert_eq!(
+                observed["server"]["sha256"],
+                digest(b"selected server contents")
+            );
+            return;
+        }
         let cli = crate::Cli::try_parse_from([
             "sql-test",
             "--suite",
             "optimizer",
             "--cluster-mode",
             "cross-process",
-            "--physical-wire-candidate-binary",
-            binary.to_str().unwrap(),
         ])
         .unwrap();
-        let record = run_record(
-            &cli,
-            &crate::resolve_repo_root().unwrap(),
-            None,
-            &["optimizer".into()],
-            None,
-        )
-        .unwrap();
+        let root = crate::resolve_repo_root().unwrap();
+        let record = run_record(&cli, &root, None, &["optimizer".into()], None).unwrap();
         let platform = &record["platform"];
         for key in ["system", "machine", "release"] {
             assert!(!platform[key].as_str().unwrap().is_empty());
@@ -1419,8 +1565,32 @@ mod lifecycle_tests {
         } else if cfg!(target_os = "linux") {
             assert_eq!(platform["system"], "Linux");
         }
-        assert_eq!(record["server"]["sha256"], digest(b"candidate contents"));
-        assert_eq!(record["server"]["launched"], "physical-wire-candidate");
+        assert_eq!(
+            record["server"]["path"],
+            std::env::var("NOVAROCKS_BIN").unwrap()
+        );
+        assert_eq!(
+            record["server"]["sha256"],
+            digest(b"selected server contents")
+        );
+        assert_eq!(record["server"]["launched"], "novarocks-bin");
+        fs::write(
+            std::env::var("NOVAROCKS_RESULTS_RECORD_PROGRAM_OUTPUT").unwrap(),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let cli = crate::Cli::try_parse_from([
+            "sql-test",
+            "--suite",
+            "optimizer",
+            "--cluster-mode",
+            "cross-process",
+            "--dry-run",
+        ])
+        .unwrap();
+        let record = run_record(&cli, &root, None, &["optimizer".into()], None).unwrap();
+        assert_eq!(record["server"]["path"], Value::Null);
+        assert_eq!(record["server"]["launched"], "external");
     }
     #[test]
     fn tracked_input_cannot_be_rebound_after_a_concurrent_change() {

@@ -20,8 +20,9 @@ from pathlib import Path
 import sys
 import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from verification.compose import compose
 from verification.dispositions import Dispositions
-from verification.model import Observation, UnitKey
+from verification.model import Attempt, Observation, Scope, UnitKey
 
 
 class Disposition(unittest.TestCase):
@@ -82,6 +83,72 @@ class Disposition(unittest.TestCase):
         del entry['exit_condition']
         with self.assertRaises(ValueError):
             Dispositions({'schema': 1, 'quarantine': [entry]}, '2026-10-19')
+
+    def test_primary_code_cannot_dispose_an_actual_failed_oracle(self):
+        policy = self.parse(self.entry())
+        for kind, step in [('expected_error',1),('be_log',1),('result_set',1),
+                           ('text_assertions',2),('query_stats_contract',3)]:
+            with self.subTest(kind=kind,step=step):
+                observation = self.observation()
+                observation.failure['statement_index'] = 1
+                observation.detail = {'oracle':{'executed':[{'step':step,'kind':kind,'outcome':'fail'}]}}
+                self.assertIsNone(policy.match(observation))
+
+    def test_missing_or_unexecuted_oracle_does_not_invent_a_secondary_failure(self):
+        policy = self.parse(self.entry())
+        for oracle in ({}, {'required':[{'step':2,'kind':'be_log'}],'executed':[]},
+                       {'executed':[{'step':1,'kind':'expected_error','outcome':'pass'}]}):
+            with self.subTest(oracle=oracle):
+                observation = self.observation()
+                observation.detail = {'oracle':oracle}
+                self.assertIsNotNone(policy.match(observation))
+
+    def test_only_the_exact_known_mismatch_result_oracle_is_disposed(self):
+        policy = self.parse(self.entry({'class':'mismatch','statement':3,'actual_digest':'sha256:abc'}))
+        observation = self.observation(failure={'class':'mismatch','statement_index':3,'actual_digest':'sha256:abc'})
+        primary = {'step':3,'kind':'result_set','outcome':'fail'}
+        observation.detail = {'oracle':{'executed':[primary]}}
+        self.assertIsNotNone(policy.match(observation))
+        for other in ({'step':4,'kind':'result_set','outcome':'fail'},
+                      {'step':3,'kind':'be_log','outcome':'fail'},
+                      {'step':3,'kind':'expected_error','outcome':'fail'}):
+            with self.subTest(other=other):
+                observation.detail = {'oracle':{'executed':[primary,other]}}
+                self.assertIsNone(policy.match(observation))
+
+    def test_raw_oracle_facts_also_prevent_matching_nested_diagnostic_codes(self):
+        policy = self.parse(self.entry())
+        observation = self.observation()
+        observation.detail = {'raw':{'oracle':{'executed':[{'step':2,'kind':'be_log','outcome':'fail'}]}}}
+        self.assertIsNone(policy.match(observation))
+        observation.detail = {}
+        observation.failure = {'class':'error','primary_failure':{'class':'error_code','error_code':'NR-1'},
+                               'additional_failures':[{'class':'error','phase':'case_cleanup'}]}
+        self.assertIsNone(policy.match(observation))
+
+    def test_direct_compose_rejects_failed_oracles_in_dev_and_formal_admission(self):
+        policy = self.parse(self.entry())
+        observation = self.observation()
+        observation.identity = {'suite':'same'}
+        observation.identity_confirmed = observation.record_complete = observation.terminated = True
+        observation.cleanup = 'ok'
+        observation.detail = {'oracle':{'executed':[]}}
+        attempt = Attempt('a',[observation],current=True,formal=True,
+                          source={'commit':'a'*40,'dirty':False})
+        scope = Scope('sql-suite:s',(observation.unit,),observation.identity,'isolated')
+        for layer in ('dev','admission'):
+            with self.subTest(layer=layer):
+                observation.detail['oracle']['executed'] = []
+                baseline = compose({},layer,[attempt],[scope],policy)
+                self.assertEqual(baseline['scopes'][0]['verdict'],'known_failure')
+                self.assertTrue(baseline['layer_ok'])
+                observation.detail['oracle']['executed'] = [{'step':2,'kind':'expected_error','outcome':'fail'}]
+                actual = compose({},layer,[attempt],[scope],policy)
+                self.assertEqual(actual['scopes'][0]['verdict'],'failed')
+                self.assertFalse(actual['layer_ok'])
+                raw = actual['scopes'][0]['observations'][0]
+                self.assertEqual(raw['category'],'counterexample')
+                self.assertEqual(raw['failure']['error_code'],'NR-1')
 
 
 if __name__ == '__main__':

@@ -310,7 +310,16 @@ impl MvApplicationError {
             novarocks_sql::compiler::SqlCompileError::Analyze(error) => error.control_error(),
             _ => None,
         };
-        let mut failure = Self::new(MvApplicationErrorKind::InvalidRequest, error.to_string());
+        let message = match &error {
+            novarocks_sql::compiler::SqlCompileError::Analyze(error)
+                if error.kind()
+                    == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
+            {
+                error.to_user_error(None).to_string()
+            }
+            _ => error.to_string(),
+        };
+        let mut failure = Self::new(MvApplicationErrorKind::InvalidRequest, message);
         failure.compile_control = control;
         failure
     }
@@ -482,4 +491,76 @@ pub trait MvCreateProviderAdapter: Send + Sync {
     ) -> Result<(), MvCreateProviderError>;
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
+}
+
+#[cfg(test)]
+mod compile_error_tests {
+    use super::*;
+    use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+    use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn mv_application_and_create_preserve_only_the_missing_implementation_sql_code() {
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/missing-pure-v1").unwrap(),
+        ));
+        let SqlCompileError::Analyze(ref analyze) = compile else {
+            panic!("missing implementation must retain typed analysis identity");
+        };
+        let expected = analyze.to_user_error(None).to_string();
+        let application = MvApplicationError::from_compile(compile.clone());
+        let provider = MvCreateProviderError::from_compile(compile);
+        assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
+        assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
+        for (message, control) in [
+            (application.message(), application.compile_control_error()),
+            (provider.message(), provider.compile_control_error()),
+        ] {
+            assert_eq!(message, expected);
+            assert!(message.starts_with("[sql.analyze.unavailable_implementation] "));
+            assert_eq!(control, None);
+        }
+    }
+
+    #[test]
+    fn mv_compile_projection_does_not_classify_unsupported_diagnostic_text() {
+        let message = "unsupported diagnostic: UnsupportedCompiledShape";
+        for compile in [
+            SqlCompileError::Analyze(AnalyzeError::internal(message)),
+            SqlCompileError::Compilation(message.into()),
+        ] {
+            let expected = compile.to_string();
+            let application = MvApplicationError::from_compile(compile.clone());
+            let provider = MvCreateProviderError::from_compile(compile);
+            assert_eq!(application.message(), expected);
+            assert_eq!(provider.message(), expected);
+            assert_eq!(application.compile_control_error(), None);
+            assert_eq!(provider.compile_control_error(), None);
+        }
+    }
+
+    #[test]
+    fn mv_compile_projection_preserves_all_three_control_causes_and_original_messages() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for compile in [
+                SqlCompileError::from(control),
+                SqlCompileError::Analyze(AnalyzeError::control(control)),
+            ] {
+                let expected = compile.to_string();
+                let application = MvApplicationError::from_compile(compile.clone());
+                let provider = MvCreateProviderError::from_compile(compile);
+                assert_eq!(application.message(), expected);
+                assert_eq!(provider.message(), expected);
+                assert_eq!(application.compile_control_error(), Some(control));
+                assert_eq!(provider.compile_control_error(), Some(control));
+                assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
+                assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
+            }
+        }
+    }
 }

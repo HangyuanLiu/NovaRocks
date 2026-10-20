@@ -19,12 +19,10 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use novarocks_proto_models::{common, expr, novarocks, plan};
+use novarocks_proto_models::{common, novarocks};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
-const PLAN_FRAGMENT_FIXTURE_HEX: &str = "0801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a020805";
-const EXPR_FIXTURE_HEX: &str = "0a040a0208016234080a12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a0c0a040a0208055a040a02180a";
 
 fn decode_fixture<M>(name: &str, hex: &str) -> M
 where
@@ -62,49 +60,6 @@ fn decode_hex(name: &str, hex: &str) -> Vec<u8> {
 
 fn id(hi: i64, lo: i64) -> common::UniqueId {
     common::UniqueId { hi, lo }
-}
-
-fn scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
-    super::common::scalar_ref(prim, false)
-}
-
-fn column_expr(column_id: u32, name: &str) -> expr::Expr {
-    expr::Expr {
-        original_definition_id: None,
-        r#type: Some(super::common::scalar_ref(
-            common::PrimitiveType::Bigint,
-            true,
-        )),
-        nullable: true,
-        kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
-            column_id,
-            qualifier: Some("lineitem".to_string()),
-            column: Some(name.to_string()),
-        })),
-    }
-}
-
-fn literal_bool(value: bool) -> expr::Expr {
-    expr::Expr {
-        original_definition_id: None,
-        r#type: Some(scalar_type(common::PrimitiveType::Boolean)),
-        nullable: false,
-        kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-            value: Some(common::LiteralValue {
-                value: Some(common::literal_value::Value::BoolValue(value)),
-            }),
-        })),
-    }
-}
-
-fn output_column(column_id: u32, name: &str, prim: common::PrimitiveType) -> common::OutputColumn {
-    common::OutputColumn {
-        column_id,
-        name: name.to_string(),
-        r#type: Some(scalar_type(prim)),
-        nullable: false,
-        is_internal: false,
-    }
 }
 
 fn release_query_options() -> novarocks::QueryOptions {
@@ -206,147 +161,11 @@ fn release_destination() -> novarocks::TaskExchangeDestination {
     }
 }
 
-fn release_stream_plan_fragment() -> plan::PlanFragment {
-    let mut fragment = release_plan_fragment();
-    fragment.sink = Some(plan::DataSink {
-        kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-            dest_node_id: 20,
-            ..Default::default()
-        })),
-    });
-    fragment
-}
-
-fn release_plan_fragment() -> plan::PlanFragment {
-    plan::PlanFragment {
-        expression_control: None,
-        frozen_calls: None,
-        semantic_parameters: None,
-        writer_semantic_parameters: None,
-        fragment_id: 1,
-        root: Some(plan::DistributedNode {
-            node_id: 10,
-            fragment_id: 1,
-            tuple_ids: vec![10],
-            nullable_tuple_ids: vec![],
-            limit: -1,
-            runtime_filter_binding_ids: vec![],
-            children: vec![
-                plan::DistributedNode {
-                    node_id: 11,
-                    fragment_id: 1,
-                    tuple_ids: vec![11],
-                    nullable_tuple_ids: vec![],
-                    limit: -1,
-                    runtime_filter_binding_ids: vec![],
-                    children: vec![],
-                    payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                        output_columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
-                        kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
-                            database: "tpch".to_string(),
-                            table: Some(plan::TableDef {
-                                name: "lineitem".to_string(),
-                                columns: vec![plan::ColumnDef {
-                                    name: "id".to_string(),
-                                    data_type: Some(scalar_type(common::PrimitiveType::Bigint)),
-                                    nullable: false,
-                                    write_default_json: None,
-                                }],
-                                iceberg_row_lineage_metadata_columns: vec![],
-                                source: None,
-                            }),
-                            alias: Some("lineitem".to_string()),
-                            columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
-                            predicates: vec![literal_bool(true)],
-                            required_columns: vec!["id".to_string()],
-                            dict_columns: vec![],
-                            variant_columns: vec![],
-                            mv_rewritten_from: None,
-                        })),
-                    })),
-                },
-                plan::DistributedNode {
-                    node_id: 12,
-                    fragment_id: 1,
-                    tuple_ids: vec![12],
-                    nullable_tuple_ids: vec![],
-                    limit: -1,
-                    runtime_filter_binding_ids: vec![],
-                    children: vec![],
-                    payload: Some(plan::distributed_node::Payload::Exchange(
-                        plan::ExchangeReceiver {
-                            original_edge_id: None,
-                            partition_type: plan::PartitionType::Hash as i32,
-                            partition_exprs: vec![column_expr(1, "l_orderkey")],
-                            source_fragment_id: 2,
-                            output_columns: vec![output_column(
-                                1,
-                                "id",
-                                common::PrimitiveType::Bigint,
-                            )],
-                            output_qualifier: Some("remote".to_string()),
-                            flavor: Some(plan::ExchangeFlavor {
-                                kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
-                            }),
-                        },
-                    )),
-                },
-            ],
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
-                kind: Some(plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
-                    join_type: plan::JoinKind::Inner as i32,
-                    eq_conditions: vec![plan::HashJoinEqCondition {
-                        left: Some(column_expr(1, "l_orderkey")),
-                        right: Some(column_expr(2, "o_orderkey")),
-                        null_safe: false,
-                    }],
-                    other_condition: None,
-                    distribution: plan::JoinDistribution::Shuffle as i32,
-                    execution_mode: Some(plan::JoinExecutionMode::Partitioned as i32),
-                })),
-            })),
-        }),
-        data_partition: Some(plan::DataPartition {
-            kind: plan::PartitionKind::Hash as i32,
-            exprs: vec![column_expr(1, "l_orderkey")],
-        }),
-        output_partition: Some(plan::DataPartition {
-            kind: plan::PartitionKind::Hash as i32,
-            exprs: vec![column_expr(1, "l_orderkey")],
-        }),
-        sink: Some(plan::DataSink {
-            kind: Some(plan::data_sink::Kind::Result(true)),
-        }),
-        output_exprs: vec![column_expr(1, "l_orderkey")],
-        output_columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
-        cte_id: None,
-        cte_exchange_nodes: vec![],
-        runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
-            fragment_id: 1,
-            bindings: vec![],
-        }),
-        execution_types: Some(super::common::scalar_table()),
-        original_call_requests: None,
-        constants: vec![],
-        constant_source_fields: None,
-    }
-}
-
 /// The two CreateTask carriers keep the plan independent of placement while
 /// preserving the release corpus for scan ranges and runtime endpoints.
 fn release_frozen_fragment() -> novarocks::FrozenFragment {
     novarocks::FrozenFragment {
-        package: Default::default(),
-        plan_version: vec![1; 16].into(),
-        plan_contract_revision: 1,
-        fragment_contract_version: 1,
-        pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
-            min: 1,
-            max: 8,
-            requires_power_of_two: false,
-        }),
-        plan: Some(release_stream_plan_fragment()),
+        package: b"opaque release package".to_vec().into(),
     }
 }
 
@@ -423,30 +242,6 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
     }
 }
 
-fn release_expr() -> expr::Expr {
-    expr::Expr {
-        original_definition_id: None,
-        r#type: Some(scalar_type(common::PrimitiveType::Boolean)),
-        nullable: false,
-        kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
-            allow_throw_exception: None,
-            decimal_overflow_policy: expr::DecimalOverflowPolicy::Unspecified as i32,
-            op: expr::BinaryOp::Gt as i32,
-            left: Some(Box::new(column_expr(1, "l_orderkey"))),
-            right: Some(Box::new(expr::Expr {
-                original_definition_id: None,
-                r#type: Some(scalar_type(common::PrimitiveType::Bigint)),
-                nullable: false,
-                kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                    value: Some(common::LiteralValue {
-                        value: Some(common::literal_value::Value::IntValue(10)),
-                    }),
-                })),
-            })),
-        }))),
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -462,8 +257,6 @@ fn print_release_fixture_hex() {
     print_fixture("CREATION_METADATA", &release_creation_metadata());
     print_fixture("CREATE_TASK_REQUEST", &release_create_task_request());
     print_fixture("FETCH_RESULT_RESPONSE", &release_fetch_result_response());
-    print_fixture("PLAN_FRAGMENT", &release_plan_fragment());
-    print_fixture("EXPR", &release_expr());
 }
 
 #[test]
@@ -475,9 +268,7 @@ fn release_create_task_carrier_fixtures_decode() {
         .expect("FrozenFragment fixture decodes");
     let metadata = novarocks::CreationMetadata::decode(request.creation_metadata.as_ref())
         .expect("CreationMetadata fixture decodes");
-    assert_eq!(fragment.plan_version.as_slice(), &[1; 16]);
-    assert_eq!(fragment.plan_contract_revision, 1);
-    assert_eq!(fragment.fragment_contract_version, 1);
+    assert_eq!(fragment.package.as_ref(), b"opaque release package");
     assert_eq!(
         metadata.query_context.as_ref().unwrap().query_execution_id,
         Some(release_query_execution_id())
@@ -486,9 +277,6 @@ fn release_create_task_carrier_fixtures_decode() {
         metadata.descriptor.as_ref().unwrap().fragment_instance_id,
         Some(id(3, 4))
     );
-    let plan = fragment.plan.as_ref().expect("FrozenFragment fixture plan");
-    assert_eq!(plan.fragment_id, 1, "FrozenFragment fixture plan id");
-
     let assignment = metadata
         .assignment
         .as_ref()
@@ -653,115 +441,4 @@ fn release_fetch_result_response_fixture_decodes() {
     assert_eq!(response.result_arrow_ipc.as_ref(), b"NRX1-fixture");
     assert_eq!(response.packet_seq, 9);
     assert!(response.eos, "FetchResultResponse fixture eos");
-}
-
-#[test]
-fn release_plan_and_expr_fixtures_decode() {
-    // Historical wire bytes still decode unknown retired tags, but cannot
-    // supply the mandatory reference or the owning type namespace.
-    let legacy: plan::PlanFragment = decode_fixture("PlanFragment", PLAN_FRAGMENT_FIXTURE_HEX);
-    assert!(legacy.execution_types.is_none());
-    assert!(
-        super::common::binding_from_ref(
-            legacy.output_columns[0].r#type.as_ref().unwrap(),
-            &super::common::scalar_table()
-        )
-        .is_err()
-    );
-    let fragment: plan::PlanFragment =
-        plan::PlanFragment::decode(release_plan_fragment().encode_to_vec().as_slice()).unwrap();
-    assert_eq!(
-        fragment.execution_types.as_ref(),
-        Some(&super::common::scalar_table())
-    );
-    assert_eq!(fragment.fragment_id, 1);
-    let root = fragment.root.expect("PlanFragment fixture root");
-    assert_eq!(root.node_id, 10);
-    assert!(
-        matches!(
-            root.payload.as_ref(),
-            Some(plan::distributed_node::Payload::Physical(node))
-                if matches!(node.kind, Some(plan::plan_node::Kind::HashJoin(_)))
-        ),
-        "PlanFragment fixture root must be HashJoin"
-    );
-    assert!(
-        root.children.iter().any(|child| matches!(
-            child.payload.as_ref(),
-            Some(plan::distributed_node::Payload::Physical(node))
-                if matches!(node.kind, Some(plan::plan_node::Kind::Scan(_)))
-        )),
-        "PlanFragment fixture must include a Scan child"
-    );
-    assert!(
-        root.children.iter().any(|child| matches!(
-            child.payload.as_ref(),
-            Some(plan::distributed_node::Payload::Exchange(_))
-        )),
-        "PlanFragment fixture must include an Exchange child"
-    );
-    assert_eq!(root.children.len(), 2);
-
-    let legacy_expression: expr::Expr = decode_fixture("Expr", EXPR_FIXTURE_HEX);
-    assert_eq!(
-        legacy_expression.r#type.as_ref().unwrap().value_binding_id,
-        None
-    );
-    assert!(
-        super::common::binding_from_ref(
-            legacy_expression.r#type.as_ref().unwrap(),
-            &super::common::scalar_table()
-        )
-        .is_err()
-    );
-    let expression: expr::Expr =
-        expr::Expr::decode(release_expr().encode_to_vec().as_slice()).unwrap();
-    assert_eq!(
-        super::common::scalar_from_ref(
-            expression.r#type.as_ref().unwrap(),
-            &super::common::scalar_table(),
-            expression.nullable
-        )
-        .unwrap(),
-        common::PrimitiveType::Boolean as i32
-    );
-    let binary = match expression.kind.as_ref() {
-        Some(expr::expr::Kind::BinaryOp(binary)) => binary,
-        other => panic!("Expr fixture kind expected BinaryOp, got {other:?}"),
-    };
-    assert_eq!(
-        binary.op,
-        expr::BinaryOp::Gt as i32,
-        "Expr fixture BinaryOp.op"
-    );
-    let left = binary.left.as_ref().expect("Expr fixture BinaryOp.left");
-    match left.kind.as_ref() {
-        Some(expr::expr::Kind::ColumnRef(column)) => {
-            assert_eq!(
-                column.column_id, 1,
-                "Expr fixture BinaryOp.left ColumnRef.column_id"
-            );
-            assert_eq!(
-                column.column.as_deref(),
-                Some("l_orderkey"),
-                "Expr fixture BinaryOp.left ColumnRef.column"
-            );
-        }
-        other => panic!("Expr fixture BinaryOp.left expected ColumnRef, got {other:?}"),
-    }
-    let right = binary.right.as_ref().expect("Expr fixture BinaryOp.right");
-    match right
-        .kind
-        .as_ref()
-        .and_then(|kind| match kind {
-            expr::expr::Kind::Literal(literal) => literal.value.as_ref(),
-            _ => None,
-        })
-        .and_then(|value| value.value.as_ref())
-    {
-        Some(common::literal_value::Value::IntValue(value)) => {
-            assert_eq!(*value, 10, "Expr fixture BinaryOp.right Literal.int_value")
-        }
-        other => panic!("Expr fixture BinaryOp.right expected Literal int 10, got {other:?}"),
-    }
 }

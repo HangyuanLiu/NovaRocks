@@ -20,19 +20,6 @@ use crate::exec::expr::ExprId;
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_types::SlotId;
 
-use super::ExecNode;
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct ChangeEventExpandNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub events: Vec<ChangeEventRuntimeSpec>,
-    pub output_slot_ids: Vec<SlotId>,
-    pub output_chunk_schema: ChunkSchemaRef,
-    pub effect_slot_id: SlotId,
-}
-
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ChangeEventRuntimeSpec {

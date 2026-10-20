@@ -30,8 +30,8 @@ use novarocks_sql::compiler::{
     SqlAuthoredPhysicalPlan, SqlCompileControl, SqlCompileIntent, SqlCompileProgress, SqlCompiler,
     SqlConstantEvaluationError, SqlConstantEvaluator, SqlFinalPlanCompileRequest,
     SqlFoldDependencyInput, SqlFoldDependencyObserver, SqlFoldDependencySource,
-    SqlFoldEvaluationOutcome, SqlPhysicalEmissionMode, SqlPlanningEnvironment, SqlSessionContext,
-    SqlStatementInput, builtin_sql_function_catalog,
+    SqlFoldEvaluationOutcome, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    builtin_sql_function_catalog,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
@@ -369,7 +369,6 @@ pub(super) fn compile_with_observer(
         builtin_sql_function_catalog().snapshot(),
         evaluator,
         policy(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
         PipelineDopDomain {
             min: 1,

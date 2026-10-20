@@ -357,18 +357,18 @@ fn target_layouts_follow_real_hash_maps_bytes_and_automatic_recursive_boxing() {
     };
     dimensions::<u32>(value);
 
-    let stats = plan::IcebergColumnStatsMap::default();
-    let _: &HashMap<String, plan::IcebergColumnStats> = &stats.entries;
-    let stats_field = field_named(actual_object(&stats), "entries");
-    actual_field(&stats_field.rust, &stats.entries);
+    let stats = novarocks::FileScanRange::default();
+    let _: &HashMap<i32, novarocks::FilePruningMinMaxValue> = &stats.file_pruning_min_max_values;
+    let stats_field = field_named(actual_object(&stats), "file_pruning_min_max_values");
+    actual_field(&stats_field.rust, &stats.file_pruning_min_max_values);
     let Storage::HashMap { key, value } = stats_field.rust.storage else {
         panic!("real HashMap cannot be modeled as another container");
     };
-    dimensions::<String>(key);
+    dimensions::<i32>(key);
     assert!(
-        matches!(value.storage, Storage::Message(target) if target == plan::IcebergColumnStats::SCHEMA_ID)
+        matches!(value.storage, Storage::Message(target) if target == novarocks::FilePruningMinMaxValue::SCHEMA_ID)
     );
-    let child = plan::IcebergColumnStats::default();
+    let child = novarocks::FilePruningMinMaxValue::default();
     let target = actual_object(&child);
     assert_eq!(
         (value.size, value.alignment),

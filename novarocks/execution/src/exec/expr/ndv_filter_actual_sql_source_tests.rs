@@ -49,24 +49,15 @@ use novarocks_sql::compiler::{
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-pub(super) fn ndv_sql_source(
-    sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    ndv_sql_source_with_semantics(
-        sql,
-        emission_mode,
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )
+pub(super) fn ndv_sql_source(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    ndv_sql_source_with_semantics(sql, novarocks_sql::sql_mode::SqlSemanticSettings::default())
 }
 fn ndv_sql_source_with_semantics(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_columns_and_semantics(
         sql,
-        emission_mode,
         sql_semantics,
         &[
             ("k", DataType::Int32),
@@ -78,12 +69,10 @@ fn ndv_sql_source_with_semantics(
 
 pub(super) fn sql_source_with_columns(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     columns: &[(&str, DataType)],
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_columns_and_semantics(
         sql,
-        emission_mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         columns,
     )
@@ -91,7 +80,6 @@ pub(super) fn sql_source_with_columns(
 
 fn sql_source_with_columns_and_semantics(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     columns: &[(&str, DataType)],
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -126,7 +114,6 @@ fn sql_source_with_columns_and_semantics(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -233,10 +220,10 @@ const HAVING: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING
 const EMPTY_WHERE: &str = "SELECT ndv(v) AS ndv_empty, approx_count_distinct(v) AS approx_empty,\n       count(DISTINCT v) AS exact_empty\nFROM fixture.ndv_null_contract WHERE k = 999;";
 const NULL_WHERE: &str = "SELECT ndv(v) AS ndv_null, approx_count_distinct(v) AS approx_null,\n       count(DISTINCT v) AS exact_null\nFROM fixture.ndv_null_contract WHERE k = 1;";
 
-fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
+fn source_probe() {
     use novarocks_physical_plan::NodeKind;
     for (query, sql) in [(3, EMPTY_WHERE), (4, NULL_WHERE), (7, HAVING)] {
-        let source = ndv_sql_source(sql, mode);
+        let source = ndv_sql_source(sql);
         let mut filters = 0;
         let mut multi_predicate_filters = 0;
         let mut aggregate_calls = 0;
@@ -246,7 +233,7 @@ fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
                     NodeKind::Filter { predicates } => {
                         filters += 1;
                         eprintln!(
-                            "NDV actual SQL query={query} mode={mode:?} fragment={:?} filter={:?} inputs={:?} predicate_count={} output={:?}",
+                            "NDV actual SQL query={query} mode=compiled fragment={:?} filter={:?} inputs={:?} predicate_count={} output={:?}",
                             fragment_id,
                             node.id,
                             node.inputs,
@@ -274,7 +261,7 @@ fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
                         aggregate_calls += calls.len();
                         for (ordinal, call) in calls.iter().enumerate() {
                             eprintln!(
-                                "NDV actual aggregate query={query} mode={mode:?} node={:?} call={ordinal} authored={call:?}",
+                                "NDV actual aggregate query={query} mode=compiled node={:?} call={ordinal} authored={call:?}",
                                 node.id
                             );
                         }
@@ -285,7 +272,7 @@ fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
                         ..
                     } => {
                         eprintln!(
-                            "NDV actual scan query={query} mode={mode:?} node={:?} relation={relation:?} residuals={residuals:?}",
+                            "NDV actual scan query={query} mode=compiled node={:?} relation={relation:?} residuals={residuals:?}",
                             node.id
                         );
                     }
@@ -296,12 +283,12 @@ fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
             // arena. It performs no lowering, decoder, rewriter or evaluation.
             for (id, expression) in fragment.expressions().iter() {
                 eprintln!(
-                    "NDV actual original definition query={query} mode={mode:?} id={id:?} expression={expression:?}"
+                    "NDV actual original definition query={query} mode=compiled id={id:?} expression={expression:?}"
                 );
             }
             for (id, value) in fragment.values() {
                 eprintln!(
-                    "NDV actual original value query={query} mode={mode:?} id={id:?} value={value:?}"
+                    "NDV actual original value query={query} mode=compiled id={id:?} value={value:?}"
                 );
             }
         }
@@ -319,14 +306,8 @@ fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
 }
 
 #[test]
-fn ndv_actual_filter_original_sql_source() {
-    source_probe(novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1);
-}
-#[test]
 fn ndv_actual_filter_candidate_sql_source() {
-    source_probe(
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    source_probe();
 }
 fn connector_binding() -> ConnectorReadBinding {
     let provider_id = ConnectorProviderId::parse("iceberg").expect("provider id");

@@ -23,7 +23,7 @@
 //! step separately undoable:
 //!
 //! ```text
-//! install_receiver          decode + prepare_fragment -> dormant handle
+//! install_receiver          decode + prepare_compiled_fragment -> dormant handle
 //! install_inbound_capability register the descriptor for frame admission
 //! apply_task_domain         initial splits / edge opens / filters
 //! submit_runnable           reserve completion and return a dormant runnable
@@ -32,7 +32,7 @@
 //!
 //! The dormant handle is what makes that split honest. Receiver registration
 //! is not a step the fragment kernel exposes on its own: it happens inside
-//! `prepare_fragment`, which also builds the pipeline and hands back a
+//! `prepare_compiled_fragment`, which also builds the pipeline and hands back a
 //! [`DormantFragmentHandle`]. So `install_receiver` prepares the whole
 //! fragment and parks the handle, transferring its physical receivers into
 //! the task's retirement owner. `remove_receiver` synchronously retires those
@@ -52,7 +52,6 @@ use novarocks_execution::connector::{
     SplitQueueConfig, SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry,
     SplitSequenceEvidence, TaskAttemptKey, TaskAttemptSplitQueues,
 };
-use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::fragment::io::{
@@ -65,7 +64,7 @@ use novarocks_execution::runtime::fragment::{
     ExecutionFailure, ExecutionFailureCause, FragmentCancelReason, FragmentExecutionError,
     FragmentInstanceSpec, FragmentLaunchError, FragmentOutcome, FragmentRuntimeOptions,
     FragmentTerminalFact, RunningFragmentHandle, ScanAssignments, compiled_sink_kind,
-    prepare_compiled_fragment, prepare_fragment,
+    prepare_compiled_fragment,
 };
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
@@ -81,6 +80,7 @@ use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
     TaskState, TerminationDetail,
 };
+use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
     ConnectorReadDecoder, MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment,
@@ -90,9 +90,7 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
     ConnectorStopOwner, ConnectorStorageResolver, read_stack::ConnectorSession,
 };
-use novarocks_task_codec::creation::{
-    decode_static_fragment, decode_static_package, take_task_assignment,
-};
+use novarocks_task_codec::creation::{decode_static_package, take_task_assignment};
 use novarocks_task_codec::domain::stored_message;
 use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
@@ -106,7 +104,6 @@ use crate::compiled_runtime_filter::program_runtime_filter_bindings;
 use crate::compiled_scan_binding::{CompiledScanTask, bind_compiled_scans};
 use crate::compiled_writer_binding::{CompiledWriteTask, bind_compiled_writers};
 use crate::fragment_instance::{NativeFragmentInstanceInput, project_task_instance};
-use crate::fragment_request::NativeFragmentRequest;
 use crate::fragment_submission::compiled_fragment_sink_assignment;
 use crate::native_fragment_query::{NativeFragmentQueryRuntime, NativeFragmentRegistrationLease};
 use crate::root_result_session::{NativeRootResultSession, RootProducerPool};
@@ -243,10 +240,8 @@ pub struct NativeTaskExecutionHost {
     /// gets a fresh queue set and can never inherit a sequence space.
     split_queues: Arc<SplitQueueRegistry<ReceivedReadSplit>>,
     tasks: Mutex<HashMap<TaskIdentity, Arc<TaskRuntime>>>,
-    /// The one static plan interpreter this process composed: the plan-tree
-    /// decoder when absent, otherwise the compiled-package compiler. A task's
-    /// carrier never selects it.
-    compiled: Option<Arc<dyn CompiledPackageCompiler>>,
+    /// The process's exact compiled interpreter. A task cannot select another path.
+    compiler: Arc<dyn CompiledPackageCompiler>,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
 }
@@ -437,6 +432,7 @@ impl NativeTaskExecutionHost {
                   a bundle struct would only move the same list one level away."
     )]
     pub(crate) fn new(
+        compiler: Arc<dyn CompiledPackageCompiler>,
         queries: NativeFragmentQueryRuntime,
         context_facts: Arc<dyn TaskQueryContextFacts>,
         capabilities: Arc<TaskInboundCapabilities>,
@@ -467,7 +463,7 @@ impl NativeTaskExecutionHost {
             completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
-            compiled: None,
+            compiler,
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
         }
@@ -482,13 +478,13 @@ impl NativeTaskExecutionHost {
         self
     }
 
-    /// Composes the compiled-package interpreter instead of the plan-tree
-    /// decoder. Composition makes this choice once per process.
+    /// Replaces the fixture compiler while retaining the same package-only path.
+    #[cfg(test)]
     pub(crate) fn with_compiled_package_compiler(
         mut self,
         compiler: Arc<dyn CompiledPackageCompiler>,
     ) -> Self {
-        self.compiled = Some(compiler);
+        self.compiler = compiler;
         self
     }
 
@@ -553,10 +549,9 @@ impl NativeTaskExecutionHost {
         Ok(root_session)
     }
 
-    /// The compiled-package half of `install_receiver`: the task's package is
-    /// received, provider-validated and compiled into a LocalProgram, then
-    /// prepared into the same dormant handle and task runtime as a plan-tree
-    /// task. The original registration lease protects early query funding and
+    /// Receives, provider-validates and compiles the task's package into a
+    /// LocalProgram, then prepares its dormant handle and task runtime.
+    /// The registration lease protects early query funding and
     /// rolls back on every refusal before installation.
     fn install_compiled_receiver(
         &self,
@@ -683,9 +678,8 @@ impl NativeTaskExecutionHost {
         let program = compiled.program();
         let runtime_filters = &compiled.runtime_filters;
         // The bindings this program's runtime-filter sites bind. They decide
-        // whether the task needs the query context's filter session, exactly
-        // as a plan-tree program's bindings do, and the session must host
-        // exactly them for this instance.
+        // whether the task needs the query context's filter session. The
+        // session must host exactly these bindings for this instance.
         let runtime_filter_bindings =
             program_runtime_filter_bindings(program.graph().requirements(), &runtime_filters)
                 .map_err(|error| {
@@ -1221,7 +1215,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
     /// static sink branch against the outbound edge bound to it.
     ///
     /// Receiver registration is not separable from preparation: the kernel
-    /// registers a task's exchange receivers inside `prepare_fragment`, which
+    /// registers a task's exchange receivers inside `prepare_compiled_fragment`, which
     /// also builds the pipeline. Preparing here and parking the dormant handle
     /// is what makes this step undoable, because dropping that handle rolls
     /// the registration back through `FragmentResources`. A refusal returns
@@ -1236,8 +1230,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         preparation_stop: novarocks_worker::TaskPreparationStopView,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         let identity = descriptor.identity();
-        let execution = identity.query_execution_id();
-        let kernel_key = descriptor.fragment_instance_id();
         if self.task_runtime(identity).is_some() {
             return Err(internal(format!(
                 "task {identity} already has a prepared fragment"
@@ -1249,292 +1241,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             crate::task_protocol_fault::hold_native_task_preparation(controls, identity)
                 .map_err(internal)?;
         }
-        if let Some(compiler) = self.compiled.clone() {
-            return self.install_compiled_receiver(
-                descriptor,
-                input,
-                compiler.as_ref(),
-                preparation_stop,
-            );
-        }
-        let (static_fragment, assignment) = input.into_parts();
-        let fragment = decode_static_fragment(&static_fragment, FieldPath::root("frozen_fragment"))
-            .map_err(|error| {
-                protocol(format!(
-                    "task {identity} static fragment is not decodable: {error}"
-                ))
-            })?;
-        // The frozen bytes end here: the decoded fragment is the one copy the
-        // rest of preparation reads.
-        drop(static_fragment);
-        fragment
-            .verify_task_dop(
-                descriptor.pipeline_dop(),
-                FieldPath::root("creation_metadata")
-                    .field("descriptor")
-                    .field("pipeline_dop"),
-            )
-            .map_err(|error| {
-                protocol(format!(
-                    "task {identity} parallelism does not fit its fragment: {error}"
-                ))
-            })?;
-        let assignment = take_task_assignment(assignment).ok_or_else(|| {
-            internal(format!(
-                "task {identity} creation assignment is not a codec-produced assignment"
-            ))
-        })?;
-        let sink_kind = fragment.sink_kind();
-
-        // Every kernel fact comes from its one owner: the identity, the
-        // descriptor, the assignment, and -- for every query-wide option -- the
-        // established context. The task carries no second copy of any of them.
-        let context_options = self.context_facts.query_options(execution)?;
-        let instance = project_task_instance(
-            descriptor,
-            assignment
-                .into_wire()
-                .map_err(|error| internal(format!("restore validated task assignment: {error}")))?,
-            context_options.runtime().as_ref().clone(),
-            sink_kind,
-        )
-        .map_err(|error| {
-            protocol(format!(
-                "task {identity} assignment is not a legal instance: {error}"
-            ))
-        })?;
-
-        let attempt = TaskAttemptKey::new(execution, kernel_key);
-        let splits = self.split_queues.open_attempt(
-            attempt,
-            SplitQueueConfig {
-                max_queued_bytes: MAX_ASSIGNMENT_RETAINED_BYTES,
-            },
-        );
-        // The queue set is opened before full decode so a scan can start and
-        // block before its first split arrives. Every later refusal is rolled
-        // back by this structural lease.
-        let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
-        let task_stop = ConnectorStopOwner::new();
-        let mut stop_guard = PreparationStopGuard::new(task_stop.clone());
-        let read_context = Arc::new(TypedReadAttemptContext::new());
-        let typed_runtime = self.typed_scan_runtime(
-            execution,
-            kernel_key,
-            Arc::clone(&read_context),
-            Arc::clone(&splits),
-        )?;
-
-        // The full static-to-assignment cross-check: scan node membership and
-        // sink edge binding both run in this decode, before any receiver is
-        // registered. The decoded plan is moved in rather than cloned.
-        let type_tracker = self
-            .queries
-            .type_construction_tracker(execution, context_options.runtime().exec_mem_limit())
-            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
-        let type_creation = crate::native_type_construction::NativeTypeConstruction::try_new(
-            type_tracker,
-            task_stop.view(),
-            preparation_stop.clone(),
-        )
-        .map_err(|error| native_type_construction_failure_to_host(identity, &error))?;
-        let request = NativeFragmentRequest::try_decode_task(
-            execution,
-            fragment.into_plan(),
-            instance,
-            descriptor.topology(),
-            task_stop.view(),
-            Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
-            Some(typed_runtime.clone()),
-            Arc::clone(self.execution_runtime.function_catalog()),
-            #[cfg(novarocks_dev_controls)]
-            self.test_controls.clone(),
-            #[cfg(novarocks_dev_controls)]
-            self.queries.observation_controls(),
-            &type_creation,
-        )
-        .map_err(|error| {
-            if let Some(cause) = error.specialization_cause() {
-                return native_specialization_failure_to_host(identity, cause);
-            }
-            match error.construction_cause() {
-                Some(cause) => native_type_construction_failure_to_host(identity, cause),
-                None => protocol(format!("task {identity} plan is not decodable: {error}")),
-            }
-        })?;
-        if request.sink_kind() != sink_kind {
-            // Both answers come from the same decoded plan, so a disagreement
-            // is a defect in this binary rather than something a peer sent.
-            return Err(internal(format!(
-                "task {identity} static sink {sink_kind:?} decoded as {:?}",
-                request.sink_kind()
-            )));
-        }
-        let expects_bindings = request.has_runtime_filter_bindings();
-        let (delivery_expire, query_expire) =
-            novarocks_execution::runtime::query_options::query_expire_durations(Some(
-                context_options.runtime().as_ref(),
-            ));
-        let exec_mem_limit = context_options.runtime().exec_mem_limit();
-        // Profiling is the query's decision, exactly as it is on the
-        // fragment-based path. Without it there is no per-operator counter to
-        // read, and this task's final info reports no operator statistics
-        // rather than reporting zeroes it never measured.
-        let profiler = context_options
-            .runtime()
-            .enable_profile()
-            .then(|| fragment_root_profiler(request.root_plan_node_id()));
-        let submission = request.into_submission();
-        // The frozen program, not the shared Result sink kind, chooses the
-        // new producer. Its complete metadata/input pool exists before any
-        // factory or driver can grow. The registry takes the provisional
-        // channel under its existing creation/context fence below.
-        let root_session = self.open_root_result_session(
-            identity,
-            submission.program().local_program().sink(),
-            matches!(
-                submission.program().local_program().nodes()
-                    [submission.program().local_program().root().index()]
-                .kind(),
-                novarocks_local_program::ProgramNodeKind::Unpivot { .. }
-            ),
-        )?;
-        let root_channel = root_session
-            .as_ref()
-            .map(|session| Arc::clone(session.channel()));
-
-        let edges = ExchangeEdgeGates::from_frozen_edges(descriptor.topology().outbound())
-            .map_err(|error| {
-                protocol(format!(
-                    "task {identity} outbound topology has no legal gate set: {error}"
-                ))
-            })?;
-
-        // Installed before preparation because preparation may already create
-        // workers that retain the sink; binding its reporter comes later,
-        // because the reporter is minted only for `submit_runnable`.
-        let operator_statistics = Arc::new(TaskOperatorStatisticsSink::new(
-            kernel_key,
-            profiler.clone(),
-        ));
-        let event_sink: Arc<dyn FragmentEventSink> =
-            Arc::new(CompositeFragmentEventSink::new(vec![
-                self.context_facts
-                    .runtime_filter_event_sink(execution, kernel_key),
-                Arc::clone(&operator_statistics) as Arc<dyn FragmentEventSink>,
-            ]));
-
-        let runtime_filter =
-            self.context_facts
-                .runtime_filter_session(execution, kernel_key, expects_bindings)?;
-        // Resource ownership starts with preparation. This registration does
-        // not activate drivers; its lease rolls back every pre-submit exit.
-        let registration = self
-            .queries
-            .register_fragment_execution(execution, kernel_key, delivery_expire, query_expire)
-            .map_err(|error| {
-                resource_exhausted(format!("task {identity} could not be registered: {error}"))
-            })?;
-        let admission = self
-            .queries
-            .prepare_admission_execution_typed(
-                execution,
-                kernel_key,
-                delivery_expire,
-                query_expire,
-                exec_mem_limit,
-                runtime_filter,
-            )
-            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
-        typed_runtime
-            .install_connector_resource_tracker(admission.fragment_mem_tracker())
-            .map_err(|error| {
-                internal(format!(
-                    "task {identity} could not install connector resource accounting: {error}"
-                ))
-            })?;
-        let mut context = admission
-            .into_prepare_context(
-                profiler,
-                Arc::clone(&self.exchange_transmitter),
-                Arc::clone(&self.result_writer),
-                event_sink,
-            )
-            .with_fragment_commit_port(Arc::clone(&self.commit_port))
-            .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
-            .with_registration_owned_exchange_receivers()
-            .with_execution_runtime(Arc::clone(&self.execution_runtime))
-            .with_result_identity(identity)
-            // Binding the gates here is what makes the closed-edge barrier
-            // real: the sinks this fragment builds consult them before every
-            // send, so a producer cannot reach a destination that has not
-            // acknowledged its own creation.
-            .with_edge_gates(Arc::clone(&edges));
-        #[cfg(novarocks_dev_controls)]
-        if let Some(observations) = self.queries.observation_controls() {
-            if let Some(observer) = observations
-                .observation_for("exchange-snapshot", execution)
-                .map_err(internal)?
-            {
-                let receiver = novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(self.execution_runtime.clone()).with_test_observer(observer.clone());
-                context = context
-                    .with_exchange_test_observer(Some(observer))
-                    .with_exchange_receiver_port(Arc::new(receiver));
-            }
-        }
-        if let Some(session) = root_session {
-            context = context.with_root_result_session(session);
-        }
-
-        // This is the receiver install. It registers every inbound exchange
-        // receiver and builds the pipeline in one step, and its rollback is
-        // dropping the handle it returns.
-        let mut dormant = prepare_fragment(submission, context)
-            .map_err(|error| preparation_failure_to_host(identity, &error))?;
-        let exchange_retirement = dormant.take_exchange_retirement();
-
-        #[cfg(novarocks_dev_controls)]
-        crate::task_execution_observation::emit_prepared_task_dop(
-            self.queries.observation_controls().as_deref(),
-            identity,
-            descriptor.fragment_instance_id(),
-            descriptor.pipeline_dop().get(),
-        );
-
-        let installation = novarocks_worker::PreparedTaskInstallation::new(
-            PreparedTaskFacts::new(sink_kind),
-            root_channel.clone(),
-        )?;
-        if let Some(channel) = &root_channel {
-            #[cfg(novarocks_dev_controls)]
-            crate::task_execution_observation::emit_prepared_client_root(
-                self.queries.observation_controls().as_deref(),
-                identity,
-                &channel.spec().contract,
-            );
-        }
-
-        self.tasks.lock().expect(TASK_LOCK).insert(
-            identity,
-            Arc::new(TaskRuntime {
-                attempt,
-                stop: task_stop,
-                sink_kind,
-                root_channel,
-                dormant: Mutex::new(Some(dormant)),
-                exchange_retirement: Mutex::new(exchange_retirement),
-                edges,
-                splits,
-                #[cfg(novarocks_dev_controls)]
-                replay_gate: Mutex::new(None),
-                read_context,
-                registration: Mutex::new(Some(registration)),
-                operator_statistics,
-            }),
-        );
-        lease.retain();
-        stop_guard.transfer_to_task();
-        Ok(installation)
+        self.install_compiled_receiver(descriptor, input, self.compiler.as_ref(), preparation_stop)
     }
 
     /// Drops everything `install_receiver` prepared.
@@ -2602,6 +2309,7 @@ fn compiled_package_rejection(
             CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
         )) => TaskFailureCategory::Execution,
         CompiledPackageError::Refused(_) => TaskFailureCategory::Protocol,
+        CompiledPackageError::Unsupported(_) => TaskFailureCategory::Unsupported,
         CompiledPackageError::ProjectMetadata(error) => preparation_memory_refusal_category(error),
         CompiledPackageError::ProjectMetadataRequest(error) => metadata_request_category(error),
         CompiledPackageError::TypeMaterialization(super::TypeMaterializationRefusal::Stopped(
@@ -2699,27 +2407,6 @@ fn memory_admission_failure_to_host(
     resource_exhausted(format!("task {identity} could not be admitted: {error}"))
 }
 
-fn native_specialization_failure_to_host(
-    identity: TaskIdentity,
-    cause: &novarocks_functions::FunctionSpecializationFailure,
-) -> HostRejection {
-    use novarocks_functions::FunctionSpecializationFailure as F;
-    use novarocks_type_contract::CompileControlError as C;
-    let category = match cause {
-        F::Control(C::ResourceExhausted) => TaskFailureCategory::ResourceExhausted,
-        F::Control(C::Cancelled | C::DeadlineExceeded) => TaskFailureCategory::Execution,
-        F::Kernel(cause) => failure_cause_category(
-            &ExecutionFailureCause::Kernel(cause.clone()),
-            TaskFailureCategory::Protocol,
-        ),
-        _ => TaskFailureCategory::Protocol,
-    };
-    HostRejection::new(
-        category,
-        format!("task {identity} writer preparation failed: {cause}"),
-    )
-}
-
 fn native_type_construction_failure_to_host(
     identity: TaskIdentity,
     error: &crate::native_type_construction::NativeTypeConstructionError,
@@ -2754,7 +2441,7 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
         PreparationStopGuard, QueryContextOptions, RootProducerPool, StandDown,
@@ -2769,8 +2456,6 @@ pub(super) mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
-    use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntime, ExecutionRuntimeConfig,
@@ -2786,6 +2471,7 @@ pub(super) mod tests {
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+    use novarocks_execution_contract::DataStreamPartitionType;
     use novarocks_execution_contract::task_execution::creation::{
         CreationContent, FrozenBytes, PreparedTaskFacts, TaskCreationInput,
     };
@@ -2811,8 +2497,9 @@ pub(super) mod tests {
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
         TerminationDetail,
     };
+    use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_models::{connector_read as connector_dto, novarocks as proto, plan};
+    use novarocks_proto_models::{connector_read as connector_dto, novarocks as proto};
     use novarocks_spi::connector::ConnectorStopOwner;
     use novarocks_spi::connector::{
         CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
@@ -3079,517 +2766,13 @@ pub(super) mod tests {
         )
     }
 
-    struct FixtureTypeControl;
-    impl novarocks_type_contract::PureCompileControl for FixtureTypeControl {
-        fn checkpoint(
-            &self,
-            _: novarocks_type_contract::CompilePhase,
-            _: u32,
-        ) -> Result<(), novarocks_type_contract::CompileControlError> {
-            Ok(())
-        }
+    pub(crate) mod creation_body {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/backend_task_execution/execution_host/creation_body.rs"
+        ));
     }
-
-    fn fixture_type_reference(id: u32) -> novarocks_proto_models::common::TypeDesc {
-        novarocks_proto_models::common::TypeDesc {
-            value_binding_id: Some(id),
-        }
-    }
-
-    fn encode_fixture_type_table(
-        declarations: &[(u32, &novarocks_type_contract::FunctionValueType)],
-    ) -> plan::ExecutionTypeTable {
-        use novarocks_plan_codec::execution_type_table::{
-            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
-        };
-        use novarocks_plan_codec::host_projection_v2::AdmissionRefusal;
-        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
-        let roots = declarations
-            .iter()
-            .map(|(id, value)| ExecutionTypeRoot { id: *id, value })
-            .collect::<Vec<_>>();
-        let mut checkpoints =
-            CompileCheckpoints::try_new(&FixtureTypeControl, CompilePhase::Encode).unwrap();
-        // This is a pure author of known test declarations, with ordinary
-        // ownership and no BE grant or invented memory invoice.
-        let mut request =
-            |_: std::alloc::Layout| Ok::<(), AdmissionRefusal<std::convert::Infallible>>(());
-        let table = ExecutionTypeTableBuilder::new(&roots)
-            .encode_observed(
-                ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
-                &mut request,
-                &mut checkpoints,
-            )
-            .unwrap()
-            .into_wire();
-        checkpoints.finish().unwrap();
-        table
-    }
-
-    fn encode_fixture_arrow_schema(
-        fields: &[(u32, &str, &novarocks_type_contract::FunctionValueType)],
-    ) -> plan::ArrowPhysicalSchema {
-        let roots = fields
-            .iter()
-            .enumerate()
-            .map(|(id, (_, _, value))| (id as u32, *value))
-            .collect::<Vec<_>>();
-        let table = encode_fixture_type_table(&roots);
-        let columns = fields
-            .iter()
-            .zip(table.value_bindings)
-            .map(
-                |((slot_id, name, value), binding)| plan::ArrowPhysicalColumn {
-                    slot_id: *slot_id,
-                    is_internal: false,
-                    field: Some(plan::ArrowPhysicalField {
-                        name: (*name).into(),
-                        nullable: value.nullable(),
-                        r#type: binding.value_layout.map(Box::new),
-
-                        logical_type_id: binding.logical_type_id,
-                    }),
-                },
-            )
-            .collect();
-        plan::ArrowPhysicalSchema {
-            columns,
-
-            logical_types: table.logical_types,
-        }
-    }
-
-    /// Actual scalar source pools and their independent field namespace. The
-    /// fixture uses the same pure IPC author as FE; no inline value decoder or
-    /// transported capacity grant participates in BE preparation.
-    fn fixture_constant_sources(
-        sources: &[(
-            u32,
-            novarocks_type_contract::FunctionValueType,
-            arrow::array::ArrayRef,
-        )],
-    ) -> (
-        novarocks_proto_models::physical_type_v2::SourceFieldTable,
-        Vec<novarocks_proto_models::call_request::IpcConstantPool>,
-    ) {
-        use novarocks_plan_codec::{
-            physical_constant_v2::prepare_constant_record_write_pure_in,
-            physical_type_v2::{TypeProjectionLimits, encode_source_field_table_pure_in},
-        };
-        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
-        let mut pools = Vec::new();
-        for (id, value, array) in sources {
-            let name = format!("host source {id}");
-            let field = Arc::new(arrow::datatypes::Field::new(
-                &name,
-                value.data_type().clone(),
-                value.nullable(),
-            ));
-            pools.push(
-                novarocks_functions::ConstantPool::try_new(
-                    field,
-                    value.clone(),
-                    array.to_data(),
-                    // The existing canonical scalar fixture envelope. Subject
-                    // reader/resource/row limits in each test are unchanged.
-                    novarocks_functions::ConstantPolicy {
-                        max_rows: u64::try_from(array.len()).unwrap(),
-                        max_array_nodes: 1,
-                        max_logical_elements: u64::try_from(array.len()).unwrap(),
-                        max_retained_buffer_bytes: 4096,
-                        max_type_depth: 1,
-                        max_type_nodes: 1,
-                        max_dictionary_depth: 1,
-                        max_metadata_bytes: u64::try_from(name.len()).unwrap(),
-                        max_library_validation_work: 65536,
-                        max_library_validation_bytes: 65536,
-                    },
-                    CompilePhase::Validate,
-                    &FixtureTypeControl,
-                )
-                .unwrap(),
-            );
-        }
-        let roots = sources
-            .iter()
-            .zip(&pools)
-            .map(|((id, _, _), pool)| (*id, pool.field_ref()))
-            .collect::<Vec<_>>();
-        let mut work =
-            CompileCheckpoints::try_new(&FixtureTypeControl, CompilePhase::Encode).unwrap();
-        let fields = encode_source_field_table_pure_in(
-            &roots,
-            TypeProjectionLimits::for_validated_source_root_count(roots.len()).unwrap(),
-            &mut work,
-        )
-        .unwrap();
-        let records = sources
-            .iter()
-            .zip(&pools)
-            .map(|((id, _, _), pool)| {
-                prepare_constant_record_write_pure_in(
-                    novarocks_physical_plan::ConstantPoolId::new(*id),
-                    *id,
-                    *id,
-                    pool,
-                    &mut work,
-                )
-                .unwrap()
-                .emit_in(&mut work)
-                .unwrap()
-            })
-            .collect();
-        work.finish().unwrap();
-        (fields, records)
-    }
-
-    /// One task's creation body: the static fragment every task of the
-    /// fragment shares, and this task's assignment.
-    #[derive(Clone)]
-    struct Body {
-        frozen: proto::FrozenFragment,
-        assignment: proto::TaskAssignment,
-    }
-
-    impl Body {
-        fn bounded_root(output: novarocks_result_contract::FrozenRootOutput, rows: &[i64]) -> Self {
-            use novarocks_proto_models::{common, expr};
-            let contract = novarocks_result_contract::RootOutputContract::new(
-                novarocks_result_contract::RootProfileId::V1,
-                output,
-            );
-            let mut body = Self::with_sink(
-                1,
-                plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::RootResult(
-                        novarocks_proto_codec::root_result::encode_root_contract(&contract),
-                    )),
-                },
-                Vec::new(),
-            );
-            let ty = novarocks_type_contract::FunctionValueType::new(
-                arrow::datatypes::DataType::Int64,
-                false,
-            );
-            let table = encode_fixture_type_table(&[(0, &ty)]);
-            let data_type = fixture_type_reference(0);
-            let column = common::OutputColumn {
-                column_id: 10,
-                name: "v".into(),
-                r#type: Some(data_type.clone()),
-                nullable: false,
-                is_internal: false,
-            };
-            let (sources, records) = fixture_constant_sources(&[(
-                0,
-                ty.clone(),
-                Arc::new(arrow::array::Int64Array::from(rows.to_vec())),
-            )]);
-            let fragment = body.frozen.plan.as_mut().unwrap();
-            fragment.constant_source_fields = Some(sources);
-            fragment.constants = records;
-            fragment.execution_types = Some(table);
-            fragment.output_columns = vec![column.clone()];
-            let node = fragment.root.as_mut().unwrap();
-            let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
-            else {
-                unreachable!()
-            };
-            physical.output_columns = vec![column.clone()];
-            physical.kind = Some(plan::plan_node::Kind::Values(plan::ValuesNode {
-                columns: vec![column],
-                rows: rows
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, _)| plan::ExprList {
-                        values: vec![expr::Expr {
-                            original_definition_id: None,
-                            r#type: Some(data_type.clone()),
-                            nullable: false,
-                            kind: Some(expr::expr::Kind::ConstantReference(
-                                novarocks_proto_models::call_request::ConstantReference {
-                                    pool_id: Some(0),
-                                    row_ordinal: u32::try_from(ordinal).unwrap(),
-                                },
-                            )),
-                        }],
-                    })
-                    .collect(),
-            }));
-            body
-        }
-        fn bounded_statistics() -> Self {
-            use arrow::datatypes::{DataType, Field, Schema};
-            use novarocks_proto_models::{common, expr};
-            let mut body = Self::bounded_root(
-                novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                    novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
-                ),
-                &[1],
-            );
-            let root = body.frozen.plan.as_mut().unwrap().root.as_mut().unwrap();
-            let mut child = root.clone();
-            child.node_id = 9;
-            let Some(plan::distributed_node::Payload::Physical(physical)) = child.payload.as_mut()
-            else {
-                unreachable!()
-            };
-            let binary = fixture_type_reference(0);
-            let column = common::OutputColumn {
-                column_id: 10,
-                name: "aggregate".into(),
-                r#type: Some(binary.clone()),
-                nullable: false,
-                is_internal: false,
-            };
-            physical.output_columns = vec![column.clone()];
-            physical.kind = Some(plan::plan_node::Kind::Values(plan::ValuesNode {
-                columns: vec![column],
-                rows: vec![plan::ExprList {
-                    values: vec![expr::Expr {
-                        original_definition_id: None,
-                        r#type: Some(binary),
-                        nullable: false,
-                        kind: Some(expr::expr::Kind::ConstantReference(
-                            novarocks_proto_models::call_request::ConstantReference {
-                                pool_id: Some(0),
-                                row_ordinal: 0,
-                            },
-                        )),
-                    }],
-                }],
-            }));
-            let label = expr::Expr {
-                original_definition_id: None,
-                r#type: Some(fixture_type_reference(1)),
-                nullable: false,
-                kind: Some(expr::expr::Kind::ConstantReference(
-                    novarocks_proto_models::call_request::ConstantReference {
-                        pool_id: Some(1),
-                        row_ordinal: 0,
-                    },
-                )),
-            };
-            let entries = Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Arc::new(Field::new("key", DataType::Utf8, false)),
-                        Arc::new(Field::new("value", DataType::Utf8, false)),
-                    ]
-                    .into(),
-                ),
-                false,
-            ));
-            let schema = Schema::new(vec![
-                Field::new(
-                    "input_fields",
-                    DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
-                    false,
-                ),
-                Field::new("blob_type", DataType::Utf8, false),
-                Field::new("body", DataType::Binary, false),
-                Field::new("properties", DataType::Map(entries, false), false),
-            ]);
-            use novarocks_type_contract::{
-                FunctionValueType, ValueKind, ValueLayout, ValueTypeRef,
-                ValueTypeStorageLifetime as S,
-            };
-            let binary_value = FunctionValueType::new(DataType::Binary, false);
-            let string_value = FunctionValueType::new(DataType::Utf8, false);
-            let item = ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int32), false, S::pure())
-                .unwrap();
-            let list = FunctionValueType::try_from_value(
-                ValueTypeRef::try_new(ValueKind::List(item), false, S::pure()).unwrap(),
-                ValueLayout::try_new(schema.field(0).data_type(), S::pure()).unwrap(),
-            )
-            .unwrap();
-            let string = ValueTypeRef::try_new(ValueKind::String, false, S::pure()).unwrap();
-            let properties = FunctionValueType::try_from_value(
-                ValueTypeRef::try_new(
-                    ValueKind::Map {
-                        key: string.clone(),
-                        value: string,
-                    },
-                    false,
-                    S::pure(),
-                )
-                .unwrap(),
-                ValueLayout::try_new(schema.field(3).data_type(), S::pure()).unwrap(),
-            )
-            .unwrap();
-            let output_schema = encode_fixture_arrow_schema(&[
-                (1, "input_fields", &list),
-                (2, "blob_type", &string_value),
-                (3, "body", &binary_value),
-                (4, "properties", &properties),
-            ]);
-            let execution_types = encode_fixture_type_table(&[
-                (0, &binary_value),
-                (1, &string_value),
-                (2, &list),
-                (3, &string_value),
-                (4, &binary_value),
-                (5, &properties),
-            ]);
-            root.children = vec![child];
-            root.payload = Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: Vec::new(),
-                kind: Some(plan::plan_node::Kind::Unpivot(plan::UnpivotNode {
-                    passthrough_columns: Vec::new(),
-                    value_output_column_id: 3,
-                    literal_output_column_ids: vec![1, 2, 4],
-                    value_mappings: vec![plan::UnpivotValueMapping {
-                        input_value_column_id: 10,
-                        constants: vec![
-                            plan::UnpivotConstant {
-                                value: Some(plan::unpivot_constant::Value::Int32List(
-                                    plan::Int32List { values: vec![7] },
-                                )),
-                            },
-                            plan::UnpivotConstant {
-                                value: Some(plan::unpivot_constant::Value::ScalarLiteral(label)),
-                            },
-                            plan::UnpivotConstant {
-                                value: Some(plan::unpivot_constant::Value::Utf8Map(
-                                    plan::Utf8Map {
-                                        entries: Vec::new(),
-                                    },
-                                )),
-                            },
-                        ],
-                    }],
-                    max_output_rows: 4096,
-                    max_output_bytes: 32 << 20,
-                    output_schema: Some(output_schema),
-                })),
-            }));
-            let (sources, records) = fixture_constant_sources(&[
-                (
-                    0,
-                    binary_value,
-                    Arc::new(arrow::array::BinaryArray::from(vec![
-                        [255_u8, 0, 3].as_slice(),
-                    ])),
-                ),
-                (
-                    1,
-                    string_value,
-                    Arc::new(arrow::array::StringArray::from(vec!["theta"])),
-                ),
-            ]);
-            let fragment = body.frozen.plan.as_mut().unwrap();
-            fragment.constant_source_fields = Some(sources);
-            fragment.constants = records;
-            fragment.execution_types = Some(execution_types);
-            fragment.output_columns = [
-                (1, "input_fields", 2),
-                (2, "blob_type", 3),
-                (3, "body", 4),
-                (4, "properties", 5),
-            ]
-            .into_iter()
-            .map(|(column_id, name, binding)| common::OutputColumn {
-                column_id,
-                name: name.into(),
-                r#type: Some(fixture_type_reference(binding)),
-                nullable: false,
-                is_internal: false,
-            })
-            .collect();
-            body
-        }
-
-        /// A decodable, self-contained fragment: one VALUES node into a NOOP
-        /// sink, frozen for exactly `pipeline_dop`.
-        fn values(pipeline_dop: u32) -> Self {
-            Self::with_sink(
-                pipeline_dop,
-                plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Noop(true)),
-                },
-                Vec::new(),
-            )
-        }
-
-        fn with_sink(pipeline_dop: u32, sink: plan::DataSink, sink_edge_ids: Vec<u32>) -> Self {
-            Self {
-                frozen: proto::FrozenFragment {
-                    package: Default::default(),
-                    plan_version: vec![1; 16],
-                    plan_contract_revision: 1,
-                    fragment_contract_version: 1,
-                    pipeline_dop_domain: Some(proto::PipelineDopDomain {
-                        min: pipeline_dop,
-                        max: pipeline_dop,
-                        requires_power_of_two: false,
-                    }),
-                    plan: Some(plan::PlanFragment {
-                        fragment_id: 7,
-                        execution_types: Some(plan::ExecutionTypeTable::default()),
-                        // These closed fixtures contain no ordinary function or
-                        // aggregate binding requests, and no IPC constant pools.
-                        original_call_requests: Some(
-                            novarocks_proto_models::call_request::FragmentCallRequests {
-                                entries: Vec::new(),
-                            },
-                        ),
-                        constants: Vec::new(),
-                        constant_source_fields: Some(
-                            novarocks_proto_models::physical_type_v2::SourceFieldTable {
-                                shape: Some(
-                                    novarocks_proto_models::physical_type_v2::TypeTable::default(),
-                                ),
-                                field_facts: Vec::new(),
-                            },
-                        ),
-                        root: Some(plan::DistributedNode {
-                            node_id: 10,
-                            fragment_id: 7,
-                            limit: -1,
-                            payload: Some(plan::distributed_node::Payload::Physical(
-                                plan::PlanNode {
-                                    output_columns: Vec::new(),
-                                    kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
-                                        rows: Vec::new(),
-                                        columns: Vec::new(),
-                                    })),
-                                },
-                            )),
-                            ..Default::default()
-                        }),
-                        sink: Some(sink),
-                        runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
-                            fragment_id: 7,
-                            bindings: Vec::new(),
-                        }),
-                        ..Default::default()
-                    }),
-                },
-                assignment: proto::TaskAssignment {
-                    instance_ordinal: 3,
-                    initial_scan_ranges: Vec::new(),
-                    sink_edge_ids,
-                },
-            }
-        }
-
-        fn frozen_bytes(&self) -> FrozenBytes {
-            FrozenBytes::freeze(self.frozen.encode_to_vec().into())
-        }
-
-        /// The input a creation winner receives, with its assignment decoded
-        /// by the codec's own assignment decoder against `descriptor`.
-        fn input(&self, descriptor: &TaskDescriptor) -> TaskCreationInput {
-            let assignment = novarocks_task_codec::creation::decode_task_assignment(
-                self.assignment.clone(),
-                descriptor,
-                FieldPath::root("assignment"),
-            )
-            .expect("a structurally legal assignment");
-            TaskCreationInput::new(self.frozen_bytes(), Box::new(assignment))
-        }
-    }
+    use creation_body::{Body, BodySink};
 
     /// An assignment this backend's codec did not produce.
     #[derive(Debug)]
@@ -3618,13 +2801,13 @@ pub(super) mod tests {
             identity,
             kernel_key,
             NonZeroUsize::new(pipeline_dop).expect("nonzero dop"),
-            vec![PlanNodeId::new(10).expect("nonnegative node")],
+            Vec::new(),
             topology,
         )
         .expect("a legal descriptor")
     }
 
-    /// A single-driver descriptor with no exchange topology.
+    /// A single-driver Values descriptor with no scans or exchange topology.
     fn consistent_descriptor(identity: TaskIdentity, kernel_key: UniqueId) -> TaskDescriptor {
         descriptor_with(identity, kernel_key, 1, ExchangeTopology::default())
     }
@@ -3678,6 +2861,50 @@ pub(super) mod tests {
         .map(|installed| installed.facts())
     }
 
+    /// A direct-host test's real Context pin for a bounded CountOnly root.
+    /// The registry normally owns this pin and marks it during the creation
+    /// commit, after reserving the runnable and before drivers start.
+    struct FixtureRootContext {
+        root: Arc<novarocks_worker::root_result_channel::RootResultChannel>,
+    }
+
+    impl FixtureRootContext {
+        fn commit(&self) {
+            self.root
+                .mark_context_owned()
+                .expect("the fixture Context takes its exact root");
+        }
+    }
+
+    impl Drop for FixtureRootContext {
+        fn drop(&mut self) {
+            self.root.close(
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextReleased,
+            );
+        }
+    }
+
+    fn install_context_root(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+    ) -> Result<FixtureRootContext, HostRejection> {
+        establish_fixture_context(host, descriptor.identity());
+        let dop = u32::try_from(descriptor.pipeline_dop().get()).expect("small dop");
+        let installation = host.install_receiver(
+            descriptor,
+            Body::values(dop).input(descriptor),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )?;
+        let (_, root) = installation.into_parts();
+        let root = root.expect("the bounded fixture returns its provisional root");
+        assert_eq!(root.spec().task, descriptor.identity());
+        assert_eq!(
+            root.spec().contract.kind(),
+            novarocks_result_contract::RootOutputKind::CountOnly
+        );
+        Ok(FixtureRootContext { root })
+    }
+
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
         ExchangeTopology::try_new(
             Vec::new(),
@@ -3724,17 +2951,8 @@ pub(super) mod tests {
     }
 
     /// A stream sink sending one unpartitioned stream to exchange node 11.
-    fn stream_sink(partition: plan::PartitionKind) -> plan::DataSink {
-        plan::DataSink {
-            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                dest_node_id: 11,
-                output_partition: Some(plan::DataPartition {
-                    kind: partition as i32,
-                    exprs: Vec::new(),
-                }),
-                ..Default::default()
-            })),
-        }
+    fn stream_sink(partition: DataStreamPartitionType) -> BodySink {
+        BodySink::Stream(partition)
     }
 
     /// A context host that answers every query-scoped question with the
@@ -3983,6 +3201,7 @@ pub(super) mod tests {
             TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
         let runtime = test_execution_runtime(Arc::clone(&facts.memory_authority));
         NativeTaskExecutionHost::new(
+            Arc::new(compiled_package_host::interpreter()),
             NativeFragmentQueryRuntime::new_for_test(
                 Arc::clone(&facts.query_manager),
                 Arc::clone(&facts.memory_authority),
@@ -4527,7 +3746,20 @@ pub(super) mod tests {
         assert_eq!(
             facts.filter_sessions_requested.load(Ordering::SeqCst),
             0,
-            "a refusal precedes every downstream fragment construction"
+            "a refused preparation cannot bind a scan runtime-filter session"
+        );
+        assert!(
+            facts
+                .compiled_filter_bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .all(BTreeSet::is_empty),
+            "a refused fixture cannot borrow any undeclared filter binding"
+        );
+        assert!(
+            host.capabilities.is_empty(),
+            "a refused install publishes no ingress capability"
         );
     }
 
@@ -4581,7 +3813,7 @@ pub(super) mod tests {
             rejection
                 .detail()
                 .as_str()
-                .contains("static fragment is not decodable"),
+                .contains("static package is not decodable"),
             "{rejection}"
         );
         assert_nothing_prepared(&host, &facts);
@@ -4612,9 +3844,43 @@ pub(super) mod tests {
             )
             .expect_err("a parallelism outside the frozen domain is not this fragment");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
-        assert!(
-            rejection.detail().as_str().contains("DOP domain"),
-            "{rejection}"
+        assert_eq!(
+            rejection.detail().as_str(),
+            format!(
+                "task {} package could not be compiled: package does not compile: invalid local lowering: DOP is outside physical domain",
+                descriptor.identity(),
+            ),
+        );
+        assert_nothing_prepared(&host, &facts);
+    }
+
+    #[test]
+    fn a_values_task_cannot_declare_a_split_driven_scan_node() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let descriptor = TaskDescriptor::try_new(
+            identity(47_001, 1, 1),
+            UniqueId::new(47_001, 1),
+            NonZeroUsize::new(1).unwrap(),
+            vec![PlanNodeId::new(10).unwrap()],
+            ExchangeTopology::default(),
+        )
+        .unwrap();
+        establish_fixture_context(&host, descriptor.identity());
+        let rejection = host
+            .install_receiver(
+                &descriptor,
+                Body::values(1).input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
+            .expect_err("a Values node cannot stand in for a split-driven scan");
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+        assert_eq!(
+            rejection.detail().as_str(),
+            format!(
+                "task {} names split-driven nodes [10], but its compiled scans are []",
+                descriptor.identity()
+            ),
         );
         assert_nothing_prepared(&host, &facts);
     }
@@ -4640,19 +3906,12 @@ pub(super) mod tests {
             )
             .expect_err("a scan assignment must name a scan node of the static plan");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
-        assert!(
-            rejection
-                .detail()
-                .as_str()
-                .contains("scan ranges assigned to unknown scan node 99"),
-            "{rejection}"
-        );
-        assert!(
-            rejection
-                .detail()
-                .as_str()
-                .contains("creation_metadata.assignment.initial_scan_ranges"),
-            "the refusal names the field the frontend actually sent: {rejection}"
+        assert_eq!(
+            rejection.detail().as_str(),
+            format!(
+                "task {} assigns scan ranges to node 99, which is not a compiled scan",
+                descriptor.identity(),
+            ),
         );
         assert_nothing_prepared(&host, &facts);
     }
@@ -4671,7 +3930,11 @@ pub(super) mod tests {
         // The frozen edge is unpartitioned; the static sink hashes. Binding
         // the one to the other would send rows to destinations the frontend
         // never planned for that partitioning.
-        let body = Body::with_sink(1, stream_sink(plan::PartitionKind::Hash), vec![edge.get()]);
+        let body = Body::with_sink(
+            1,
+            stream_sink(DataStreamPartitionType::HashPartitioned),
+            vec![edge.get()],
+        );
 
         establish_fixture_context(&host, descriptor.identity());
 
@@ -4704,8 +3967,8 @@ pub(super) mod tests {
 
         let prepared =
             install(&host, &descriptor).expect("task-local DOP 1 is legal under context DOP 8");
-        assert_eq!(prepared.sink_kind(), FragmentSinkKind::Noop);
-        assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 1);
+        assert_eq!(prepared.sink_kind(), FragmentSinkKind::Result);
+        assert_eq!(facts.compiled_filter_bindings.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -4786,13 +4049,7 @@ pub(super) mod tests {
             host.result_writer = writer.clone();
             let task = identity(80_030 + index as i64, 1, 1);
             let descriptor = consistent_descriptor(task, UniqueId::new(80_030 + index as i64, 1));
-            let body = Body::with_sink(
-                1,
-                plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
-                },
-                Vec::new(),
-            );
+            let body = Body::with_sink(1, BodySink::Result, Vec::new());
             establish_fixture_context(&host, descriptor.identity());
             let refusal = host
                 .install_receiver(
@@ -4849,7 +4106,7 @@ pub(super) mod tests {
         );
         let first_descriptor = consistent_descriptor(first, UniqueId::new(523, 524));
         let sibling_descriptor = consistent_descriptor(sibling, UniqueId::new(525, 526));
-        install(&host, &first_descriptor).expect("first prepares");
+        let context_root = install_context_root(&host, &first_descriptor).expect("first prepares");
         let (owner, reporter) = reporter_for(first);
         // Submission retains the registration in PreparedNativeStart. No
         // commit has occurred, so this test cannot accidentally run drivers.
@@ -4875,6 +4132,7 @@ pub(super) mod tests {
             1,
             "the submitted start owns its registration independently of receiver removal"
         );
+        context_root.commit();
         runnable.commit_creation();
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4902,7 +4160,7 @@ pub(super) mod tests {
             descriptor_with(producer, kernel_key, 1, outbound_topology(edge, consumer));
         let body = Body::with_sink(
             1,
-            stream_sink(plan::PartitionKind::Unpartitioned),
+            stream_sink(DataStreamPartitionType::Unpartitioned),
             vec![edge.get()],
         );
 
@@ -4920,7 +4178,7 @@ pub(super) mod tests {
             FragmentSinkKind::DataStream,
             "the prepared facts report the validated static sink"
         );
-        assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 1);
+        assert_eq!(facts.compiled_filter_bindings.lock().unwrap().len(), 1);
 
         // An edge the descriptor never froze has no gate, so granting it would
         // be inventing a destination.
@@ -4967,7 +4225,7 @@ pub(super) mod tests {
         );
         let body = Body::with_sink(
             1,
-            stream_sink(plan::PartitionKind::Unpartitioned),
+            stream_sink(DataStreamPartitionType::Unpartitioned),
             vec![edge.get()],
         );
         establish_fixture_context(&host, descriptor.identity());
@@ -5286,6 +4544,20 @@ pub(super) mod tests {
         runnable
     }
 
+    fn submit_committed_in_context(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+        reporter: TaskStatusReporter,
+        context: &FixtureRootContext,
+    ) -> Arc<dyn RunnableTask> {
+        let runnable = host
+            .submit_runnable(descriptor, reporter)
+            .expect("a prepared fragment starts");
+        context.commit();
+        runnable.commit_creation();
+        runnable
+    }
+
     #[test]
     fn submitted_runnable_stays_dormant_until_creation_commit() {
         let facts = Arc::new(StubContextFacts::default());
@@ -5294,7 +4566,7 @@ pub(super) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(189, 190));
         let (owner, reporter) = planned_reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
         let runnable = host
@@ -5311,6 +4583,7 @@ pub(super) mod tests {
         ));
         assert_eq!(owner.state(), TaskState::Planned);
         assert!(!owner.convergence().actual_stopped());
+        context_root.commit();
         runnable.commit_creation();
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         await_runtime_convergence(&owner);
@@ -5364,18 +4637,18 @@ pub(super) mod tests {
         let descriptor = consistent_descriptor(task, kernel_key);
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        let runnable = submit_committed(&host, &descriptor, reporter);
+        let runnable = submit_committed_in_context(&host, &descriptor, reporter, &context_root);
 
-        // A NOOP sink owes nothing further, so the completion owner is the
-        // only thing that may publish FINISHED. If it never reported, this
-        // would hang at PLANNED and the poll would fail.
+        // CountOnly hands output responsibility to its context without a
+        // client read. The completion owner must still publish FINISHED;
+        // otherwise this would hang at PLANNED and the poll would fail.
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         assert!(
             owner.output_released(),
-            "a finished non-root task has released its output responsibility"
+            "the finished CountOnly task handed its output responsibility to its context"
         );
         await_runtime_convergence(&owner);
         let convergence = owner.convergence();
@@ -5407,10 +4680,10 @@ pub(super) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(213, 214));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        submit_committed(&host, &descriptor, reporter);
+        submit_committed_in_context(&host, &descriptor, reporter, &context_root);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         assert_eq!(
@@ -6599,161 +5872,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn plan_tree_receiver_retirement_waits_for_the_original_inbound_gate() {
-        for (ordinal, stop) in [
-            ReceiverStop::Success,
-            ReceiverStop::Quiesce,
-            ReceiverStop::BeforeStart,
-            ReceiverStop::Abort,
-            ReceiverStop::Rollback,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let facts = Arc::new(StubContextFacts::default());
-            let host = host(facts);
-            let query = 83_100 + ordinal as i64;
-            let descriptor = descriptor_with(
-                identity(query, 1, 1),
-                UniqueId::new(query, 1),
-                1,
-                inbound_topology(
-                    FragmentNodeId::new(10),
-                    vec![ExchangeSource::new(
-                        identity(query, 2, 1),
-                        UniqueId::new(query, 2),
-                        0,
-                    )],
-                ),
-            );
-            let mut body = Body::values(1);
-            body.frozen
-                .plan
-                .as_mut()
-                .unwrap()
-                .root
-                .as_mut()
-                .unwrap()
-                .payload = Some(plan::distributed_node::Payload::Exchange(
-                plan::ExchangeReceiver {
-                    partition_type: plan::PartitionType::Unpartitioned as i32,
-                    source_fragment_id: 8,
-                    flavor: Some(plan::ExchangeFlavor {
-                        kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
-                    }),
-                    ..Default::default()
-                },
-            ));
-            let input = body.input(&descriptor);
-            receiver_retirement_case(host, descriptor, input, stop, false);
-        }
-    }
-
-    #[test]
-    fn plan_tree_receiver_nonempty_data_remains_authorized_after_normal_quiesce() {
-        for (ordinal, stop) in [ReceiverStop::Success, ReceiverStop::Quiesce]
-            .into_iter()
-            .enumerate()
-        {
-            let host = host(Arc::new(StubContextFacts::default()));
-            let query = 83_400 + ordinal as i64;
-            let descriptor = descriptor_with(
-                identity(query, 1, 1),
-                UniqueId::new(query, 1),
-                1,
-                inbound_topology(
-                    FragmentNodeId::new(10),
-                    vec![ExchangeSource::new(
-                        identity(query, 2, 1),
-                        UniqueId::new(query, 2),
-                        0,
-                    )],
-                ),
-            );
-            let mut body = Body::values(1);
-            let ty = novarocks_type_contract::FunctionValueType::new(
-                arrow::datatypes::DataType::Int64,
-                false,
-            );
-            let column = novarocks_proto_models::common::OutputColumn {
-                column_id: 10,
-                name: "v".into(),
-                r#type: Some(fixture_type_reference(0)),
-                nullable: false,
-                is_internal: false,
-            };
-            let fragment = body.frozen.plan.as_mut().unwrap();
-            fragment.execution_types = Some(encode_fixture_type_table(&[(0, &ty)]));
-            fragment.output_columns = vec![column.clone()];
-            fragment.root.as_mut().unwrap().payload = Some(
-                plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
-                    partition_type: plan::PartitionType::Unpartitioned as i32,
-                    source_fragment_id: 8,
-                    output_columns: vec![column],
-                    flavor: Some(plan::ExchangeFlavor {
-                        kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
-                    }),
-                    ..Default::default()
-                }),
-            );
-            let input = body.input(&descriptor);
-            receiver_retirement_case(host, descriptor, input, stop, true);
-        }
-    }
-
-    #[test]
-    fn plan_tree_receiver_nonempty_data_stops_on_true_abort() {
-        for (ordinal, stop) in [ReceiverStop::Abort, ReceiverStop::QuiesceThenAbort]
-            .into_iter()
-            .enumerate()
-        {
-            let host = host(Arc::new(StubContextFacts::default()));
-            let query = 83_500 + ordinal as i64;
-            let descriptor = descriptor_with(
-                identity(query, 1, 1),
-                UniqueId::new(query, 1),
-                1,
-                inbound_topology(
-                    FragmentNodeId::new(10),
-                    vec![ExchangeSource::new(
-                        identity(query, 2, 1),
-                        UniqueId::new(query, 2),
-                        0,
-                    )],
-                ),
-            );
-            let mut body = Body::values(1);
-            let ty = novarocks_type_contract::FunctionValueType::new(
-                arrow::datatypes::DataType::Int64,
-                false,
-            );
-            let column = novarocks_proto_models::common::OutputColumn {
-                column_id: 10,
-                name: "v".into(),
-                r#type: Some(fixture_type_reference(0)),
-                nullable: false,
-                is_internal: false,
-            };
-            let fragment = body.frozen.plan.as_mut().unwrap();
-            fragment.execution_types = Some(encode_fixture_type_table(&[(0, &ty)]));
-            fragment.output_columns = vec![column.clone()];
-            fragment.root.as_mut().unwrap().payload = Some(
-                plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
-                    partition_type: plan::PartitionType::Unpartitioned as i32,
-                    source_fragment_id: 8,
-                    output_columns: vec![column],
-                    flavor: Some(plan::ExchangeFlavor {
-                        kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
-                    }),
-                    ..Default::default()
-                }),
-            );
-            let input = body.input(&descriptor);
-            receiver_retirement_case(host, descriptor, input, stop, true);
-        }
-    }
-
-    #[test]
     fn an_abort_racing_a_submitted_task_still_reaches_a_terminal_status() {
         let facts = Arc::new(StubContextFacts::default());
         let mut host = host(Arc::clone(&facts));
@@ -6781,24 +5899,7 @@ pub(super) mod tests {
 
         // This sender never sends data or EOS, so the fragment cannot finish
         // before the abort wins the first-wins terminal latch.
-        let mut body = Body::values(1);
-        body.frozen
-            .plan
-            .as_mut()
-            .expect("a plan")
-            .root
-            .as_mut()
-            .expect("a root")
-            .payload = Some(plan::distributed_node::Payload::Exchange(
-            plan::ExchangeReceiver {
-                partition_type: plan::PartitionType::Unpartitioned as i32,
-                source_fragment_id: 8,
-                flavor: Some(plan::ExchangeFlavor {
-                    kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
-                }),
-                ..Default::default()
-            },
-        ));
+        let body = Body::receiver(1, node.get());
         establish_fixture_context(&host, descriptor.identity());
         host.install_receiver(
             &descriptor,
@@ -6827,8 +5928,9 @@ pub(super) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(211, 212));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
-        let _runnable = submit_committed(&host, &descriptor, reporter.clone());
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
+        let _runnable =
+            submit_committed_in_context(&host, &descriptor, reporter.clone(), &context_root);
 
         // The dormant handle is taken exactly once. A second submit must not
         // start a second execution over the same pipeline.
@@ -6977,15 +6079,14 @@ pub(super) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(271, 272));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
-        let _runnable = submit_committed(&host, &descriptor, reporter);
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
+        let _runnable = submit_committed_in_context(&host, &descriptor, reporter, &context_root);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");
         let entries = final_info.operator_statistics();
-        // The fixture plan is one VALUES node feeding a NOOP sink. The VALUES
-        // operator names plan node 10; the NOOP sink names no plan node at all
-        // and is therefore refused rather than attributed to node 10.
+        // The fixture is one VALUES node and a bounded CountOnly sink. Only
+        // the source carries node 10; a subordinate sink is not attributed to it.
         assert_eq!(
             entries.len(),
             1,
@@ -7009,8 +6110,8 @@ pub(super) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(281, 282));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
-        let _runnable = submit_committed(&host, &descriptor, reporter);
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
+        let _runnable = submit_committed_in_context(&host, &descriptor, reporter, &context_root);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");
@@ -7320,8 +6421,19 @@ pub(super) mod tests {
     fn a_winning_round_prepares_once_and_a_replay_reuses_the_prepared_task() {
         let fixture = OwnerFixture::new(61);
         let identity = fixture.identity(1);
-        let descriptor = consistent_descriptor(identity, UniqueId::new(611, 1));
-        let accepted = fixture.create(&descriptor, &Body::values(1));
+        let edge = ExchangeEdgeId::new(1).expect("nonzero edge");
+        let descriptor = descriptor_with(
+            identity,
+            UniqueId::new(611, 1),
+            1,
+            outbound_topology(edge, self::identity(61, 2, 1)),
+        );
+        let winner = Body::with_sink(
+            1,
+            BodySink::Stream(DataStreamPartitionType::Unpartitioned),
+            vec![edge.get()],
+        );
+        let accepted = fixture.create(&descriptor, &winner);
         assert_eq!(
             accepted.outcome(),
             OperationOutcome::Accepted,
@@ -7337,13 +6449,7 @@ pub(super) mod tests {
             2,
             ExchangeTopology::default(),
         );
-        let mut changed_body = Body::with_sink(
-            2,
-            plan::DataSink {
-                kind: Some(plan::data_sink::Kind::Result(true)),
-            },
-            Vec::new(),
-        );
+        let mut changed_body = Body::with_sink(2, BodySink::Result, Vec::new());
         changed_body.assignment.instance_ordinal = 9;
         let replay = fixture.create(&changed, &changed_body);
         assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
@@ -7353,8 +6459,8 @@ pub(super) mod tests {
             1,
             "the host interpreted the winner's body and never the replay's"
         );
-        // The NOOP sink the winner proved still governs the task, live or
-        // retired: the replay's result sink promoted nothing.
+        // The genuine Stream sink the winner proved still governs the task,
+        // live or retired: the replay's result sink promoted nothing.
         let route = fixture.registry.root_result_route(identity);
         assert!(
             !matches!(
@@ -7363,6 +6469,26 @@ pub(super) mod tests {
                     | novarocks_worker::RootResultRoute::TerminalResultOwner(_)
             ),
             "{route:?}"
+        );
+        // This real Stream waits behind its frozen Closed edge. End that
+        // wait through the owner and retain actual-stop evidence before exit.
+        fixture.registry.abort_query_context(
+            &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                AbortCause::QueryFailed,
+            ),
+        );
+        let source = fixture.registry.status_source(fixture.context).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while source.latest_task_convergence(identity).is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            source.latest_task_convergence(identity).is_some(),
+            "the Stream winner must actually stop"
         );
     }
 
@@ -7386,11 +6512,12 @@ pub(super) mod tests {
             OperationOutcome::InvalidStateOrRequest,
             "{refused:?}"
         );
-        assert!(
-            refused
-                .detail()
-                .is_some_and(|detail| detail.as_str().contains("DOP domain")),
-            "{refused:?}"
+        assert_eq!(
+            refused.detail().map(|detail| detail.as_str()),
+            Some(format!(
+                "task {} package could not be compiled: package does not compile: invalid local lowering: DOP is outside physical domain",
+                descriptor.identity(),
+            ).as_str()),
         );
         assert_eq!(fixture.host.installs.load(Ordering::SeqCst), 1);
         assert!(
@@ -7514,7 +6641,7 @@ pub(super) mod tests {
                 &descriptor,
                 &Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]),
             );
-            assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+            assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
             let channel = fixture
                 .host
                 .inner
@@ -7605,7 +6732,7 @@ pub(super) mod tests {
             &descriptor,
             &Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]),
         );
-        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         let channel = fixture
             .host
             .inner
@@ -7781,11 +6908,7 @@ pub(super) mod tests {
             ExchangeTopology::default(),
         );
         let mut body = Body::bounded_root(FrozenRootOutput::CountOnly, &[1, 2]);
-        body.frozen.pipeline_dop_domain = Some(proto::PipelineDopDomain {
-            min: 64,
-            max: 64,
-            requires_power_of_two: false,
-        });
+        body.set_dop(64);
         let receipt = fixture.create(&descriptor, &body);
         assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         wait_bounded_root_finished(&fixture, root);
@@ -7825,7 +6948,7 @@ pub(super) mod tests {
         let schema = ClientRenderSchema::try_new(
             vec![RenderColumn {
                 source_ordinal: 0,
-                source_slot: Some(10),
+                source_slot: Some(0),
                 name: "v".into(),
                 field: RenderField {
                     nullable: false,
@@ -7967,15 +7090,13 @@ pub(super) mod tests {
         let root = identity(91_006, 1, 1);
         let descriptor = consistent_descriptor(root, UniqueId::new(91_006, 1));
         let mut body = Body::bounded_statistics();
-        let node = body.frozen.plan.as_mut().unwrap().root.as_mut().unwrap();
-        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
-        else {
-            unreachable!()
-        };
-        let Some(plan::plan_node::Kind::Unpivot(unpivot)) = physical.kind.as_mut() else {
-            unreachable!()
-        };
-        unpivot.max_output_bytes -= 1;
+        body.mutate_package(|package| {
+            let node = package.fragment.as_mut().unwrap().nodes.iter_mut()
+                .find(|node| matches!(node.kind, Some(novarocks_proto_models::physical_package_v2::physical_node::Kind::Unpivot(_))))
+                .expect("real Unpivot root");
+            let Some(novarocks_proto_models::physical_package_v2::physical_node::Kind::Unpivot(unpivot)) = node.kind.as_mut() else { unreachable!() };
+            unpivot.max_output_bytes -= 1;
+        });
         let available = host.result_retained_limits.per_process().get()
             - host.root_producer_pool.reserved_bytes();
         let reserve_remaining = |phase| {
@@ -8084,7 +7205,7 @@ pub(super) mod tests {
                     },
                 )
                 .unwrap()
-                .bind_native_slots(&[10])
+                .bind_native_slots(&[0])
                 .unwrap(),
             ),
             &[],
@@ -8106,15 +7227,9 @@ pub(super) mod tests {
         let fixture = OwnerFixture::new(90_503);
         let root = fixture.identity(1);
         let descriptor = consistent_descriptor(root, UniqueId::new(90_503, 1));
-        let body = Body::with_sink(
-            1,
-            plan::DataSink {
-                kind: Some(plan::data_sink::Kind::Result(true)),
-            },
-            Vec::new(),
-        );
+        let body = Body::with_sink(1, BodySink::Result, Vec::new());
         let receipt = fixture.create(&descriptor, &body);
-        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         assert!(
             matches!(
                 fixture.registry.root_result_route(root),
@@ -8156,6 +7271,7 @@ pub(super) mod tests {
         let ingress = crate::task_protocol_ingress::RegistryTaskExecutionIngress::new(
             Arc::clone(&fixture.registry),
             NativeCompatibilityId::new([0x71; 32]),
+            crate::backend_application::test_static_package_admission(),
         );
         let response = runtime
             .block_on(ingress.fetch_task_result(proto::FetchTaskResultRequest {
@@ -8807,7 +7923,6 @@ pub(super) mod tests {
                 builtin_sql_function_catalog().snapshot(),
                 noop_constant_evaluator(),
                 constants(),
-                novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {
                     min: 1,
@@ -9129,8 +8244,7 @@ pub(super) mod tests {
             assert_eq!(prepared.facts().sink_kind(), FragmentSinkKind::DataStream);
             assert!(host.task_runtime(identity).is_some());
             // A program with no runtime-filter site asks for the session of
-            // exactly no binding, which is the plan-tree task's
-            // `expects_bindings = false`; it never asks the plan-tree way.
+            // exactly no binding; no scan binding requests a runtime-filter session.
             assert_eq!(
                 *facts
                     .compiled_filter_bindings
@@ -9202,57 +8316,26 @@ pub(super) mod tests {
         // interpreter's carrier, and a package it cannot compile is refused
         // as content, before anything is prepared.
         #[test]
-        fn each_host_refuses_the_other_interpreters_carrier() {
-            let (package, receiver) = select_one_producer();
+        fn compiled_host_refuses_absent_or_malformed_package_before_installation() {
+            let (_, receiver) = select_one_producer();
             let compiled = compiled_host(Arc::new(StubContextFacts::default()));
             let identity = super::identity(71, 1, 1);
             let descriptor = producer_descriptor(identity, receiver, &[]);
             establish_fixture_context(&compiled, descriptor.identity());
-            let plan_tree = compiled
-                .install_receiver(
-                    &descriptor,
-                    producer_input(&descriptor, Body::values(1).frozen_bytes()),
-                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
-                )
-                .expect_err("a compiled host reads no plan tree");
-            assert_eq!(plan_tree.category(), TaskFailureCategory::Protocol);
-            assert!(
-                plan_tree
-                    .detail()
-                    .as_str()
-                    .contains("static package is not decodable"),
-                "{plan_tree}"
-            );
-
-            let legacy = host(Arc::new(StubContextFacts::default()));
-            establish_fixture_context(&legacy, descriptor.identity());
-            let refused = legacy
-                .install_receiver(
-                    &descriptor,
-                    producer_input(&descriptor, package_carrier(&package)),
-                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
-                )
-                .expect_err("a plan-tree host reads no package");
-            assert_eq!(refused.category(), TaskFailureCategory::Protocol);
-
-            establish_fixture_context(&compiled, descriptor.identity());
-
-            let garbage = compiled
-                .install_receiver(
-                    &descriptor,
-                    producer_input(&descriptor, package_carrier(b"not a package")),
-                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
-                )
-                .expect_err("an unreceivable package");
-            assert_eq!(garbage.category(), TaskFailureCategory::Protocol);
-            assert!(
-                garbage
-                    .detail()
-                    .as_str()
-                    .contains("package could not be compiled"),
-                "{garbage}"
-            );
-            assert!(compiled.task_runtime(identity).is_none());
+            for carrier in [
+                FrozenBytes::freeze(proto::FrozenFragment::default().encode_to_vec().into()),
+                package_carrier(b"not a package"),
+            ] {
+                let failure = compiled
+                    .install_receiver(
+                        &descriptor,
+                        producer_input(&descriptor, carrier),
+                        novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+                    )
+                    .expect_err("unreceivable package");
+                assert_eq!(failure.category(), TaskFailureCategory::Protocol);
+                assert!(compiled.task_runtime(identity).is_none());
+            }
         }
 
         #[test]
@@ -9820,6 +8903,7 @@ pub(super) mod tests {
             .expect("finite test producer pool");
             let runtime = test_execution_runtime(Arc::clone(&facts.0.memory_authority));
             NativeTaskExecutionHost::new(
+                Arc::new(interpreter()),
                 NativeFragmentQueryRuntime::new_for_test(
                     Arc::clone(&facts.0.query_manager),
                     Arc::clone(&facts.0.memory_authority),
@@ -10116,6 +9200,7 @@ pub(super) mod tests {
             .expect("finite test producer pool");
             let runtime = test_execution_runtime(Arc::clone(&facts.stub.memory_authority));
             NativeTaskExecutionHost::new(
+                Arc::new(interpreter()),
                 NativeFragmentQueryRuntime::new_for_test(
                     Arc::clone(&facts.stub.query_manager),
                     Arc::clone(&facts.stub.memory_authority),

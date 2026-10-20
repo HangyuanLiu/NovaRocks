@@ -203,7 +203,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
     ///
     /// The plan is encoded when it is prepared, so submitting it takes
     /// nothing the caller has to assemble first.
-    fn run(&self) -> Result<QueryExecutionResult, String> {
+    fn run(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
         {
             let mut assembly = self
                 .native_assembly
@@ -223,8 +223,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
                         Some(&self.execution),
                         &self.connector_context,
                         Arc::clone(&self.write_session),
-                    )
-                    .map_err(|error| error.to_string())?,
+                    )?,
                 );
             }
         }

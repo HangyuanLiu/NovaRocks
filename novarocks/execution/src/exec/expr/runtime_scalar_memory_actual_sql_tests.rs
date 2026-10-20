@@ -36,7 +36,7 @@ use arrow::{
 };
 use novarocks_local_program::{ProgramNodeId, ProgramNodeKind};
 use novarocks_memory::{AccountKind, ExternalRef};
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
@@ -47,7 +47,6 @@ use std::sync::Arc;
 fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
     let source = sql_source_with_columns(
         "SELECT first_value(bit_shift_left(v,c)) OVER () AS r FROM fixture.ndv_null_contract",
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         &[("v", DataType::Int64), ("c", DataType::Int64)],
     );
     let mut found = None;
@@ -184,7 +183,6 @@ pub(crate) fn scan_shift_base() -> (
 ) {
     let source = sql_source_with_columns(
         "SELECT bit_shift_left(v,c) AS r FROM fixture.ndv_null_contract",
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         &[("v", DataType::Int64), ("c", DataType::Int64)],
     );
     let functions = installed_builtin_owner_catalogue();

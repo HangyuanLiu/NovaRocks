@@ -17,27 +17,25 @@
 //! Actual original SQL semantic sources; no new environment checker.
 use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_semantics;
 use arrow::datatypes::DataType;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::SemanticParameterValue;
-pub(super) fn concat_source(mode: SqlPhysicalEmissionMode) -> SqlAuthoredPhysicalPlan {
+pub(super) fn concat_source() -> SqlAuthoredPhysicalPlan {
     sql_source_with_semantics(
         "SELECT GROUP_CONCAT(CAST(k AS VARCHAR)) FROM fixture",
         DataType::Int64,
-        mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default().with_group_concat_max_len(4096),
     )
 }
-pub(super) fn unix_source() -> SqlAuthoredPhysicalPlan {
-    sql_source_with_semantics(
+pub(super) fn unix_source()
+-> Result<SqlAuthoredPhysicalPlan, novarocks_sql::compiler::SqlCompileProgressError> {
+    super::numeric_unary_original_nonnull_sql_baseline_tests::try_sql_source_with_declared_fields(
         "SELECT FROM_UNIXTIME(CAST(k AS BIGINT)) FROM fixture",
-        DataType::Int64,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        &[arrow::datatypes::Field::new("k", DataType::Int64, false)],
     )
 }
 #[test]
 fn e08s1_environment_original_concat_has_actual_lexical_sparse_values() {
-    let source = concat_source(SqlPhysicalEmissionMode::OriginalNativeV1);
+    let source = concat_source();
     let values = source.plan().parameters().entries();
     assert_eq!(
         values
@@ -52,21 +50,5 @@ fn e08s1_environment_original_concat_has_actual_lexical_sparse_values() {
             .filter(|v| matches!(v, SemanticParameterValue::GroupConcatMaxLen(4096)))
             .count(),
         1
-    );
-}
-#[test]
-fn e08s1_environment_original_unixtime_has_no_statement_zone_author() {
-    let source = unix_source();
-    assert!(
-        !source
-            .plan()
-            .parameters()
-            .entries()
-            .values()
-            .any(|v| matches!(v, SemanticParameterValue::TimeZone(_)))
-    );
-    assert_eq!(
-        source.emission_mode(),
-        SqlPhysicalEmissionMode::OriginalNativeV1
     );
 }

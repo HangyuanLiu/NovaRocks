@@ -22,12 +22,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use arrow_array::{Array, Int64Array};
 use novarocks_cluster_harness::ServerHandle;
-use novarocks_proto_models::{common, expr, novarocks as proto, plan};
+use novarocks_proto_models::{common, novarocks as proto};
 use prost::Message;
 
 use super::native_compatibility::{raw_operation_envelope, raw_unary};
 use super::native_creation::{
-    RawBackendSession, RawCreate, observe_task_terminal_and_stopped, outcome, session_control,
+    RawBackendSession, RawCreate, RawSink, compiled_fragment, observe_task_terminal_and_stopped,
+    outcome, session_control,
 };
 use super::query_lifecycle::{await_resource_convergence, resource_snapshot};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
@@ -113,8 +114,22 @@ impl Scenario for SameProducerNormalClose {
                 hi: 0x5b,
                 lo: producer_base.kernel_key_low,
             };
-            let receiver_a = receiver(&a, 1, false, &producer_identity, producer_finst)?;
-            let receiver_b = receiver(&b, 2, true, &producer_identity, producer_finst)?;
+            let receiver_a = receiver(
+                &a,
+                1,
+                false,
+                &producer_identity,
+                producer_finst,
+                self.multicast,
+            )?;
+            let receiver_b = receiver(
+                &b,
+                2,
+                true,
+                &producer_identity,
+                producer_finst,
+                self.multicast,
+            )?;
             let producer = producer(
                 &producer_base,
                 producer_identity,
@@ -124,9 +139,16 @@ impl Scenario for SameProducerNormalClose {
                 context,
                 self.multicast,
             )?;
+            // Submit the actual multicast package first so an unsupported sink
+            // is reported by the compiler, rather than a fabricated verdict.
+            if self.multicast {
+                producer.accept_and_await_installed(context, &p)?;
+            }
             receiver_a.accept_and_await_installed(context, &a)?;
             receiver_b.accept_and_await_installed(context, &b)?;
-            producer.accept_and_await_installed(context, &p)?;
+            if !self.multicast {
+                producer.accept_and_await_installed(context, &p)?;
+            }
             context.action(format!(
                 "froze attempt={:?} P={:?} finst={producer_finst:?} A={:?} B={:?}; P Installed with edges Closed; multicast={}",
                 producer.identity.query_execution_id, producer.identity, receiver_a.identity, receiver_b.identity, self.multicast,
@@ -320,76 +342,39 @@ fn freeze(frozen: proto::FrozenFragment, metadata: proto::CreationMetadata) -> F
     }
 }
 
-fn column() -> common::OutputColumn {
-    common::OutputColumn {
-        column_id: 1,
-        name: "v".into(),
-        r#type: Some(bigint()),
-        nullable: false,
-        is_internal: false,
-    }
-}
-
-fn bigint() -> common::TypeDesc {
-    common::TypeDesc {
-        value_binding_id: Some(0),
-    }
-}
-
-// The original fixture declares v BIGINT NOT NULL. All its columns and literals
-// reference this fragment-owned complete type; no first-batch inference exists.
-fn bigint_table() -> plan::ExecutionTypeTable {
-    use novarocks_proto_models::{arrow_type as a, value_type as v};
-    plan::ExecutionTypeTable {
-        logical_types: vec![v::LogicalTypeDefinition {
-            id: Some(0),
-            nullable: false,
-            kind: Some(v::logical_type_definition::Kind::Scalar(v::ScalarValue {
-                kind: v::ScalarKind::Int64 as i32,
-                ..Default::default()
-            })),
-        }],
-        value_bindings: vec![plan::ExecutionValueBinding {
-            id: Some(0),
-            logical_type_id: Some(0),
-            value_layout: Some(a::ArrowPhysicalType {
-                kind: Some(a::arrow_physical_type::Kind::Primitive(
-                    a::ArrowPrimitiveType::Int64 as i32,
-                )),
-            }),
-        }],
-    }
-}
-
 fn receiver(
     session: &RawBackendSession,
     id: u32,
     result: bool,
     source: &proto::TaskIdentity,
     source_finst: common::UniqueId,
+    multicast: bool,
 ) -> Result<FrozenTask> {
     let mut base = RawCreate::values(session, id);
     base.pipeline_dop = 1;
     base.exchange_input = true;
-    base.sink = if result {
-        plan::data_sink::Kind::Result(true)
-    } else {
-        plan::data_sink::Kind::Noop(true)
-    };
-    let (mut frozen, mut metadata) = carriers(&base)?;
-    let fragment = frozen.plan.as_mut().expect("fixture plan");
-    fragment.execution_types = Some(bigint_table());
-    fragment.output_columns = vec![column()];
-    let Some(plan::distributed_node::Payload::Exchange(exchange)) = fragment
-        .root
+    let (_, mut metadata) = carriers(&base)?;
+    let fragment_id = if multicast && result { 3 } else { 1 };
+    let edge = if multicast && result { 2 } else { 1 };
+    let frozen = compiled_fragment(
+        fragment_id,
+        1,
+        Some((edge, multicast)),
+        if result {
+            RawSink::Result
+        } else {
+            RawSink::CountOnly
+        },
+        &[],
+    );
+    metadata
+        .descriptor
         .as_mut()
-        .expect("fixture root")
-        .payload
+        .expect("fixture descriptor")
+        .identity
         .as_mut()
-    else {
-        unreachable!()
-    };
-    exchange.output_columns = vec![column()];
+        .expect("fixture identity")
+        .stage_id = fragment_id;
     let inbound = &mut metadata
         .descriptor
         .as_mut()
@@ -417,58 +402,8 @@ fn producer(
 ) -> Result<FrozenTask> {
     let mut base = base.clone();
     base.pipeline_dop = 1;
-    let (mut frozen, mut metadata) = carriers(&base)?;
-    let stream = || plan::DataStreamSink {
-        dest_node_id: 10,
-        target_fragment_id: 1,
-        output_partition: Some(plan::DataPartition {
-            kind: plan::PartitionKind::Unpartitioned as i32,
-            exprs: Vec::new(),
-        }),
-        output_columns: vec![1],
-        ..Default::default()
-    };
-    let fragment = frozen.plan.as_mut().expect("fixture plan");
-    fragment.execution_types = Some(bigint_table());
-    fragment.fragment_id = 2;
-    fragment.output_columns = vec![column()];
-    fragment
-        .runtime_filter_bindings
-        .as_mut()
-        .expect("fixture RF table")
-        .fragment_id = 2;
-    fragment.sink = Some(plan::DataSink {
-        kind: Some(if multicast {
-            plan::data_sink::Kind::MultiCastDataStream(plan::MultiCastDataStreamSink {
-                sinks: vec![stream(), stream()],
-            })
-        } else {
-            plan::data_sink::Kind::DataStream(stream())
-        }),
-    });
-    let root = fragment.root.as_mut().expect("fixture root");
-    root.fragment_id = 2;
-    root.payload = Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-        output_columns: vec![column()],
-        kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
-            columns: vec![column()],
-            rows: ROWS
-                .iter()
-                .map(|value| plan::ExprList {
-                    values: vec![expr::Expr {
-                        original_definition_id: None,
-                        r#type: Some(bigint()),
-                        nullable: false,
-                        kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                            value: Some(common::LiteralValue {
-                                value: Some(common::literal_value::Value::IntValue(*value)),
-                            }),
-                        })),
-                    }],
-                })
-                .collect(),
-        })),
-    }));
+    let (_, mut metadata) = carriers(&base)?;
+    let frozen = compiled_fragment(2, 1, None, RawSink::Stream { multicast }, &ROWS);
     let descriptor = metadata.descriptor.as_mut().expect("fixture descriptor");
     descriptor.identity = Some(identity);
     descriptor.fragment_instance_id = Some(finst);
@@ -579,7 +514,8 @@ fn fetch_rows(
                 "B returned another schema"
             );
             ensure!(
-                u32::from_le_bytes(wire[10..14].try_into()?) == 1,
+                // LocalCompiler allocates the sole receiver channel from slot zero.
+                u32::from_le_bytes(wire[10..14].try_into()?) == 0,
                 "B result slot differs"
             );
             let chunks =

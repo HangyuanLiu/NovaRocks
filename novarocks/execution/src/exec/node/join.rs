@@ -18,7 +18,6 @@ use crate::runtime_filter::RuntimeFilterProducerContract;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
-use crate::exec::node::ExecNode;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JoinType {
@@ -87,38 +86,5 @@ impl JoinRuntimeFilterProducerBinding {
 
     pub const fn channel_id(&self) -> u32 {
         self.contract.channel_id().get()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct JoinNode {
-    pub left: Box<ExecNode>,
-    pub right: Box<ExecNode>,
-    pub node_id: i32,
-    pub join_type: JoinType,
-    pub distribution_mode: JoinDistributionMode,
-    pub left_chunk_schema: ChunkSchemaRef,
-    pub right_chunk_schema: ChunkSchemaRef,
-    pub join_scope_chunk_schema: ChunkSchemaRef,
-    pub probe_keys: Vec<ExprId>,
-    pub build_keys: Vec<ExprId>,
-    /// Null-safe flags aligned with join key pairs from FE eq_join_conjuncts.
-    /// `true` means this key uses null-safe equality (`<=>` / EQ_FOR_NULL).
-    pub eq_null_safe: Vec<bool>,
-    pub residual_predicate: Option<ExprId>,
-    pub runtime_filter_execution: JoinRuntimeFilterExecution,
-}
-
-impl JoinNode {
-    pub fn left_schema(&self) -> arrow::datatypes::SchemaRef {
-        self.left_chunk_schema.arrow_schema_ref()
-    }
-
-    pub fn right_schema(&self) -> arrow::datatypes::SchemaRef {
-        self.right_chunk_schema.arrow_schema_ref()
-    }
-
-    pub fn join_scope_schema(&self) -> arrow::datatypes::SchemaRef {
-        self.join_scope_chunk_schema.arrow_schema_ref()
     }
 }

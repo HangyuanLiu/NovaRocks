@@ -41,6 +41,7 @@ pub fn error_kind_for_domain_code(code: &str) -> Option<ErrorKind> {
         | "sql.admit.session_global_scope_unsupported"
         | "sql.admit.session_transaction_unsupported"
         | "sql.analyze.unsupported_expression"
+        | "sql.analyze.unavailable_implementation"
         | "sql.analyze.unsupported_query_shape" => ErrorKind::ER_NOT_SUPPORTED_YET,
         "sql.admit.kill_denied" => ErrorKind::ER_KILL_DENIED_ERROR,
         "sql.analyze.unknown_table" => ErrorKind::ER_NO_SUCH_TABLE,
@@ -69,6 +70,14 @@ mod tests {
         assert_eq!(
             error_kind_for_domain_code("sql.admit.persisted_definition_semantics_unsupported"),
             Some(ErrorKind::ER_NOT_SUPPORTED_YET),
+        );
+    }
+
+    #[test]
+    fn unavailable_compiled_implementation_is_an_explicit_unsupported_error() {
+        assert_eq!(
+            error_kind_for_domain_code("sql.analyze.unavailable_implementation"),
+            Some(ErrorKind::ER_NOT_SUPPORTED_YET)
         );
     }
 

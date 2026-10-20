@@ -155,6 +155,10 @@ impl EngineError {
         Self::static_message(EngineErrorCode::CommitKnownCommittedFinalizeFailed, message)
     }
 
+    pub fn unsupported_compiled_shape(message: impl Into<String>) -> Self {
+        Self::static_message(EngineErrorCode::UnsupportedCompiledShape, message)
+    }
+
     pub fn query_timeout(message: impl Into<String>) -> Self {
         Self::static_message(EngineErrorCode::QueryTimeout, message)
     }
@@ -227,6 +231,7 @@ mod tests {
             EngineErrorCode::IcebergWriteDescriptorMismatch,
             EngineErrorCode::UnsupportedPositionDeleteDescriptor,
             EngineErrorCode::UnsupportedDistributedDmlShape,
+            EngineErrorCode::UnsupportedCompiledShape,
             EngineErrorCode::DistributedWriteOutputMismatch,
             EngineErrorCode::WriteCoordinatorGone,
             EngineErrorCode::CommitKnownUncommitted,
@@ -322,6 +327,16 @@ mod tests {
         assert_eq!(
             err.to_bracketed_user_message(),
             "[UnsupportedPositionDeleteDescriptor] position delete output descriptor missing file_path field"
+        );
+    }
+
+    #[test]
+    fn compiled_refusal_formats_the_stable_client_identity() {
+        let error = EngineError::unsupported_compiled_shape("FULL OUTER hash join");
+        assert_eq!(error.code(), EngineErrorCode::UnsupportedCompiledShape);
+        assert_eq!(
+            error.to_bracketed_user_message(),
+            "[UnsupportedCompiledShape] FULL OUTER hash join"
         );
     }
 

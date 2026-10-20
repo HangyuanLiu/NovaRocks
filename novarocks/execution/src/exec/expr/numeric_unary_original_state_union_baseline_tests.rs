@@ -17,16 +17,12 @@
 
 //! Independent original state-source construction baseline. UNRUN expectations.
 use novarocks_physical_plan::{AggregatePhase, NodeKind};
-use novarocks_sql::compiler::{SqlCompileControl, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlCompileControl;
 fn check(sum: Option<(i64, i64, i64)>, intermediate: bool) {
     let control = SqlCompileControl::unbounded();
-    let owner = novarocks_sql::compiler::ordinary_union_source_for_test(
-        sum,
-        intermediate,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        &control,
-    )
-    .unwrap();
+    let owner =
+        novarocks_sql::compiler::ordinary_union_source_for_test(sum, intermediate, &control)
+            .unwrap();
     let mut partial = 0;
     let mut middle = 0;
     let mut final_calls = 0;

@@ -42,6 +42,26 @@ def classify(path, dispositions=None, admission_membership=False):
         errors.append(str(error))
     run = records[0] if records and records[0].get('kind') == 'run' else {}
     selection = next((row for row in records if row.get('kind') == 'selection'), {})
+    # A code observed while a negative oracle fails is not a direct refusal.
+    # Other failed oracles remain independent facts after the primary refusal;
+    # missing oracles alone are not failures because the refusal may stop work.
+    assertion_failures = {}
+    independent_assertions = {}
+    for observation in observations:
+        failed = [value for value in observation.detail.get('oracle', {}).get('executed', [])
+                  if value.get('outcome') == 'fail']
+        if failed:
+            key = (str(observation.unit), observation.lifecycle, observation.ref)
+            assertion_failures[key] = failed
+            # G15 also supports an exact registered result mismatch. Its own
+            # failed result oracle is the primary fact, not another failure.
+            primary = observation.failure or {}
+            covered = primary.get('class') == 'mismatch' and disposition.match(observation)
+            independent = [value for value in failed if not (
+                covered and value.get('kind') == 'result_set'
+                and value.get('step') == primary.get('statement_index'))]
+            if independent:
+                independent_assertions[key] = independent
     scopes = []
     for suite in selection.get('suites', []):
         units = tuple(UnitKey('sql-case', suite['suite'] + '/' + case['case']) for case in suite['cases'])
@@ -70,10 +90,16 @@ def classify(path, dispositions=None, admission_membership=False):
     for item in composition['scopes']:
         for raw in item['observations']:
             unit = UnitKey.parse(raw['unit'])
+            failed_oracles = assertion_failures.get((raw['unit'], raw['lifecycle'], raw['ref']), [])
+            primary = raw.get('failure') or {}
+            failed_primary_assertion = (primary.get('class') == 'error_code' and any(
+                value.get('step') == primary.get('statement_index') for value in failed_oracles))
             if raw['category'] not in ('pass', 'counterexample'):
                 status = 'NOT_RUN' if raw['category'] == 'coverage_gap' else 'DIAGNOSTIC'
             elif raw['category'] == 'pass':
                 status = 'STALE_KNOWN_FAILURE' if any(entry['unit'] == str(unit) for _, _, _, entry in disposition.known_failures) else 'PASS'
+            elif failed_primary_assertion:
+                status = 'NEW_FAILURE'
             elif disposition.match(next(value for value in observations if value.ref == raw['ref'] and str(value.unit) == raw['unit'] and value.lifecycle == raw['lifecycle'])):
                 status = 'KNOWN_FAIL'
             else:
@@ -98,7 +124,17 @@ def classify(path, dispositions=None, admission_membership=False):
         status = 'FAIL'
     if end.get('exit_code') == 0 and any(row['native_failure'] for row in rows):
         status = 'FAIL'
+    strict_failures = [
+        {'unit':unit, 'lifecycle':lifecycle, 'ref':ref, 'failed_oracles':failed}
+        for (unit, lifecycle, ref), failed in independent_assertions.items()
+        if UnitKey.parse(unit) not in excluded]
+    strict_failures += [{'suite':row.get('suite'), 'init':row['init']}
+                        for row in records if row.get('kind') == 'suite'
+                        and row.get('init', {}).get('status') == 'failed']
+    if strict_failures:
+        status = 'FAIL'
     return {'schema':1,'status':status,'rows':rows,'errors':errors,'composition':composition,
+            'strict_failures':strict_failures,
             'membership':{'layer':'admission' if admission_membership else 'dev',
                           'excluded':{str(unit):entry for unit,entry in excluded.items()}},
             'native_exit_code':end.get('exit_code'),'source':'local-rehearsal'}

@@ -21,7 +21,7 @@ use super::ndv_filter_actual_sql_source_tests::sql_source_with_columns;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::ExprKind;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{ValueLogicalType, arithmetic_result_value_type_with_op};
 fn statement(text: &str, query: u32) -> String {
     let marker = format!("-- query {query}\n");
@@ -43,7 +43,7 @@ fn statement(text: &str, query: u32) -> String {
         .unwrap()
         .replace("${case_db}", "fixture")
 }
-fn sources(mode: SqlPhysicalEmissionMode) -> Vec<SqlAuthoredPhysicalPlan> {
+fn sources() -> Vec<SqlAuthoredPhysicalPlan> {
     let statistic = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/sql/correctness/aggregate/sql/agg_test_statistic.sql"
@@ -59,11 +59,11 @@ fn sources(mode: SqlPhysicalEmissionMode) -> Vec<SqlAuthoredPhysicalPlan> {
     ];
     [statement(statistic, 8), statement(nullable, 2)]
         .into_iter()
-        .map(|sql| sql_source_with_columns(&sql, mode, &fields))
+        .map(|sql| sql_source_with_columns(&sql, &fields))
         .collect()
 }
-fn authored(mode: SqlPhysicalEmissionMode) {
-    for (case, source) in sources(mode).into_iter().enumerate() {
+fn authored() {
+    for (case, source) in sources().into_iter().enumerate() {
         let mut float = 0;
         for fragment in source.plan().fragments().values() {
             for (id, expr) in fragment.expressions().iter() {
@@ -83,7 +83,7 @@ fn authored(mode: SqlPhysicalEmissionMode) {
                 let left = &fragment.expressions().get(*left).unwrap().ty;
                 let right = &fragment.expressions().get(*right).unwrap().ty;
                 eprintln!(
-                    "statistics original arithmetic case={case} mode={mode:?} fragment={:?} definition={id:?} operator={operator:?} left={left:?} right={right:?} result={:?} policy={decimal_overflow_policy:?} allow_source={allow_throw_exception:?}",
+                    "statistics original arithmetic case={case} mode=compiled fragment={:?} definition={id:?} operator={operator:?} left={left:?} right={right:?} result={:?} policy={decimal_overflow_policy:?} allow_source={allow_throw_exception:?}",
                     fragment.id(),
                     expr.ty
                 );
@@ -109,17 +109,14 @@ fn authored(mode: SqlPhysicalEmissionMode) {
         );
     }
 }
-#[test]
-fn float_arithmetic_statistics_actual_original_sql_source() {
-    authored(SqlPhysicalEmissionMode::OriginalNativeV1)
-}
+
 #[test]
 fn float_arithmetic_statistics_actual_candidate_sql_source() {
-    authored(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
+    authored()
 }
-fn completed(mode: SqlPhysicalEmissionMode) {
+fn completed() {
     let functions = installed_builtin_owner_catalogue();
-    for source in sources(mode) {
+    for source in sources() {
         for (id, result) in compiler_results(&source, &functions) {
             result.unwrap_or_else(|error| {
                 panic!("statistics complete package fragment {id:?}: {error}")
@@ -127,11 +124,8 @@ fn completed(mode: SqlPhysicalEmissionMode) {
         }
     }
 }
-#[test]
-fn float_arithmetic_statistics_actual_original_sql_complete_compilation() {
-    completed(SqlPhysicalEmissionMode::OriginalNativeV1)
-}
+
 #[test]
 fn float_arithmetic_statistics_actual_candidate_sql_complete_compilation() {
-    completed(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
+    completed()
 }

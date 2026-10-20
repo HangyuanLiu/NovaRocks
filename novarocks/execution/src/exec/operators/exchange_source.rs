@@ -34,17 +34,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::ExprArena;
-use crate::exec::node::exchange_source::ExchangeSourceNode;
-use crate::exec::operators::runtime_filter::{RuntimeFilterConsumerSet, RuntimeFilterGate};
 use crate::exec::pipeline::binding::ExchangeBinding;
-use crate::exec::pipeline::operator::{
-    DriverBlockDeadline, Operator, ProcessorOperator, forward_observable,
-};
+use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::exchange;
-use crate::runtime::fragment::io::{ExchangeReceiverKey, FragmentEventSink, NoopFragmentEventSink};
+use crate::runtime::fragment::io::ExchangeReceiverKey;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::UniqueId;
 use tracing::debug;
@@ -210,7 +205,6 @@ pub struct ExchangeSourceFactory {
     name: String,
     node: ExchangeSourceIdentity,
     binding: ExchangeBinding,
-    runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     idle_progress: Arc<ExchangeIdleProgress>,
 }
 
@@ -223,33 +217,6 @@ struct ExchangeSourceIdentity {
 }
 
 impl ExchangeSourceFactory {
-    pub(crate) fn new_native(
-        node: ExchangeSourceNode,
-        binding: ExchangeBinding,
-        arena: Arc<ExprArena>,
-    ) -> Result<Self, String> {
-        let name = node.profile_name();
-        let consumers = if node.native_runtime_filter_specs().is_empty() {
-            None
-        } else {
-            Some(RuntimeFilterConsumerSet::from_plan(
-                "ExchangeSource",
-                node.native_runtime_filter_specs(),
-                arena,
-            )?)
-        };
-        Ok(Self {
-            name,
-            node: ExchangeSourceIdentity {
-                node_id: node.node_id,
-                timeout: node.timeout,
-            },
-            binding,
-            runtime_filter_consumers: consumers,
-            idle_progress: Arc::new(ExchangeIdleProgress::new()),
-        })
-    }
-
     /// Build the source for a compiled ExchangeSource (local-compiler
     /// output). Its builder validates the frozen local node's supported shape.
     /// The receiver registry supplies exact typed chunks; no expression arena
@@ -263,7 +230,6 @@ impl ExchangeSourceFactory {
             name: format!("EXCHANGE_SOURCE (id={node_id})"),
             node: ExchangeSourceIdentity { node_id, timeout },
             binding,
-            runtime_filter_consumers: None,
             idle_progress: Arc::new(ExchangeIdleProgress::new()),
         }
     }
@@ -279,11 +245,6 @@ impl OperatorFactory for ExchangeSourceFactory {
         let idle_deadline = Arc::new(ExchangeIdleDeadline::new());
         self.idle_progress
             .register(&idle_deadline, &source_observable);
-        // A chunk held at the runtime-filter gate waits on the same stable
-        // source observable as ordinary input.
-        if let Some(consumers) = &self.runtime_filter_consumers {
-            forward_observable(&consumers.gate_observable(), &source_observable);
-        }
         Box::new(ExchangeSourceOperator {
             name: self.name.clone(),
             node: self.node.clone(),
@@ -298,11 +259,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             logged_first_none: false,
             #[cfg(novarocks_dev_controls)]
             last_partial_eos_marker_count: 0,
-            native_runtime_filter_consumers: self.runtime_filter_consumers.clone(),
-            gated_chunk: None,
-            event_sink: Arc::new(NoopFragmentEventSink),
             receiver_mem_tracker_ready: false,
-            construction: None,
         })
     }
 
@@ -325,39 +282,12 @@ struct ExchangeSourceOperator {
     logged_first_none: bool,
     #[cfg(novarocks_dev_controls)]
     last_partial_eos_marker_count: usize,
-    native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
-    /// The first chunk received, held while the runtime-filter gate that its
-    /// arrival opened is still pending.
-    gated_chunk: Option<Chunk>,
-    event_sink: Arc<dyn FragmentEventSink>,
     receiver_mem_tracker_ready: bool,
-    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
-}
-
-impl ExchangeSourceOperator {
-    fn gate_open(&self) -> bool {
-        self.native_runtime_filter_consumers
-            .as_ref()
-            .is_none_or(|consumers| matches!(consumers.poll_gate(), RuntimeFilterGate::Open))
-    }
 }
 
 impl Operator for ExchangeSourceOperator {
-    fn creates_typed_storage(&self) -> bool {
-        self.native_runtime_filter_consumers.is_some()
-    }
-    fn set_construction_factory(
-        &mut self,
-        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-    ) {
-        self.construction = Some(factory);
-    }
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn set_fragment_event_sink(&mut self, event_sink: Arc<dyn FragmentEventSink>) {
-        self.event_sink = event_sink;
     }
 
     fn prepare(&mut self) -> ExecutionResult<()> {
@@ -377,18 +307,6 @@ impl Operator for ExchangeSourceOperator {
             self.binding.expected_senders,
             self.node.timeout
         );
-        Ok(())
-    }
-
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        let _ = state;
-        Ok(())
-    }
-
-    fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
-            consumers.bind(state)?;
-        }
         Ok(())
     }
 
@@ -422,9 +340,6 @@ impl ProcessorOperator for ExchangeSourceOperator {
     fn has_output(&self) -> bool {
         if self.finished {
             return false;
-        }
-        if self.gated_chunk.is_some() {
-            return self.gate_open();
         }
         let Some(receiver) = self.receiver.as_ref() else {
             return false;
@@ -488,45 +403,15 @@ impl ProcessorOperator for ExchangeSourceOperator {
         }
 
         loop {
-            let out = match self.gated_chunk.take() {
-                Some(chunk) => Some(exchange::ExchangePopResult::Chunk(chunk)),
-                None => {
-                    let receiver = self.receiver.as_ref().expect("receiver");
-                    receiver
-                        .try_pop_next_with_stats(self.binding.expected_senders)
-                        .map_err(|e| e.to_string())?
-                }
-            };
+            let receiver = self.receiver.as_ref().expect("receiver");
+            let out = receiver
+                .try_pop_next_with_stats(self.binding.expected_senders)
+                .map_err(|e| e.to_string())?;
 
             match out {
                 Some(exchange::ExchangePopResult::Chunk(chunk)) => {
                     self.idle_deadline.clear();
                     let input_rows = chunk.len();
-                    let chunk =
-                        if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
-                            // The gate's wait starts with the first chunk
-                            // actually received and holds it until it opens.
-                            if !matches!(consumers.poll_gate(), RuntimeFilterGate::Open) {
-                                self.gated_chunk = Some(chunk);
-                                return Ok(None);
-                            }
-                            let Some(chunk) = consumers.apply_chunk_created(
-                            chunk,
-                            self.construction.as_deref().ok_or(
-                                crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                            )?,
-                            &super::compiled_expression::RuntimeKernelControl::new(
-                                state.error_state(),
-                            ),
-                            Some(&self.event_sink),
-                        )?
-                        else {
-                            continue;
-                        };
-                            chunk
-                        } else {
-                            chunk
-                        };
                     if chunk.is_empty() {
                         debug!(
                             "ExchangeSource filtered empty chunk: node_id={} driver_id={} input_rows={}",
@@ -679,14 +564,6 @@ impl ProcessorOperator for ExchangeSourceOperator {
     }
 
     fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
-        // Input already arrived: the wait is the gate's, not the exchange's
-        // idle timeout.
-        if self.gated_chunk.is_some() {
-            return self
-                .native_runtime_filter_consumers
-                .as_ref()
-                .and_then(RuntimeFilterConsumerSet::gate_deadline);
-        }
         self.idle_deadline.arm(self.node.timeout)
     }
 }
@@ -710,20 +587,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use crate::runtime_filter::{
-        self as execution, RuntimeFilterArtifactQueryError, RuntimeFilterBindingId,
-        RuntimeFilterChannelId, RuntimeFilterConsumerContract, RuntimeFilterExecutionContract,
-        RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterScalarRef,
-    };
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks_spi::connector::ConnectorScalarValue;
 
     use super::*;
-    use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
     use crate::exec::pipeline::binding::ExchangeBinding;
     use crate::exec::pipeline::driver::PipelineDriver;
     use crate::exec::pipeline::fragment_context::FragmentContext;
@@ -736,13 +604,10 @@ mod tests {
     use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
 
-    fn created_int32_chunk(values: Vec<i32>) -> Chunk {
+    fn int32_chunk(values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef],
-        )
-        .unwrap();
+        let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("test batch");
         crate::exec::chunk::typed_fixture::chunk(
             batch,
             &[SlotId::new(1)],
@@ -752,10 +617,9 @@ mod tests {
             )],
         )
     }
-    fn created_int32_schema(schema: Arc<Schema>) -> Arc<ChunkSchema> {
-        assert_eq!(schema.fields().len(), 1);
-        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
-        assert!(!schema.field(0).is_nullable());
+
+    fn register_int32_receiver(binding: &ExchangeBinding) {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let layout = crate::exec::chunk::typed_fixture::layout(
             schema,
             &[SlotId::new(1)],
@@ -764,24 +628,24 @@ mod tests {
                 false,
             )],
         );
-        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        let creation_factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            crate::runtime::mem_tracker::MemTracker::new_root("declared exchange filter source"),
+            crate::runtime::mem_tracker::MemTracker::new_root("exchange source receiver fixture"),
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
-        )
-        .unwrap()
-        .create_compiled_chunk_schema(&layout)
-        .unwrap()
-    }
-
-    fn int32_chunk(values: Vec<i32>) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("test batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
+        ).unwrap();
+        let expected_chunk_schema = creation_factory
+            .create_compiled_chunk_schema(&layout)
+            .unwrap();
+        binding
+            .receiver_port
+            .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
+                key: receiver_key(binding.key),
+                expected_senders: binding.expected_senders,
+                expected_chunk_schema,
+                column_binding: exchange::ExchangeColumnBinding::Positional,
+                creation_factory,
+            })
+            .expect("register typed receiver");
     }
 
     fn int32_values(chunk: &Chunk) -> Vec<i32> {
@@ -793,150 +657,6 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("int32 array");
         (0..ints.len()).map(|row| ints.value(row)).collect()
-    }
-
-    struct Int32MembershipQuery {
-        accepted: Vec<i32>,
-    }
-
-    impl execution::evaluator::RuntimeFilterArtifactQuery for Int32MembershipQuery {
-        fn data_type(&self) -> &DataType {
-            &DataType::Int32
-        }
-
-        fn matches_null(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
-            Ok(false)
-        }
-
-        fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
-            Ok(!self.accepted.is_empty())
-        }
-
-        fn non_null_value_may_match(
-            &self,
-            value: RuntimeFilterScalarRef<'_>,
-        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
-            match value {
-                RuntimeFilterScalarRef::Int32(value) => Ok(self.accepted.contains(&value)),
-                _ => Err(RuntimeFilterArtifactQueryError::ContractViolation),
-            }
-        }
-
-        fn non_null_range_may_match(
-            &self,
-            _: &ConnectorScalarValue,
-            _: &ConnectorScalarValue,
-        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
-            Ok(true)
-        }
-    }
-
-    struct PublishedSubscription {
-        snapshot: Arc<execution::RuntimeFilterSnapshot>,
-        published: Arc<crate::runtime::observable::Observable>,
-    }
-
-    impl PublishedSubscription {
-        fn new(snapshot: Arc<execution::RuntimeFilterSnapshot>) -> Self {
-            Self {
-                snapshot,
-                published: Arc::new(crate::runtime::observable::Observable::new()),
-            }
-        }
-    }
-
-    impl execution::BlockingSnapshotSubscription for PublishedSubscription {
-        fn try_outcome(&self) -> Option<execution::SnapshotAcquireOutcome> {
-            Some(execution::SnapshotAcquireOutcome::Published(Arc::clone(
-                &self.snapshot,
-            )))
-        }
-
-        fn outcome_observable(&self) -> Arc<crate::runtime::observable::Observable> {
-            Arc::clone(&self.published)
-        }
-
-        fn record_consumer_outcome(&self, _: &execution::SnapshotAcquireOutcome) {}
-
-        fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
-            Some(Arc::clone(&self.snapshot))
-        }
-    }
-
-    struct PublishedSession {
-        subscription: Arc<dyn execution::BlockingSnapshotSubscription>,
-    }
-
-    impl execution::RuntimeFilterSession for PublishedSession {
-        fn open_producer(
-            &self,
-            _: execution::RuntimeFilterProducerOpenRequest,
-        ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
-            execution::RuntimeFilterContractViolation,
-        > {
-            Err(execution::RuntimeFilterContractViolation::new(
-                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                "consumer-only test session",
-            ))
-        }
-
-        fn subscribe(
-            &self,
-            _: execution::RuntimeFilterSubscriptionRequest,
-        ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
-            execution::RuntimeFilterContractViolation,
-        > {
-            Ok(execution::RuntimeFilterBindOutcome::Bound(
-                execution::RuntimeFilterSubscriptionHandle::Blocking(Arc::clone(
-                    &self.subscription,
-                )),
-            ))
-        }
-
-        fn open_final_domain_completion(
-            &self,
-            _: execution::RuntimeFilterFinalDomainOpenRequest,
-        ) -> Result<
-            execution::RuntimeFilterBindOutcome<
-                execution::RuntimeFilterFinalDomainCompletionHandle,
-            >,
-            execution::RuntimeFilterContractViolation,
-        > {
-            Err(execution::RuntimeFilterContractViolation::new(
-                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                "consumer-only test session",
-            ))
-        }
-    }
-
-    fn membership_binding(expr_id: crate::exec::expr::ExprId) -> RuntimeFilterConsumerBinding {
-        let schema = RuntimeFilterMembershipSchema::new(
-            &DataType::Int32,
-            RuntimeFilterNullSemantics::NeverMatches,
-        )
-        .expect("membership schema");
-        let contract = RuntimeFilterConsumerContract::membership_blocking(
-            RuntimeFilterBindingId::new(1),
-            RuntimeFilterChannelId::new(2),
-            RuntimeFilterExecutionContract::Membership(schema),
-        )
-        .expect("membership consumer contract");
-        RuntimeFilterConsumerBinding::new(expr_id, contract)
-    }
-
-    fn published_runtime_state(accepted: Vec<i32>) -> RuntimeState {
-        let snapshot = Arc::new(execution::RuntimeFilterSnapshot::new(
-            RuntimeFilterBindingId::new(1),
-            execution::LogicalVersion::FIRST,
-            [0; 32],
-            Arc::new(Int32MembershipQuery { accepted }),
-        ));
-        let session: execution::RuntimeFilterSessionRef = Arc::new(PublishedSession {
-            subscription: Arc::new(PublishedSubscription::new(snapshot)),
-        });
-        runtime_state().with_runtime_filter_session(Some(session))
     }
 
     fn runtime_state() -> RuntimeState {
@@ -1001,24 +721,13 @@ mod tests {
     }
 
     fn timeout_pipeline(key: exchange::ExchangeKey, timeout: Duration) -> TimeoutPipeline {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let node = ExchangeSourceNode::new(
-            key.node_id,
-            timeout,
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema"),
-        );
         let binding = ExchangeBinding {
             key,
             expected_senders: 1,
             receiver_port: in_process_test_exchange_receiver_port(),
         };
-        let factory = ExchangeSourceFactory::new_native(
-            node,
-            binding.clone(),
-            Arc::new(ExprArena::default()),
-        )
-        .expect("exchange source factory");
+        register_int32_receiver(&binding);
+        let factory = ExchangeSourceFactory::new_compiled(key.node_id, timeout, binding.clone());
         let state = Arc::new(runtime_state());
         let mut source = factory.create(1, 0);
         source.prepare().expect("prepare exchange source");
@@ -1206,24 +915,14 @@ mod tests {
             finst_id_lo: 92_022,
             node_id: 92_023,
         };
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let node = ExchangeSourceNode::new(
-            key.node_id,
-            Duration::from_secs(1),
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema"),
-        );
+        let timeout = Duration::from_secs(1);
         let binding = ExchangeBinding {
             key,
             expected_senders: 1,
             receiver_port: in_process_test_exchange_receiver_port(),
         };
-        let factory = ExchangeSourceFactory::new_native(
-            node,
-            binding.clone(),
-            Arc::new(ExprArena::default()),
-        )
-        .expect("exchange source factory");
+        register_int32_receiver(&binding);
+        let factory = ExchangeSourceFactory::new_compiled(key.node_id, timeout, binding.clone());
         let mut first = factory.create(2, 0);
         let mut second = factory.create(2, 1);
         first.prepare().expect("prepare first exchange source");
@@ -1284,24 +983,14 @@ mod tests {
             finst_id_lo: 92_032,
             node_id: 92_033,
         };
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let node = ExchangeSourceNode::new(
-            key.node_id,
-            Duration::from_secs(1),
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema"),
-        );
+        let timeout = Duration::from_secs(1);
         let binding = ExchangeBinding {
             key,
             expected_senders: 3,
             receiver_port: in_process_test_exchange_receiver_port(),
         };
-        let factory = ExchangeSourceFactory::new_native(
-            node,
-            binding.clone(),
-            Arc::new(ExprArena::default()),
-        )
-        .expect("exchange source factory");
+        register_int32_receiver(&binding);
+        let factory = ExchangeSourceFactory::new_compiled(key.node_id, timeout, binding.clone());
         let state = Arc::new(runtime_state());
         let fragment = Arc::new(FragmentContext::new(
             None,
@@ -1389,234 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn native_exchange_source_applies_the_shared_membership_mask() {
-        let key = exchange::ExchangeKey {
-            finst_id_hi: 91_001,
-            finst_id_lo: 91_002,
-            node_id: 91_003,
-        };
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let mut arena = ExprArena::default();
-        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let node = ExchangeSourceNode::new(
-            key.node_id,
-            Duration::from_secs(2),
-            created_int32_schema(schema.clone()),
-        )
-        .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
-        let binding = ExchangeBinding {
-            key,
-            expected_senders: 1,
-            receiver_port: in_process_test_exchange_receiver_port(),
-        };
-        let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
-        let state = published_runtime_state(vec![2, 4]);
-        let mut source = factory.create(1, 0);
-        source.set_construction_factory(
-            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-                crate::runtime::mem_tracker::MemTracker::new_root("exchange filter evaluation construction"),
-                state.error_state(),
-            ).unwrap(),
-        );
-        source.prepare().unwrap();
-        source.bind_runtime_state(&state).unwrap();
-        source.activate(&state).unwrap();
-        binding_receiver_port(&factory).push_local(
-            receiver_key(key),
-            0,
-            0,
-            vec![created_int32_chunk(vec![1, 2, 3, 4])],
-            true,
-        );
-
-        let output = source
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
-            .unwrap();
-        assert_eq!(int32_values(&output), vec![2, 4]);
-        binding_receiver_port(&factory)
-            .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
-    }
-
-    #[test]
-    fn native_exchange_source_continues_after_first_chunk_is_fully_filtered() {
-        let key = exchange::ExchangeKey {
-            finst_id_hi: 91_011,
-            finst_id_lo: 91_012,
-            node_id: 91_013,
-        };
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let mut arena = ExprArena::default();
-        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let node = ExchangeSourceNode::new(
-            key.node_id,
-            Duration::from_secs(2),
-            created_int32_schema(schema.clone()),
-        )
-        .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
-        let binding = ExchangeBinding {
-            key,
-            expected_senders: 1,
-            receiver_port: in_process_test_exchange_receiver_port(),
-        };
-        let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
-        let state = published_runtime_state(vec![2, 4]);
-        let mut source = factory.create(1, 0);
-        source.set_construction_factory(
-            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-                crate::runtime::mem_tracker::MemTracker::new_root("exchange filter evaluation construction"),
-                state.error_state(),
-            ).unwrap(),
-        );
-        source.prepare().unwrap();
-        source.bind_runtime_state(&state).unwrap();
-        source.activate(&state).unwrap();
-        binding_receiver_port(&factory).push_local(
-            receiver_key(key),
-            0,
-            0,
-            vec![
-                created_int32_chunk(vec![1, 3]),
-                created_int32_chunk(vec![2, 4]),
-            ],
-            true,
-        );
-
-        let output = source
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
-            .unwrap();
-        assert_eq!(int32_values(&output), vec![2, 4]);
-        binding_receiver_port(&factory)
-            .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
-    }
-
-    /// A blocking subscription the test publishes later.
-    struct LaterSubscription {
-        outcome: std::sync::Mutex<Option<execution::SnapshotAcquireOutcome>>,
-        published: Arc<Observable>,
-    }
-
-    impl execution::BlockingSnapshotSubscription for LaterSubscription {
-        fn try_outcome(&self) -> Option<execution::SnapshotAcquireOutcome> {
-            self.outcome.lock().expect("outcome lock").clone()
-        }
-
-        fn outcome_observable(&self) -> Arc<Observable> {
-            Arc::clone(&self.published)
-        }
-
-        fn record_consumer_outcome(&self, _: &execution::SnapshotAcquireOutcome) {}
-
-        fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
-            None
-        }
-    }
-
-    #[test]
-    fn the_first_received_chunk_waits_at_a_pending_gate_without_popping_more() {
-        let key = exchange::ExchangeKey {
-            finst_id_hi: 91_021,
-            finst_id_lo: 91_022,
-            node_id: 91_023,
-        };
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let mut arena = ExprArena::default();
-        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let node = ExchangeSourceNode::new(
-            key.node_id,
-            Duration::from_secs(2),
-            created_int32_schema(schema.clone()),
-        )
-        .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
-        let binding = ExchangeBinding {
-            key,
-            expected_senders: 1,
-            receiver_port: in_process_test_exchange_receiver_port(),
-        };
-        let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
-        let subscription = Arc::new(LaterSubscription {
-            outcome: std::sync::Mutex::new(None),
-            published: Arc::new(Observable::new()),
-        });
-        let session: execution::RuntimeFilterSessionRef = Arc::new(PublishedSession {
-            subscription: Arc::clone(&subscription)
-                as Arc<dyn execution::BlockingSnapshotSubscription>,
-        });
-        let state = runtime_state().with_runtime_filter_session(Some(session));
-        let mut source = factory.create(1, 0);
-        source.set_construction_factory(
-            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-                crate::runtime::mem_tracker::MemTracker::new_root("exchange filter evaluation construction"),
-                state.error_state(),
-            ).unwrap(),
-        );
-        source.prepare().unwrap();
-        source.bind_runtime_state(&state).unwrap();
-        source.activate(&state).unwrap();
-        let processor = source.as_processor_mut().unwrap();
-        let source_observable = processor.source_observable().expect("source observable");
-        binding_receiver_port(&factory).push_local(
-            receiver_key(key),
-            0,
-            0,
-            vec![
-                created_int32_chunk(vec![1, 2, 3, 4]),
-                created_int32_chunk(vec![2, 5]),
-            ],
-            true,
-        );
-
-        assert!(processor.pull_chunk(&state).unwrap().is_none());
-        assert!(
-            !processor.has_output(),
-            "the gate holds the first chunk back"
-        );
-        assert!(
-            processor.pull_chunk(&state).unwrap().is_none(),
-            "a held chunk is not popped again, nor is the next one"
-        );
-        let deadline = processor
-            .source_block_deadline()
-            .expect("a held chunk waits at most for the gate's deadline");
-        assert!(deadline.at() > Instant::now() + Duration::from_millis(500));
-
-        let generation = source_observable.generation();
-        *subscription.outcome.lock().expect("outcome lock") =
-            Some(execution::SnapshotAcquireOutcome::Published(Arc::new(
-                execution::RuntimeFilterSnapshot::new(
-                    RuntimeFilterBindingId::new(1),
-                    execution::LogicalVersion::FIRST,
-                    [0; 32],
-                    Arc::new(Int32MembershipQuery {
-                        accepted: vec![2, 4],
-                    }),
-                ),
-            )));
-        subscription.published.notify_observers();
-        assert!(
-            source_observable.generation() > generation,
-            "a publication wakes the parked source"
-        );
-
-        assert!(processor.has_output());
-        let first = processor.pull_chunk(&state).unwrap().expect("held chunk");
-        assert_eq!(int32_values(&first), vec![2, 4]);
-        let second = processor.pull_chunk(&state).unwrap().expect("next chunk");
-        assert_eq!(int32_values(&second), vec![2]);
-        binding_receiver_port(&factory)
-            .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
-    }
-
-    #[test]
-    fn native_factory_leaves_receiver_registration_to_the_fragment_resource_lease() {
+    fn compiled_factory_leaves_receiver_registration_to_the_fragment_resource_lease() {
         // Receiver registration is acquired exactly once by FragmentResources during
         // prepare. The factory only consumes that registration through its binding.
         let key = exchange::ExchangeKey {
@@ -1624,19 +1086,12 @@ mod tests {
             finst_id_lo: 88_002,
             node_id: 5,
         };
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema");
-        let node = ExchangeSourceNode::new(5, Duration::from_secs(60), chunk_schema);
         let binding = ExchangeBinding {
             key,
             expected_senders: 4,
             receiver_port: in_process_test_exchange_receiver_port(),
         };
-        let factory =
-            ExchangeSourceFactory::new_native(node, binding, Arc::new(ExprArena::default()))
-                .expect("native exchange factory");
+        let factory = ExchangeSourceFactory::new_compiled(5, Duration::from_secs(60), binding);
         assert!(
             binding_receiver_port(&factory)
                 .snapshot(receiver_key(key))

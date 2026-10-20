@@ -17,11 +17,8 @@
 //! Real original nullable corpus field source, ordered full requests and permanent complete compiler.
 use arrow::datatypes::{DataType, Field};
 use novarocks_physical_plan::{NodeKind, PhysicalCallDefinition, PhysicalCallSite};
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
-fn source(
-    mode: SqlPhysicalEmissionMode,
-    full: bool,
-) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+
+fn source(full: bool) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let fields = vec![
         Field::new("id", DataType::Int32, true),
         Field::new("grp", DataType::Int32, true),
@@ -37,16 +34,13 @@ fn source(
         "SELECT approx_top_k(v) AS a,approx_top_k(v,3) AS b,approx_top_k(v,3,100) AS c FROM fixture"
     };
     super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields(
-        sql, &fields, mode,
+        sql, &fields,
     )
 }
 #[test]
 fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        let source = source(mode, false);
+    {
+        let source = source(false);
         let mut found = 0;
         for fragment in source.plan().fragments().values() {
             for node in fragment.nodes().values() {
@@ -79,7 +73,7 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
                     ));
                     assert!(call.binding.function.result_type.nullable());
                     eprintln!(
-                        "APPROX_TOP_K actual mode={mode:?} fragment={:?} site={site:?} binding={:?} request={req:?}",
+                        "APPROX_TOP_K actual mode=compiled fragment={:?} site={site:?} binding={:?} request={req:?}",
                         fragment.id(),
                         call.binding
                     );
@@ -92,10 +86,7 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
 }
 #[test]
 fn approx_top_k_actual_original_required_sql_complete_compilation() {
-    let source = source(
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        true,
-    );
+    let source = source(true);
     let results = super::filter_conjunction_actual_sql_compiler_tests::compiler_results(
         &source,
         &super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue(),

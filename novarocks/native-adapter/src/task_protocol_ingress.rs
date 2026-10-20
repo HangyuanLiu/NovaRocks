@@ -84,34 +84,17 @@ pub struct RegistryTaskExecutionIngress {
     observation_controls:
         std::sync::OnceLock<Arc<crate::test_observation_controls::NativeObservationControls>>,
     native_compatibility_id: NativeCompatibilityId,
-    /// Present exactly when this process composed the compiled-package
-    /// interpreter; it bounds every create's package before the owner sees it.
-    static_package_admission: Option<Arc<StaticPackageAdmission>>,
+    /// Bounds every create's package before its owner classifies the identity.
+    static_package_admission: Arc<StaticPackageAdmission>,
 }
 
 impl RegistryTaskExecutionIngress {
-    /// The ingress of a plan-tree process: no package carrier is gated here.
+    /// The ingress is gated by the same model and wire admission its
+    /// compiled-package receiver uses.
     pub fn new(
         registry: Arc<TaskExecutionRegistry>,
         native_compatibility_id: NativeCompatibilityId,
-    ) -> Arc<Self> {
-        Self::compose(registry, native_compatibility_id, None)
-    }
-
-    /// The ingress of a compiled-package process, gated by the same decode
-    /// model and wire admission its package receiver uses.
-    pub fn with_static_package_admission(
-        registry: Arc<TaskExecutionRegistry>,
-        native_compatibility_id: NativeCompatibilityId,
-        admission: Arc<StaticPackageAdmission>,
-    ) -> Arc<Self> {
-        Self::compose(registry, native_compatibility_id, Some(admission))
-    }
-
-    fn compose(
-        registry: Arc<TaskExecutionRegistry>,
-        native_compatibility_id: NativeCompatibilityId,
-        static_package_admission: Option<Arc<StaticPackageAdmission>>,
+        static_package_admission: Arc<StaticPackageAdmission>,
     ) -> Arc<Self> {
         assert!(
             registry.config().max_tasks_per_context
@@ -738,7 +721,7 @@ impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
     }
 
     fn static_package_admission(&self) -> Option<&StaticPackageAdmission> {
-        self.static_package_admission.as_deref()
+        Some(self.static_package_admission.as_ref())
     }
 }
 
@@ -832,6 +815,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use crate::backend_task_execution::execution_host::tests::creation_body::{Body, BodySink};
     use novarocks_execution_contract::task_execution::context_convergence::{
         QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
         QueryContextConvergenceState, QueryContextConvergenceVersion,
@@ -854,8 +838,9 @@ mod tests {
         TaskStatusVersion,
     };
     use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    use novarocks_execution_contract::{DataStreamPartitionType, FragmentSinkKind};
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_models::{catalog, common, plan};
+    use novarocks_proto_models::{catalog, common};
     use novarocks_task_codec::identity::{
         encode_query_context_ref, encode_task_identity, encode_task_operation_id,
     };
@@ -924,9 +909,8 @@ mod tests {
     /// codec can read, so these cases fail only on the protocol boundary they
     /// are about.
     ///
-    /// It interprets the winner's static fragment with the one codec decoder
-    /// the real host uses, which is where the sink kind the owner acts on
-    /// comes from. It also keeps a ledger of the static bytes it was handed,
+    /// It reads the winning package's sink with the actual carrier decoder
+    /// and generated package DTO, after ingress resource admission. It also keeps a ledger of the static bytes it was handed,
     /// so a case can prove the host was reached once per winning round and
     /// never for a replay.
     #[derive(Default)]
@@ -972,20 +956,45 @@ mod tests {
                 .lock()
                 .expect("prepared")
                 .push(fragment.to_bytes());
-            let decoded = novarocks_task_codec::creation::decode_static_fragment(
+            let decoded = novarocks_task_codec::creation::decode_static_package(
                 &fragment,
                 FieldPath::root("frozen_fragment"),
             )
             .map_err(|error| {
                 HostRejection::new(
-                    novarocks_execution_contract::task_execution::status::TaskFailureCategory::Protocol,
-                    format!("static fragment is not decodable: {error}"),
+                    novarocks_execution_contract::TaskFailureCategory::Protocol,
+                    format!("static package carrier is not decodable: {error}"),
                 )
             })?;
-            novarocks_worker::PreparedTaskInstallation::new(
-                PreparedTaskFacts::new(decoded.sink_kind()),
-                None,
+            let package = novarocks_proto_models::physical_package_v2::FragmentPackage::decode(
+                decoded.package().clone(),
             )
+            .map_err(|error| {
+                HostRejection::new(
+                    novarocks_execution_contract::TaskFailureCategory::Protocol,
+                    format!("static package is not decodable: {error}"),
+                )
+            })?;
+            use novarocks_proto_models::physical_package_v2::fragment_sink::Kind;
+            let kind = package
+                .fragment
+                .as_ref()
+                .and_then(|fragment| fragment.sink.as_ref())
+                .and_then(|sink| sink.kind.as_ref())
+                .ok_or_else(|| {
+                    HostRejection::new(
+                        novarocks_execution_contract::TaskFailureCategory::Protocol,
+                        "static package has no sink",
+                    )
+                })?;
+            let sink_kind = match kind {
+                Kind::Result(_) | Kind::RootResult(_) => FragmentSinkKind::Result,
+                Kind::StreamEdgeId(_) => FragmentSinkKind::DataStream,
+                Kind::Multicast(_) => FragmentSinkKind::MultiCastDataStream,
+                Kind::Router(_) => FragmentSinkKind::SplitDataStream,
+                Kind::Noop(_) => FragmentSinkKind::Noop,
+            };
+            novarocks_worker::PreparedTaskInstallation::new(PreparedTaskFacts::new(sink_kind), None)
         }
 
         fn remove_receiver(&self, _descriptor: &TaskDescriptor) {}
@@ -1031,17 +1040,12 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            Self::composed(None)
+            Self::with_static_package_admission(
+                crate::backend_application::test_static_package_admission(),
+            )
         }
 
-        /// The ingress of a process that composed the compiled-package
-        /// interpreter. The execution side is still the plan-tree fake, which
-        /// refuses a package carrier the way a plan-tree host would.
-        fn with_static_package_admission(admission: StaticPackageAdmission) -> Self {
-            Self::composed(Some(Arc::new(admission)))
-        }
-
-        fn composed(admission: Option<Arc<StaticPackageAdmission>>) -> Self {
+        fn with_static_package_admission(admission: Arc<StaticPackageAdmission>) -> Self {
             let backend = BackendProcessId::new_v7();
             let mut config = TaskExecutionRegistryConfig::for_process(
                 backend,
@@ -1064,17 +1068,11 @@ mod tests {
                     None,
                 ),
             );
-            let ingress = match admission {
-                None => RegistryTaskExecutionIngress::new(
-                    Arc::clone(&registry),
-                    native_compatibility_id,
-                ),
-                Some(admission) => RegistryTaskExecutionIngress::with_static_package_admission(
-                    Arc::clone(&registry),
-                    native_compatibility_id,
-                    admission,
-                ),
-            };
+            let ingress = RegistryTaskExecutionIngress::new(
+                Arc::clone(&registry),
+                native_compatibility_id,
+                admission,
+            );
             Self {
                 ingress,
                 registry,
@@ -1427,24 +1425,7 @@ mod tests {
         /// A single-fragment root task: no exchange topology, one result sink.
         fn root(context: QueryContextRef, identity: TaskIdentity) -> Self {
             Self {
-                frozen: proto::FrozenFragment {
-                    package: Default::default(),
-                    plan_version: vec![1; 16],
-                    plan_contract_revision: 1,
-                    fragment_contract_version: 1,
-                    pipeline_dop_domain: Some(proto::PipelineDopDomain {
-                        min: 2,
-                        max: 2,
-                        requires_power_of_two: false,
-                    }),
-                    plan: Some(plan::PlanFragment {
-                        fragment_id: 1,
-                        sink: Some(plan::DataSink {
-                            kind: Some(plan::data_sink::Kind::Result(true)),
-                        }),
-                        ..Default::default()
-                    }),
-                },
+                frozen: Body::with_sink(2, BodySink::Result, vec![]).frozen,
                 metadata: proto::CreationMetadata {
                     query_context: Some(encode_query_context_ref(context)),
                     descriptor: Some(proto::TaskDescriptor {
@@ -1465,21 +1446,12 @@ mod tests {
         /// result. Its one outbound edge carries the producer's position.
         fn producer(context: QueryContextRef, identity: TaskIdentity) -> Self {
             let mut carriers = Self::root(context, identity);
-            carriers
-                .frozen
-                .plan
-                .as_mut()
-                .expect("the fixture carries a plan")
-                .sink = Some(plan::DataSink {
-                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                    dest_node_id: 17,
-                    output_partition: Some(plan::DataPartition {
-                        kind: plan::PartitionKind::Unpartitioned as i32,
-                        exprs: Vec::new(),
-                    }),
-                    ..Default::default()
-                })),
-            });
+            carriers.frozen = Body::with_sink(
+                2,
+                BodySink::Stream(DataStreamPartitionType::Unpartitioned),
+                vec![1],
+            )
+            .frozen;
             carriers
                 .metadata
                 .descriptor
@@ -2781,11 +2753,21 @@ mod tests {
         fixture.wait_installed(identity);
 
         let mut changed = CreateCarriers::producer(context, identity);
-        changed.frozen.pipeline_dop_domain = Some(proto::PipelineDopDomain {
-            min: 1,
-            max: 4,
-            requires_power_of_two: false,
+        let mut changed_body = Body::with_sink(
+            3,
+            BodySink::Stream(DataStreamPartitionType::Unpartitioned),
+            vec![1],
+        );
+        changed_body.mutate_package(|package| {
+            package.fragment.as_mut().unwrap().dop_domain = Some(
+                novarocks_proto_models::physical_package_v2::PipelineDopDomain {
+                    min: 1,
+                    max: 4,
+                    requires_power_of_two: false,
+                },
+            );
         });
+        changed.frozen = changed_body.frozen;
         let descriptor = changed
             .metadata
             .descriptor
@@ -2990,7 +2972,7 @@ mod tests {
         assert_eq!(fixture.task_host.prepared().len(), 1);
     }
 
-    /// Compiled-package carriers at the ingress of each kind of process.
+    /// Every ingress admits compiled-package resources before identity lookup.
     mod static_package_gate {
         use super::*;
         use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
@@ -2999,7 +2981,7 @@ mod tests {
 
         /// The admitted package byte bound of these cases. Every other wire
         /// limit is the receiver's generous test admission.
-        const MAX_PACKAGE_BYTES: usize = 64;
+        const MAX_PACKAGE_BYTES: usize = 64 * 1024;
 
         struct Unbounded;
         impl PureCompileControl for Unbounded {
@@ -3008,13 +2990,13 @@ mod tests {
             }
         }
 
-        fn admission() -> StaticPackageAdmission {
+        fn admission() -> Arc<StaticPackageAdmission> {
             let mut wire = decode_limits().wire;
             wire.max_input_bytes = MAX_PACKAGE_BYTES;
-            StaticPackageAdmission::new(
+            Arc::new(StaticPackageAdmission::new(
                 Arc::new(FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model")),
                 wire,
-            )
+            ))
         }
 
         /// A root task whose static carrier is a package of `len` bytes and
@@ -3053,7 +3035,8 @@ mod tests {
             let fixture = Fixture::with_static_package_admission(admission());
             let context = fixture.context();
             let identity = fixture.identity(9, 9);
-            let admitted = package_carriers(context, identity, MAX_PACKAGE_BYTES / 2);
+            let admitted = CreateCarriers::root(context, identity);
+            assert!(admitted.frozen.package.len() <= MAX_PACKAGE_BYTES);
             let accepted = fixture.apply(vec![
                 fixture.establish(context, TaskOperationId::new_v7()),
                 admitted.operation(TaskOperationId::new_v7()),
@@ -3064,10 +3047,7 @@ mod tests {
                 "{:?}",
                 accepted.receipts[1]
             );
-            // The fake host is a plan-tree interpreter, so the admitted
-            // package spends the identity on a terminal preparation failure.
-            let failed = fixture.wait_status(identity, TaskStatus::is_terminal);
-            assert_eq!(failed.state(), TaskState::Failed);
+            fixture.wait_installed(identity);
             assert_eq!(fixture.task_host.prepared(), vec![admitted.frozen_bytes()]);
 
             let oversized = package_carriers(context, identity, MAX_PACKAGE_BYTES + 1);
@@ -3081,7 +3061,7 @@ mod tests {
             );
 
             let replay = fixture.apply(vec![
-                package_carriers(context, identity, 1).operation(TaskOperationId::new_v7()),
+                CreateCarriers::root(context, identity).operation(TaskOperationId::new_v7()),
             ]);
             assert_eq!(
                 outcome_of(&replay.receipts[0]),
@@ -3119,38 +3099,18 @@ mod tests {
             );
         }
 
-        /// The gate bounds only the package carrier. A plan-tree carrier has
-        /// no package and passes to its owner unchanged; refusing it is the
-        /// compiled interpreter's carrier law, not this gate's.
+        /// Missing packages pass the resource-only gate, then the winning
+        /// interpreter refuses the carrier without installing the task.
         #[test]
-        fn a_carrier_without_a_package_passes_the_package_gate() {
+        fn a_carrier_without_a_package_is_refused_by_the_winner() {
             let fixture = Fixture::with_static_package_admission(admission());
             let context = fixture.context();
             let identity = fixture.identity(9, 11);
+            let mut missing = CreateCarriers::root(context, identity);
+            missing.frozen.package = bytes::Bytes::new();
             let response = fixture.apply(vec![
                 fixture.establish(context, TaskOperationId::new_v7()),
-                create_task(context, identity, TaskOperationId::new_v7()),
-            ]);
-            assert_eq!(
-                outcome_of(&response.receipts[1]),
-                proto::TaskOperationOutcome::Accepted,
-                "{:?}",
-                response.receipts[1]
-            );
-            fixture.wait_installed(identity);
-        }
-
-        /// A plan-tree process composes no gate: production ingress is
-        /// unchanged, and its own interpreter refuses any package it is sent.
-        #[test]
-        fn a_plan_tree_process_composes_no_package_gate() {
-            let fixture = Fixture::new();
-            let context = fixture.context();
-            let identity = fixture.identity(9, 12);
-            let unbounded = package_carriers(context, identity, MAX_PACKAGE_BYTES + 1);
-            let response = fixture.apply(vec![
-                fixture.establish(context, TaskOperationId::new_v7()),
-                unbounded.operation(TaskOperationId::new_v7()),
+                missing.operation(TaskOperationId::new_v7()),
             ]);
             assert_eq!(
                 outcome_of(&response.receipts[1]),
@@ -3160,7 +3120,31 @@ mod tests {
             );
             let failed = fixture.wait_status(identity, TaskStatus::is_terminal);
             assert_eq!(failed.state(), TaskState::Failed);
-            assert_eq!(fixture.task_host.prepared(), vec![unbounded.frozen_bytes()]);
+            assert_eq!(fixture.task_host.prepared(), vec![missing.frozen_bytes()]);
+        }
+
+        /// A malformed prefix is resource-bounded, then refused by the sole
+        /// protobuf interpreter at the winning task's preparation boundary.
+        #[test]
+        fn a_corrupt_package_is_refused_by_the_winner() {
+            let fixture = Fixture::with_static_package_admission(admission());
+            let context = fixture.context();
+            let identity = fixture.identity(9, 12);
+            let mut corrupt = CreateCarriers::root(context, identity);
+            corrupt.frozen.package = bytes::Bytes::from_static(&[0xff]);
+            let response = fixture.apply(vec![
+                fixture.establish(context, TaskOperationId::new_v7()),
+                corrupt.operation(TaskOperationId::new_v7()),
+            ]);
+            assert_eq!(
+                outcome_of(&response.receipts[1]),
+                proto::TaskOperationOutcome::Accepted,
+                "{:?}",
+                response.receipts[1]
+            );
+            let failed = fixture.wait_status(identity, TaskStatus::is_terminal);
+            assert_eq!(failed.state(), TaskState::Failed);
+            assert_eq!(fixture.task_host.prepared(), vec![corrupt.frozen_bytes()]);
         }
     }
 }

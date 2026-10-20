@@ -151,6 +151,7 @@ fn rejection_from_host(rejection: HostRejection) -> DomainExecutionRejection {
     let outcome = match rejection.category() {
         TaskFailureCategory::ResourceExhausted => OperationOutcome::ResourceExhausted,
         TaskFailureCategory::Protocol
+        | TaskFailureCategory::Unsupported
         | TaskFailureCategory::Exchange
         | TaskFailureCategory::Execution
         | TaskFailureCategory::Internal => OperationOutcome::InvalidStateOrRequest,

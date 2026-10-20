@@ -35,7 +35,6 @@ use std::sync::Arc;
 use novarocks_spi::connector::write_stack::{WriteTargetOrdinal, validate_query_target_ordinals};
 
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
-use crate::exec::node::ExecNode;
 use crate::exec::node::table_write_aggregate::WriterFinalAggregatePlan;
 #[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
@@ -46,18 +45,16 @@ use crate::exec::node::table_write_relation::{
     WriterMultiplexRelationSchema,
 };
 
-/// The bounded aggregation stage of one distributed write.
-#[derive(Clone)]
-pub struct TableFinishNode {
-    pub inputs: Vec<ExecNode>,
+/// Neutral finish-test facts paired with an actual Task validation binding.
+/// No input node or construction-plan authority is retained.
+#[cfg(test)]
+pub(crate) struct FinishFixture {
     pub node_id: i32,
     expected_targets: Arc<Vec<WriteTargetOrdinal>>,
-    fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+    binding: TableFinishRuntimeBinding,
     writer_multiplex_schema: WriterMultiplexRelationSchema,
     root_result_schema: RootWriteResultRelationSchema,
     final_aggregate_plan: WriterFinalAggregatePlan,
-    #[cfg(novarocks_dev_controls)]
-    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 /// Runtime validation authority for a single Task instance of TableFinish.
@@ -85,15 +82,14 @@ impl TableFinishRuntimeBinding {
     }
 }
 
-impl TableFinishNode {
+#[cfg(test)]
+impl FinishFixture {
     pub fn try_new(
-        inputs: Vec<ExecNode>,
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
         fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     ) -> Result<Self, ExecPlanBuildError> {
         Self::try_new_with_relations(
-            inputs,
             node_id,
             expected_targets,
             fragment_validator,
@@ -104,7 +100,6 @@ impl TableFinishNode {
     }
 
     pub fn try_new_with_relations(
-        inputs: Vec<ExecNode>,
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
         fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
@@ -112,12 +107,6 @@ impl TableFinishNode {
         root_result_schema: RootWriteResultRelationSchema,
         final_aggregate_plan: WriterFinalAggregatePlan,
     ) -> Result<Self, ExecPlanBuildError> {
-        if inputs.is_empty() {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Node,
-                "table finish requires at least one writer input".to_string(),
-            ));
-        }
         // The expected set is the targets *this query's* writers feed, so it is
         // validated as a query set: non-empty, inside the frozen bound, and
         // free of duplicates. It is deliberately not required to be dense from
@@ -132,22 +121,19 @@ impl TableFinishNode {
             )
         })?;
         Ok(Self {
-            inputs,
             node_id,
             expected_targets: Arc::new(expected_targets),
-            fragment_validator,
+            binding: TableFinishRuntimeBinding::new(fragment_validator),
             writer_multiplex_schema,
             root_result_schema,
             final_aggregate_plan,
-            #[cfg(novarocks_dev_controls)]
-            aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
     #[cfg(novarocks_dev_controls)]
     pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
-        self.aggregate_guard = guard;
+        self.binding.aggregate_guard = guard;
         self
     }
 
@@ -165,7 +151,7 @@ impl TableFinishNode {
     }
 
     pub const fn fragment_validator(&self) -> &Arc<dyn ConnectorCommitFragmentCarrierValidator> {
-        &self.fragment_validator
+        &self.binding.fragment_validator
     }
 
     pub const fn writer_multiplex_schema(&self) -> &WriterMultiplexRelationSchema {
@@ -180,46 +166,18 @@ impl TableFinishNode {
         &self.final_aggregate_plan
     }
 
-    pub(crate) fn into_static_parts_with_binding(
-        self,
-    ) -> (
-        TableFinishRuntimeBinding,
-        (
-            Vec<ExecNode>,
-            Vec<WriteTargetOrdinal>,
-            WriterMultiplexRelationSchema,
-            RootWriteResultRelationSchema,
-            WriterFinalAggregatePlan,
-        ),
-    ) {
-        (
-            TableFinishRuntimeBinding {
-                fragment_validator: self.fragment_validator,
-                #[cfg(novarocks_dev_controls)]
-                aggregate_guard: self.aggregate_guard,
-            },
-            (
-                self.inputs,
-                Arc::unwrap_or_clone(self.expected_targets),
-                self.writer_multiplex_schema,
-                self.root_result_schema,
-                self.final_aggregate_plan,
-            ),
-        )
-    }
-
     #[cfg(novarocks_dev_controls)]
     pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
-        &self.aggregate_guard
+        &self.binding.aggregate_guard
     }
 }
 
-impl std::fmt::Debug for TableFinishNode {
+#[cfg(test)]
+impl std::fmt::Debug for FinishFixture {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("TableFinishNode")
+            .debug_struct("FinishFixture")
             .field("node_id", &self.node_id)
-            .field("inputs", &self.inputs.len())
             .field("expected_targets", &self.expected_targets)
             .finish_non_exhaustive()
     }

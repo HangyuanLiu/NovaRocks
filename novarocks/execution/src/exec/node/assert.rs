@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::exec::node::ExecNode;
 
 use novarocks_types::SlotId;
 
@@ -41,11 +40,4 @@ pub enum AssertNumRowsMode {
         key_labels: Vec<String>,
         message_prefix: String,
     },
-}
-
-#[derive(Clone, Debug)]
-pub struct AssertNumRowsNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub mode: AssertNumRowsMode,
 }

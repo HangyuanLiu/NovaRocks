@@ -29,7 +29,7 @@ def records(status='pass',code=0):
     return [
       {'kind':'run','schema':1,'mode':'verify','verification':{'verify_enabled':True,'record_from':'reference'},'platform':{'system':'fixture','machine':'fixture','release':'fixture'}},
       {'kind':'selection','suites':[{'suite':'s','inputs_sha256':'inputs','verify_enabled':True,'query_timeout_secs':60,'declaration':{'scope':'suite','initial_state':'isolated','env_inputs':[]},'cases':[{'case':'a'}]}]},
-      {'kind':'case','suite':'s','case':'a','lifecycle_id':'L','status':status,'oracle':{'required':[{'step':1,'kind':'expected_error'}],'executed':[{'step':1,'kind':'expected_error','outcome':'pass','policy':{}}]},'failure':{'class':'error_code','error_code':'NR-FAIL','statement_index':1,'actual_digest':None} if status=='fail' else None},
+      {'kind':'case','suite':'s','case':'a','lifecycle_id':'L','status':status,'oracle':{'required':[{'step':1,'kind':'result_set'}],'executed':[]} if status=='fail' else {'required':[{'step':1,'kind':'expected_error'}],'executed':[{'step':1,'kind':'expected_error','outcome':'pass','policy':{}}]},'failure':{'class':'error_code','error_code':'NR-FAIL','statement_index':1,'actual_digest':None} if status=='fail' else None},
       {'kind':'suite','suite':'s','lifecycle_id':'L','inputs_end_sha256':'inputs','inputs_stable':True,'executed_cases':['a'],'cleanup':{'status':'ok'}},
       {'kind':'server','cleanup':{'status':'ok'}},{'kind':'fixture','shutdown':{'status':'ok'},'resources':[]},
       {'kind':'end','completed':True,'exit_code':code}]
@@ -37,6 +37,25 @@ def put(name,rows):
     (root/(name+'.results.jsonl')).write_text(''.join(json.dumps(row)+'\n' for row in rows))
 put('pass',records());put('fail',records('fail',1));put('truncated',records()[:-1])
 violation=records();violation[4]['cleanup']['status']='failed';put('cleanup',violation)
+# Port upstream strict-refusal cases as independent native records. Code text
+# in a diagnostic or expected PASS never supplies a failure feature.
+negative=records('fail',1);negative[2]['oracle']={'required':[{'step':1,'kind':'expected_error'}],'executed':[{'step':1,'kind':'expected_error','outcome':'fail'}]};put('negative',negative)
+verify=records('fail',1);verify[2]['failure'].update({'class':'mismatch','actual_digest':'actual'});put('verify',verify)
+diagnostic=records('fail',1);diagnostic[2]['failure']['class']='error';diagnostic[2]['reason']='VERIFY FAILED: expected PASS NR-FAIL';put('diagnostic',diagnostic)
+for name,additional in [('case-cleanup',[{'class':'error','phase':'case_cleanup','error':'database busy'}]), ('multiple-refusals',[{'class':'error_code','error_code':'NR-OTHER','statement_index':2}])]:
+    aggregate=records('fail',1)
+    primary=copy.deepcopy(aggregate[2]['failure'])
+    aggregate[2]['failure']={'class':'error','primary_failure':primary,'additional_failures':additional}
+    put(name,aggregate)
+for code in ('NR-FAIL.extra','UnknownEngineCode'):
+    unknown=records('fail',1);unknown[2]['failure']['error_code']=code;put(code,unknown)
+expected=records();expected[2]['reason']='expected error matched: UnknownEngineCode NR-FAIL';put('expected',expected)
+direct=records('fail',1);direct[2]['reason']='target execute failed; diagnostic quotes PASS and UnknownEngineCode';put('direct',direct)
+secondary=records('fail',1)
+secondary[2]['oracle']={'required':[{'step':1,'kind':'result_set'},{'step':2,'kind':'expected_error'}], 'executed':[{'step':2,'kind':'expected_error','outcome':'fail'}]}
+put('secondary',secondary)
+for phase in ('init','cleanup'):
+    hook=records('fail',1);hook[3][phase]={'status':'failed','errors':['suite hook failed']};put('suite-'+phase,hook)
 empty={'schema':1,'known_failures':[],'quarantine':[]}
 (root/'empty.json').write_text(json.dumps(empty))
 known=copy.deepcopy(empty);known['known_failures']=[{'unit':'sql-case:s/a','failure':{'class':'error_code','code':'NR-FAIL'},'reason':'independent failing fixture','owner':'test owner','expires':'9999-12-31'}]
@@ -45,6 +64,7 @@ FIXTURES
 ci_init_summary_state
 check() {
   local file="$1" dispositions="$2" expected="$3" expected_code="$4" code=0
+  CI_KNOWN_FAILURE_ROWS=""
   DISPOSITIONS_FILE="$test_root/$dispositions.json"
   ci_classify_sql_results s "$test_root/$file.results.jsonl" || code=$?
   test "$CI_SQL_RESULT_STATUS" = "$expected"
@@ -65,6 +85,19 @@ check pass known UNEXPECTED_PASS 1
 [[ "$CI_KNOWN_FAILURE_ROWS" == *STALE_KNOWN_FAILURE* ]]
 check cleanup empty FAIL 1
 check truncated empty FAIL 1
+check expected empty PASS 0
+check direct known KNOWN_FAIL 0
+test "$(printf '%s\n' "$CI_KNOWN_FAILURE_ROWS" | rg -c KNOWN_FAIL)" = 1
+for fixture in negative verify diagnostic NR-FAIL.extra UnknownEngineCode case-cleanup multiple-refusals; do
+  check "$fixture" known FAIL 1
+  [[ "$CI_KNOWN_FAILURE_ROWS" != *KNOWN_FAIL* ]]
+done
+check secondary known FAIL 1
+[[ "$CI_KNOWN_FAILURE_ROWS" == *NEW_FAILURE* ]]
+for fixture in suite-init suite-cleanup; do
+  check "$fixture" known FAIL 1
+  [[ "$CI_KNOWN_FAILURE_ROWS" == *KNOWN_FAIL* ]]
+done
 
 # Terminal text is deliberately false. Reclassification must use native records.
 mkdir -p "$test_root/reclassify/sql"

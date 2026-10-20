@@ -26,6 +26,7 @@ pub enum EngineErrorCode {
     IcebergWriteDescriptorMismatch,
     UnsupportedPositionDeleteDescriptor,
     UnsupportedDistributedDmlShape,
+    UnsupportedCompiledShape,
     DistributedWriteOutputMismatch,
     WriteCoordinatorGone,
     CommitKnownUncommitted,
@@ -46,6 +47,7 @@ impl EngineErrorCode {
             Self::IcebergWriteDescriptorMismatch => "IcebergWriteDescriptorMismatch",
             Self::UnsupportedPositionDeleteDescriptor => "UnsupportedPositionDeleteDescriptor",
             Self::UnsupportedDistributedDmlShape => "UnsupportedDistributedDmlShape",
+            Self::UnsupportedCompiledShape => "UnsupportedCompiledShape",
             Self::DistributedWriteOutputMismatch => "DistributedWriteOutputMismatch",
             Self::WriteCoordinatorGone => "WriteCoordinatorGone",
             Self::CommitKnownUncommitted => "CommitKnownUncommitted",
@@ -68,6 +70,7 @@ impl EngineErrorCode {
                 Some(Self::UnsupportedPositionDeleteDescriptor)
             }
             "UnsupportedDistributedDmlShape" => Some(Self::UnsupportedDistributedDmlShape),
+            "UnsupportedCompiledShape" => Some(Self::UnsupportedCompiledShape),
             "DistributedWriteOutputMismatch" => Some(Self::DistributedWriteOutputMismatch),
             "WriteCoordinatorGone" => Some(Self::WriteCoordinatorGone),
             "CommitKnownUncommitted" => Some(Self::CommitKnownUncommitted),
@@ -90,6 +93,13 @@ impl fmt::Display for EngineErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_compiled_shape_code_round_trips() {
+        let code = EngineErrorCode::UnsupportedCompiledShape;
+        assert_eq!(code.as_str(), "UnsupportedCompiledShape");
+        assert_eq!(EngineErrorCode::parse(code.as_str()), Some(code));
+    }
 
     #[test]
     fn unsupported_position_delete_descriptor_code_round_trips() {

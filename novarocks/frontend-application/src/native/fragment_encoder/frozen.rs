@@ -38,13 +38,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_execution::task_execution::{FragmentContractVersion, FrozenBytes};
+use novarocks_execution::task_execution::FrozenBytes;
 use novarocks_physical_plan::{
     Edge, EdgeId, Fragment, FragmentPackage, FragmentSink, NodeKind, PipelineDopDomain,
-    PlanVersionId,
 };
 use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
-use novarocks_proto_models::{novarocks as wire, plan};
+use novarocks_proto_models::novarocks as wire;
 use novarocks_type_contract::PureCompileControl;
 use prost::Message;
 
@@ -64,6 +63,17 @@ pub(crate) struct StaticSinkTarget {
 }
 
 impl StaticSinkTarget {
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        target_fragment_id: FragmentId,
+        target_exchange_node_id: i32,
+    ) -> Self {
+        Self {
+            target_fragment_id,
+            target_exchange_node_id,
+        }
+    }
+
     pub(crate) const fn target_fragment_id(self) -> FragmentId {
         self.target_fragment_id
     }
@@ -125,18 +135,9 @@ impl FragmentFacts {
     }
 }
 
-/// What a frozen fragment carries besides its plan.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct StaticFragmentHeader {
-    pub(crate) plan_version: PlanVersionId,
-    pub(crate) plan_contract_revision: u32,
-    pub(crate) dop_domain: PipelineDopDomain,
-}
-
 /// One fragment's static plan as immutable bytes, with its typed facts.
 ///
-/// Its only constructors are [`FragmentArtifact::freeze`] for a plan tree and
-/// [`FragmentArtifact::freeze_package`] for a compiled package, so the bytes
+/// Its constructor [`FragmentArtifact::freeze_package`] freezes a checked package, so the bytes
 /// and the facts always come from one plan. Tasks and resends hold it by
 /// `Arc` and clone the bytes' shared backing; nothing re-encodes it.
 #[derive(Debug)]
@@ -149,61 +150,6 @@ pub(crate) struct FragmentArtifact {
 }
 
 impl FragmentArtifact {
-    /// Encodes one fragment's static plan, once.
-    ///
-    /// The plan must carry its root and a known static sink: a plan without
-    /// either could never be installed, and the backend would refuse it only
-    /// after a task had been placed and sent. The generated message is
-    /// consumed; what survives is the bytes and the facts read from it.
-    pub(crate) fn freeze(
-        plan: plan::PlanFragment,
-        header: StaticFragmentHeader,
-    ) -> Result<Arc<Self>, String> {
-        let fragment_id = plan.fragment_id;
-        let root = plan
-            .root
-            .as_ref()
-            .ok_or_else(|| format!("native fragment {fragment_id} carries no root node"))?;
-        let root_plan_node_id = root.node_id;
-        let declares_table_writer = contains_writer(root);
-        let carries_runtime_filter_bindings = plan.runtime_filter_bindings.is_some();
-        let kind = plan
-            .sink
-            .as_ref()
-            .and_then(|sink| sink.kind.as_ref())
-            .ok_or_else(|| format!("native fragment {fragment_id} carries no sink"))?;
-        let sink_targets = static_sink_targets(kind);
-        let facts = FragmentFacts {
-            fragment_id,
-            dop_domain: header.dop_domain,
-            sink_targets,
-            root_plan_node_id,
-            declares_table_writer,
-            carries_runtime_filter_bindings,
-        };
-        let frozen = wire::FrozenFragment {
-            package: Default::default(),
-            plan_version: header.plan_version.as_bytes().to_vec(),
-            plan_contract_revision: header.plan_contract_revision,
-            fragment_contract_version: u32::from(FragmentContractVersion::CURRENT.get()),
-            pipeline_dop_domain: Some(wire::PipelineDopDomain {
-                min: header.dop_domain.min,
-                max: header.dop_domain.max,
-                requires_power_of_two: header.dop_domain.requires_power_of_two,
-            }),
-            plan: Some(plan),
-        };
-        let content = FrozenBytes::freeze(frozen.encode_to_vec().into());
-        #[cfg(test)]
-        tests::record_freeze();
-        let retained = static_fragment_frozen(content.len());
-        Ok(Arc::new(Self {
-            content,
-            facts,
-            _retained: retained,
-        }))
-    }
-
     /// Encodes one fragment's checked v2 package, once, as a compiled
     /// carrier.
     ///
@@ -264,13 +210,6 @@ impl FragmentArtifact {
     }
 }
 
-fn contains_writer(node: &plan::DistributedNode) -> bool {
-    matches!(
-        node.payload.as_ref(),
-        Some(plan::distributed_node::Payload::TableWriter(_))
-    ) || node.children.iter().any(contains_writer)
-}
-
 /// A physical fragment's static sink branches, in the order its sink declares
 /// them, each addressed by the destination of the plan edge it feeds.
 fn package_sink_targets(
@@ -318,33 +257,6 @@ fn package_sink_targets(
         .collect()
 }
 
-/// The static sink branches, in the order the plan declares them. A sink
-/// that delivers nowhere -- the result, or a sink that discards -- has none.
-fn static_sink_targets(kind: &plan::data_sink::Kind) -> Box<[StaticSinkTarget]> {
-    let target = |target_fragment_id, target_exchange_node_id| StaticSinkTarget {
-        target_fragment_id,
-        target_exchange_node_id,
-    };
-    match kind {
-        plan::data_sink::Kind::Result(_)
-        | plan::data_sink::Kind::RootResult(_)
-        | plan::data_sink::Kind::Noop(_) => Box::default(),
-        plan::data_sink::Kind::DataStream(stream) => {
-            Box::new([target(stream.target_fragment_id, stream.dest_node_id)])
-        }
-        plan::data_sink::Kind::MultiCastDataStream(multicast) => multicast
-            .sinks
-            .iter()
-            .map(|stream| target(stream.target_fragment_id, stream.dest_node_id))
-            .collect(),
-        plan::data_sink::Kind::ChangeStreamRouter(router) => router
-            .routes
-            .iter()
-            .map(|route| target(route.target_fragment_id, route.target_exchange_node_id))
-            .collect(),
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::Cell;
@@ -365,85 +277,277 @@ pub(crate) mod tests {
         FREEZES.with(Cell::get)
     }
 
-    fn header() -> StaticFragmentHeader {
-        StaticFragmentHeader {
-            plan_version: PlanVersionId::try_new([7; 16]).expect("nonzero version"),
-            plan_contract_revision: 1,
-            dop_domain: PipelineDopDomain {
+    /// Freeze a structurally checked package for control-plane tests. Padding
+    /// belongs to real uncompressed Binary constants, so descriptor capacity
+    /// tests measure the actual carrier bytes. This fixture claims no runtime
+    /// support beyond Result and a single Stream sink.
+    pub(crate) fn frozen_package(
+        fragment_id: u32,
+        root_node_id: i32,
+        version: [u8; 16],
+        dop_domain: PipelineDopDomain,
+        target: Option<(u32, i32)>,
+        padding: usize,
+    ) -> Arc<FragmentArtifact> {
+        use novarocks_physical_plan as p;
+        use novarocks_type_contract::{
+            CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
+            ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation,
+            ExpressionUseId, SemanticParameters,
+        };
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let id = p::FragmentId::new(fragment_id);
+        let node = p::NodeId::new(u32::try_from(root_node_id).expect("nonnegative root"));
+        let ty = p::ValueType::new(arrow::datatypes::DataType::Binary, false);
+        let mut builder = p::FragmentBuilder::new(id);
+        let mut constants = p::ConstantPools::empty();
+        let mut values = Vec::new();
+        let mut expressions = Vec::new();
+        // Each pool stays below the flat-batch per-pool ceiling while the
+        // complete package can exceed the task descriptor ceiling.
+        let mut remaining = padding;
+        loop {
+            let width = remaining.min(4 << 20);
+            let bytes = vec![1; width];
+            let literal = p::ConstantValue::from_binary(
+                Arc::new(arrow::datatypes::Field::new(
+                    "payload",
+                    arrow::datatypes::DataType::Binary,
+                    false,
+                )),
+                ty.clone(),
+                &bytes,
+                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+                CompilePhase::Validate,
+                &control,
+            )
+            .expect("an admitted real Binary constant");
+            let pool = p::ConstantPoolId::new(values.len() as u32);
+            constants
+                .insert(pool, literal.pool().clone())
+                .expect("unique constant pool");
+            let value = builder
+                .add_value(
+                    ty.clone(),
+                    p::ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal: values.len() as u32,
+                    },
+                )
+                .expect("output value");
+            let expr = builder
+                .add_expression(
+                    node,
+                    ty.clone(),
+                    p::ExprKind::Constant(p::ConstantReference {
+                        pool,
+                        ordinal: literal.ordinal(),
+                    }),
+                )
+                .expect("constant expression");
+            values.push(value);
+            expressions.push(expr);
+            remaining -= width;
+            if remaining == 0 {
+                break;
+            }
+        }
+        builder
+            .add_values(
+                node,
+                vec![expressions.into_boxed_slice()].into_boxed_slice(),
+                values.clone().into_boxed_slice(),
+            )
+            .expect("Values node");
+        let edge_id = p::EdgeId::new(0);
+        let sink = if target.is_some() {
+            p::FragmentSink::Stream { edge: edge_id }
+        } else {
+            p::FragmentSink::Result
+        };
+        let fragment = builder
+            .finish_definition(node, sink, dop_domain)
+            .expect("checked fragment definition");
+        let roots = p::PhysicalExpressionRoots::try_new(&fragment, &control).expect("roots");
+        let bindings = roots
+            .sites()
+            .iter()
+            .enumerate()
+            .map(|(i, (site, _))| (*site, ExpressionUseId::new(i as u32)))
+            .collect();
+        let uses = roots
+            .sites()
+            .iter()
+            .enumerate()
+            .map(|(i, (_, root))| ExpressionInvocation {
+                context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(i as u32),
+                    domain: EvaluationDomainId::new(0),
+                    demand: root.demand,
+                },
+                definition: root.expr,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            })
+            .collect();
+        let flow = ExpressionControlFlow::try_new(
+            vec![ExpressionEvaluationDomain {
+                id: EvaluationDomainId::new(0),
+                parent: None,
+                guard: None,
+            }],
+            uses,
+            fragment.expressions(),
+            CompilePhase::Validate,
+            &control,
+        )
+        .expect("complete eager constant flow");
+        let expression_uses = p::PhysicalRootUses::try_new(&fragment, flow, bindings, &control)
+            .expect("exact root uses");
+        let calls = p::FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &control)
+            .expect("complete empty calls");
+        let pruning =
+            p::FrozenFragmentPruning::try_new(id, vec![], &control).expect("empty pruning");
+        let mut edges = BTreeMap::new();
+        let mut cuts = p::FragmentCuts::default();
+        let result = match target {
+            Some((target_fragment, target_node)) => {
+                let target_fragment = p::FragmentId::new(target_fragment);
+                let target_node =
+                    p::NodeId::new(u32::try_from(target_node).expect("nonnegative target"));
+                let partitioning = p::EdgePartitioning {
+                    source: p::Distribution::Singleton,
+                    source_multiplicity: p::RowMultiplicity::SingleCopy,
+                    destination: p::Distribution::Singleton,
+                    destination_multiplicity: p::RowMultiplicity::SingleCopy,
+                };
+                edges.insert(
+                    edge_id,
+                    p::Edge {
+                        id: edge_id,
+                        kind: p::EdgeKind::Stream,
+                        source: p::EdgeSource {
+                            fragment: id,
+                            projection: values.clone().into_boxed_slice(),
+                        },
+                        destination: p::EdgeDestination {
+                            fragment: target_fragment,
+                            node: target_node,
+                            receive_mapping: values.iter().map(|v| (*v, *v)).collect(),
+                        },
+                        partitioning: partitioning.clone(),
+                    },
+                );
+                cuts.outbound = vec![p::OutboundFragmentCut {
+                    edge: edge_id,
+                    kind: p::EdgeKind::Stream,
+                    destination_fragment: target_fragment,
+                    destination_node: target_node,
+                    projection: values
+                        .iter()
+                        .map(|v| p::CutValue {
+                            value: *v,
+                            ty: ty.clone(),
+                        })
+                        .collect(),
+                    destination_imports: values
+                        .iter()
+                        .map(|v| p::CutImport {
+                            source: p::CutValue {
+                                value: *v,
+                                ty: ty.clone(),
+                            },
+                            destination: *v,
+                        })
+                        .collect(),
+                    partitioning,
+                    change_stream_writer: None,
+                    writer_result: None,
+                }]
+                .into_boxed_slice();
+                None
+            }
+            None => Some(p::ResultPort {
+                scalar_schema: None,
+                fragment: id,
+                output: fragment.nodes()[&node].output.clone(),
+                fields: values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| p::ResultField {
+                        domain: p::ResultValueDomain::Plain,
+                        name: format!("payload{i}").into(),
+                        alias: None,
+                        value: *v,
+                        ty: ty.clone(),
+                    })
+                    .collect(),
+            }),
+        };
+        let package = p::FragmentPackage::try_new(
+            p::FragmentPackageInput {
+                constants,
+                version: p::PlanVersionId::try_new(version).expect("nonzero version"),
+                required: p::RequiredContracts::default(),
+                fragment,
+                expression_uses,
+                calls,
+                pruning,
+                cuts,
+                result,
+                parameters: SemanticParameters::default(),
+                scans: BTreeMap::new(),
+                writes: BTreeMap::new(),
+                annotations: Box::default(),
+            },
+            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+            &control,
+        )
+        .expect("checked package");
+        FragmentArtifact::freeze_package(&package, &edges, &PackageEncodeLimits::FROZEN, &control)
+            .expect("a genuine package freezes")
+    }
+
+    #[test]
+    fn freezing_encodes_the_package_once_and_reads_its_facts_from_the_same_package() {
+        let before = freezes_on_this_thread();
+        let artifact = frozen_package(
+            3,
+            11,
+            [7; 16],
+            PipelineDopDomain {
                 min: 1,
                 max: 8,
                 requires_power_of_two: false,
             },
-        }
-    }
-
-    fn fragment(sink: plan::data_sink::Kind) -> plan::PlanFragment {
-        plan::PlanFragment {
-            fragment_id: 3,
-            root: Some(plan::DistributedNode {
-                node_id: 11,
-                ..Default::default()
-            }),
-            sink: Some(plan::DataSink { kind: Some(sink) }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn freezing_encodes_the_plan_once_and_reads_its_facts_from_the_same_plan() {
-        let before = freezes_on_this_thread();
-        let artifact = FragmentArtifact::freeze(
-            fragment(plan::data_sink::Kind::MultiCastDataStream(
-                plan::MultiCastDataStreamSink {
-                    sinks: vec![
-                        plan::DataStreamSink {
-                            dest_node_id: 20,
-                            target_fragment_id: 5,
-                            ..Default::default()
-                        },
-                        plan::DataStreamSink {
-                            dest_node_id: 21,
-                            target_fragment_id: 4,
-                            ..Default::default()
-                        },
-                    ],
-                },
-            )),
-            header(),
-        )
-        .expect("a frozen fragment");
+            Some((5, 20)),
+            0,
+        );
         assert_eq!(freezes_on_this_thread() - before, 1);
         let facts = artifact.facts();
         assert_eq!(facts.fragment_id(), 3);
         assert_eq!(facts.root_plan_node_id(), 11);
-        assert_eq!(
-            facts
-                .sink_targets()
-                .iter()
-                .map(|target| (
-                    target.target_fragment_id(),
-                    target.target_exchange_node_id()
-                ))
-                .collect::<Vec<_>>(),
-            vec![(5, 20), (4, 21)],
-            "branch order is the static plan's own"
-        );
+        assert_eq!(facts.sink_targets(), &[StaticSinkTarget::for_test(5, 20)]);
         assert!(!facts.declares_table_writer());
-        assert!(!facts.carries_runtime_filter_bindings());
-
-        let decoded = wire::FrozenFragment::decode(artifact.content().bytes().clone())
-            .expect("the frozen bytes are one FrozenFragment");
-        assert_eq!(decoded.plan_version, vec![7; 16]);
-        assert_eq!(decoded.plan.expect("plan").fragment_id, 3);
-    }
-
-    #[test]
-    fn a_plan_without_a_root_or_a_sink_cannot_be_frozen() {
-        let mut no_root = fragment(plan::data_sink::Kind::Result(true));
-        no_root.root = None;
-        assert!(FragmentArtifact::freeze(no_root, header()).is_err());
-        let mut no_sink = fragment(plan::data_sink::Kind::Result(true));
-        no_sink.sink = None;
-        assert!(FragmentArtifact::freeze(no_sink, header()).is_err());
+        assert!(facts.carries_runtime_filter_bindings());
+        let frozen = wire::FrozenFragment::decode(artifact.content().bytes().clone())
+            .expect("FrozenFragment");
+        assert!(!frozen.package.is_empty());
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let model =
+            novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel::try_new(
+                &control,
+            )
+            .expect("decode model");
+        let decoded = novarocks_plan_codec::physical_package_v2::decode_fragment_package(
+            &frozen.package,
+            &model,
+            &novarocks_plan_codec::physical_package_v2::test_support::decode_limits(),
+            &control,
+        )
+        .expect("checked package decodes");
+        assert_eq!(decoded.version().as_bytes(), &[7; 16]);
+        assert_eq!(decoded.fragment().id().get(), 3);
+        assert_eq!(decoded.fragment().root().get(), 11);
     }
 }

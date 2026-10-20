@@ -232,6 +232,8 @@ pub enum TaskFailureCategory {
     Protocol,
     /// An engine invariant was violated.
     Internal,
+    /// A valid plan requires a capability this compiled interpreter lacks.
+    Unsupported,
 }
 
 impl TaskFailureCategory {
@@ -242,6 +244,7 @@ impl TaskFailureCategory {
             Self::Exchange => "EXCHANGE",
             Self::Protocol => "PROTOCOL",
             Self::Internal => "INTERNAL",
+            Self::Unsupported => "UNSUPPORTED",
         }
     }
 }
@@ -1227,6 +1230,19 @@ mod tests {
                 Err(TaskStatusError::InstalledPreparationFailure)
             );
         }
+    }
+
+    #[test]
+    fn unsupported_category_has_stable_text_and_keeps_preparation_phase() {
+        assert_eq!(TaskFailureCategory::Unsupported.as_str(), "UNSUPPORTED");
+        assert_eq!(TaskFailureCategory::Unsupported.to_string(), "UNSUPPORTED");
+        let failure = TaskFailure::new_in_phase(
+            TaskFailureCategory::Unsupported,
+            SafeDetail::truncating("FULL OUTER hash join"),
+            TaskFailurePhase::Preparation,
+        );
+        assert_eq!(failure.category(), TaskFailureCategory::Unsupported);
+        assert_eq!(failure.phase(), TaskFailurePhase::Preparation);
     }
 
     #[test]

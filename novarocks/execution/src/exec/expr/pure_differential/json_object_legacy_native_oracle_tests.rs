@@ -406,7 +406,7 @@ fn ancestors(
 #[test]
 fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation() {
     use novarocks_physical_plan::{ExprKind, NodeKind};
-    use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
     let fields = native_columns()
         .iter()
         .zip(["id", "k", "v", "n", "flag", "day", "amount"])
@@ -414,7 +414,7 @@ fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation
         .collect::<Vec<_>>();
     let mut records = Vec::new();
     for (query, sql) in ORIGINAL_SQL {
-        let source = super::super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields(sql, &fields, SqlPhysicalEmissionMode::OriginalNativeV1);
+        let source = super::super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields(sql, &fields);
         let plan = source.plan();
         let result = plan.result_port().unwrap();
         let live = ancestors(plan, (result.fragment, result.output.node));
@@ -492,7 +492,7 @@ fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation
         records.push(json!({"query":query,"sql":sql,"headers":headers,"fields":format!("{:?}",result.fields),"full_plan":format!("{plan:#?}"),"reachable_json_project_count":owners.len(),"call_metadata":call_metadata}));
     }
     if let Ok(path) = std::env::var("C16_ORIGINAL_SQL_OUT") {
-        std::fs::write(path, serde_json::to_string_pretty(&json!({"mode":"OriginalNativeV1","fold":"NoOp original source fixture","queries":records})).unwrap()+"\n").unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(&json!({"mode":"CompiledPackage","fold":"NoOp original source fixture","queries":records})).unwrap()+"\n").unwrap();
     }
 }
 

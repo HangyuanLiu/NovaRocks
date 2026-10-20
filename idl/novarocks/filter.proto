@@ -19,7 +19,7 @@ syntax = "proto3";
 package novarocks.filter;
 
 import "common.proto";
-import "plan.proto";
+import "execution_shared.proto";
 
 enum RuntimeFilterEnvelopeKind {
   RUNTIME_FILTER_ENVELOPE_KIND_UNSPECIFIED = 0;

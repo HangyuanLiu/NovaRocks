@@ -31,7 +31,7 @@ use http::{Request, header};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
-use novarocks_proto_models::{common, novarocks as proto, plan};
+use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 use prost::Message;
 use std::collections::BTreeSet;
@@ -1133,24 +1133,13 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
         .clone()
         .expect("raw query context carries a backend identity");
     let fragment_instance_id = common::UniqueId { hi: 93, lo: 94 };
-    let frozen_fragment = proto::FrozenFragment {
-        package: Default::default(),
-        plan_version: vec![1; 16].into(),
-        plan_contract_revision: 1,
-        fragment_contract_version: 1,
-        pipeline_dop_domain: Some(proto::PipelineDopDomain {
-            min: 2,
-            max: 2,
-            requires_power_of_two: false,
-        }),
-        plan: Some(plan::PlanFragment {
-            fragment_id: 1,
-            sink: Some(plan::DataSink {
-                kind: Some(plan::data_sink::Kind::Result(true)),
-            }),
-            ..Default::default()
-        }),
-    };
+    let frozen_fragment = super::native_creation::compiled_fragment(
+        1,
+        2,
+        None,
+        super::native_creation::RawSink::Result,
+        &[],
+    );
     // Each creation fact has one owner: the descriptor owns identity, kernel
     // key, parallelism and topology, the context owns every query-wide option,
     // and the assignment owns only the instance ordinal, the initial scan

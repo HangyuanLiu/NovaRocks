@@ -70,7 +70,7 @@ use novarocks_workload_control::WorkloadConfig;
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
-use crate::static_plan::{FrontendStaticPlanCarrier, ServerStaticPlan};
+use crate::static_plan::ServerStaticPlan;
 use novarocks_execution::exec::expr::agg::{
     ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     contribute_builtin_aggregate_implementations,
@@ -645,21 +645,9 @@ pub fn compose_frontend_role_config(
         query_blocking_workers,
         query_blocking_queue,
     ));
-    // Static plan carrier hook: the frontend freezes the one carrier this
-    // island's backends interpret, under the same package admission the
-    // backend receiver uses. Production keeps the frontend's plan-tree
-    // carrier untouched.
-    match static_plan.frontend_carrier() {
-        FrontendStaticPlanCarrier::PlanTree => {}
-        #[cfg(feature = "physical-wire-v2-candidate")]
-        FrontendStaticPlanCarrier::CompiledPackage { admission, limits } => {
-            execution = execution.with_static_plan_carrier(
-                novarocks_frontend_application::StaticPlanCarrier::CompiledPackage(
-                    novarocks_frontend_application::CompiledPackageCarrier::new(admission, limits),
-                ),
-            );
-        }
-    }
+    // The frontend freezes the one carrier its island's backends interpret,
+    // under the same structural package admission as their receiver.
+    execution = execution.with_static_plan_carrier(static_plan.frontend_carrier());
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =

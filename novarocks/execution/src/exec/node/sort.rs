@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::expr::ExprId;
-use crate::exec::node::ExecNode;
 
 #[derive(Clone, Debug)]
 pub struct SortExpression {
@@ -37,23 +36,4 @@ pub enum SortTopNType {
     // `TTopNType::DENSE_RANK` yet; we keep this variant for compatibility
     // and for direct-plan/engine-side coverage.
     DenseRank,
-}
-
-#[derive(Clone, Debug)]
-pub struct SortNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub use_top_n: bool,
-    pub order_by: Vec<SortExpression>,
-    pub limit: Option<usize>,
-    pub offset: usize,
-    // Ranking semantics for topn boundary handling.
-    pub topn_type: SortTopNType,
-    pub max_buffered_rows: Option<usize>,
-    pub max_buffered_bytes: Option<usize>,
-    /// Partition keys for per-partition TopN. Empty for non-partition sorts.
-    pub partition_exprs: Vec<SortExpression>,
-    /// Per-partition row cap. `Some` ⇒ truncate each `partition_exprs` group to
-    /// the top-`partition_limit` by `topn_type`. `None` ⇒ ordinary sort/topn.
-    pub partition_limit: Option<usize>,
 }

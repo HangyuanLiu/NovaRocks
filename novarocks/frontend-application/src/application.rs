@@ -829,7 +829,7 @@ pub struct FrontendApplicationHost {
     mv_startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
+    static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
 }
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
@@ -903,7 +903,7 @@ pub struct FrontendExecutionConfig {
     /// The one static carrier every completed plan of this process is frozen
     /// into. It travels with the function catalog to every owner that
     /// encodes a plan, and is never chosen per statement.
-    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
+    static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
     mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
@@ -975,10 +975,13 @@ impl FrontendExecutionConfig {
             native_compatibility_id,
             function_catalog,
             constant_policy,
-            // Production freezes plan trees; a compiled-package composition
-            // selects its carrier explicitly.
+            // Default composition freezes the same package structure that the
+            // production receiver admits.
             static_plan_carrier:
-                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+                crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                    novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                    novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                ),
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             mv_remote_effect_policy:
@@ -1052,13 +1055,11 @@ impl FrontendExecutionConfig {
         self.constant_policy
     }
 
-    /// Select the static carrier this process freezes every completed plan
-    /// into. The composition that selects the compiled package carrier must
-    /// also compose a backend that interprets it; nothing here falls back to
-    /// the plan tree.
+    /// Supply the package admission and encode limits paired with this
+    /// process's compiled backend interpreter.
     pub fn with_static_plan_carrier(
         mut self,
-        carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
+        carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
     ) -> Self {
         self.static_plan_carrier = carrier;
         self
@@ -1882,7 +1883,7 @@ impl FrontendApplicationHost {
     /// beside the function catalog.
     pub(crate) const fn static_plan_carrier(
         &self,
-    ) -> crate::query_execution::package_freeze::StaticPlanCarrier {
+    ) -> crate::query_execution::package_freeze::CompiledPackageCarrier {
         self.static_plan_carrier
     }
 

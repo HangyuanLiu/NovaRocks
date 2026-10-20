@@ -31,7 +31,7 @@ use novarocks_local_program::{
     StaticExprKind,
 };
 use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition};
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::{ControlShape, FunctionVolatility};
 use std::{
     sync::{Arc, Mutex},
@@ -61,10 +61,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn authored(sql: &str, expected: usize) -> Vec<Arc<LocalProgram>> {
-    let source = approx_sql_source(
-        sql,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = approx_sql_source(sql);
     let mut count = 0;
     for fragment in source.plan().fragments().values() {
         for (id, expr) in fragment.expressions().iter() {

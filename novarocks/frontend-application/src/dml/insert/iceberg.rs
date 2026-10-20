@@ -49,7 +49,7 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
             match self
                 .engine
                 .run_iceberg_write(self.prepared.handle.as_ref())
-                .map_err(crate::dml::error::DmlError::executor)?
+                .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?
             {
                 IcebergWriteReport::NoOp => CoordinatedWriteReport::NoOp,
                 IcebergWriteReport::CommitRequired(handle) => {
@@ -115,5 +115,79 @@ pub(super) fn write_transaction_spec(prepared: &PreparedIcebergInsert) -> WriteT
             table: operation.table.clone(),
             reference: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
         },
+    }
+}
+
+#[cfg(test)]
+mod runtime_identity_tests {
+    use super::*;
+    use crate::dml::error::DmlExecutionError;
+    use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+    use crate::query_execution::dml::insert::{
+        IcebergInsertOperation, IcebergPreparedInsert, PrepareIcebergInsert, ResolveInsertTarget,
+        ResolvedInsertTarget,
+    };
+    use novarocks_types::EngineErrorCode;
+
+    struct Prepared;
+    impl IcebergPreparedInsert for Prepared {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    struct RefusingEngine {
+        code: Option<EngineErrorCode>,
+    }
+    impl InsertEngine for RefusingEngine {
+        fn resolve_target(&self, _: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String> {
+            panic!("already prepared");
+        }
+        fn prepare_iceberg_write(
+            &self,
+            _: PrepareIcebergInsert,
+        ) -> Result<PreparedIcebergInsert, String> {
+            panic!("already prepared");
+        }
+        fn run_iceberg_write(
+            &self,
+            _: &dyn IcebergPreparedInsert,
+        ) -> Result<IcebergWriteReport, DmlExecutionError> {
+            Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::Failed,
+                "unsupported diagnostic",
+            )
+            .with_engine_error_code(self.code)
+            .into())
+        }
+        fn finalize_iceberg_write(&self, _: &dyn IcebergPreparedInsert) -> Result<(), String> {
+            panic!("refused write cannot finalize");
+        }
+    }
+
+    #[test]
+    fn insert_execution_port_keeps_typed_runtime_identity_through_executor_projection() {
+        for code in [None, Some(EngineErrorCode::UnsupportedCompiledShape)] {
+            let engine = RefusingEngine { code };
+            let prepared = PreparedIcebergInsert {
+                operation: IcebergInsertOperation {
+                    publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
+                    catalog: "ice".into(),
+                    namespace: "db".into(),
+                    table: "orders".into(),
+                    target_ref: "main".into(),
+                    attempt_id: "fixture".into(),
+                    is_overwrite: false,
+                    base_snapshot_id: None,
+                },
+                handle: Arc::new(Prepared),
+                sql_source: "INSERT INTO orders SELECT ...".into(),
+            };
+            let error = IcebergInsertWriteExecutor::new(&engine, &prepared)
+                .run_coordinated_write(&write_transaction_spec(&prepared))
+                .err()
+                .unwrap();
+            assert_eq!(error.engine_error_code(), code);
+            assert_eq!(format!("{}", error), "Executor: unsupported diagnostic");
+        }
     }
 }

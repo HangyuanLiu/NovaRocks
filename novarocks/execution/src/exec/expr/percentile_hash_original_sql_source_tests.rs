@@ -17,13 +17,13 @@
 //! Genuine original SQL binding author. Exact candidate presence is absent before owner install.
 use super::approx_percentile_actual_sql_source_tests::approx_sql_source;
 use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition};
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 const CORPUS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/aggregate/sql/agg_percentile_semantics.sql"
 ));
 fn source(sql: &str, expected_arity: usize) {
-    let owner = approx_sql_source(sql, SqlPhysicalEmissionMode::OriginalNativeV1);
+    let owner = approx_sql_source(sql);
     let mut count = 0;
     for fragment in owner.plan().fragments().values() {
         for (id, expr) in fragment.expressions().iter() {

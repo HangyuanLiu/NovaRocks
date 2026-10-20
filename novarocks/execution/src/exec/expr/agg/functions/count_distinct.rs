@@ -221,50 +221,13 @@ mod tests {
     use std::mem::MaybeUninit;
     use std::sync::Arc;
 
-    #[cfg(feature = "core-pipeline-integration")]
-    use std::collections::HashMap;
-    #[cfg(feature = "core-pipeline-integration")]
-    use std::time::Duration;
-
-    #[cfg(feature = "core-pipeline-integration")]
-    use arrow::array::Int32Array;
     use arrow::array::{ArrayRef, Int64Array, ListArray, NullArray};
     use arrow::datatypes::{DataType, Int32Type};
-    #[cfg(feature = "core-pipeline-integration")]
-    use arrow::datatypes::{Field, Schema};
-    #[cfg(feature = "core-pipeline-integration")]
-    use arrow::record_batch::RecordBatch;
 
     use super::{AggregateFunction, CountDistinctAgg, DistinctSet, get_or_init_set};
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::agg::{AggInputView, AggStatePtr};
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::expr::{ExprArena, ExprNode};
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::node::aggregate::AggregateNode;
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::node::values::ValuesNode;
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
     use crate::runtime::mem_tracker::MemTracker;
-    #[cfg(feature = "core-pipeline-integration")]
-    use crate::runtime::runtime_state::RuntimeState;
-    #[cfg(feature = "core-pipeline-integration")]
-    use novarocks_types::SlotId;
-
-    #[cfg(feature = "core-pipeline-integration")]
-    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
-        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
-            .expect("chunk schema")
-    }
 
     #[test]
     fn count_distinct_supports_int_list_values() {
@@ -338,126 +301,6 @@ mod tests {
 
         let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(out.value(0), 0);
-    }
-
-    #[cfg(feature = "core-pipeline-integration")]
-    #[test]
-    fn group_by_multi_distinct_count_is_correct_with_dop_2() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int32, false),
-            Field::new("v", DataType::Int32, false),
-        ]));
-        let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3, 3, 3, 3])) as arrow::array::ArrayRef;
-        let vals =
-            Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8, 9, 9])) as arrow::array::ArrayRef;
-        let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        };
-        let output_chunk_schema = chunk_schema_of(
-            &Arc::new(Schema::new(vec![
-                Field::new("k", DataType::Int32, false),
-                Field::new("cnt", DataType::Int64, true),
-            ])),
-            &[SlotId::new(1), SlotId::new(2)],
-        );
-
-        let mut arena = ExprArena::default();
-        let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let v = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
-
-        let plan = ExecPlan {
-            arena,
-            root: ExecNode {
-                kind: ExecNodeKind::Aggregate(AggregateNode {
-                    input: Box::new(ExecNode {
-                        kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 0 }),
-                    }),
-                    node_id: 0,
-                    group_by: vec![k],
-                    functions: vec![AggFunction {
-                        name: "multi_distinct_count".to_string(),
-                        inputs: vec![v],
-                        input_is_intermediate: false,
-                        types: Some(AggTypeSignature {
-                            intermediate_type: Some(DataType::Binary),
-                            output_type: Some(DataType::Int64),
-                            input_arg_type: None,
-                        }),
-                        ..Default::default()
-                    }],
-                    resolved_aggregates: vec![
-                        crate::exec::expr::agg::test_builtin_execution_function_set()
-                            .catalog()
-                            .resolve_aggregate_trusted("multi_distinct_count", &[DataType::Int32])
-                            .expect("resolved builtin aggregate"),
-                    ],
-                    need_finalize: true,
-                    input_is_intermediate: false,
-                    output_chunk_schema,
-                    runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
-                        topn_producers: Vec::new(),
-                    },
-                    streaming_preaggregation_mode: None,
-                }),
-            },
-        };
-
-        let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
-        execute_native_plan_with_pipeline(
-            plan,
-            false,
-            Duration::from_millis(10),
-            Box::new(ResultSinkFactory::new(handle.clone())),
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            None,
-            None,
-            2,
-            runtime_state,
-            None,
-            None,
-            None,
-        )
-        .expect("execute plan");
-
-        let chunks = handle.take_chunks();
-        let mut out: HashMap<i32, i64> = HashMap::new();
-        for chunk in chunks {
-            if chunk.is_empty() {
-                continue;
-            }
-            assert_eq!(chunk.columns().len(), 2);
-            let k_arr = chunk
-                .columns()
-                .first()
-                .expect("k column")
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("k Int32");
-            let v_arr = chunk
-                .columns()
-                .get(1)
-                .expect("distinct count column")
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("distinct count Int64");
-            for i in 0..chunk.len() {
-                out.insert(k_arr.value(i), v_arr.value(i));
-            }
-        }
-
-        assert_eq!(out.get(&1).copied(), Some(2));
-        assert_eq!(out.get(&2).copied(), Some(1));
-        assert_eq!(out.get(&3).copied(), Some(3));
-        assert_eq!(out.len(), 3);
     }
 
     #[test]

@@ -23,10 +23,8 @@
 //! sealed it; the original extraction law publishes the checked packages; the
 //! v2 sender encodes them.
 //!
-//! Which carrier a Frontend freezes its plans into is one composition choice,
-//! [`StaticPlanCarrier`]. Production composes the plan tree; the compiled
-//! package carrier is selected only by a composition that also runs a
-//! compiled-package backend.
+//! The host provides [`CompiledPackageCarrier`] admission and encode limits
+//! once, paired with the compiled-package backend.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -45,34 +43,6 @@ use prost::Message;
 
 use crate::query_execution::package_reads::author_frozen_reads;
 use crate::query_execution::provider_read_facts::FrozenReadEncoding;
-
-/// The static carrier one Frontend process freezes every completed plan into.
-///
-/// A process interprets exactly one carrier: the composition chooses it once,
-/// before any statement is admitted, and every owner that encodes a completed
-/// plan receives the same choice beside its function catalog. A plan the
-/// chosen carrier cannot express is refused; it never falls back to the other
-/// carrier, because a backend interprets only the carrier its own composition
-/// chose.
-#[derive(Clone, Copy, Debug)]
-pub enum StaticPlanCarrier {
-    /// The production native plan tree (`FrozenFragment` fields 1-5).
-    PlanTree,
-    /// One v2 `FragmentPackage` per fragment, carried as
-    /// `FrozenFragment.package` with no plan-tree field beside it.
-    CompiledPackage(CompiledPackageCarrier),
-}
-
-impl StaticPlanCarrier {
-    /// Freeze the SQL emission policy before the statement's first completion.
-    /// This projects the already selected process carrier; it never guesses one.
-    pub const fn sql_emission_mode(self) -> novarocks_sql::compiler::SqlPhysicalEmissionMode {
-        match self {
-            Self::PlanTree=>novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-            Self::CompiledPackage(_)=>novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        }
-    }
-}
 
 /// Host-owned configuration of the compiled package carrier.
 ///
@@ -135,6 +105,9 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
     fn from(error: PackageFreezeError) -> Self {
         match error {
             PackageFreezeError::Control(cause) => Self::Control(cause),
+            PackageFreezeError::Semantics(
+                novarocks_sql::compiler::PackageSemanticsError::UnsupportedCapability(detail),
+            ) => Self::UnsupportedCapability(format!("compiled package carrier: {detail}")),
             other => Self::Invalid(format!("compiled package carrier: {other}")),
         }
     }
@@ -181,10 +154,6 @@ pub(crate) fn extract_checked_packages(
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, PackageFreezeError> {
     let plan = candidate.plan();
     let scans = author_frozen_reads(plan, encodings, control)?;
-    if let Some(mode)=candidate.sql_emission_mode()
-        && mode!=novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration {
-        return Err(PackageFreezeError::Facts("SQL source was not authored for the compiled package carrier".to_string()));
-    }
     let semantics = candidate
         .author_package_semantics(statement_constant_policy, control)
         .map_err(|error| match error {
@@ -232,4 +201,39 @@ pub(crate) fn encode_checked_package(
         other => PackageFreezeError::Encode(other),
     })?;
     Ok(wire.encode_to_vec())
+}
+
+#[cfg(test)]
+mod error_projection_tests {
+    use super::*;
+    use novarocks_plan_codec::PhysicalEncodeError;
+    use novarocks_sql::compiler::PackageSemanticsError;
+
+    #[test]
+    fn package_freeze_preserves_only_typed_semantic_capability_refusals() {
+        let detail = "cast List<Int8> to List<Int64>";
+        let error = PhysicalEncodeError::from(PackageFreezeError::Semantics(
+            PackageSemanticsError::UnsupportedCapability(detail.into()),
+        ));
+        assert_eq!(
+            error,
+            PhysicalEncodeError::UnsupportedCapability(format!(
+                "compiled package carrier: {detail}"
+            ))
+        );
+        let invalid = PhysicalEncodeError::from(PackageFreezeError::Semantics(
+            PackageSemanticsError::Effects("UnsupportedCast diagnostic".into()),
+        ));
+        assert!(matches!(invalid, PhysicalEncodeError::Invalid(_)));
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            assert_eq!(
+                PhysicalEncodeError::from(PackageFreezeError::Control(cause)),
+                PhysicalEncodeError::Control(cause)
+            );
+        }
+    }
 }

@@ -252,7 +252,7 @@ fn bind_first_refresh_write_dataflow(
     // The recipes are sealed once, here, and travel with the plan they were
     // sealed for, so an encode can never pair one round's plan with another's
     // session.
-    let sealed_write_targets = write_session
+    let _sealed_write_targets = write_session
         .seal_write_targets()
         .map_err(|error| format!("seal MV first-refresh write target: {error}"))?;
     match prepared.into_execution_artifact() {
@@ -274,10 +274,7 @@ fn bind_first_refresh_write_dataflow(
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
                 novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
-            let field_names = std::collections::BTreeMap::from([(
-                write_target_ordinal,
-                sink.accepted_field_names().into_iter().collect(),
-            )]);
+
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
             let materializer =
                 crate::catalog_application::query_materializer::CatalogServiceMaterializer::new(
@@ -295,7 +292,6 @@ fn bind_first_refresh_write_dataflow(
             let analyzed = analyze_mv_first_refresh_connector_write(
                 physical_sql,
                 SqlMvFirstRefreshAnalyzeContext {
-                    emission_mode: query_kernel.static_plan_carrier().sql_emission_mode(),
                     current_catalog: current_catalog.clone(),
                     current_database: current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
@@ -329,9 +325,7 @@ fn bind_first_refresh_write_dataflow(
                 bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
-                sealed_write_targets,
                 needs,
-                field_names,
                 |version, dop, reads, targets| {
                     completion.finish(version, dop, reads, targets, &finish_control)
                 },
@@ -379,10 +373,7 @@ fn bind_first_refresh_write_dataflow(
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
                 novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
-            let field_names = std::collections::BTreeMap::from([(
-                write_target_ordinal,
-                sink.accepted_field_names().into_iter().collect(),
-            )]);
+
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
             let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
@@ -399,7 +390,6 @@ fn bind_first_refresh_write_dataflow(
                 crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed =
                 analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
-                    emission_mode: query_kernel.static_plan_carrier().sql_emission_mode(),
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                     expected_root_hash_column: root_hash_column,
@@ -435,9 +425,7 @@ fn bind_first_refresh_write_dataflow(
                 bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
-                sealed_write_targets,
                 needs,
-                field_names,
                 |version, dop, reads, targets| {
                     completion.finish(version, dop, reads, targets, &finish_control)
                 },

@@ -239,7 +239,16 @@ impl From<novarocks_sql::compiler::SqlCompileError> for RefreshError {
             E::Analyze(error) => error.control_error(),
             _ => None,
         };
-        let mut failure = Self::user(error.to_string());
+        let message = match &error {
+            novarocks_sql::compiler::SqlCompileError::Analyze(error)
+                if error.kind()
+                    == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
+            {
+                error.to_user_error(None).to_string()
+            }
+            _ => error.to_string(),
+        };
+        let mut failure = Self::user(message);
         failure.compile_control = control;
         failure
     }
@@ -308,6 +317,39 @@ mod tests {
         );
     }
     #[test]
+    fn refresh_compile_projection_preserves_only_the_missing_implementation_sql_code() {
+        use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+        use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/refresh/missing-pure-v1").unwrap(),
+        ));
+        let SqlCompileError::Analyze(ref analyze) = compile else {
+            panic!("missing implementation must retain typed analysis identity");
+        };
+        let expected = analyze.to_user_error(None).to_string();
+        let failure = RefreshError::from(compile);
+        assert_eq!(failure.message, expected);
+        assert!(
+            failure
+                .message
+                .starts_with("[sql.analyze.unavailable_implementation] ")
+        );
+        assert_eq!(failure.kind, RefreshErrorKind::UserError);
+        assert!(failure.kind.should_rollback_after_commit());
+        assert_eq!(failure.compile_control_error(), None);
+
+        let ordinary = SqlCompileError::Analyze(AnalyzeError::internal(
+            "unsupported diagnostic: UnsupportedCompiledShape",
+        ));
+        let expected = ordinary.to_string();
+        let ordinary = RefreshError::from(ordinary);
+        assert_eq!(ordinary.message, expected);
+        assert_eq!(ordinary.kind, RefreshErrorKind::UserError);
+        assert_eq!(ordinary.compile_control_error(), None);
+    }
+
+    #[test]
     fn compile_control_cause_keeps_existing_refresh_kind_and_rollback_rule() {
         use novarocks_type_contract::CompileControlError;
         for control in [
@@ -315,7 +357,10 @@ mod tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let error = RefreshError::from(novarocks_sql::compiler::SqlCompileError::from(control));
+            let compile = novarocks_sql::compiler::SqlCompileError::from(control);
+            let expected = compile.to_string();
+            let error = RefreshError::from(compile);
+            assert_eq!(error.message, expected);
             assert_eq!(error.compile_control_error(), Some(control));
             assert_eq!(error.kind, RefreshErrorKind::UserError);
             assert!(error.kind.should_rollback_after_commit());

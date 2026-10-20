@@ -374,7 +374,6 @@ fn state_sources_grouped_topn_refuses_transported_state_without_a_rows_fallback(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
-        crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         &control,
     );
     let Err(error) = result else {

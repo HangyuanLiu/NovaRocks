@@ -110,7 +110,9 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy;
     /// The static carrier the kernel's composition chose for every plan.
-    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier;
+    fn static_plan_carrier(
+        &self,
+    ) -> &crate::query_execution::package_freeze::CompiledPackageCarrier;
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
@@ -135,7 +137,9 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
         self.constant_policy()
     }
 
-    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+    fn static_plan_carrier(
+        &self,
+    ) -> &crate::query_execution::package_freeze::CompiledPackageCarrier {
         self.static_plan_carrier()
     }
 
@@ -179,7 +183,9 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
         self.constant_policy()
     }
 
-    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+    fn static_plan_carrier(
+        &self,
+    ) -> &crate::query_execution::package_freeze::CompiledPackageCarrier {
         self.static_plan_carrier()
     }
 
@@ -1376,7 +1382,10 @@ impl PreparedDmlWriteAssembly {
 
     pub(crate) fn finish(
         self,
-    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    ) -> Result<
+        crate::query_execution::outcome::QueryExecutionResult,
+        crate::dml::error::DmlExecutionError,
+    > {
         let (query_execution, request) = self.into_request()?;
         execute_distributed_write_request(&query_execution, request)
     }
@@ -1501,7 +1510,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         DmlQueryExecutionKernel::constant_policy(state),
-        DmlQueryExecutionKernel::static_plan_carrier(state).sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)
@@ -1549,11 +1557,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         .encode_writer_handle_payload(write_target.handle())
         .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
     let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
-        sealed: &sealed_write_targets,
-        field_names: std::collections::BTreeMap::from([(
-            ordinal,
-            sink.accepted_field_names().into_iter().collect(),
-        )]),
         session: write_session.as_ref(),
     };
 
@@ -1568,7 +1571,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         statistics_requirements,
         &optimizer_settings,
         decimal_overflow_policy,
-        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -1623,11 +1625,9 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        DmlQueryExecutionKernel::function_catalog(state),
         DmlQueryExecutionKernel::static_plan_carrier(state),
         DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
@@ -1803,12 +1803,15 @@ fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionO
 fn execute_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     request: crate::query_execution::contract::DistributedQueryRequest,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+) -> Result<
+    crate::query_execution::outcome::QueryExecutionResult,
+    crate::dml::error::DmlExecutionError,
+> {
     query_execution
         .execute(request)
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
-        .map_err(|error| error.to_string())
+        .map_err(crate::dml::error::DmlExecutionError::from)
 }
 
 #[cfg(test)]

@@ -2843,6 +2843,7 @@ fn accepted_preparation_preserves_host_category_phase_and_same_identity_across_a
         TaskFailureCategory::Exchange,
         TaskFailureCategory::Execution,
         TaskFailureCategory::Internal,
+        TaskFailureCategory::Unsupported,
         TaskFailureCategory::ResourceExhausted,
     ]
     .into_iter()
@@ -2938,6 +2939,7 @@ fn accepted_preparation_category_retention_keeps_original_synchronous_operation_
         TaskFailureCategory::Exchange,
         TaskFailureCategory::Execution,
         TaskFailureCategory::Internal,
+        TaskFailureCategory::Unsupported,
         TaskFailureCategory::ResourceExhausted,
     ] {
         for stage in [Receiver, Capability, Domain, Submit] {

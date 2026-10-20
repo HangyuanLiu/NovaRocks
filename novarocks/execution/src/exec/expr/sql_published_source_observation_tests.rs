@@ -15,9 +15,8 @@ use novarocks_sql::compiler::{
     SqlAnalyzeRequest, SqlAuthoredPhysicalPlan, SqlCancellationObservation, SqlCompileControl,
     SqlCompileError, SqlCompileIntent, SqlCompileProgress, SqlCompileProgressError, SqlCompiler,
     SqlFinalPlanCompileRequest, SqlFoldDependencyInput, SqlFoldDependencyObserver,
-    SqlFoldEvaluationOutcome, SqlOptimizeRequest, SqlPhysicalEmissionMode, SqlPlannerTableSnapshot,
-    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
-    noop_constant_evaluator,
+    SqlFoldEvaluationOutcome, SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
+    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 use novarocks_sql::planning::dml::{
@@ -115,18 +114,11 @@ fn session() -> SqlSessionContext {
         optimizer_settings: settings(),
     }
 }
-fn mode_values() -> [SqlPhysicalEmissionMode; 2] {
-    [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ]
-}
 fn control(probe: &Arc<Probe>) -> SqlCompileControl {
     SqlCompileControl::unbounded().with_fold_dependency_observer(probe.clone())
 }
 fn query(
     sql: &str,
-    mode: SqlPhysicalEmissionMode,
     control: SqlCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileProgressError> {
     let request = SqlFinalPlanCompileRequest::new(
@@ -138,7 +130,6 @@ fn query(
         builtin_sql_function_catalog().snapshot(),
         noop_constant_evaluator(),
         super::pure_differential::constant_policy(),
-        mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -160,11 +151,7 @@ fn query(
 }
 // The same public SQL/DML producer used by the permanent Writer source fixture.
 // Only explicit context/observer arguments differ; no replacement physical graph.
-fn dml(
-    sql: &str,
-    mode: SqlPhysicalEmissionMode,
-    control: SqlCompileControl,
-) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
+fn dml(sql: &str, control: SqlCompileControl) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let functions = build_builtin_engine_function_catalog().unwrap();
     let catalog = PlannerMemoryCatalog::default();
     let catalog = SqlPlannerTableSnapshot::new(&catalog);
@@ -181,7 +168,6 @@ fn dml(
         noop_constant_evaluator(),
         None,
         super::pure_differential::constant_policy(),
-        mode,
         control.clone(),
     ))?
     .into_pending()?;
@@ -239,7 +225,6 @@ fn dml(
                     requires_power_of_two: true,
                 },
                 DmlFinalizedProviderReadSet::empty(),
-                mode,
             ),
             DmlFinalizedWriteTargetSet::try_new([DmlFinalizedWriteTarget { ordinal, handle }])
                 .unwrap(),
@@ -253,7 +238,6 @@ fn assert_same_source(actual: &SqlAuthoredPhysicalPlan, probe: &Probe) {
     assert_eq!(sources.len(), 1);
     let loaned = &sources[0];
     assert!(std::ptr::eq(actual.plan(), loaned.plan()));
-    assert_eq!(actual.emission_mode(), loaned.emission_mode());
     let actual_port = actual.original_public_result_declaration();
     let loaned_port = loaned.original_public_result_declaration();
     assert_eq!(
@@ -287,12 +271,11 @@ fn causes() -> [CompileControlError; 3] {
     ]
 }
 #[test]
-fn sql_published_source_query_loans_same_complete_owner_in_both_modes() {
-    for mode in mode_values() {
+fn sql_published_source_query_loans_same_complete_owner_for_compiled() {
+    {
         let probe = Probe::new(None);
         let source = query(
             "SELECT upper('publication') AS original_name",
-            mode,
             control(&probe),
         )
         .unwrap();
@@ -320,14 +303,9 @@ fn sql_published_source_query_loans_same_complete_owner_in_both_modes() {
 }
 #[test]
 fn sql_published_source_actual_dml_loans_writer_and_finish_same_owner() {
-    for mode in mode_values() {
+    {
         let probe = Probe::new(None);
-        let source = dml(
-            "SELECT CAST(7 AS BIGINT) AS order_id",
-            mode,
-            control(&probe),
-        )
-        .unwrap();
+        let source = dml("SELECT CAST(7 AS BIGINT) AS order_id", control(&probe)).unwrap();
         assert_same_source(&source, &probe);
         assert!(source.plan().fragments().values().any(|f| {
             f.nodes()
@@ -345,12 +323,7 @@ fn sql_published_source_actual_dml_loans_writer_and_finish_same_owner() {
 fn sql_published_source_query_preserves_three_typed_control_causes() {
     for cause in causes() {
         let probe = Probe::new(Some(cause));
-        let error = query(
-            "SELECT 7 AS original_name",
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-            control(&probe),
-        )
-        .unwrap_err();
+        let error = query("SELECT 7 AS original_name", control(&probe)).unwrap_err();
         let SqlCompileProgressError::Compile(error) = error else {
             panic!("unexpected source error: {error:?}");
         };
@@ -363,12 +336,7 @@ fn sql_published_source_query_preserves_three_typed_control_causes() {
 fn sql_published_source_actual_dml_preserves_three_typed_control_causes() {
     for cause in causes() {
         let probe = Probe::new(Some(cause));
-        let error = dml(
-            "SELECT CAST(7 AS BIGINT) AS order_id",
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-            control(&probe),
-        )
-        .unwrap_err();
+        let error = dml("SELECT CAST(7 AS BIGINT) AS order_id", control(&probe)).unwrap_err();
         assert_compile_cause(&error, cause);
         assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
         assert!(probe.sources.lock().unwrap().is_empty());
@@ -376,18 +344,16 @@ fn sql_published_source_actual_dml_preserves_three_typed_control_causes() {
 }
 #[test]
 fn sql_published_source_default_none_adds_no_compile_checkpoint() {
-    for mode in mode_values() {
+    {
         let original = Arc::new(CountCancellation(AtomicUsize::new(0)));
         let observed = Arc::new(CountCancellation(AtomicUsize::new(0)));
         let first = query(
             "SELECT 7 AS original_name",
-            mode,
             SqlCompileControl::new(None, original.clone()),
         )
         .unwrap();
         let second = query(
             "SELECT 7 AS original_name",
-            mode,
             SqlCompileControl::new(None, observed.clone())
                 .with_fold_dependency_observer(Arc::new(DefaultObserver)),
         )
@@ -409,18 +375,12 @@ fn sql_published_source_default_none_adds_no_compile_checkpoint() {
 fn sql_published_source_original_query_failure_precedes_refusing_observer() {
     let original = query(
         "SELECT missing_publication_column",
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         SqlCompileControl::unbounded(),
     )
     .unwrap_err();
     for cause in causes() {
         let probe = Probe::new(Some(cause));
-        let actual = query(
-            "SELECT missing_publication_column",
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-            control(&probe),
-        )
-        .unwrap_err();
+        let actual = query("SELECT missing_publication_column", control(&probe)).unwrap_err();
         assert_eq!(actual.to_string(), original.to_string());
         assert_eq!(probe.calls.load(Ordering::Relaxed), 0);
     }
@@ -429,7 +389,6 @@ fn sql_published_source_original_query_failure_precedes_refusing_observer() {
 fn sql_published_source_original_dml_data_error_precedes_refusing_observer() {
     let original = dml(
         "SELECT 7 AS order_id, 8 AS unexpected_column",
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         SqlCompileControl::unbounded(),
     )
     .unwrap_err();
@@ -437,7 +396,6 @@ fn sql_published_source_original_dml_data_error_precedes_refusing_observer() {
         let probe = Probe::new(Some(cause));
         let actual = dml(
             "SELECT 7 AS order_id, 8 AS unexpected_column",
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control(&probe),
         )
         .unwrap_err();
@@ -451,19 +409,9 @@ fn sql_published_source_query_owned_observer_drops_without_plan_cycle() {
         let probe = Probe::new(None);
         let weak = Arc::downgrade(&probe);
         let source = if is_dml {
-            dml(
-                "SELECT CAST(7 AS BIGINT) AS order_id",
-                SqlPhysicalEmissionMode::OriginalNativeV1,
-                control(&probe),
-            )
-            .unwrap()
+            dml("SELECT CAST(7 AS BIGINT) AS order_id", control(&probe)).unwrap()
         } else {
-            query(
-                "SELECT 7 AS original_name",
-                SqlPhysicalEmissionMode::OriginalNativeV1,
-                control(&probe),
-            )
-            .unwrap()
+            query("SELECT 7 AS original_name", control(&probe)).unwrap()
         };
         assert_same_source(&source, &probe);
         drop(probe);

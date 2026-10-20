@@ -32,7 +32,7 @@ use crate::binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArgumen
 
 mod dependency_loan;
 mod result_declaration;
-use crate::compiler::SqlPhysicalEmissionMode;
+
 pub use dependency_loan::{
     SqlCallDependencyLoan, SqlCallDependencyProvenance, SqlCallDependencySite,
     SqlCanonicalDependencyLoan,
@@ -42,42 +42,6 @@ pub use result_declaration::{
     CheckedSqlResultDeclaration, ResultDeclarationError, SqlResultDeclaration,
 };
 
-/// Closed completed publication; an invalid mode/receipt pair cannot survive here.
-#[derive(Clone, Debug)]
-enum PublishedResultSource {
-    OriginalNativeV1,
-    Exact(Arc<PublishedSqlResultDeclaration>),
-}
-impl PublishedResultSource {
-    fn publish(
-        mode: SqlPhysicalEmissionMode,
-        declaration: Option<SqlResultDeclaration>,
-        plan: &PhysicalPlan,
-        control: &dyn PureCompileControl,
-    ) -> Result<Self, ResultDeclarationError> {
-        match (mode, declaration) {
-            (SqlPhysicalEmissionMode::OriginalNativeV1, None) => Ok(Self::OriginalNativeV1),
-            (SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration, Some(declaration)) => {
-                let port = plan
-                    .result_port()
-                    .ok_or(ResultDeclarationError::Association(
-                        "exact SQL emission has no actual computed result port",
-                    ))?;
-                let declaration = declaration.publish(plan.version(), port, control)?;
-                Ok(Self::Exact(Arc::new(declaration)))
-            }
-            _ => Err(ResultDeclarationError::Association(
-                "SQL emission mode differs from its original result declaration presence",
-            )),
-        }
-    }
-    const fn mode(&self) -> SqlPhysicalEmissionMode {
-        match self {
-            Self::OriginalNativeV1 => SqlPhysicalEmissionMode::OriginalNativeV1,
-            Self::Exact(_) => SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        }
-    }
-}
 fn result_declaration_construction_error(error: ResultDeclarationError) -> PlanConstructionError {
     match error {
         ResultDeclarationError::Control(cause) => PlanConstructionError::Constants(
@@ -112,7 +76,7 @@ pub struct SqlAuthoredPhysicalPlan {
     plan: Arc<PhysicalPlan>,
     call_sources: Arc<SqlLogicalSourceJournal>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    public_result_source: PublishedResultSource,
+    public_result_source: Arc<PublishedSqlResultDeclaration>,
 }
 impl std::fmt::Debug for SqlAuthoredPhysicalPlan {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -120,53 +84,30 @@ impl std::fmt::Debug for SqlAuthoredPhysicalPlan {
             .debug_struct("SqlAuthoredPhysicalPlan")
             .field("plan", &self.plan)
             .field("call_sources", &self.call_sources)
-            .field("emission_mode", &self.emission_mode())
             .field("functions", &"retained immutable catalogue")
             .finish()
     }
 }
 impl SqlAuthoredPhysicalPlan {
-    /// Frozen at the first host request and sealed by the same emission publication.
-    pub const fn emission_mode(&self) -> SqlPhysicalEmissionMode {
-        self.public_result_source.mode()
+    /// The immutable publication proof loans the original port.
+    pub fn original_public_result_declaration(&self) -> Option<CheckedSqlResultDeclaration<'_>> {
+        Some(self.public_result_source.checked_loan())
     }
 
-    /// The immutable publication proof loans the original port without reconstructing
-    /// another schema or choosing a mode at this consumer boundary.
-    pub fn original_public_result_declaration(&self) -> Option<CheckedSqlResultDeclaration<'_>> {
-        match &self.public_result_source {
-            PublishedResultSource::OriginalNativeV1 => self
-                .plan
-                .result_port()
-                .map(CheckedSqlResultDeclaration::from_original_port),
-            PublishedResultSource::Exact(declaration) => Some(declaration.checked_loan()),
-        }
-    }
     /// Re-observe the association against this owner's actual immutable plan.
     pub fn checked_original_result_declaration_observed(
         &self,
         control: &dyn PureCompileControl,
     ) -> Result<Option<CheckedSqlResultDeclaration<'_>>, ResultDeclarationError> {
-        match &self.public_result_source {
-            PublishedResultSource::OriginalNativeV1 => {
-                let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-                work.step()?;
-                let loan = self.original_public_result_declaration();
-                work.finish()?;
-                Ok(loan)
-            }
-            PublishedResultSource::Exact(declaration) => {
-                let port = self
-                    .plan
-                    .result_port()
-                    .ok_or(ResultDeclarationError::Association(
-                        "published exact SQL source has no computed port",
-                    ))?;
-                declaration
-                    .recheck_observed(self.plan.version(), port, control)
-                    .map(Some)
-            }
-        }
+        let port = self
+            .plan
+            .result_port()
+            .ok_or(ResultDeclarationError::Association(
+                "published SQL source has no computed port",
+            ))?;
+        self.public_result_source
+            .recheck_observed(self.plan.version(), port, control)
+            .map(Some)
     }
 
     /// The original completion snapshot moves with this source owner. Fresh
@@ -1018,22 +959,19 @@ pub(crate) struct LoweredSqlPhysicalDraft {
     builder: PlanBuilder,
     call_sources: SqlLogicalSourceJournal,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    emission_mode: SqlPhysicalEmissionMode,
-    result_declaration: Option<SqlResultDeclaration>,
+    result_declaration: SqlResultDeclaration,
 }
 impl LoweredSqlPhysicalDraft {
     pub(super) fn from_lowering(
         builder: PlanBuilder,
         call_sources: SqlLogicalSourceJournal,
         functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-        emission_mode: SqlPhysicalEmissionMode,
-        result_declaration: Option<SqlResultDeclaration>,
+        result_declaration: SqlResultDeclaration,
     ) -> Self {
         Self {
             builder,
             call_sources,
             functions,
-            emission_mode,
             result_declaration,
         }
     }
@@ -1076,28 +1014,17 @@ impl LoweredSqlPhysicalDraft {
             CompileCheckpoints::try_new(control, CompilePhase::Validate).map_err(control_error)?;
         let result = (|| {
             work.flush().map_err(control_error)?;
-            if !matches!(
-                (&self.emission_mode, &self.result_declaration),
-                (SqlPhysicalEmissionMode::OriginalNativeV1, None)
-                    | (
-                        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-                        Some(_)
-                    )
-            ) {
-                return Err(result_declaration_construction_error(
-                    ResultDeclarationError::Association(
-                        "SQL emission mode differs from its original result declaration presence",
-                    ),
-                ));
-            }
             let plan = self.builder.finish_observed(control)?;
-            let public_result_source = PublishedResultSource::publish(
-                self.emission_mode,
-                self.result_declaration,
-                &plan,
-                control,
-            )
-            .map_err(result_declaration_construction_error)?;
+            let port = plan.result_port().ok_or_else(|| {
+                result_declaration_construction_error(ResultDeclarationError::Association(
+                    "SQL emission has no actual computed result port",
+                ))
+            })?;
+            let public_result_source = Arc::new(
+                self.result_declaration
+                    .publish(plan.version(), port, control)
+                    .map_err(result_declaration_construction_error)?,
+            );
             work.flush().map_err(control_error)?;
             let plan = Arc::new(plan);
             work.step().map_err(control_error)?;

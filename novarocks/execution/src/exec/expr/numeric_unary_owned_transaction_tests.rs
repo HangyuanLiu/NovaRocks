@@ -34,9 +34,7 @@ use novarocks_local_program::{
     ProgramNodeKind, ProgramUseRef, StaticExprKind,
 };
 use novarocks_physical_plan::*;
-use novarocks_sql::compiler::{
-    SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode, author_fragment_package_semantics,
-};
+use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
     ValueTypeStorageLifetime,
@@ -452,7 +450,6 @@ fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_ke
         let source = sql_source(
             "SELECT -k AS original_negated FROM fixture",
             input.data_type().clone(),
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         );
         let original = source
             .checked_original_result_declaration_observed(&Control)
@@ -511,11 +508,7 @@ fn numeric_unary_owned_transaction_actual_coalesce_isnull_and_if_are_consumers_o
         "SELECT -k IS NULL AS observed FROM fixture",
         "SELECT IF(k=CAST(-128 AS TINYINT),CAST(0 AS TINYINT),-k) AS observed FROM fixture",
     ] {
-        let source = sql_source(
-            sql,
-            DataType::Int8,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
+        let source = sql_source(sql, DataType::Int8);
         let programs = programs(&source);
         let (program, root) = producer_root(&programs);
         let data = batch(&program, root, Arc::new(Int8Array::from(vec![i8::MIN, 1])));
@@ -540,11 +533,7 @@ fn numeric_unary_owned_transaction_actual_coalesce_isnull_and_if_are_consumers_o
 #[test]
 fn numeric_unary_owned_transaction_actual_int64_inactive_overflow_and_failed_frame_preserve_exact_control()
  {
-    let source = sql_source(
-        "SELECT -k AS observed FROM fixture",
-        DataType::Int64,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = sql_source("SELECT -k AS observed FROM fixture", DataType::Int64);
     let programs = programs(&source);
     let (program, root) = producer_root(&programs);
     let data = batch(
@@ -631,11 +620,7 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
         "SELECT x FROM fixture, UNNEST([-k]) AS u(x)",
     ] {
         eprintln!("actual canonical state SQL: {sql}");
-        let source = sql_source(
-            sql,
-            DataType::Int8,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
+        let source = sql_source(sql, DataType::Int8);
         assert!(
             source
                 .checked_original_result_declaration_observed(&Control)

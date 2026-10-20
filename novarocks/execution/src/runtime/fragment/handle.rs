@@ -19,22 +19,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::exec::fragment::program::FragmentProgram;
-use crate::exec::pipeline::executor::{
-    PreparedPipelineExecution, prepare_report_neutral_local_program_pipeline_execution,
-};
+use crate::exec::pipeline::executor::PreparedPipelineExecution;
 use crate::runtime::execution_runtime::ExecutionRuntime;
 use crate::runtime::fragment::error::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
     FragmentLaunchErrorKind, FragmentLaunchStage,
 };
-use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::fragment::io::FragmentEventSink;
 #[cfg(test)]
 use crate::runtime::fragment::io::NoopFragmentEventSink;
 use crate::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentResultWriter, ResultPresentation, ResultWriteSpec,
+    ExchangeFrameTransmitter, FragmentResultWriter, ResultWriteSpec,
 };
 use crate::runtime::fragment::io::{
     ExchangeReceiverPort, FragmentCommitPort, UnavailableExchangeReceiverPort,
@@ -44,9 +40,6 @@ use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaul
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
-use crate::runtime::fragment::scan::materialize_scan_bindings;
-use crate::runtime::fragment::sink::materialize_fragment_sink_with_result;
-use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::runtime_state::RuntimeState;
@@ -101,7 +94,6 @@ type ReceiverConstruction = (
 
 #[cfg(test)]
 mod owner_tests {
-    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -110,14 +102,8 @@ mod owner_tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::expr::ExprArena;
-    use crate::exec::fragment::program::{
-        FragmentContractVersion, FragmentProgram, FragmentProgramOptions, RuntimeFilterContract,
-    };
-    use crate::exec::fragment::sink::FragmentSinkProgram;
-    use crate::exec::node::values::ValuesNode;
-    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, ExternalSinkRequirement};
+    use crate::exec::chunk::Chunk;
+    use crate::exec::fragment::program::FragmentContractVersion;
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
@@ -127,13 +113,12 @@ mod owner_tests {
         ExchangeReceiverRegistration, ExecutionRuntimeExchangeReceiverPort, FragmentIoError,
         FragmentResultSession, FragmentResultWriter, ResultAbort, ResultWriteSpec,
     };
-    use crate::runtime::fragment::submission::FragmentSubmission;
     use crate::runtime::query_options::QueryOptions;
     use novarocks_types::{QueryId, SlotId, UniqueId};
 
     use super::{
-        FragmentCancelReason, FragmentOutcome, FragmentPrepareContext, RunningFragmentHandle,
-        prepare_fragment,
+        CompiledFragmentSubmission, FragmentCancelReason, FragmentOutcome, FragmentPrepareContext,
+        RunningFragmentHandle, prepare_compiled_fragment,
     };
 
     /// Loan the actual registration to the two preparation rollback fixtures;
@@ -210,7 +195,7 @@ mod owner_tests {
         }
     }
 
-    fn noop_submission(finst_id: UniqueId) -> FragmentSubmission {
+    fn empty_result_submission(finst_id: UniqueId) -> CompiledFragmentSubmission {
         submission(
             finst_id,
             crate::exec::chunk::typed_fixture::chunk(
@@ -218,55 +203,16 @@ mod owner_tests {
                 &[],
                 &[],
             ),
-            FragmentSinkProgram::Noop,
+            novarocks_physical_plan::FragmentSink::Result,
         )
     }
 
     fn submission(
         finst_id: UniqueId,
         chunk: Chunk,
-        sink: FragmentSinkProgram,
-    ) -> FragmentSubmission {
-        static_submission(finst_id, chunk, sink.into_static().expect("static sink"))
-    }
-
-    fn static_submission(
-        finst_id: UniqueId,
-        chunk: Chunk,
-        sink: novarocks_local_program::StaticSinkProgram,
-    ) -> FragmentSubmission {
-        let plan = ExecPlan {
-            arena: ExprArena::default(),
-            root: ExecNode {
-                kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 19 }),
-            },
-        };
-        let profile = crate::exec::chunk::typed_fixture::profile(
-            &plan,
-            NonZeroUsize::new(1).expect("one driver"),
-            None,
-        );
-        let sink_requirements = if matches!(
-            &sink,
-            novarocks_local_program::StaticSinkProgram::Result
-                | novarocks_local_program::StaticSinkProgram::RootResult(_)
-        ) {
-            vec![ExternalSinkRequirement::Result]
-        } else {
-            Vec::new()
-        };
-        let (local, bindings) =
-            crate::exec::chunk::typed_fixture::lower(plan, profile, sink_requirements, sink);
-        let program = Arc::new(
-            FragmentProgram::try_new(
-                Arc::new(local),
-                FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
-            )
-            .expect("fragment program"),
-        );
+        sink: novarocks_physical_plan::FragmentSink,
+    ) -> CompiledFragmentSubmission {
+        let program = crate::exec::pipeline::builder::values_chunk_program(&chunk, sink);
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             QueryId::new(finst_id.high() - 2, finst_id.low() - 2),
@@ -275,10 +221,34 @@ mod owner_tests {
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,
             FragmentRuntimeOptions::new(QueryOptions::default(), false),
-            NonZeroUsize::new(1).expect("one driver"),
-            BackendNum::try_new(1).expect("backend number"),
+            NonZeroUsize::MIN,
+            BackendNum::try_new(1).unwrap(),
         );
-        FragmentSubmission::try_new(program, bindings, instance).expect("valid submission")
+        CompiledFragmentSubmission::try_new(
+            program,
+            super::super::scan::CompiledScanSources::new(),
+            instance,
+        )
+        .unwrap()
+    }
+
+    fn static_submission(
+        finst_id: UniqueId,
+        chunk: Chunk,
+        sink: novarocks_local_program::StaticSinkProgram,
+    ) -> CompiledFragmentSubmission {
+        let sink = match sink {
+            novarocks_local_program::StaticSinkProgram::RootResult(contract) => {
+                novarocks_physical_plan::FragmentSink::RootResult(Box::new(
+                    contract.as_ref().clone(),
+                ))
+            }
+            novarocks_local_program::StaticSinkProgram::Result => {
+                novarocks_physical_plan::FragmentSink::Result
+            }
+            _ => panic!("lifecycle fixture requires an admitted result sink"),
+        };
+        submission(finst_id, chunk, sink)
     }
 
     fn one_row_chunk() -> Chunk {
@@ -360,7 +330,7 @@ mod owner_tests {
                 Arc::clone(self) as Arc<dyn crate::runtime::fragment::io::RootResultSession>
             )
         }
-        fn submission(&self) -> FragmentSubmission {
+        fn submission(&self) -> CompiledFragmentSubmission {
             static_submission(
                 UniqueId::new(399, 400),
                 one_row_chunk(),
@@ -432,11 +402,11 @@ mod owner_tests {
         let root = BoundedRootSession::new();
         let mut missing = root.context();
         missing.root_result_session = None;
-        assert!(prepare_fragment(root.submission(), missing).is_err());
+        assert!(prepare_compiled_fragment(root.submission(), missing).is_err());
         assert!(root.aborts.lock().unwrap().is_empty());
         let wrong = BoundedRootSession::new();
         assert!(
-            prepare_fragment(
+            prepare_compiled_fragment(
                 root.submission(),
                 wrong.context().with_result_identity(root.spec.task)
             )
@@ -451,7 +421,7 @@ mod owner_tests {
     fn bounded_root_prepare_rollback_aborts_the_exact_provisional_owner() {
         let root = BoundedRootSession::new();
         assert!(
-            prepare_fragment(
+            prepare_compiled_fragment(
                 root.submission(),
                 root.context()
                     .with_prepare_failure(super::PrepareFailurePoint::AfterResult)
@@ -463,7 +433,7 @@ mod owner_tests {
             &[ResultAbort::PrepareRollback]
         );
         let root = BoundedRootSession::new();
-        let dormant = prepare_fragment(root.submission(), root.context()).unwrap();
+        let dormant = prepare_compiled_fragment(root.submission(), root.context()).unwrap();
         drop(dormant);
         assert_eq!(
             root.aborts.lock().unwrap().as_slice(),
@@ -473,7 +443,7 @@ mod owner_tests {
     #[test]
     fn bounded_root_success_waits_actual_producer_exit_then_preserves_context_ownership() {
         let root = BoundedRootSession::new();
-        let running = prepare_fragment(root.submission(), root.context())
+        let running = prepare_compiled_fragment(root.submission(), root.context())
             .unwrap()
             .start();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -496,7 +466,7 @@ mod owner_tests {
     #[test]
     fn bounded_root_cancellation_retains_host_input_until_actual_exit() {
         let root = BoundedRootSession::new();
-        let running = prepare_fragment(root.submission(), root.context())
+        let running = prepare_compiled_fragment(root.submission(), root.context())
             .unwrap()
             .start();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -613,8 +583,12 @@ mod owner_tests {
         context.result_writer = Arc::new(BlockingResultWriter {
             session: Arc::clone(session),
         });
-        prepare_fragment(
-            submission(finst_id, one_row_chunk(), FragmentSinkProgram::Result),
+        prepare_compiled_fragment(
+            submission(
+                finst_id,
+                one_row_chunk(),
+                novarocks_physical_plan::FragmentSink::Result,
+            ),
             context,
         )
         .expect("result fragment prepares")
@@ -623,7 +597,7 @@ mod owner_tests {
 
     /// Reuse the original registration and real receiver port while keeping
     /// the pipeline itself minimal: these tests isolate its cleanup owner.
-    fn noop_with_receiver(
+    fn empty_result_with_receiver(
         id: UniqueId,
     ) -> (
         super::DormantFragmentHandle,
@@ -632,7 +606,7 @@ mod owner_tests {
     ) {
         let context = FragmentPrepareContext::default();
         let port = Arc::clone(&context.exchange_receiver_port);
-        let mut dormant = prepare_fragment(noop_submission(id), context).unwrap();
+        let mut dormant = prepare_compiled_fragment(empty_result_submission(id), context).unwrap();
         let tracker =
             crate::runtime::mem_tracker::MemTracker::new_root("receiver retirement fixture");
         let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
@@ -666,7 +640,8 @@ mod owner_tests {
     #[test]
     fn direct_execution_keeps_original_receiver_terminal_cleanup_without_transfer() {
         for (ordinal, failed) in [false, true].into_iter().enumerate() {
-            let (dormant, port, key) = noop_with_receiver(UniqueId::new(84_100, ordinal as i64));
+            let (dormant, port, key) =
+                empty_result_with_receiver(UniqueId::new(84_100, ordinal as i64));
             assert!(port.snapshot(key).is_some());
             let running = if failed {
                 dormant.start_failed("original execution failure")
@@ -680,121 +655,10 @@ mod owner_tests {
     }
 
     #[test]
-    fn plan_tree_receiver_prepare_rollback_preserves_primary_and_cleanup_diagnostics() {
-        use crate::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
-        use crate::exec::node::exchange_source::ExchangeSourceNode;
-        use crate::runtime::fragment::instance::ExchangeInputAssignment;
-        use crate::runtime::fragment::resources::ResourceKind;
-
-        let id = UniqueId::new(84_500, 1);
-        let node = FragmentNodeId::new(71);
-        let schema = crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0)
-            .chunk_schema_ref();
-        let plan = ExecPlan {
-            arena: ExprArena::default(),
-            root: ExecNode {
-                kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
-                    node.get(),
-                    Duration::from_secs(1),
-                    schema.clone(),
-                )),
-            },
-        };
-        let profile = crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::MIN, None);
-        let (local, bindings) = crate::exec::chunk::typed_fixture::lower(
-            plan,
-            profile,
-            Vec::new(),
-            novarocks_local_program::StaticSinkProgram::Noop,
-        );
-        let program = Arc::new(
-            FragmentProgram::try_new(
-                Arc::new(local),
-                FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-                BTreeMap::new(),
-                BTreeMap::from([(node, ExchangeInputContract::new(schema))]),
-                RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
-            )
-            .unwrap(),
-        );
-        let instance = FragmentInstanceSpec::new_native(
-            FragmentContractVersion::CURRENT,
-            QueryId::new(84_498, 1),
-            FragmentInstanceId::new(id),
-            ScanAssignments::default(),
-            ExchangeInputAssignments::new(BTreeMap::from([(
-                node,
-                ExchangeInputAssignment::new(NonZeroUsize::MIN),
-            )])),
-            FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), false),
-            NonZeroUsize::MIN,
-            BackendNum::try_new(1).unwrap(),
-        );
-        let submission = FragmentSubmission::try_new(program, bindings, instance).unwrap();
-        let runtime = crate::runtime::execution_runtime::test_execution_runtime();
-        let port = ReceiverConstructionPort::new(runtime.clone());
-        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("receiver rollback");
-        tracker.install_limit_once(1024 * 1024).unwrap();
-        let mut context = FragmentPrepareContext::default()
-            .with_execution_runtime(runtime)
-            .with_exchange_receiver_port(port.clone())
-            .with_registration_owned_exchange_receivers()
-            .with_prepare_failure(super::PrepareFailurePoint::AfterExchange)
-            .with_cleanup_failure(ResourceKind::Exchange);
-        context.mem_tracker = Some(tracker.clone());
-        let error = match prepare_fragment(submission, context) {
-            Err(error) => error,
-            Ok(_) => panic!("the original AfterExchange failure must refuse preparation"),
-        };
-        assert_eq!(error.stage(), super::FragmentLaunchStage::Register);
-        assert_eq!(
-            error.kind(),
-            super::FragmentLaunchErrorKind::ResourceUnavailable
-        );
-        assert_eq!(
-            error.detail(),
-            super::PrepareFailurePoint::AfterExchange.detail()
-        );
-        assert_eq!(
-            error.cleanup_diagnostics(),
-            &["injected exchange registration cleanup failure"]
-        );
-        let loans = port.registrations.lock().unwrap();
-        assert_eq!(
-            loans.len(),
-            1,
-            "the actual receiver was installed before failure"
-        );
-        let loan = &loans[0];
-        assert_eq!(
-            loan.key,
-            ExchangeReceiverKey {
-                fragment_instance_id: id,
-                node_id: node.get()
-            }
-        );
-        assert!(port.snapshot(loan.key).is_none());
-        assert_eq!(
-            loan.creation_factory.observe_input_work(1).unwrap_err(),
-            crate::exec::pipeline::operator::ConstructionFailure::Caller(Box::new(
-                novarocks_functions::KernelFailure::Cancelled.into(),
-            )),
-        );
-        assert!(
-            tracker.current() > 0,
-            "the independent factory loan is still live"
-        );
-        drop(loans);
-        port.registrations.lock().unwrap().clear();
-        assert_eq!(tracker.current(), 0);
-    }
-
-    #[test]
     fn transferred_receiver_survives_raw_terminal_until_explicit_retirement() {
         for (ordinal, failed) in [false, true].into_iter().enumerate() {
             let (mut dormant, port, key) =
-                noop_with_receiver(UniqueId::new(84_101, ordinal as i64));
+                empty_result_with_receiver(UniqueId::new(84_101, ordinal as i64));
             let mut retirement = dormant
                 .take_exchange_retirement()
                 .expect("unique original receiver owner");
@@ -819,7 +683,7 @@ mod owner_tests {
 
     #[test]
     fn transferred_dormant_receiver_rolls_back_once_without_a_terminal_fact() {
-        let (mut dormant, port, key) = noop_with_receiver(UniqueId::new(84_102, 1));
+        let (mut dormant, port, key) = empty_result_with_receiver(UniqueId::new(84_102, 1));
         let retirement = dormant.take_exchange_retirement().unwrap();
         drop(dormant);
         assert!(
@@ -831,9 +695,9 @@ mod owner_tests {
     }
 
     #[test]
-    fn execution_owner_prepares_starts_and_freezes_a_noop_fragment() {
-        let handle = prepare_fragment(
-            noop_submission(UniqueId::new(91, 92)),
+    fn execution_owner_prepares_starts_and_freezes_an_empty_result_fragment() {
+        let handle = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(91, 92)),
             FragmentPrepareContext::default(),
         )
         .expect("fragment prepares");
@@ -933,11 +797,11 @@ mod owner_tests {
         context.result_writer = Arc::new(BlockingResultWriter {
             session: Arc::clone(&session),
         });
-        let running = prepare_fragment(
+        let running = prepare_compiled_fragment(
             submission(
                 UniqueId::new(95, 96),
                 one_row_chunk(),
-                FragmentSinkProgram::Result,
+                novarocks_physical_plan::FragmentSink::Result,
             ),
             context,
         )
@@ -1004,10 +868,11 @@ mod owner_tests {
         // stopped fact the terminal path depends on.
         let context = context
             .with_execution_runtime(crate::runtime::execution_runtime::test_execution_runtime());
-        let terminal = prepare_fragment(noop_submission(UniqueId::new(99, 100)), context)
-            .expect("noop fragment prepares")
-            .start()
-            .join();
+        let terminal =
+            prepare_compiled_fragment(empty_result_submission(UniqueId::new(99, 100)), context)
+                .expect("noop fragment prepares")
+                .start()
+                .join();
 
         let profile = terminal.profile().expect("a profiled fragment reports one");
         let memory = profile
@@ -1038,8 +903,8 @@ mod owner_tests {
 
     #[test]
     fn stopped_observer_panic_after_terminal_freeze_is_isolated() {
-        let running = prepare_fragment(
-            noop_submission(UniqueId::new(97, 98)),
+        let running = prepare_compiled_fragment(
+            empty_result_submission(UniqueId::new(97, 98)),
             FragmentPrepareContext::default(),
         )
         .expect("fragment prepares")
@@ -1765,159 +1630,11 @@ impl Drop for RunningFragmentInner {
 }
 
 #[path = "compiled_prepare.rs"]
-mod compiled_prepare;
+pub(super) mod compiled_prepare;
 pub use compiled_prepare::{
     CompiledFragmentSubmission, CompiledWriterBindings, compiled_sink_kind,
     prepare_compiled_fragment, prepare_compiled_fragment_with_metadata_host,
 };
-
-pub fn prepare_fragment(
-    submission: FragmentSubmission,
-    context: FragmentPrepareContext,
-) -> Result<DormantFragmentHandle, FragmentLaunchError> {
-    let program: &Arc<FragmentProgram> = submission.program();
-    let instance = submission.instance();
-    let query_id = instance.query_id();
-    let finst_id = instance.fragment_instance_id().get();
-    let logical_pipeline_dop = i32::try_from(instance.pipeline_dop().get()).map_err(|_| {
-        FragmentLaunchError::new(
-            FragmentLaunchStage::BuildPipelines,
-            FragmentLaunchErrorKind::PipelineBuild,
-            format!(
-                "pipeline DOP {} exceeds runtime representation",
-                instance.pipeline_dop()
-            ),
-        )
-    })?;
-    let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(logical_pipeline_dop);
-    let mut resources = FragmentResources::new(
-        Arc::clone(&context.commit_port),
-        Arc::clone(&context.exchange_receiver_port),
-        context.cleanup_faults(),
-    );
-    let prepare_result = (|| {
-        resources.acquire_sink_commit(finst_id)?;
-        context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;
-        let mut result_spec = context.result_spec.clone().unwrap_or_else(|| {
-            ResultWriteSpec::new(
-                finst_id,
-                ResultPresentation::MysqlText,
-                None,
-                instance.runtime_options().typed_result_sink(),
-            )
-        });
-        if let Some(identity) = context.result_identity {
-            result_spec = result_spec.with_task_identity(identity);
-        }
-        resources.acquire_root_result(
-            program,
-            context.root_result_session.clone(),
-            context.result_identity,
-        )?;
-        resources.acquire_result(program, &context.result_writer, result_spec)?;
-        context.fail_if_injected(PrepareFailurePoint::AfterResult)?;
-        let runtime_state = build_runtime_state(RuntimeStateInputs {
-            query_options: apply_query_option_overrides(
-                Some(instance.runtime_options().query_options().clone()),
-                context.execution_runtime.as_deref(),
-            ),
-            query_id: Some(query_id),
-            fragment_instance_id: Some(finst_id),
-            backend_num: Some(instance.backend_num().get()),
-            mem_tracker: context.mem_tracker.clone(),
-            runtime_filter_session: context.runtime_filter.clone(),
-            execution_runtime: context.execution_runtime.clone(),
-            query_memory: context.query_memory.clone(),
-            task_identity: context.result_identity,
-            #[cfg(novarocks_dev_controls)]
-            exchange_test_observer: context.exchange_test_observer.clone(),
-        })
-        .map_err(|error| {
-            FragmentLaunchError::new(
-                FragmentLaunchStage::BuildRuntimeState,
-                FragmentLaunchErrorKind::ResourceUnavailable,
-                error,
-            )
-        })?;
-        let (receiver_creation, receiver_construction_stop) =
-            if program.exchange_inputs().is_empty() {
-                (None, None)
-            } else {
-                let (factory, stop) =
-                    context
-                        .receiver_construction(&runtime_state)
-                        .map_err(|cause| {
-                            FragmentLaunchError::from_failure(
-                                FragmentLaunchStage::Register,
-                                FragmentLaunchErrorKind::ResourceUnavailable,
-                                cause.into(),
-                            )
-                        })?;
-                (Some(factory), stop)
-            };
-        resources.acquire_exchange(
-            program,
-            instance,
-            receiver_creation,
-            receiver_construction_stop,
-        )?;
-        context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
-
-        let materialized_sink = materialize_fragment_sink_with_result(
-            program,
-            instance,
-            Arc::clone(&context.exchange_transmitter),
-            resources.result_session(),
-            resources.root_result_session(),
-            context.edge_gates.clone(),
-            runtime_state.error_state(),
-        )?;
-        let sink = materialized_sink.factory;
-        let _group_execution_scan_dop = context.group_execution_scan_dop;
-        let exchange_bindings = materialize_exchange_bindings(
-            program,
-            instance,
-            Arc::clone(&context.exchange_receiver_port),
-        );
-        let scan_bindings =
-            materialize_scan_bindings(program, submission.runtime_bindings(), instance)?;
-        prepare_report_neutral_local_program_pipeline_execution(
-            program.local_program(),
-            submission.runtime_bindings(),
-            false,
-            Duration::from_millis(50),
-            sink,
-            exchange_bindings,
-            scan_bindings,
-            Some((finst_id.high(), finst_id.low())),
-            context.profiler.clone(),
-            pipeline_dop,
-            runtime_state,
-            context.root_sink_dop,
-            context.runtime_filter.clone(),
-            Arc::clone(&context.event_sink),
-        )
-        .map_err(|error| {
-            FragmentLaunchError::from_failure(
-                FragmentLaunchStage::BuildPipelines,
-                FragmentLaunchErrorKind::PipelineBuild,
-                error,
-            )
-        })
-    })();
-    match prepare_result {
-        Ok(prepared) => Ok(DormantFragmentHandle {
-            prepared,
-            resources,
-            query_id,
-            fragment_instance_id: finst_id,
-            profiler: context.profiler.clone(),
-            mem_tracker: context.mem_tracker.clone(),
-            start_failure: context.start_failure(),
-        }),
-        Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
-    }
-}
 
 #[cfg(test)]
 mod typed_failure_tests {

@@ -110,62 +110,6 @@ pub struct WriterMultiplexRelationSchema {
 }
 
 impl WriterMultiplexRelationSchema {
-    pub(crate) fn try_from_static_layout(
-        layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<Self, String> {
-        if !layout.is_typed() {
-            return Err("writer multiplex requires a complete typed layout".into());
-        }
-        for ordinal in 0..WRITE_RELATION_COLUMN_COUNT {
-            let binding = layout
-                .value_binding_at(ordinal)
-                .ok_or("writer prefix binding is absent")?;
-            if !plain_relation_value(binding.value_type()) {
-                return Err("writer multiplex fixed prefix has a nominal domain".into());
-            }
-        }
-        if layout.slots().len() < WRITE_RELATION_FRAGMENT_INDEX + 1 {
-            return Err("writer multiplex layout lacks fixed prefix".to_string());
-        }
-        let auxiliary = layout
-            .slots()
-            .iter()
-            .zip(layout.schema().fields())
-            .enumerate()
-            .skip(WRITE_RELATION_FRAGMENT_INDEX + 1)
-            .map(|(ordinal, (slot, field))| {
-                let binding = layout.value_binding_at(ordinal).ok_or_else(|| {
-                    "writer auxiliary channel lacks its complete compiled binding".to_string()
-                })?;
-                let value_type =
-                    novarocks_type_contract::FunctionValueType::try_from_typed_binding(
-                        binding.clone(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                WriterAuxiliaryChannel::try_new(slot.0, field.name(), value_type)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let contract =
-            WriterMultiplexSchema::try_new(auxiliary).map_err(|error| error.to_string())?;
-        contract
-            .validate_exact_arrow_schema(layout.schema())
-            .map_err(|error| error.to_string())?;
-        if contract
-            .slot_ids()
-            .into_iter()
-            .map(SlotId::new)
-            .collect::<Vec<_>>()
-            != layout.slots()
-        {
-            return Err("writer multiplex slot order differs from static layout".to_string());
-        }
-        Ok(Self {
-            contract,
-            chunk_schema: ChunkSchema::from_static_layout(layout)?,
-        })
-    }
-
     /// Bind a compiled program's positional writer relation: the layout is the
     /// exact SPI relation by Arrow schema, and every column, the fixed prefix
     /// included, is carried by its compiler-allocated layout slot. An
@@ -502,6 +446,7 @@ impl WriterMultiplexRelationTemplate {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum WriterRelationPreparation {
+    #[cfg(test)]
     Existing(WriterMultiplexRelationSchema),
     Compiled {
         template: WriterMultiplexRelationTemplate,
@@ -520,12 +465,14 @@ impl WriterRelationPreparation {
     }
     pub(crate) fn slots(&self) -> &[SlotId] {
         match self {
+            #[cfg(test)]
             Self::Existing(schema) => schema.chunk_schema().slot_ids(),
             Self::Compiled { template, .. } => template.slots(),
         }
     }
     pub(crate) fn schema(&self) -> Result<&WriterMultiplexRelationSchema, String> {
         match self {
+            #[cfg(test)]
             Self::Existing(schema) => Ok(schema),
             Self::Compiled {
                 prepared: Some(schema),
@@ -639,22 +586,6 @@ pub struct RootWriteResultRelationSchema {
 }
 
 impl RootWriteResultRelationSchema {
-    pub(crate) fn try_from_static_layout(
-        layout: &novarocks_local_program::StaticLayout,
-    ) -> Result<Self, String> {
-        let contract = RootWriteResultSchema::new();
-        contract
-            .validate_exact_arrow_schema(layout.schema())
-            .map_err(|error| error.to_string())?;
-        if contract.slot_ids().map(SlotId::new).as_slice() != layout.slots() {
-            return Err("root write result slot order differs from static layout".to_string());
-        }
-        Ok(Self {
-            contract,
-            chunk_schema: ChunkSchema::from_static_layout(layout)?,
-        })
-    }
-
     /// Explicit legacy direct-fixture adapter. Production compiled preparation
     /// uses RootWriteResultRelationTemplate and the installed creating owner.
     #[cfg(test)]

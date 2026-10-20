@@ -38,7 +38,7 @@ use arrow::{
 use novarocks_functions::ScalarInvocationActivation as Activation;
 use novarocks_local_program::{ProgramNodeKind, ProgramStateTemplate, StaticExprKind};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TopUpPolicy};
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
@@ -68,25 +68,22 @@ fn runtime_control(memory: Option<&QueryMemoryBinding>) -> RuntimeKernelControl 
     control.bind_mem_tracker(MemTracker::new_root("actual-json-sql"));
     control
 }
-fn programs(sql: &str, mode: SqlPhysicalEmissionMode) -> Vec<Arc<LocalProgram>> {
+fn programs(sql: &str) -> Vec<Arc<LocalProgram>> {
     let fields = [
         Field::new("k", DataType::Utf8, true),
         Field::new("v", DataType::Utf8, true),
         Field::new("n", DataType::Int64, true),
         Field::new("flag", DataType::Boolean, true),
     ];
-    let source = sql_source_with_declared_fields(sql, &fields, mode);
+    let source = sql_source_with_declared_fields(sql, &fields);
     compiler_results(&source, &installed_builtin_owner_catalogue())
         .into_values()
         .map(|p| Arc::new(p.expect("actual SQL package compiles")))
         .collect()
 }
-fn project(
-    sql: &str,
-    mode: SqlPhysicalEmissionMode,
-) -> (Arc<LocalProgram>, ProgramExpressionRootSite, RecordBatch) {
+fn project(sql: &str) -> (Arc<LocalProgram>, ProgramExpressionRootSite, RecordBatch) {
     let mut selected = None;
-    for program in programs(sql, mode) {
+    for program in programs(sql) {
         let calls = program.checked().channels().expressions().resolved_calls();
         for call in calls.calls().values() {
             let ProgramStateTemplate::ScalarInvocation { scope, kernel } = call.state_template()
@@ -155,17 +152,14 @@ fn project(
 
 #[test]
 fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossless_data() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         for data in [false, true] {
             let sql = if data {
                 "SELECT json_object([n], v) AS j FROM t"
             } else {
                 "SELECT json_object(k, v) AS j FROM t"
             };
-            let (program, site, input) = project(sql, mode);
+            let (program, site, input) = project(sql);
             let binding = binding();
             let control = runtime_control(Some(&binding));
             let mut frame = CompiledExpressionInstance::try_new_with_allocator(
@@ -256,10 +250,7 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
 
 #[test]
 fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_latch_before_body() {
-    let (program, site, input) = project(
-        "SELECT json_object(k, v) AS j FROM t",
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let (program, site, input) = project("SELECT json_object(k, v) AS j FROM t");
     for rebind in [false, true] {
         let binding = binding();
         let mut control = runtime_control(rebind.then_some(&binding));
@@ -309,15 +300,9 @@ fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_lat
 
 #[test]
 fn runtime_invocation_memory_actual_sql_ordered_filter_or_scan_suppresses_and_maps_selected_data() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         let mut selected = None;
-        for program in programs(
-            "SELECT n FROM t WHERE flag AND json_object([n], v) IS NULL",
-            mode,
-        ) {
+        for program in programs("SELECT n FROM t WHERE flag AND json_object([n], v) IS NULL") {
             for (index, node) in program.graph().nodes().iter().enumerate() {
                 let predicates = match node.kind() {
                     ProgramNodeKind::Filter { predicates, .. } => predicates.as_ref(),

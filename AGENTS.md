@@ -197,70 +197,82 @@ SQL client
   `local_result_writer.rs` (governed bounded result delivery),
   `error_mapping/**`.
 
-### 4.3 Native Plan Wire and BE-Side Fragment Decode
+### 4.3 Native Compiled Package and BE Preparation
 
-- `novarocks/plan-codec/src/**`
-  Deterministic planner-IR-to-protobuf encoding for the native FE/BE boundary;
-  `native_type.rs` and `physical_expr.rs` encode the frozen type and expression vocabulary.
+- `novarocks-server/library/src/{static_plan.rs,compiled_composition.rs}`
+  Server 唯一组合 compiled package 解释器；FE/BE 共用冻结的 pure 目录与 codec 上限。
+  `command.rs` 的 `--build-info` 输出 pure 摘要、封存定义数及确定排序的排除清单。
+  没有解释器选择 CLI、candidate feature 或 v1 fallback。
 
-- `novarocks/native-adapter/src/fragment_plan_node.rs`
-  Native node lowering during BE preparation, dispatched by node type.
+- `novarocks/frontend-application/src/query_execution/physical_encoding.rs`
+  从完成的 planner physical IR 经 `encode_completed_packages` 冻结 package。
+  SQL 的精确结果声明、类型与函数准入快照必须随原始输入保留，不能从展示信息猜测。
 
-- `novarocks/native-adapter/src/fragment_plan_decode/**`
-  Per-node decode (filter, project, sort, topn, joins, table function,
-  table write, unpivot, change-event expand).
+- `novarocks/plan-codec/src/physical_package_v2/**`
+  package 编解码与验证；`frozen_limits.rs` 拥有生产编码/解码上限和常量策略。
+  `physical_type_v2.rs` 与 `physical_expression_v2.rs` 拥有对应 frozen vocabulary。
 
-- `novarocks/native-adapter/src/fragment_expression/**`
-  Expression decode by expression kind.
+- `idl/novarocks/{service.proto,execution_shared.proto,physical_package_v2.proto}`
+  `FrozenFragment` 仅携带 opaque package；旧计划树字段永久 reserved。
+  `execution_shared.proto` 保留 RF 与类型共享消息的 `novarocks.plan` namespace；
+  Rust `plan` 模块仍存在不代表存在 v1 decoder。
 
-- `novarocks/native-adapter/src/{fragment_layout.rs,descriptor_snapshot.rs}`
-  Output-layout and exchange-input contract projections; tuple/slot descriptors.
+- `novarocks/task-codec/src/{creation.rs,resource_preflight.rs}` 与
+  `novarocks/native-adapter/src/{task_protocol_ingress.rs,static_package_admission.rs}`
+  在 Task 接管之前约束载体资源，准确保留 replay/identity 与 Worker 的 charge 所有权。
+  接管后的 package 语义解码和局部编译仍由 BE preparation 执行。
 
-- `novarocks/native-adapter/src/{fragment_submission.rs,fragment_instance.rs,fragment_plan_decode_submission.rs}`
-  Fragment envelope and per-task assignment projection. Accepted preparation
-  separates the decoded construction plan into pure `LocalProgram` and exact
-  task-owned `LocalRuntimeBindings` before pipeline preparation.
+- `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
+  解码 package、验证 provider recipes，经 LocalCompiler 产生 `LocalProgram`；
+  再绑定本 Task 的 scan、writer、exchange、sink 与 RF endpoints，准备 compiled pipeline。
+  `compiled_scan_binding.rs`、`compiled_writer_binding.rs` 和 `compiled_runtime_filter.rs`
+  分别承接这些角色本地投影；`native_type_decode.rs` 是 RF 等消费者共用的类型解码 owner。
 
-Keep generated DTO decode at this boundary; do not move it into Worker or
-Execution, and do not recreate a Backend facade around it.
+生产静态计划只有 package → LocalCompiler → compiled pipeline 一条路径。generated DTO
+投影留在 adapter，纯降级留在 LocalCompiler，Task 生命周期留在 Worker。
+修改前阅读 [ADR-0185](docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)。
 
-### 4.4 Execution Plan and Operators
+F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力补齐或 CI 全绿。只有准确具名的
+能力拒绝可临时登记，错误结果、崩溃、非预期超时与未覆盖项不能白名单化。整个 UEA-5E 的 Z
+仍须清零修复账、相关登记及 pure 排除清单，并完成原生 1FE+3BE 与全部约定 CI 的最终验证。
+
+### 4.4 Local Program and Operators
+
+- `novarocks/local-compiler/src/**`
+  只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
+  不获取 Task、connector runtime 或 topology。能力拒绝必须与非法输入及控制失败保持 typed 区分。
 
 - `novarocks/local-program/src/**`
-  Pure task-independent node, expression, layout, sink and binding-requirement
-  facts. `LocalProgram` owns no live scan, writer, connector or async capability.
+  纯 Task-independent 节点、compiled expression、layout、sink 和 binding requirement facts；
+  不拥有 live scan、writer、connector 或 async capability。
 
-- `novarocks/execution/src/exec/node/lowering.rs`
-  Separates a construction `ExecPlan` into `LocalProgram` and per-task
-  `LocalRuntimeBindings`; the bindings retain exact scan/writer/finisher owners.
+- `novarocks/execution/src/exec/node/**`
+  compiled 与旧 evaluator 仍复用的值描述、scan/writer 等运行能力；
+  `ExecPlan`、`ExecNode` 构造树和 lowering bridge 已删除，不得按目录名删除共享值类型。
 
-- `novarocks/execution/src/runtime/fragment/submission.rs`
-  One task submission owns its program and runtime bindings, with exact
-  requirement/binding validation before drivers are prepared.
+- `novarocks/execution/src/exec/expr/**`
+  `compiled_program/**` 执行已绑定的 pure 核心。旧 `ExprArena`、名字注册表、函数外壳和
+  legacy aggregate adapter 暂留给 F3：FE `query_execution/constant_eval.rs`、
+  `query_execution/row_mutation.rs` 的 COW cast 以及 compiled 的
+  `exec/expr/compiled_program/guarded.rs` 共享 IN helper 仍有生产依赖。
+  旧 evaluator 的私有 differential oracle 测试也保留；它不是生产计划树解释器。
 
-- `novarocks/execution/src/exec/node/mod.rs`
-  `ExecNode`, `ExecNodeKind`, `ExecPlan` construction types.
-
-- `novarocks/execution/src/exec/expr/mod.rs`
-  `ExprArena` and `ExprNode` execution-layer structures.
-
-- `novarocks/execution/src/exec/operators/mod.rs`
-  Operator factory registration; concrete operators are under
-  `novarocks/execution/src/exec/operators/**`.
+- `novarocks/execution/src/exec/operators/**`
+  compiled 算子与 factory；`compiled_expression.rs` 直接运行 compiled expression，
+  不经旧 arena 或名字分派。
 
 - `novarocks/execution/src/exec/chunk/{mod.rs,chunk_impl.rs}`
-  `Chunk` (Arrow `RecordBatch` wrapper) and slot metadata mapping.
+  `Chunk`（Arrow `RecordBatch` 包装）及 slot metadata mapping。
 
 ### 4.5 Pipeline Execution Framework
 
-- `novarocks/execution/src/exec/pipeline/builder.rs`
-  Construction-plan helpers; `builder/local.rs` builds the production pipeline
-  directly from `LocalProgram` and exact `LocalRuntimeBindings`.
+- `novarocks/execution/src/exec/pipeline/builder/compiled.rs`
+  从 `LocalProgram` 和本 Task 准确绑定的能力建立 pipeline；`builder.rs` 拥有共享图值。
+  `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/fragment`。
 
 - `novarocks/execution/src/exec/pipeline/executor.rs`
-  Top-level pipeline execution entry, including
-  `prepare_report_neutral_local_program_pipeline_execution` for one pure program
-  and its task-owned capabilities.
+  `prepare_compiled_program_pipeline_execution_with_profiler` 准备 compiled pipeline；
+  program 与 Task 能力分别传入，不能重建已删除的 construction plan bridge。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
@@ -391,8 +403,8 @@ Execution, and do not recreate a Backend facade around it.
 3. Persistent tables belong to external providers. Iceberg owns its catalog and
    mutation truth; Paimon owns its external snapshots and exposes only its
    supported read capability.
-4. The frontend freezes native fragment and Connector facts, then sends them to
-   one or more `role=be` processes through native gRPC.
+4. Frontend 将完成的物理计划冻结成 compiled packages，连同准确的 Connector facts
+   经 native gRPC 提交到一个或多个 `role=be` 进程。
 5. BE hosts bind installed Connector execution instances and run Arrow batches
    through the pipeline/runtime stack.
 
@@ -438,6 +450,11 @@ Execution, and do not recreate a Backend facade around it.
    unknown RPC outcomes until Installed, terminal evidence or permanent
    stand-down. W must not exceed that exact backend descriptor's advertised
    per-context preparation positions P.
+   FE 只发送 compiled package。BE 的 `CompiledPackageInterpreter` 解码并局部编译，
+   `NativeTaskExecutionHost` 绑定 Task 能力后准备 compiled pipeline；没有 v1 解码或树构造桥。
+   BE 的 typed 能力拒绝沿 `TaskFailureCategory::Unsupported` 与
+   `AttemptFailureClass::Unsupported` 传至 `[UnsupportedCompiledShape]`，不重试或重新规划。
+   SQL 分析期缺 pure 实现保留 `[sql.analyze.unavailable_implementation]`。
 3. Push exchange edges start Closed and open once every frozen destination has
    an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
@@ -469,12 +486,11 @@ Execution, and do not recreate a Backend facade around it.
 - `Chunk`: `novarocks/execution/src/exec/chunk/chunk_impl.rs`
   Arrow `RecordBatch` wrapper with `slot_id -> column_index` mapping and memory accounting.
 
-- `ExecPlan` / `ExecNode` / `ExecNodeKind`: `novarocks/execution/src/exec/node/mod.rs`
-  Temporary construction plan tree; production driver preparation consumes
-  `LocalProgram` plus per-task `LocalRuntimeBindings`.
+- `LocalProgram`: `novarocks/local-program/src/**`
+  纯 compiled program；Task 的 exchange、scan、writer 与 sink 能力在 BE preparation 另行绑定。
 
 - `ExprArena` / `ExprNode`: `novarocks/execution/src/exec/expr/mod.rs`
-  Arena-based expression graph model.
+  F3 待迁移的旧表达式求值器，供 FE 折叠等保留调用方与私有 oracle 使用；不构造生产 fragment 树。
 
 - `RuntimeState`: `novarocks/execution/src/runtime/runtime_state.rs`
   Runtime context for cache and runtime filter behavior.
@@ -906,11 +922,11 @@ suspected case against a clean server before attributing it to the change.
 - **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
   `novarocks/sql/src/{analysis,analyzer,semantic}/**`,
   `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
-- **Fragment decode changes**: start with
-  `novarocks/native-adapter/src/fragment_plan_node.rs` and the relevant
-  `fragment_plan_decode/**` or `fragment_expression/**` submodule; program/binding
-  separation is in `fragment_plan_decode_submission.rs` and Execution
-  `exec/node/lowering.rs`. The wire vocabulary lives in `novarocks/plan-codec/src/**`.
+- **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
+  `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
+  与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、
+  `compiled_writer_binding.rs`、`compiled_runtime_filter.rs`，pipeline 见 Execution
+  `exec/pipeline/builder/compiled.rs`。先读 ADR-0185，禁止恢复 v1 decoder/构造桥。
 - **MySQL protocol behavior**: inspect `novarocks/mysql-adapter/src/listener.rs`,
   `result_encoding.rs`, `relay_result_writer.rs` and `local_result_writer.rs`.
 - **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for
@@ -924,9 +940,9 @@ suspected case against a clean server before attributing it to the change.
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md) 与 [ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 后再改身份、字段继承、派发生命周期或清理授权。
-- **Execution semantics/operator behavior**: inspect
-  `novarocks/execution/src/exec/node/**` and
-  `novarocks/execution/src/exec/operators/**`.
+- **Execution semantics/operator behavior**：先核对 `novarocks/local-compiler/src/**` 和
+  `novarocks/local-program/src/**`，再看 Execution `exec/pipeline/builder/compiled.rs`、
+  `exec/operators/**`；`exec/node/**` 仍有共享值类型和运行能力，不能当旧树整片删除。
 - **Scheduling/parallelism**: inspect `novarocks/execution/src/exec/pipeline/**`.
 - **Exchange behavior**: inspect `novarocks/execution/src/runtime/exchange.rs`,
   `novarocks/execution/src/runtime/fragment/io/**`,

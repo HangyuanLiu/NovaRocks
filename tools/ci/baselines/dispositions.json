@@ -10,6 +10,2356 @@
       "reason": "The existing DECIMAL256 cast case fails at statement 7: no matching declared overload. Retain the raw failure until the missing overload is implemented. Observed on the TST-G15 native 1FE+3BE classification run.",
       "owner": "NovaRocks SQL decimal owner",
       "expires": "2026-11-18"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_collection_string_dict_semantics",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_sum_map_basic",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_agg_with_limit",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Int64, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_always_null_statistic_funcs",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: Values combined copy carrier lacks selected-copy preflight; owner B7, I2, I5; remove after capability repair and native verification",
+      "owner": "B7, I2, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_approx_top_k",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/approx_top_k/derived-v1; owner B9, I1, I5; remove after capability repair and native verification",
+      "owner": "B9, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_array_agg",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_count_distinct",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/row/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_dict_merge",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: Values combined copy carrier lacks selected-copy preflight); terminal_round=read=AttemptFailed write=attempt failed contexts_established=true tasks_cr; owner B7, I2, I5; remove after capability repair and native verification",
+      "owner": "B7, I2, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_groupby_array",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_generate/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_map_agg",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_percentile_approx_weighted",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_serialize_key_agg",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/agg_test_sum_map",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:aggregate/opaque_result_domain_handoff",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_filter_topn_with_window",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
+      "owner": "B5, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_lead_lag_array_type",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_join/(list<any<T>>,utf8...)->utf8;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_preagg_state_contract",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_session_number_gap",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.window/session_number/(any<T>,i64)->i64;strict;legacy; owner B9, I1, I5; remove after capability repair and native verification",
+      "owner": "B9, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_array_agg_over_window",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/array_agg/derived-v1; owner B9, I1, I5; remove after capability repair and native verification",
+      "owner": "B9, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_bitmap_union_window",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_minmax_by_window_function",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_session_number",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.window/session_number/(any<T>,i64)->i64;strict;legacy; owner B9, I1, I5; remove after capability repair and native verification",
+      "owner": "B9, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_window_function_streaming",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
+      "owner": "B5, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_window_functions_with_complex_types",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_window_hll_bitmap",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_window_pre_agg_with_rank",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
+      "owner": "B5, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/analytic_test_window_with_null_child",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
+      "owner": "B5, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:analytic/window_result_domain_handoff",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/variant_get/dynamic-v1; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/array_generate_temporal_domain",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_generate/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/array_null_elements",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_contains/(list<any<T>>,any<T>)->bool;widen;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/array_ordered_logical_null",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_sort/(list<any<T>>)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/array_sortby_null_order_controls",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_generate/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/array_varchar_common_coercion",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_any_value",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/row/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_array_basic_functions",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_sum/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_array_slice_concat_distinct",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_slice/(list<any<T>>,i64,i64)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_array_slice_zero_offset_semantics",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_slice/(list<any<T>>,i64,i64)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_array_sort_join",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_sort/(list<any<T>>)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_binary_comparison",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_group_by",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_map_basic_functions",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_map_concat_override",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_map_empty_concat_entries",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_map_entries_semantics",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_map_higher_order",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_map_keys_values_unnest",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_map_subscript_access",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_nested_map_array_access",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_prune_nested",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/row/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_semi_cast",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_struct_prune",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_struct_union_field_order",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/__struct_subfield/dynamic-v1; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_struct_uppercase",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_test_array_contains",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_test_array_distinct",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_test_array_map_2",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_test_array_sort_lambda",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_sort_lambda/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_test_array_sortby",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: Values combined copy carrier lacks selected-copy preflight); terminal_round=read=AttemptFailed write=attempt failed contexts_established=true tasks_cr; owner B7, I2, I5; remove after capability repair and native verification",
+      "owner": "B7, I2, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_test_array_top_n",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/complex_test_arrays_zip",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/arrays_zip/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/json_list_semantic_schema",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:complex-type/map_null_values_lookup",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:cte/cte_in_where_subquery",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:cte/cte_multi_alias",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:cte/cte_recursive",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:distributed-resilience/task-lease-renewal-ack-loss",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/sleep/(i64)->bool;strict;legacy; owner B8, I1, I5; lifecycle suffix remains unverified until capability repair",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:filter/test_scan_predicate_expr_reuse",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/bitmap_binary_ops",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/bitmap_to_base64_bound_result",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/concat_array_family",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_concat/(list<any<T>>...)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_binary_functions",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/from_binary/(binary,utf8)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_bitmap_binary",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_bitmap_replace_if_not_null",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_from_string/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_bitmap_sub_bitmap",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_from_string/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_bitmap_to_array",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_bitmap_to_base64",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_to_base64/(binary)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_bitmap_to_string",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_from_string/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_bitmap_unnest",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_cast",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: Utf8, to: Binary; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_conditional",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_encode_row_id",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/encode_row_id/(any...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_encryption",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/aes_encrypt/(any...)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_field",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: Timestamp(Microsecond, None), to: Float64; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_field_common_type",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: Utf8, to: Float64; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_iceberg_transform",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/__iceberg_transform_truncate/(any<T>,i64)->any<T>;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_round",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags)); terminal_round=read=AttemptFailed write=attempt failed contexts_established=true tasks_cr; owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_str_to_map",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/str_to_map/dynamic-v1; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_synopse",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/bar/(i64,i64,i64,i64)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_to_datetime",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/to_datetime/(i64,i64)->datetime;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/function_typeof",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/get_json_object/(any,utf8)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:function/map_aggregate_input_schema",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg/iceberg_v3_branch_row_lineage",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4; remove after capability repair and native verification",
+      "owner": "B4",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-compatibility/java_variant_shredded_read",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/variant_typeof/(any)->utf8;strict;legacy; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-compatibility/java_variant_unshredded_read",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/variant_typeof/(any)->utf8;strict;legacy; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-compatibility/novarocks_mor_lineage_spark_read",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-compatibility/spark_multi_dv_puffin_novarocks_dml",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-compatibility/spark_rest_minio_v3_complex_nested",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/__struct_subfield/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-compatibility/spark_rest_minio_v3_mv_refresh",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ddl/catalog_complex_type",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ddl/default_complex",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/insert_exact_numeric_input",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/merge_insert_row_id_unique",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/mor_lineage_sequence_inheritance",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/struct_named_metadata_value",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/update_mor",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/variant_get",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/try_variant_get/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/variant_insert",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/variant_typeof/(any)->utf8;strict;legacy; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-dml/write_adaptation_types",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_aggregate_avg_min_max",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_basic_lifecycle",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_merge_cow",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_merge_mor",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_projection_filter",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_projection_hidden_pk_delete",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_projection_partition_evolution_delete",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_refresh_strategy",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a11_base_rename_unreferenced",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a11_target_field_id_mismatch",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a1_large_delta_mixed",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a1_update_only",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_a11_base_nullability_change_referenced",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_a11_base_rename_group_key",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_a11_base_rename_measure",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_base_partition_evolution",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_bool_and",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/bool_and_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_bool_or",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/bool_or_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_count_only_delete_boundary",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_cross_join",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_cross_join_bag_delta",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_filter_join",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_bool",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_date",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_decimal128",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_delete_boundary",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_delete_non_boundary",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_float",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_insert_only",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_partitioned",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_string",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_min_max_timestamp",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_nested_join",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_aggregate_target",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_base_delete_row_lineage",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_branch_union_aggregate",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_delete_applicability",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_empty_delta_metadata_only",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_fan_in_aggregate_union",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_a11_base_drop_referenced",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
+      "owner": "B8, B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_a11_base_type_change_referenced",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
+      "owner": "B8, B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_aggregate",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_aggregate_a11_base_rename_group_key",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_aggregate_a11_base_rename_join_key",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_aggregate_base_partition_evolution",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_aggregate_min_max",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_key_update_multiplicity",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
+      "owner": "B8, B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_refresh_logical_plan",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
+      "owner": "B8, B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_two_base_delta",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
+      "owner": "B8, B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_mv_dependency_graph",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/sum_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_noop_and_stale_refresh",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_optimize_replace_refresh",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_partitioned_aggregate_day_transform",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_partitioned_aggregate_target",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_partitioned_join_aggregate_dim_move",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_union_of_aggregate_over_join",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/iceberg_ivm_union_projection_filter",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-ivm/imv_projection_filter_cutover_basic",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-mv-apply/iceberg_mv_aggregate_change_stream_apply",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-mv-apply/iceberg_mv_join_incremental_delete",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
+      "owner": "B8, B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-rest/iceberg_rest_ivm_change_op_delta_source",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/sum_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:iceberg-rest/iceberg_rest_update_merge",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_apply_to_join",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_bucket_shuffle_right_outer_equivalence",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/assert_true/(bool)->bool;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_composite_in_unknown",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_direct_mapping",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_eliminate_with_constant",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_fixed_size",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_fixed_size_string",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/uuid/()->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_force_partition_hash",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_full_outer_null_fill",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_full_outer_with_using",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_interleaving",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_large_in_predicate",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
+      "owner": "B5, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_linear_chained",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/uuid/()->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_map_type",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_non_finite_float_key_null_semantics",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_null_aware_anti",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: nested-loop null-aware anti join with a predicate; owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_one_key",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_partition_hash",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/uuid/()->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_predicate_expr_reuse",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_predicate_move_around",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_range_direct_mapping",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_reorder_no_op_invocations",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_self_join_hash",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_self_join_nljoin",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_skew_v2",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_test_nest_loop_join",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_using_comprehensive",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/join_with_using",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:join/push_topn_through_outer_join_result",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
+      "owner": "B3, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:limit/limit_offset_basic",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:materialized-view/lake_native_mv_smoke",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
+      "owner": "B1",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/column_id_binding_repeat_using",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3; remove after capability repair and native verification",
+      "owner": "B3",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/constant_folding",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/now/()->datetime;strict;legacy; owner B8; remove after capability repair and native verification",
+      "owner": "B8",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/imv_aggregate_filter_join_logical",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/imv_aggregate_logical_cutover",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/imv_aggregate_nested_join_logical",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/imv_join_aggregate_logical_cutover",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.aggregate/sum_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
+      "owner": "B1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/oq1c_cte_receive_column_remap",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
+      "owner": "B4",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/ranking_window_topn",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5; remove after capability repair and native verification",
+      "owner": "B5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:optimizer/variant_path_pushdown",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/variant_get/dynamic-v1; owner B7; remove after capability repair and native verification",
+      "owner": "B7",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:project/project_cast_json_to_map",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: Utf8, to: Map(Field { name: \"entries\", data_type: Struct([Field { name: \"key\", data_type: Utf8 }, Field { name: \"value\", data_type: Utf8, nullable: true }]) }, false); owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:project/project_cast_json_to_struct",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: Utf8, to: Struct([Field { name: \"col1\", data_type: Int32, nullable: true }, Field { name: \"col2\", data_type: Int32, nullable: true }, Field { name: \"col3\", data_type: Int32, nullable: true }]); owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:project/project_date_function_semantics",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "Missing installed pure implementation for builtin.scalar/hour_from_unixtime/(i64)->i32;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:runtime-filter/runtime_filter_multi_columns",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3; remove after capability repair and native verification",
+      "owner": "B3",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:runtime-filter/runtime_filter_outer_cross_exchange_guard",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
+      "owner": "B4",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:runtime-filter/runtime_filter_partition_crash",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
+      "owner": "B4",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:runtime-filter/runtime_filter_push_down_grf_broadcast",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3; remove after capability repair and native verification",
+      "owner": "B3",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_chain_ops",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_except_basic",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_except_multi_stage_null",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_except_three_stage_null_duplicates",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_except_varchar_cast",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_except_with_null",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_intersect_basic",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_intersect_multi_column_null",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_intersect_three_way_null_duplicates",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_intersect_with_null",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_union_distinct_dedup",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_union_distinct_with_null",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:set-op/set_union_mixed_all_distinct_chain",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
+      "owner": "B4, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:sort/ranking_window_topn_correctness",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
+      "owner": "B5, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:sort/topn_rank_partition_filter_tie_expand",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
+      "owner": "B5, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:table-function/table_function_unnest_cross_empty_result",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Int8, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:table-function/table_function_unnest_left_join_empty_null",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Int8, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:table-function/table_function_unnest_multi_array_uneven_left_join",
+      "failure": {
+        "class": "error_code",
+        "code": "UnsupportedCompiledShape"
+      },
+      "reason": "Unsupported compiled cast from: List(Field { data_type: Int8, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification",
+      "owner": "B7, B8, I1, I5",
+      "expires": "2026-12-15"
     }
   ],
   "quarantine": []

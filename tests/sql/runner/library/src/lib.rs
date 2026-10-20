@@ -339,18 +339,34 @@ fn evaluate_expected_error_branch_with_sql_error_descriptors(
 }
 
 fn annotate_failure_with_engine_error_code(message: &str, source: &str) -> String {
-    if message.contains("engine_error_code=") {
-        return message.to_string();
+    let mut labels = Vec::new();
+    if !message.contains("engine_error_code=")
+        && let Some(code) = extract_engine_error_code(source)
+            .or_else(|| extract_engine_error_code(message))
+            .or_else(|| {
+                message
+                    .strip_prefix("target execute failed: ")
+                    .and_then(extract_engine_error_code)
+            })
+    {
+        labels.push(format!("engine_error_code={code}"));
     }
-    extract_engine_error_code(source)
-        .or_else(|| extract_engine_error_code(message))
-        .or_else(|| {
-            message
-                .strip_prefix("target execute failed: ")
-                .and_then(extract_engine_error_code)
-        })
-        .map(|code| format!("engine_error_code={} {}", code, message))
-        .unwrap_or_else(|| message.to_string())
+    if !message.contains("sql_error_code=")
+        && let Some(code) = extract_sql_error_code(source)
+            .or_else(|| extract_sql_error_code(message))
+            .or_else(|| {
+                message
+                    .strip_prefix("target execute failed: ")
+                    .and_then(extract_sql_error_code)
+            })
+    {
+        labels.push(format!("sql_error_code={code}"));
+    }
+    if labels.is_empty() {
+        message.to_string()
+    } else {
+        format!("{} {}", labels.join(" "), message)
+    }
 }
 
 fn expected_engine_error_code_diff_result(
@@ -511,11 +527,6 @@ pub(crate) struct Cli {
     #[arg(long)]
     cluster_launch_profile: Option<novarocks_cluster_harness::LaunchProfile>,
 
-    /// Explicit inert physical-wire candidate artifact for cross-process verification.
-    /// Every role must self-report the candidate and test-controls capabilities.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["dry_run", "no_verify", "update_expected", "list_suites", "list_extensions"])]
-    physical_wire_candidate_binary: Option<PathBuf>,
-
     /// SQL statements applied, in order, to each target case session before its first step.
     #[arg(long = "target-session-sql", value_name = "SQL", action = ArgAction::Append)]
     target_session_sql: Vec<String>,
@@ -552,24 +563,6 @@ fn verify_override(cli: &Cli) -> Option<bool> {
     } else {
         None
     }
-}
-
-fn validate_physical_wire_candidate_args(cli: &Cli) -> Result<()> {
-    if cli.physical_wire_candidate_binary.is_some() {
-        ensure!(
-            cli.cluster_mode == ClusterMode::CrossProcess && cli.mode == Mode::Verify,
-            "--physical-wire-candidate-binary requires --cluster-mode cross-process --mode verify"
-        );
-        ensure!(
-            !cli.dry_run
-                && !cli.no_verify
-                && !cli.update_expected
-                && !cli.list_suites
-                && !cli.list_extensions,
-            "physical-wire candidate selection requires actual result verification"
-        );
-    }
-    Ok(())
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -2692,6 +2685,9 @@ fn run_case_observed(
             continue;
         }
         evidence.begin_step(step.query_number, case_failed);
+        if step.meta.cleanup {
+            evidence.mark_cleanup_step();
+        }
         let order_sensitive = query_order_sensitive(step, ctx.order_sensitive_default);
         let epsilon = query_float_epsilon(step, ctx.float_epsilon);
 
@@ -2711,6 +2707,10 @@ fn run_case_observed(
                         Ok(Some(snapshot)) => Some(snapshot),
                         Ok(None) => {
                             case_failed = true;
+                            evidence.record_independent_failure(
+                                Some(step.query_number),
+                                "query-execution resource oracle was advertised but returned no baseline".into(),
+                            );
                             let _ = writeln!(
                                 log,
                                 "    ❌ query-execution resource oracle was advertised but returned no baseline"
@@ -2719,6 +2719,10 @@ fn run_case_observed(
                         }
                         Err(error) => {
                             case_failed = true;
+                            evidence.record_independent_failure(
+                                Some(step.query_number),
+                                format!("failed to capture pre-fault query-execution resource baseline: {error:#}"),
+                            );
                             let _ = writeln!(
                                 log,
                                 "    ❌ failed to capture pre-fault query-execution resource baseline: {error:#}"
@@ -2730,6 +2734,10 @@ fn run_case_observed(
                 Ok(_) => None,
                 Err(_) => {
                     case_failed = true;
+                    evidence.record_independent_failure(
+                        Some(step.query_number),
+                        "server handle mutex is poisoned before resource baseline capture".into(),
+                    );
                     let _ = writeln!(log, "    ❌ server handle mutex is poisoned");
                     break;
                 }
@@ -2771,6 +2779,13 @@ fn run_case_observed(
                 });
             if let Err(exc) = fault_result {
                 case_failed = true;
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    format!(
+                        "failed to apply fault injection before step {}: {exc:#}",
+                        step.query_number
+                    ),
+                );
                 let _ = writeln!(
                     log,
                     "    ❌ failed to apply fault injection before step {}: {:#}",
@@ -2791,12 +2806,20 @@ fn run_case_observed(
                 }
                 Err(error) => {
                     case_failed = true;
+                    evidence.record_independent_failure(
+                        Some(step.query_number),
+                        format!("install orphan fixture: {error:#}"),
+                    );
                     let _ = writeln!(log, "    ❌ install orphan fixture: {error:#}");
                     break;
                 }
             },
             None if step.meta.iceberg_orphan_fixture_absent => {
                 case_failed = true;
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    "@iceberg_orphan_fixture_absent requires @iceberg_orphan_fixture".into(),
+                );
                 let _ = writeln!(
                     log,
                     "    ❌ @iceberg_orphan_fixture_absent requires @iceberg_orphan_fixture"
@@ -2820,6 +2843,10 @@ fn run_case_observed(
                         }
                         Err(error) => {
                             case_failed = true;
+                            evidence.record_independent_failure(
+                                Some(step.query_number),
+                                format!("arm publication catalog fault: {error:#}"),
+                            );
                             let _ =
                                 writeln!(log, "    ❌ arm publication catalog fault: {error:#}");
                             break;
@@ -2828,6 +2855,10 @@ fn run_case_observed(
                 }
                 None => {
                     case_failed = true;
+                    evidence.record_independent_failure(
+                        Some(step.query_number),
+                        "@publication_catalog_fault requires the runner-owned publication catalog fixture".into(),
+                    );
                     let _ = writeln!(
                         log,
                         "    ❌ @publication_catalog_fault requires the runner-owned publication catalog fixture"
@@ -2843,12 +2874,20 @@ fn run_case_observed(
                     Ok(hold) => Some(hold),
                     Err(error) => {
                         case_failed = true;
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            format!("arm REST service hold: {error:#}"),
+                        );
                         let _ = writeln!(log, "    ❌ arm REST service hold: {error:#}");
                         break;
                     }
                 },
                 None => {
                     case_failed = true;
+                    evidence.record_independent_failure(
+                        Some(step.query_number),
+                        "REST service hold requires the V11 fixture".into(),
+                    );
                     let _ = writeln!(log, "    ❌ REST service hold requires the V11 fixture");
                     break;
                 }
@@ -2868,6 +2907,13 @@ fn run_case_observed(
             Ok(snapshot) => snapshot,
             Err(error) => {
                 case_failed = true;
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    format!(
+                        "failed to snapshot BE log evidence before step {}: {error:#}",
+                        step.query_number
+                    ),
+                );
                 let _ = writeln!(
                     log,
                     "    ❌ failed to snapshot BE log evidence before step {}: {error:#}",
@@ -3008,6 +3054,10 @@ fn run_case_observed(
                     if step.meta.publication_service_hold.is_some()
                         && err_msg.starts_with("FAIL (runner service hold")
                     {
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            format!("runner service hold failed: {err_msg}"),
+                        );
                         last_failure = err_msg;
                         break;
                     }
@@ -3023,7 +3073,7 @@ fn run_case_observed(
                         );
                         if expected_result.is_err() {
                             evidence.record_failure(
-                                serde_json::json!({"class":"error_code", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)), "statement_index":step.query_number, "actual_digest":null}),
+                                serde_json::json!({"class":"error", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)), "statement_index":step.query_number, "actual_digest":null}),
                             );
                         }
                         if let Err(reason) = expected_result {
@@ -3114,8 +3164,18 @@ fn run_case_observed(
                                 last_failure =
                                     format!("missing expected result file: {}", path.display());
                             }
+                            evidence.record_failure(serde_json::json!({
+                                "class":"error", "error_code":null,
+                                "statement_index":step.query_number, "actual_digest":null,
+                                "error":last_failure
+                            }));
                         } else {
                             last_failure = "missing result_dir in verify mode".to_string();
+                            evidence.record_failure(serde_json::json!({
+                                "class":"error", "error_code":null,
+                                "statement_index":step.query_number, "actual_digest":null,
+                                "error":last_failure
+                            }));
                         }
                     }
 
@@ -3157,12 +3217,21 @@ fn run_case_observed(
                             &mut log,
                         ) {
                             case_failed = true;
+                            evidence.record_independent_failure(
+                                Some(step.query_number),
+                                format!("post-step server action failed: {error:#}"),
+                            );
                             let _ = writeln!(log, "    ❌ {error:#}");
                             continue;
                         }
                         if step.meta.iceberg_orphan_fixture_absent {
                             let Some(fixture) = orphan_fixture.as_ref() else {
                                 case_failed = true;
+                                evidence.record_independent_failure(
+                                    Some(step.query_number),
+                                    "orphan fixture was not installed before the absence check"
+                                        .into(),
+                                );
                                 let _ = writeln!(log, "    ❌ orphan fixture was not installed");
                                 continue;
                             };
@@ -3200,12 +3269,20 @@ fn run_case_observed(
                         &mut log,
                     ) {
                         case_failed = true;
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            format!("post-step server action failed: {error:#}"),
+                        );
                         let _ = writeln!(log, "    ❌ {error:#}");
                         continue;
                     }
                     if step.meta.iceberg_orphan_fixture_absent {
                         let Some(fixture) = orphan_fixture.as_ref() else {
                             case_failed = true;
+                            evidence.record_independent_failure(
+                                Some(step.query_number),
+                                "orphan fixture was not installed before the absence check".into(),
+                            );
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
                             continue;
                         };
@@ -3550,7 +3627,7 @@ fn run_case_observed(
                         );
                         if expected_result.is_err() {
                             evidence.record_failure(
-                                serde_json::json!({"class":"error_code", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)), "statement_index":step.query_number, "actual_digest":null}),
+                                serde_json::json!({"class":"error", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)), "statement_index":step.query_number, "actual_digest":null}),
                             );
                         }
                         if let Err(reason) = expected_result {
@@ -3562,6 +3639,11 @@ fn run_case_observed(
                         }
                     } else if !ok || execution.is_none() {
                         last_failure = format!("record source execute failed: {}", err_msg);
+                        evidence.record_failure(serde_json::json!({
+                            "class":"error", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)),
+                            "statement_index":step.query_number, "actual_digest":null,
+                            "error":last_failure
+                        }));
                     } else {
                         let Some(execution) = execution else {
                             unreachable!("checked above");
@@ -3608,6 +3690,7 @@ fn run_case_observed(
                             Ok(()) => true,
                             Err(reason) => {
                                 case_failed = true;
+                                evidence.record_expected_error_log(step, true, false);
                                 last_failure = reason;
                                 false
                             }
@@ -3638,12 +3721,20 @@ fn run_case_observed(
                         )
                     {
                         case_failed = true;
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            format!("post-step server action failed: {error:#}"),
+                        );
                         let _ = writeln!(log, "    ❌ {error:#}");
                         continue;
                     }
                     if step.meta.iceberg_orphan_fixture_absent {
                         let Some(fixture) = orphan_fixture.as_ref() else {
                             case_failed = true;
+                            evidence.record_independent_failure(
+                                Some(step.query_number),
+                                "orphan fixture was not installed before the absence check".into(),
+                            );
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
                             continue;
                         };
@@ -3671,6 +3762,7 @@ fn run_case_observed(
                     case_elapsed += wait_elapsed;
                     if !wait_ok {
                         case_failed = true;
+                        evidence.record(step, "wait_alter", false, serde_json::json!({}));
                     } else {
                         let be_log_ok = if ctx.record_from == RecordFrom::Target {
                             match run_be_log_directives_for_successful_step(
@@ -3682,6 +3774,7 @@ fn run_case_observed(
                                 Ok(()) => true,
                                 Err(reason) => {
                                     case_failed = true;
+                                    evidence.record(step, "be_log", false, serde_json::json!({}));
                                     let _ = writeln!(log, "    ❌ FAIL: {reason}");
                                     false
                                 }
@@ -3704,6 +3797,11 @@ fn run_case_observed(
                                     Ok(()) => true,
                                     Err(msg) => {
                                         case_failed = true;
+                                        for kind in ["explain_contains", "explain_not_contains"] {
+                                            if results_record::required(step).contains(&kind) {
+                                                evidence.record(step, kind, false, serde_json::json!({"explain_rewritten":!ctx.rewrite_explain_contains_as_not_contains.is_empty()}));
+                                            }
+                                        }
                                         let _ = writeln!(log, "    ❌ {}", msg);
                                         false
                                     }
@@ -3799,6 +3897,11 @@ fn run_case_observed(
                         );
                     } else {
                         case_failed = true;
+                        evidence.record_failure(serde_json::json!({
+                            "class":"error", "error_code":null,
+                            "statement_index":step.query_number, "actual_digest":null,
+                            "error":format!("diff expected engine error mismatch: {expected_code_result:?}")
+                        }));
                         let _ = writeln!(
                             log,
                             "    ❌ DIFF FAILED {}",
@@ -3845,6 +3948,11 @@ fn run_case_observed(
                         }
                         Some(Err(reason)) => {
                             case_failed = true;
+                            evidence.record_failure(serde_json::json!({
+                                "class":"error", "error_code":null,
+                                "statement_index":step.query_number, "actual_digest":null,
+                                "error":format!("diff target SQL error contract failed: {reason}")
+                            }));
                             let _ = writeln!(log, "    ❌ DIFF FAILED {reason}");
                         }
                         None => unreachable!("checked has_sql_error_assertion above"),
@@ -3895,6 +4003,11 @@ fn run_case_observed(
                         );
                     } else {
                         case_failed = true;
+                        evidence.record_failure(serde_json::json!({
+                            "class":"error", "error_code":null,
+                            "statement_index":step.query_number, "actual_digest":null,
+                            "error":format!("diff expected error mismatch: target_ok={ok_t}, target_err={err_t}, reference_ok={ok_r}, reference_err={err_r}")
+                        }));
                         let _ = writeln!(
                             log,
                             "    ❌ DIFF FAILED expected error {:?} (target_ok={}, target_err={}, reference_ok={}, reference_err={})",
@@ -3928,6 +4041,11 @@ fn run_case_observed(
                             &format!("target execute failed: {}", err_t),
                             &err_t,
                         );
+                        evidence.record_failure(serde_json::json!({
+                            "class":"error", "error_code":extract_engine_error_code(&err_t).or_else(|| extract_sql_error_code(&err_t)),
+                            "statement_index":step.query_number, "actual_digest":null,
+                            "error":failure
+                        }));
                         let _ = writeln!(log, "    ❌ {}", failure);
                     } else {
                         let Some(execution_t) = execution_t else {
@@ -3950,6 +4068,11 @@ fn run_case_observed(
                         };
                         if !ok_r || execution_r.is_none() {
                             case_failed = true;
+                            evidence.record_failure(serde_json::json!({
+                                "class":"error", "error_code":extract_engine_error_code(&err_r).or_else(|| extract_sql_error_code(&err_r)),
+                                "statement_index":step.query_number, "actual_digest":null,
+                                "error":format!("diff reference execute failed: {err_r}")
+                            }));
                             case_elapsed += execution_t.elapsed;
                             let _ = writeln!(log, "    ❌ reference execute failed: {}", err_r);
                         } else {
@@ -3976,6 +4099,11 @@ fn run_case_observed(
                                 );
                             } else {
                                 case_failed = true;
+                                evidence.record_failure(serde_json::json!({
+                                    "class":"error", "error_code":null,
+                                    "statement_index":step.query_number, "actual_digest":null,
+                                    "error":format!("diff result comparison failed: {reason}")
+                                }));
                                 let _ = writeln!(log, "    ❌ DIFF FAILED: {}", reason);
                                 if let Some(root) = mismatch_artifact_root(ctx, &mut log).as_ref() {
                                     let artifact_id =
@@ -4022,6 +4150,10 @@ fn run_case_observed(
                 }
                 Err(error) => {
                     case_failed = true;
+                    evidence.record_case_cleanup_failure(
+                        Some(step.query_number),
+                        format!("publication catalog fault cleanup: {error:#}"),
+                    );
                     let _ = writeln!(log, "    ❌ publication catalog fault cleanup: {error:#}");
                 }
             }
@@ -4033,6 +4165,10 @@ fn run_case_observed(
         ] {
             if let Err(error) = result {
                 case_failed = true;
+                evidence.record_case_cleanup_failure(
+                    Some(step.query_number),
+                    format!("{action} fault cleanup: {error:#}"),
+                );
                 let _ = writeln!(log, "    ❌ {action} fault cleanup: {error:#}");
                 preserve_case_failure_snapshot(
                     ctx,
@@ -4069,6 +4205,10 @@ fn run_case_observed(
                 }
                 Err(error) => {
                     case_failed = true;
+                    evidence.record_independent_failure(
+                        Some(step.query_number),
+                        format!("query-execution resource convergence failed: {error:#}"),
+                    );
                     let _ = writeln!(
                         log,
                         "    ❌ query-execution resource convergence failed: {error:#}"
@@ -4114,6 +4254,10 @@ fn run_case_observed(
                 && let Err(error) = guard.drain()
             {
                 case_failed = true;
+                evidence.record_case_cleanup_failure(
+                    Some(step.query_number),
+                    format!("exact statement lifecycle observation cleanup failed: {error:#}"),
+                );
                 let _ = writeln!(
                     log,
                     "    ❌ exact statement lifecycle observation cleanup failed: {error:#}"
@@ -4152,6 +4296,10 @@ fn run_case_observed(
 
     for (query_number, error) in fault_cleanup_errors.take() {
         case_failed = true;
+        evidence.record_case_cleanup_failure(
+            Some(query_number),
+            format!("step {query_number} early-exit fault cleanup: {error}"),
+        );
         let _ = writeln!(
             log,
             "    ❌ step {query_number} early-exit fault cleanup: {error}"
@@ -4167,6 +4315,10 @@ fn run_case_observed(
     ) {
         if let Err(error) = closed {
             case_failed = true;
+            evidence.record_case_cleanup_failure(
+                None,
+                format!("{role} MySQL socket owner cleanup: {error:#}"),
+            );
             let _ = writeln!(log, "    ❌ {role} MySQL socket owner cleanup: {error:#}");
         }
     }
@@ -4180,6 +4332,10 @@ fn run_case_observed(
             ctx.controls.as_ref().map(|controls| controls.deadline),
         ) {
             case_failed = true;
+            evidence.record_case_cleanup_failure(
+                None,
+                format!("failed to cleanup target case database {db_name}: {exc:#}"),
+            );
             let _ = writeln!(
                 log,
                 "    ❌ failed to cleanup target case database {}: {:#}",
@@ -4196,6 +4352,10 @@ fn run_case_observed(
             )
         {
             case_failed = true;
+            evidence.record_case_cleanup_failure(
+                None,
+                format!("failed to cleanup reference case database {db_name}: {exc:#}"),
+            );
             let _ = writeln!(
                 log,
                 "    ❌ failed to cleanup reference case database {}: {:#}",
@@ -5235,7 +5395,6 @@ fn validate_dataset_launch_profile(
 }
 
 pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
-    validate_physical_wire_candidate_args(&cli)?;
     let base_dir = resolve_repo_root()?;
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
@@ -5867,21 +6026,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         } else {
             selected_cluster_size
         };
-        let (test_sessions, controls) = if let Some(binary) = &cli.physical_wire_candidate_binary {
-            let plan = control_plan::build_physical_wire_candidate(
-                &prepared_inputs,
-                launch_cluster_size,
-                cluster::startup_timeout(),
-                binary,
-                &cli.target_session_sql,
-            )?;
-            failure_artifacts.record_provenance("physical-wire-candidate-intent".into(), serde_json::json!({
-                "role_launches": plan.planned_launch_summaries(),
-                "remaining_original_budget_millis": plan.deadline().saturating_duration_since(Instant::now()).as_millis(),
-                "status": "inert-intents-not-action-evidence"
-            }));
-            (Some(plan), None)
-        } else if !cli.dry_run && control_plan::required(&prepared_inputs) {
+        let (test_sessions, controls) = if !cli.dry_run && control_plan::required(&prepared_inputs)
+        {
             ensure!(
                 launch_cluster_mode == ClusterMode::CrossProcess,
                 "internal SQL controls require a runner-owned native cross-process launch"
@@ -5926,7 +6072,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             &runner_config,
             launch_profile,
             test_sessions,
-            cli.physical_wire_candidate_binary.as_deref(),
         )?;
         let launched_target_port = server_handle.target_port();
         let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
@@ -7146,6 +7291,60 @@ mod tests {
     }
 
     #[test]
+    fn failure_log_includes_sql_error_code_when_available() {
+        let msg = "target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] compiled implementation unavailable";
+
+        assert_eq!(
+            annotate_failure_with_engine_error_code(msg, msg),
+            format!("sql_error_code=sql.analyze.unavailable_implementation {msg}")
+        );
+        assert_eq!(
+            annotate_failure_with_engine_error_code(
+                "target execute failed",
+                "ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] compiled implementation unavailable"
+            ),
+            "sql_error_code=sql.analyze.unavailable_implementation target execute failed"
+        );
+    }
+
+    #[test]
+    fn failure_log_preserves_existing_code_tags_without_duplicates() {
+        for msg in [
+            "engine_error_code=QueryTimeout target execute failed: [QueryTimeout] slow query",
+            "sql_error_code=sql.analyze.unavailable_implementation target execute failed",
+            "engine_error_code=UnsupportedCompiledShape sql_error_code=sql.analyze.unavailable_implementation target execute failed",
+        ] {
+            assert_eq!(annotate_failure_with_engine_error_code(msg, msg), msg);
+        }
+    }
+
+    #[test]
+    fn failure_log_adds_missing_code_tag_without_replacing_existing_tag() {
+        let msg = "engine_error_code=UnsupportedCompiledShape target execute failed";
+        let annotated = annotate_failure_with_engine_error_code(
+            msg,
+            "[sql.analyze.unavailable_implementation] compiled implementation unavailable",
+        );
+        assert_eq!(
+            annotated,
+            format!("sql_error_code=sql.analyze.unavailable_implementation {msg}")
+        );
+        assert_eq!(
+            annotate_failure_with_engine_error_code(&annotated, &annotated),
+            annotated
+        );
+
+        let msg = "sql_error_code=sql.analyze.unavailable_implementation target execute failed";
+        assert_eq!(
+            annotate_failure_with_engine_error_code(
+                msg,
+                "[UnsupportedCompiledShape] unsupported plan"
+            ),
+            format!("engine_error_code=UnsupportedCompiledShape {msg}")
+        );
+    }
+
+    #[test]
     fn failure_log_leaves_plain_errors_unclassified() {
         let msg = "target execute failed: plain execution error";
 
@@ -7290,51 +7489,23 @@ mod tests {
     }
 
     #[test]
-    fn physical_wire_candidate_cli_requires_actual_cross_process_verify() {
+    fn retired_physical_wire_candidate_cli_is_rejected() {
         use clap::Parser;
-        let ordinary = crate::Cli::try_parse_from(["runner", "--suite", "filter"]).unwrap();
-        assert!(ordinary.physical_wire_candidate_binary.is_none());
-        crate::validate_physical_wire_candidate_args(&ordinary).unwrap();
-        let args = [
+        let ordinary = crate::Cli::try_parse_from(["runner", "--suite", "filter"]);
+        assert!(ordinary.is_ok());
+        let error = crate::Cli::try_parse_from([
             "runner",
             "--suite",
             "filter",
             "--physical-wire-candidate-binary",
-            "/candidate",
+            "/retired",
             "--cluster-mode",
             "cross-process",
             "--mode",
             "verify",
-        ];
-        let candidate = crate::Cli::try_parse_from(args).unwrap();
-        crate::validate_physical_wire_candidate_args(&candidate).unwrap();
-        for extra in [
-            "--dry-run",
-            "--no-verify",
-            "--update-expected",
-            "--list-suites",
-            "--list-extensions",
-        ] {
-            assert!(
-                crate::Cli::try_parse_from(args.into_iter().chain([extra])).is_err(),
-                "{extra}"
-            );
-        }
-        for mode in ["record", "diff"] {
-            let mut invalid = args.to_vec();
-            *invalid.last_mut().unwrap() = mode;
-            let cli = crate::Cli::try_parse_from(invalid).unwrap();
-            assert!(crate::validate_physical_wire_candidate_args(&cli).is_err());
-        }
-        let local = crate::Cli::try_parse_from([
-            "runner",
-            "--suite",
-            "filter",
-            "--physical-wire-candidate-binary",
-            "/candidate",
         ])
-        .unwrap();
-        assert!(crate::validate_physical_wire_candidate_args(&local).is_err());
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

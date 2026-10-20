@@ -30,7 +30,7 @@ use arrow::{
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::ProgramNodeKind;
 use novarocks_physical_plan::NodeKind;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use std::{sync::Arc, time::Duration};
 struct Control;
 impl KernelEvaluationControl for Control {
@@ -46,7 +46,6 @@ fn source() -> SqlAuthoredPhysicalPlan {
     sql_source_with_single_field_and_core_residuals(
         "SELECT k FROM t_filter_is_not_null_and_range WHERE k IS NOT NULL AND k >= 10 AND k < 20",
         Field::new("k", DataType::Int32, true),
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     )
 }
 fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {

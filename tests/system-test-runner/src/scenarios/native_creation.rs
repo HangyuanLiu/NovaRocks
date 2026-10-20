@@ -37,7 +37,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_native_trust::NativeEndpointConnector;
-use novarocks_proto_models::{common, novarocks as proto, plan};
+use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
 use crate::actors::mysql as mysql_actor;
@@ -187,7 +187,7 @@ impl Scenario for FrozenReplayAndMembership {
         let mut variant = first.clone();
         variant.kernel_key_low = 2;
         variant.pipeline_dop = 3;
-        variant.sink = plan::data_sink::Kind::Result(true);
+        variant.sink = RawSink::Result;
         variant.instance_ordinal = 9;
         let changed = session.apply(variant.operation(), "changed-body CreateTask replay")?;
         for (label, replay) in [("exact", &exact), ("changed-body", &changed)] {
@@ -572,6 +572,281 @@ impl RawBackendSession {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RawSink {
+    CountOnly,
+    Result,
+    Stream { multicast: bool },
+}
+
+/// Author immutable package facts through the checked production constructors.
+/// No runtime capability, legacy tree, or test-only library helper is involved.
+pub(super) fn compiled_fragment(
+    fragment_id: u32,
+    dop: u32,
+    input: Option<(u32, bool)>,
+    sink: RawSink,
+    rows: &[i64],
+) -> proto::FrozenFragment {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+    use novarocks_functions::{ConstantPool, FunctionValueType};
+    use novarocks_physical_plan::*;
+    use novarocks_type_contract::{
+        CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
+        ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+        PureCompileControl, SemanticParameters,
+    };
+    use prost::Message;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let root = NodeId::new(10);
+    let value = ValueId::new(1);
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    let mut builder = FragmentBuilder::new(FragmentId::new(fragment_id));
+    let mut cuts = FragmentCuts::default();
+    let partitioning = || EdgePartitioning {
+        source: Distribution::Singleton,
+        source_multiplicity: RowMultiplicity::SingleCopy,
+        destination: Distribution::Singleton,
+        destination_multiplicity: RowMultiplicity::SingleCopy,
+    };
+    let cut_value = || CutValue {
+        value,
+        ty: ty.clone(),
+    };
+    let mut constants = ConstantPools::empty();
+    if let Some((edge, multicast)) = input {
+        let edge = EdgeId::new(edge);
+        builder
+            .insert_value(ValueDef {
+                id: value,
+                ty: ty.clone(),
+                origin: if multicast {
+                    ValueOrigin::CteImport {
+                        edge,
+                        producer_fragment: FragmentId::new(2),
+                        producer_value: value,
+                    }
+                } else {
+                    ValueOrigin::ExchangeImport {
+                        edge,
+                        source_value: value,
+                    }
+                },
+            })
+            .expect("receiver value");
+        builder
+            .add_exchange_source(
+                root,
+                edge,
+                Box::from([(value, value)]),
+                Box::from([value]),
+                Distribution::Singleton,
+                RowMultiplicity::SingleCopy,
+            )
+            .expect("receiver node");
+        cuts.inbound = Box::from([InboundFragmentCut {
+            edge,
+            kind: if multicast {
+                EdgeKind::CteMulticast
+            } else {
+                EdgeKind::Stream
+            },
+            source_fragment: FragmentId::new(2),
+            destination_node: root,
+            imports: Box::from([CutImport {
+                source: cut_value(),
+                destination: value,
+            }]),
+            partitioning: partitioning(),
+            change_stream_writer: None,
+            writer_result: None,
+        }]);
+    } else {
+        builder
+            .insert_value(ValueDef {
+                id: value,
+                ty: ty.clone(),
+                origin: ValueOrigin::NodeOutput {
+                    node: root,
+                    output_ordinal: 0,
+                },
+            })
+            .expect("values output");
+        let mut cells: Vec<Box<[ExprId]>> = Vec::new();
+        if !rows.is_empty() {
+            let array = Int64Array::from(rows.to_vec());
+            let source = ConstantPool::try_new(
+                Arc::new(Field::new("v", DataType::Int64, false)),
+                ty.clone(),
+                arrow_array::Array::to_data(&array),
+                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+                CompilePhase::Validate,
+                &Control,
+            )
+            .expect("BIGINT constant owner");
+            constants
+                .insert(ConstantPoolId::new(0), source)
+                .expect("constant pool");
+            for ordinal in 0..rows.len() {
+                let expression = builder
+                    .add_expression(
+                        root,
+                        ty.clone(),
+                        ExprKind::Constant(ConstantReference {
+                            pool: ConstantPoolId::new(0),
+                            ordinal: ordinal as u32,
+                        }),
+                    )
+                    .expect("constant expression");
+                cells.push(Box::from([expression]));
+            }
+        }
+        builder
+            .add_values(root, cells.into_boxed_slice(), Box::from([value]))
+            .expect("values node");
+    }
+    let sink = match sink {
+        RawSink::CountOnly => FragmentSink::RootResult(Box::new(
+            novarocks_result_contract::RootOutputContract::new(
+                novarocks_result_contract::RootProfileId::V1,
+                novarocks_result_contract::FrozenRootOutput::CountOnly,
+            ),
+        )),
+        RawSink::Result => FragmentSink::Result,
+        RawSink::Stream { multicast } => {
+            cuts.outbound = (1..=if multicast { 2 } else { 1 })
+                .map(|edge| OutboundFragmentCut {
+                    edge: EdgeId::new(edge),
+                    kind: if multicast {
+                        EdgeKind::CteMulticast
+                    } else {
+                        EdgeKind::Stream
+                    },
+                    destination_fragment: FragmentId::new(if edge == 2 { 3 } else { 1 }),
+                    destination_node: root,
+                    projection: Box::from([cut_value()]),
+                    destination_imports: Box::from([CutImport {
+                        source: cut_value(),
+                        destination: value,
+                    }]),
+                    partitioning: partitioning(),
+                    change_stream_writer: None,
+                    writer_result: None,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            if multicast {
+                FragmentSink::Multicast {
+                    edges: Box::from([EdgeId::new(1), EdgeId::new(2)]),
+                }
+            } else {
+                FragmentSink::Stream {
+                    edge: EdgeId::new(1),
+                }
+            }
+        }
+    };
+    let fragment = builder
+        .finish_definition(
+            root,
+            sink,
+            PipelineDopDomain {
+                min: dop,
+                max: dop,
+                requires_power_of_two: false,
+            },
+        )
+        .expect("checked fragment");
+    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).expect("expression roots");
+    let domain = EvaluationDomainId::new(0);
+    let mut invocations = Vec::new();
+    let mut bindings = Vec::new();
+    for (ordinal, (site, expression)) in roots.sites().iter().enumerate() {
+        let use_id = ExpressionUseId::new(ordinal as u32);
+        invocations.push(ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id,
+                domain,
+                demand: expression.demand,
+            },
+            definition: expression.expr,
+            control: ControlShape::Eager,
+            arguments: Box::default(),
+        });
+        bindings.push((*site, use_id));
+    }
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        invocations,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .expect("expression control");
+    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).expect("root uses");
+    let calls =
+        FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).expect("call-free table");
+    let result = matches!(
+        fragment.sink(),
+        FragmentSink::Result | FragmentSink::RootResult(_)
+    )
+    .then(|| ResultPort {
+        scalar_schema: None,
+        fragment: fragment.id(),
+        output: fragment.nodes()[&root].output.clone(),
+        fields: vec![ResultField {
+            domain: ResultValueDomain::Plain,
+            name: "v".into(),
+            alias: None,
+            value,
+            ty: ty.clone(),
+        }]
+        .into_boxed_slice(),
+    });
+    let package = FragmentPackage::try_new(
+        FragmentPackageInput {
+            constants,
+            version: PlanVersionId::try_new([0x5b; 16]).expect("version"),
+            required: RequiredContracts::default(),
+            pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control)
+                .expect("empty pruning"),
+            fragment,
+            expression_uses: uses,
+            calls,
+            cuts,
+            result,
+            parameters: SemanticParameters::try_new([]).expect("parameters"),
+            scans: BTreeMap::new(),
+            writes: BTreeMap::new(),
+            annotations: Box::default(),
+        },
+        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+        &Control,
+    )
+    .expect("checked package");
+    let wire = novarocks_plan_codec::physical_package_v2::encode_fragment_package(
+        &package,
+        &novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+        &Control,
+    )
+    .expect("package codec");
+    proto::FrozenFragment {
+        package: wire.encode_to_vec().into(),
+    }
+}
+
 /// Every fact one raw create carries, so a test can vary exactly one body
 /// fact and keep the identity.
 #[derive(Clone)]
@@ -581,7 +856,7 @@ pub(super) struct RawCreate {
     pub(super) backend_override: Option<BackendProcessId>,
     pub(super) kernel_key_low: i64,
     pub(super) pipeline_dop: u32,
-    pub(super) sink: plan::data_sink::Kind,
+    pub(super) sink: RawSink,
     pub(super) instance_ordinal: u32,
     pub(super) initial_domains: Vec<proto::TaskDomainUpdate>,
     pub(super) max_wait_millis: u64,
@@ -589,7 +864,7 @@ pub(super) struct RawCreate {
 }
 
 impl RawCreate {
-    /// A decodable, self-contained task: one VALUES node into a NOOP sink,
+    /// A checked, self-contained task: one VALUES node into a count-only root,
     /// frozen for exactly its own parallelism.
     pub(super) fn values(session: &RawBackendSession, task_id: u32) -> Self {
         Self {
@@ -602,7 +877,7 @@ impl RawCreate {
                 .wrapping_mul(1024)
                 .wrapping_add(i64::from(task_id) * 100 + 1),
             pipeline_dop: 2,
-            sink: plan::data_sink::Kind::Noop(true),
+            sink: RawSink::CountOnly,
             instance_ordinal: 0,
             initial_domains: Vec::new(),
             max_wait_millis: 15_000,
@@ -631,52 +906,13 @@ impl RawCreate {
                 .clone()
                 .expect("a raw context carries its backend"),
         };
-        let frozen = proto::FrozenFragment {
-            package: Default::default(),
-            plan_version: vec![0x5b; 16],
-            plan_contract_revision: 1,
-            fragment_contract_version: 1,
-            pipeline_dop_domain: Some(proto::PipelineDopDomain {
-                min: self.pipeline_dop,
-                max: self.pipeline_dop,
-                requires_power_of_two: false,
-            }),
-            plan: Some(plan::PlanFragment {
-                fragment_id: 1,
-                root: Some(plan::DistributedNode {
-                    node_id: 10,
-                    fragment_id: 1,
-                    limit: -1,
-                    payload: Some(if self.exchange_input {
-                        plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
-                            partition_type: plan::PartitionType::Unpartitioned as i32,
-                            source_fragment_id: 2,
-                            flavor: Some(plan::ExchangeFlavor {
-                                kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
-                            }),
-                            ..Default::default()
-                        })
-                    } else {
-                        plan::distributed_node::Payload::Physical(plan::PlanNode {
-                            output_columns: Vec::new(),
-                            kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
-                                rows: Vec::new(),
-                                columns: Vec::new(),
-                            })),
-                        })
-                    }),
-                    ..Default::default()
-                }),
-                sink: Some(plan::DataSink {
-                    kind: Some(self.sink.clone()),
-                }),
-                runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
-                    fragment_id: 1,
-                    bindings: Vec::new(),
-                }),
-                ..Default::default()
-            }),
-        };
+        let frozen = compiled_fragment(
+            1,
+            self.pipeline_dop,
+            self.exchange_input.then_some((1, false)),
+            self.sink,
+            &[],
+        );
         let metadata = proto::CreationMetadata {
             query_context: Some(context),
             descriptor: Some(proto::TaskDescriptor {

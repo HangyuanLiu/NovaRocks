@@ -84,7 +84,7 @@ fn binding_fits(
             Failure::Source(cause) => ConstructionFailure::InvalidSource(cause.to_string()).into(),
         })
 }
-impl TableFunctionProcessorOperator {
+impl TableFunctionFixtureOperator {
     pub(super) fn validate_typed_declarations(
         &self,
         owner: &dyn InputConstructionOwner,

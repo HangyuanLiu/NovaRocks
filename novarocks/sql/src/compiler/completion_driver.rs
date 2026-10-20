@@ -69,7 +69,6 @@ pub struct SqlFinalPlanCompileRequest {
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
     constant_policy: novarocks_functions::ConstantPolicy,
-    emission_mode: super::SqlPhysicalEmissionMode,
     control: SqlCompileControl,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
@@ -85,7 +84,6 @@ impl fmt::Debug for SqlFinalPlanCompileRequest {
             .field("intent", &self.intent)
             .field("session", &self.session)
             .field("environment", &self.environment)
-            .field("emission_mode", &self.emission_mode)
             .field("dop_domain", &self.dop_domain)
             .field("scan_read_budget", &self.scan_read_budget)
             .field("limits", &self.limits)
@@ -107,7 +105,6 @@ impl SqlFinalPlanCompileRequest {
         functions: Arc<dyn SqlFunctionCatalog>,
         constant_evaluator: &'static dyn SqlConstantEvaluator,
         constant_policy: novarocks_functions::ConstantPolicy,
-        emission_mode: super::SqlPhysicalEmissionMode,
         control: SqlCompileControl,
         dop_domain: PipelineDopDomain,
         scan_read_budget: ScanReadBudget,
@@ -122,7 +119,6 @@ impl SqlFinalPlanCompileRequest {
             functions: functions.snapshot(),
             constant_evaluator,
             constant_policy,
-            emission_mode,
             control,
             dop_domain,
             scan_read_budget,
@@ -149,7 +145,6 @@ impl SqlFinalPlanCompileRequest {
             functions,
             constant_evaluator,
             constant_policy,
-            emission_mode,
             control,
             dop_domain,
             scan_read_budget,
@@ -173,7 +168,6 @@ impl SqlFinalPlanCompileRequest {
             functions,
             constant_evaluator,
             constant_policy,
-            emission_mode,
             dop_domain,
             scan_read_budget,
             display_intent,
@@ -298,7 +292,6 @@ struct FinalPlanCommon {
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
     constant_policy: novarocks_functions::ConstantPolicy,
-    emission_mode: super::SqlPhysicalEmissionMode,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
     display_intent: SqlDisplayIntent,
@@ -549,7 +542,6 @@ fn analyze_with_catalog(
         common.constant_evaluator,
         mv_definitions,
         common.constant_policy,
-        common.emission_mode,
         control.clone(),
     );
     match SqlCompiler::analyze(request)? {
@@ -856,10 +848,9 @@ fn provider_or_ready_step(
     // Retain the exact catalogue snapshot that authored optimizer bindings,
     // rather than the earlier request snapshot whose outer owner may differ.
     common.functions = functions;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         &common.session.optimizer_settings,
-        common.emission_mode,
     );
     let offer_predicates = common
         .session
@@ -890,7 +881,6 @@ fn provider_or_ready_step(
             common.functions,
             root_allow_throw_exception,
             common.constant_policy,
-            common.emission_mode,
             control,
         )
         .map_err(SqlCompileError::from)?;
@@ -1246,7 +1236,6 @@ pub(super) fn resume_provider_read(
             state.common.functions,
             state.root_allow_throw_exception,
             state.common.constant_policy,
-            state.common.emission_mode,
             control,
         )
         .map_err(SqlCompileError::from)?;
@@ -1327,7 +1316,6 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
             PipelineDopDomain {
                 min: 1,
@@ -1375,7 +1363,6 @@ mod tests {
                 input.constant_evaluator,
                 None,
                 crate::constant::test_constant_policy(),
-                input.emission_mode,
                 input.control.clone(),
             ))
             .unwrap()
@@ -2880,7 +2867,6 @@ mod tests {
     // derived two-column boundary, not the original ten-column query 114.
     fn distinct_rows_topn_sequence_fixture(
         sql: &str,
-        mode: super::super::SqlPhysicalEmissionMode,
     ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
         let columns = vec![
             novarocks_types::schema::ColumnDef {
@@ -2899,7 +2885,6 @@ mod tests {
             },
         ];
         let mut input = request(sql, SqlCompileIntent::Query);
-        input.emission_mode = mode;
         input.dop_domain = PipelineDopDomain {
             min: 2,
             max: 2,
@@ -2974,30 +2959,26 @@ mod tests {
     // cannot exercise this state lifecycle. Native owns actual result/exit proof.
     fn grouped_state_topn_sequence_fixture(
         sql: &str,
-        mode: super::super::SqlPhysicalEmissionMode,
     ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
-        grouped_state_topn_sequence_fixture_with_disabled(sql, mode, false)
+        grouped_state_topn_sequence_fixture_with_disabled(sql, false)
     }
 
     fn grouped_state_topn_sequence_fixture_with_disabled(
         sql: &str,
-        mode: super::super::SqlPhysicalEmissionMode,
         disable_preagg: bool,
     ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
-        grouped_state_topn_sequence_fixture_with_options(sql, mode, disable_preagg, &[])
+        grouped_state_topn_sequence_fixture_with_options(sql, disable_preagg, &[])
     }
 
     fn grouped_state_topn_sequence_fixture_with_observed_metrics(
         sql: &str,
-        mode: super::super::SqlPhysicalEmissionMode,
         additional_metrics: &[(&str, u64, f64, f64)],
     ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
-        grouped_state_topn_sequence_fixture_with_options(sql, mode, false, additional_metrics)
+        grouped_state_topn_sequence_fixture_with_options(sql, false, additional_metrics)
     }
 
     fn grouped_state_topn_sequence_fixture_with_options(
         sql: &str,
-        mode: super::super::SqlPhysicalEmissionMode,
         disable_preagg: bool,
         additional_metrics: &[(&str, u64, f64, f64)],
     ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
@@ -3032,7 +3013,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut input = request(sql, SqlCompileIntent::Query);
-        input.emission_mode = mode;
         if disable_preagg {
             input
                 .session
@@ -3178,7 +3158,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_aggregate_topn_compile_preserves_modes_and_exact_endpoints() {
+    fn ordered_aggregate_topn_compile_preserves_exact_endpoints() {
         let suite =
             include_str!("../../../../tests/sql/correctness/aggregate/sql/compressed_key.sql");
         let original = suite
@@ -3200,10 +3180,7 @@ mod tests {
         let lanes: [(&str, &[(&str, u64, f64, f64)]); 2] =
             [("Missing", &[]), ("HistoricalC9", &observed_c9)];
         for (statistics, metrics) in lanes {
-            for mode in [
-                super::super::SqlPhysicalEmissionMode::OriginalNativeV1,
-                super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            ] {
+            {
                 for (label, sql) in [
                     (
                         "inner-140",
@@ -3211,24 +3188,25 @@ mod tests {
                     ),
                     ("original-140", original),
                 ] {
-                    let progress = grouped_state_topn_sequence_fixture_with_observed_metrics(
-                        sql, mode, metrics,
-                    )
-                    .unwrap_or_else(|error| panic!("{statistics} {mode:?} {label}: {error:#?}"));
+                    let progress =
+                        grouped_state_topn_sequence_fixture_with_observed_metrics(sql, metrics)
+                            .unwrap_or_else(|error| {
+                                panic!("{statistics} compiled {label}: {error:#?}")
+                            });
                     let SqlCompileProgress::Complete(completed) = progress else {
-                        panic!("unresolved completion needs for {statistics} {mode:?} {label}");
+                        panic!("unresolved completion needs for {statistics} compiled {label}");
                     };
                     let owner = completed.into_plan();
                     let plan = owner.plan();
                     if metrics.is_empty() {
-                        assert!(plan.runtime_filters().is_empty(), "{mode:?} {label}");
+                        assert!(plan.runtime_filters().is_empty(), "compiled {label}");
                         continue;
                     }
                     use novarocks_physical_plan::{
                         AggregateGrouping, NodeKind, RuntimeFilterConsumerTarget,
                         RuntimeFilterDomain, RuntimeFilterProducerTarget, TopNReduction,
                     };
-                    assert_eq!(plan.runtime_filters().len(), 1, "{mode:?} {label}");
+                    assert_eq!(plan.runtime_filters().len(), 1, "compiled {label}");
                     let filter = plan.runtime_filters().values().next().unwrap();
                     let RuntimeFilterDomain::Ordered { key, inclusive, .. } = &filter.domain else {
                         panic!("expected the original ordered domain");
@@ -3279,25 +3257,19 @@ mod tests {
                     let scan_fragment = &plan.fragments()[&consumer.endpoint.fragment];
                     let scan = &scan_fragment.nodes()[&consumer.endpoint.node];
                     assert!(matches!(scan.kind, NodeKind::Scan { .. }));
-                    match mode {
-                        super::super::SqlPhysicalEmissionMode::OriginalNativeV1 => {
-                            assert_eq!(*grouping, AggregateGrouping::Complete);
-                            assert!(matches!(reduction, TopNReduction::Rows));
-                        }
-                        super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
-                            assert_eq!(*grouping, AggregateGrouping::Partial);
-                            assert!(matches!(reduction, TopNReduction::GroupedStates { .. }));
-                            assert_eq!(consumer.endpoint.fragment, producer.endpoint.fragment);
-                            assert_eq!(aggregate.inputs.as_ref(), &[scan.id]);
-                            assert_eq!(producer.endpoint.values, consumer.endpoint.values);
-                        }
+                    {
+                        assert_eq!(*grouping, AggregateGrouping::Partial);
+                        assert!(matches!(reduction, TopNReduction::GroupedStates { .. }));
+                        assert_eq!(consumer.endpoint.fragment, producer.endpoint.fragment);
+                        assert_eq!(aggregate.inputs.as_ref(), &[scan.id]);
+                        assert_eq!(producer.endpoint.values, consumer.endpoint.values);
                     }
                 }
             }
         }
     }
 
-    fn assert_grouped_state_topn_sequence(mode: super::super::SqlPhysicalEmissionMode) {
+    fn assert_grouped_state_topn_sequence() {
         let queries = [
             (
                 "inner",
@@ -3310,16 +3282,11 @@ mod tests {
         ];
         let mut failures = Vec::new();
         for (label, sql) in queries {
-            match grouped_state_topn_sequence_fixture(sql, mode) {
+            match grouped_state_topn_sequence_fixture(sql) {
                 Ok(SqlCompileProgress::Complete(completed)) => {
                     let owner = completed.into_plan();
-                    match mode {
-                        super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
-                            assert_grouped_state_topn_sources(&owner);
-                        }
-                        super::super::SqlPhysicalEmissionMode::OriginalNativeV1 => {
-                            assert_original_complete_group_topn_sources(&owner);
-                        }
+                    {
+                        assert_grouped_state_topn_sources(&owner);
                     }
                 }
                 Ok(SqlCompileProgress::Incomplete(_)) => {
@@ -3328,10 +3295,10 @@ mod tests {
                 Err(error) => failures.push(format!("{label}: {error:?}")),
             }
         }
-        assert!(failures.is_empty(), "{mode:?}: {failures:?}");
+        assert!(failures.is_empty(), "compiled: {failures:?}");
     }
 
-    fn assert_original_complete_group_topn_sources(owner: &super::super::SqlAuthoredPhysicalPlan) {
+    fn assert_complete_group_topn_sources(owner: &super::super::SqlAuthoredPhysicalPlan) {
         use novarocks_physical_plan::{AggregateGrouping, NodeKind, TopNPhase, TopNReduction};
 
         let mut topn_count = 0;
@@ -3458,39 +3425,26 @@ mod tests {
     }
 
     #[test]
-    fn grouped_state_topn_sequence_original() {
-        assert_grouped_state_topn_sequence(super::super::SqlPhysicalEmissionMode::OriginalNativeV1);
-    }
-
-    #[test]
-    fn grouped_state_topn_sequence_respects_user_disable_in_both_modes() {
-        for mode in [
-            super::super::SqlPhysicalEmissionMode::OriginalNativeV1,
-            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        ] {
+    fn grouped_state_topn_sequence_respects_user_disable_for_compiled() {
+        {
             let completed = grouped_state_topn_sequence_fixture_with_disabled(
-                "SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100",
-                mode, true,
+                "SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100",true,
             ).unwrap().into_complete().expect("all facts are supplied");
-            assert_original_complete_group_topn_sources(&completed.into_plan());
+            assert_complete_group_topn_sources(&completed.into_plan());
         }
     }
 
     #[test]
     fn grouped_state_topn_sequence_candidate() {
-        assert_grouped_state_topn_sequence(
-            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
+        assert_grouped_state_topn_sequence();
     }
 
     #[test]
     fn grouped_state_topn_sequence_multiple_aggregate_sources() {
         let sql = "SELECT c1,c2,c3,COUNT(*) AS cnt,SUM(c4) AS total,MIN(c4) AS lo,MAX(c4) AS hi FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100";
-        let SqlCompileProgress::Complete(completed) = grouped_state_topn_sequence_fixture(
-            sql,
-            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        )
-        .unwrap() else {
+        let SqlCompileProgress::Complete(completed) =
+            grouped_state_topn_sequence_fixture(sql).unwrap()
+        else {
             panic!("expected complete multi-aggregate state reduction");
         };
         let owner = completed.into_plan();
@@ -3506,13 +3460,13 @@ mod tests {
         assert_grouped_state_topn_sources(&owner);
     }
 
-    fn assert_distinct_rows_topn_sequence(mode: super::super::SqlPhysicalEmissionMode) {
+    fn assert_distinct_rows_topn_sequence() {
         let mut failures = Vec::new();
         for sql in [
             "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 1;",
             "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 30,1;",
         ] {
-            match distinct_rows_topn_sequence_fixture(sql, mode) {
+            match distinct_rows_topn_sequence_fixture(sql) {
                 Ok(SqlCompileProgress::Complete(completed)) => {
                     let plan = completed.plan();
                     let result = plan.result_port().expect("result port");
@@ -3578,19 +3532,12 @@ mod tests {
                 }
             }
         }
-        assert!(failures.is_empty(), "{mode:?}: {failures:?}");
-    }
-
-    #[test]
-    fn distinct_rows_topn_sequence_original() {
-        assert_distinct_rows_topn_sequence(super::super::SqlPhysicalEmissionMode::OriginalNativeV1);
+        assert!(failures.is_empty(), "compiled: {failures:?}");
     }
 
     #[test]
     fn distinct_rows_topn_sequence_candidate() {
-        assert_distinct_rows_topn_sequence(
-            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
+        assert_distinct_rows_topn_sequence();
     }
 
     pub(super) fn frozen_table_statistics(
@@ -3816,7 +3763,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
         ))
         .expect("actual COW MERGE selection analysis")
@@ -3848,7 +3794,6 @@ mod tests {
         let (completion, needs) = crate::planning::dml::begin_final_dml_read_plan(
             crate::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
             &SessionOptimizerSettings::default(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         )
         .expect("actual COW MERGE selection optimization");
         let reads =
@@ -3959,7 +3904,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         ))
         .expect("analysis")
@@ -3973,7 +3917,6 @@ mod tests {
                 SqlCompileControl::unbounded(),
             ),
             &SessionOptimizerSettings::default(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         )
         .expect("optimized DML source");
         drop(statistics);

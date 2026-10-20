@@ -20,7 +20,6 @@ use crate::runtime_filter::RuntimeFilterProducerContract;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
-use crate::exec::node::ExecNode;
 use arrow::datatypes::DataType;
 use novarocks_functions::ResolvedAggregateSignature;
 
@@ -139,21 +138,4 @@ pub enum StreamingPreaggregationMode {
     ForceStreaming,
     ForcePreaggregation,
     LimitedMem,
-}
-
-#[derive(Clone, Debug)]
-pub struct AggregateNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub group_by: Vec<ExprId>,
-    pub functions: Vec<AggFunction>,
-    /// Exact immutable-catalog selections aligned with `functions`.
-    pub resolved_aggregates: Vec<ResolvedAggregateSignature>,
-    pub need_finalize: bool,
-    /// True only when *all* functions in this node are merge-aggregates.
-    /// Mixed merge/update aggregates are supported via per-function flags.
-    pub input_is_intermediate: bool,
-    pub output_chunk_schema: ChunkSchemaRef,
-    pub runtime_filter_spec: AggregateRuntimeFilterSpec,
-    pub streaming_preaggregation_mode: Option<StreamingPreaggregationMode>,
 }

@@ -22,7 +22,7 @@ use novarocks_functions::{
 };
 use novarocks_physical_plan::ExprKind;
 use novarocks_sql::compiler::{
-    SqlCallDependencySite, SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
+    SqlCallDependencySite, SqlCompileControl, builtin_sql_function_catalog,
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
 const SQL: &str = include_str!(concat!(
@@ -30,8 +30,8 @@ const SQL: &str = include_str!(concat!(
     "/../../tests/sql/correctness/project/sql/project_append_trailing_char_if_absent_semantics.sql"
 ));
 
-pub(super) fn bindings(mode: SqlPhysicalEmissionMode) -> Vec<ResolvedFunctionBinding> {
-    let owner = sql_source(SQL, DataType::Int64, mode);
+pub(super) fn bindings() -> Vec<ResolvedFunctionBinding> {
+    let owner = sql_source(SQL, DataType::Int64);
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut bindings = Vec::new();
@@ -65,7 +65,7 @@ pub(super) fn bindings(mode: SqlPhysicalEmissionMode) -> Vec<ResolvedFunctionBin
             assert_eq!(output.data_type().clone(), DataType::Utf8);
             assert!(output.nullable());
             eprintln!(
-                "append static original journal mode={mode:?} fragment={:?} source={:?} binding={binding:?}",
+                "append static original journal mode=compiled fragment={:?} source={:?} binding={binding:?}",
                 fragment.id(),
                 source.id
             );
@@ -84,7 +84,7 @@ pub(super) fn bindings(mode: SqlPhysicalEmissionMode) -> Vec<ResolvedFunctionBin
 fn e08s1_append_original_static_actual_corpus_journal_and_deferred_suffix_remain_unchanged() {
     let original = builtin_sql_function_catalog().snapshot();
     let control = SqlCompileControl::unbounded();
-    for binding in bindings(SqlPhysicalEmissionMode::OriginalNativeV1) {
+    for binding in bindings() {
         original
             .admit_bound_lifecycle_observed(&binding, PureCallLifecycle::Scalar, &control)
             .unwrap();

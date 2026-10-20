@@ -29,12 +29,12 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
-use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
 use novarocks_execution::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks as proto;
@@ -216,7 +216,6 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
 
-    use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution_contract::task_execution::descriptor::{
         DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeInbound,
@@ -224,6 +223,7 @@ mod tests {
     };
     use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::novarocks;
     use novarocks_types::UniqueId;

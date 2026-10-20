@@ -28,10 +28,7 @@ use novarocks_physical_plan::{
     RuntimeFilterCoverageNode, RuntimeFilterProducer,
     RuntimeFilterProducerTarget as PhysicalProducerTarget,
 };
-use novarocks_plan_codec::{
-    PhysicalV1RuntimeFilterBindingRole, physical_v1_runtime_filter_bindings,
-    physical_v1_runtime_filter_comparator_digest,
-};
+use novarocks_plan_codec::runtime_filter_comparator_digest;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AttemptRuntimeFilterApplyPoint {
@@ -225,10 +222,12 @@ impl AttemptRuntimeFilterFacts {
         }
         let mut deployment_bindings = Vec::new();
         let mut join_progress = Vec::new();
-        for binding in physical_v1_runtime_filter_bindings(plan)? {
+        for binding in novarocks_physical_plan::runtime_filter_bindings(plan)
+            .map_err(|error| error.to_string())?
+        {
             let filter = &plan.runtime_filters()[&binding.filter];
             let (role, witness) = match binding.role {
-                PhysicalV1RuntimeFilterBindingRole::Producer(index) => {
+                novarocks_physical_plan::RuntimeFilterBindingRole::Producer(index) => {
                     let producer = &filter.producers[index];
                     join_progress.push(completed_join_progress(
                         plan,
@@ -242,7 +241,7 @@ impl AttemptRuntimeFilterFacts {
                         Some(producer.witness.get()),
                     )
                 }
-                PhysicalV1RuntimeFilterBindingRole::Consumer(index) => {
+                novarocks_physical_plan::RuntimeFilterBindingRole::Consumer(index) => {
                     let consumer = &filter.consumers[index];
                     let scan_type = match consumer.target {
                         novarocks_physical_plan::RuntimeFilterConsumerTarget::ScanField { .. }
@@ -320,13 +319,12 @@ fn completed_channel(filter: &RuntimeFilter) -> Result<AttemptRuntimeFilterChann
             }
         }
         RuntimeFilterDomain::Ordered { key, inclusive, .. } => {
-            let comparator_digest = physical_v1_runtime_filter_comparator_digest(filter)?
-                .ok_or_else(|| {
-                    format!(
-                        "ordered runtime filter {} has no comparator digest",
-                        filter.id.get()
-                    )
-                })?;
+            let comparator_digest = runtime_filter_comparator_digest(filter)?.ok_or_else(|| {
+                format!(
+                    "ordered runtime filter {} has no comparator digest",
+                    filter.id.get()
+                )
+            })?;
             AttemptRuntimeFilterLogicalDomainFacts::Ordered {
                 keys: vec![AttemptRuntimeFilterOrderKeyFacts {
                     value_type: key.ty.clone(),

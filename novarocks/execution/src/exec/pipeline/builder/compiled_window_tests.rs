@@ -30,9 +30,7 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_type_contract::{WindowBound, WindowFrameUnits};
 
 use super::family_fixture::try_run;
-use super::window_fixture::{
-    Arg, Call, Key, Shape, compile, installed_catalog, package, try_compile,
-};
+use super::window_fixture::{Arg, Call, Key, Shape, compile, installed_catalog, package};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -680,16 +678,73 @@ fn empty_input_emits_no_rows() {
 
 #[test]
 fn aggregate_over_without_a_window_kernel_is_refused_before_running() {
-    // AVG installs no pure aggregate owner and so no window kernel.
-    let catalog = installed_catalog();
+    use novarocks_functions::{FunctionKind, PureKernelAbi};
+    use novarocks_local_compiler::{
+        FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers,
+    };
+
+    use super::family_fixture::{FixtureControl, constant_policy};
+    use super::window_fixture::{WINDOW, window_catalog};
+
+    // Install the real aggregate-only owner. Its legitimate metadata and
+    // effects reach the missing window ABI boundary instead of failing an
+    // earlier unknown-function lookup.
+    let catalog = window_catalog(&[("any_value", FunctionKind::Aggregate)]);
+    let declaration = catalog
+        .metadata()
+        .definition("any_value", FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap();
+    let installed = catalog
+        .metadata()
+        .pure_overload_declaration_observed(
+            declaration.function_id(),
+            FunctionKind::Aggregate,
+            &declaration.overloads()[0].identity,
+            &FixtureControl,
+        )
+        .unwrap();
+    assert_eq!(installed.implementation().abi, PureKernelAbi::AggregateV1);
     let shape = Shape {
         partition: vec![P],
         order: vec![key(O, true, false)],
-        calls: vec![Call::uninstalled_aggregate("avg", &[Arg::Column(X)])],
+        calls: vec![Call::aggregate("any_value", &[Arg::Column(X)])],
     };
-    let error = try_compile(package(&rows(), 3, &shape, &catalog, 1), &catalog, 1).unwrap_err();
+    let providers =
+        novarocks_connector_contract::PureProviderProgramCatalog::<std::io::Error>::try_new(
+            &[],
+            vec![],
+            &FixtureControl,
+        )
+        .unwrap();
+    let validated = validate_fragment_providers(
+        package(&rows(), 3, &shape, &catalog, 1),
+        &providers,
+        &FixtureControl,
+    )
+    .unwrap();
+    let error = compile_fragment(
+        validated,
+        &catalog,
+        LocalCompileOptions {
+            pipeline_dop: std::num::NonZeroUsize::MIN,
+            root_sink_dop: Some(std::num::NonZeroUsize::MIN),
+            kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
+            constants: constant_policy(),
+            exchange_wait: std::time::Duration::from_secs(120),
+        },
+        &FixtureControl,
+    )
+    .unwrap_err();
     assert!(
-        error.contains("aggregate OVER without an installed pure window kernel"),
+        matches!(
+            error,
+            FragmentCompileError::Unsupported {
+                node: Some(node),
+                feature: "aggregate OVER without an installed pure window kernel",
+            } if node == WINDOW
+        ),
         "{error}"
     );
 }

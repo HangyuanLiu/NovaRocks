@@ -24,7 +24,6 @@ use novarocks_physical_plan::{
 fn source() -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     super::bitmap_to_string_actual_sql_source_tests::bitmap_sql_source(
         "SELECT bitmap_union_int(id_int) AS bitmap_union_cnt, bitmap_to_string(bitmap_agg(id_int)) AS bitmap_members FROM fixture.t_agg_sketch_bitmap_source WHERE id_int IS NOT NULL",
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
     )
 }
 #[test]

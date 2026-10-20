@@ -61,7 +61,7 @@ mod mv;
 pub use mv::management_audit::FileManagementAuditSink;
 pub use mv::startup_isolation_file::StartupIsolationSource;
 mod native;
-pub use query_execution::package_freeze::{CompiledPackageCarrier, StaticPlanCarrier};
+pub use query_execution::package_freeze::CompiledPackageCarrier;
 #[cfg(novarocks_dev_controls)]
 mod preparation_diagnostics;
 pub(crate) mod query;

@@ -26,7 +26,6 @@ use std::sync::Arc;
 
 use super::{FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
 use crate::native::fragment_encoder::frozen::FragmentArtifact;
-use crate::query_execution::assembly::{CteMulticastConsumer, RouterSubmissionEdge};
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
@@ -239,8 +238,6 @@ pub(crate) struct SubmissionFragmentFacts {
     /// the schedule's answer, not the plan's, so every fragment carries its
     /// own rather than the plan guessing which one will be asked.
     output_columns: Vec<PlanOutputColumn>,
-    cte_id: Option<u32>,
-    dop_domain: novarocks_physical_plan::PipelineDopDomain,
 }
 
 impl SubmissionFragmentFacts {
@@ -249,15 +246,11 @@ impl SubmissionFragmentFacts {
         fragment_id: FragmentId,
         role: NativeSubmissionFragmentRole,
         output_columns: Vec<PlanOutputColumn>,
-        cte_id: Option<u32>,
-        dop_domain: novarocks_physical_plan::PipelineDopDomain,
     ) -> Self {
         Self {
             fragment_id,
             role,
             output_columns,
-            cte_id,
-            dop_domain,
         }
     }
 
@@ -268,69 +261,31 @@ impl SubmissionFragmentFacts {
     pub(crate) fn output_columns(&self) -> &[PlanOutputColumn] {
         &self.output_columns
     }
-
-    /// The CTE this fragment produces, if it is a CTE producer.
-    pub(crate) const fn cte_id(&self) -> Option<u32> {
-        self.cte_id
-    }
-
-    pub(crate) const fn dop_domain(&self) -> novarocks_physical_plan::PipelineDopDomain {
-        self.dop_domain
-    }
 }
 
 /// What submission encoding reads about a plan, as values.
 ///
-/// The planner's own edge is kept only for the two shapes that read its
-/// detail -- CTE multicast and change-stream routing. A plain stream edge is
-/// read for nothing but whether it exists, so only the set of fragments that
-/// have one is carried. That is what a completed plan can supply without
-/// inventing a partition expression or a slot list it does not have.
+/// A stream edge is read only for whether it exists, so submission carries
+/// the set of fragments that have one beside their result role and columns.
 #[derive(Clone)]
 pub(crate) struct SubmissionPlanFacts {
-    version: novarocks_physical_plan::PlanVersionId,
-    contract_revision: u32,
     order: Vec<FragmentId>,
     fragments: Vec<SubmissionFragmentFacts>,
     stream_edge_sources: std::collections::BTreeSet<FragmentId>,
-    /// Every consumer of every CTE, grouped by the CTE it reads. Which
-    /// instances receive is placement's answer and is joined in at
-    /// submission; everything here is a property of the plan.
-    cte_consumers: BTreeMap<u32, Vec<CteMulticastConsumer>>,
-    router_edges: Vec<RouterSubmissionEdge>,
 }
 
 impl SubmissionPlanFacts {
-    /// The same facts, for a plan that was completed rather than sealed.
-    ///
-    /// The encoded completed plan supplies the exact router fields submission
-    /// patches; its partitions and slots remain in the native template.
+    /// The completed plan supplies exact fragment roles and stream ownership.
     pub(crate) fn for_completed_plan(
-        version: novarocks_physical_plan::PlanVersionId,
-        contract_revision: u32,
         order: Vec<FragmentId>,
         fragments: Vec<SubmissionFragmentFacts>,
         stream_edge_sources: std::collections::BTreeSet<FragmentId>,
-        cte_consumers: BTreeMap<u32, Vec<CteMulticastConsumer>>,
-        router_edges: Vec<RouterSubmissionEdge>,
     ) -> Self {
         Self {
-            version,
-            contract_revision,
             order,
             fragments,
             stream_edge_sources,
-            cte_consumers,
-            router_edges,
         }
-    }
-
-    pub(crate) const fn version(&self) -> novarocks_physical_plan::PlanVersionId {
-        self.version
-    }
-
-    pub(crate) const fn contract_revision(&self) -> u32 {
-        self.contract_revision
     }
 
     /// The fragments this plan has, as the set every other artifact is
@@ -350,14 +305,6 @@ impl SubmissionPlanFacts {
 
     pub(crate) fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {
         self.stream_edge_sources.contains(&fragment_id)
-    }
-
-    pub(crate) fn cte_consumers(&self) -> &BTreeMap<u32, Vec<CteMulticastConsumer>> {
-        &self.cte_consumers
-    }
-
-    pub(crate) fn router_edges(&self) -> &[RouterSubmissionEdge] {
-        &self.router_edges
     }
 }
 

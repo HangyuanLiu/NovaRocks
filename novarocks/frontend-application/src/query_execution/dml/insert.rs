@@ -163,7 +163,7 @@ pub trait InsertEngine: Send + Sync {
     fn run_iceberg_write(
         &self,
         prepared: &dyn IcebergPreparedInsert,
-    ) -> Result<IcebergWriteReport, String>;
+    ) -> Result<IcebergWriteReport, crate::dml::error::DmlExecutionError>;
 
     fn commit_iceberg_write_terminal(
         &self,
@@ -418,7 +418,7 @@ impl InsertEngine for DmlExecutionKernel {
     fn run_iceberg_write(
         &self,
         prepared: &dyn IcebergPreparedInsert,
-    ) -> Result<IcebergWriteReport, String> {
+    ) -> Result<IcebergWriteReport, crate::dml::error::DmlExecutionError> {
         let prepared = downcast_prepared(prepared)?;
         Ok(iceberg_write_report_from_result(
             prepared.prepared.run_coordinated_write()?,
@@ -579,7 +579,10 @@ mod tests {
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 crate::application::test_constant_policy(),
-                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+                crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                    novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                    novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                ),
             ),
             None,
             Arc::clone(&connector_control),

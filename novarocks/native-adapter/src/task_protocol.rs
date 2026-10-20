@@ -705,6 +705,7 @@ pub fn host_rejection_status(rejection: HostRejection) -> tonic::Status {
     match rejection.category() {
         TaskFailureCategory::Protocol => tonic::Status::invalid_argument(detail),
         TaskFailureCategory::ResourceExhausted => tonic::Status::resource_exhausted(detail),
+        TaskFailureCategory::Unsupported => tonic::Status::unimplemented(detail),
         TaskFailureCategory::Execution
         | TaskFailureCategory::Exchange
         | TaskFailureCategory::Internal => tonic::Status::internal(detail),

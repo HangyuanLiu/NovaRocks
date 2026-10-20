@@ -105,74 +105,6 @@ impl CompletedPhysicalPlanCandidate {
         })
     }
 
-    /// Borrow ordinary original requests from the already closed physical plan;
-    /// only Writer sites need the additional SQL-journal preparation receipt.
-    pub fn author_native_writer_preparation(
-        &self,
-        policy: novarocks_physical_plan::ConstantPolicy,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<
-        std::collections::BTreeMap<
-            novarocks_physical_plan::FragmentId,
-            novarocks_sql::compiler::NativeWriterPreparation,
-        >,
-        novarocks_sql::compiler::PackageSemanticsError,
-    > {
-        match &self.source {
-            CompletedPlanSource::Sql(source) => {
-                novarocks_sql::compiler::author_native_writer_preparation(source, policy, control)
-            }
-            CompletedPlanSource::Program(program) => {
-                use novarocks_physical_plan::PhysicalCallSite;
-                let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-                    control,
-                    novarocks_type_contract::CompilePhase::FunctionSpecialization,
-                )?;
-                let result = (|| {
-                    let mut has_writer = false;
-                    for fragment in program.fragments().values() {
-                        novarocks_physical_plan::visit_relational_calls_observed::<
-                            novarocks_physical_plan::FrozenCallError,
-                        >(fragment, &mut work, |site, _, _| {
-                            if matches!(
-                                site,
-                                PhysicalCallSite::WriterPartial { .. }
-                                    | PhysicalCallSite::WriterFinal { .. }
-                            ) {
-                                has_writer = true;
-                            }
-                            Ok(())
-                        })
-                        .map_err(|cause| match cause {
-                            novarocks_physical_plan::FrozenCallError::Control(cause) => {
-                                novarocks_sql::compiler::PackageSemanticsError::Control(cause)
-                            }
-                            _ => novarocks_sql::compiler::PackageSemanticsError::InvalidSource(
-                                "a structural program has no original SQL Writer source",
-                            ),
-                        })?;
-                    }
-                    if has_writer {
-                        return Err(
-                            novarocks_sql::compiler::PackageSemanticsError::InvalidSource(
-                                "a structural program has no original SQL Writer source",
-                            ),
-                        );
-                    }
-                    Ok(std::collections::BTreeMap::new())
-                })();
-                if matches!(
-                    result,
-                    Err(novarocks_sql::compiler::PackageSemanticsError::Control(_))
-                ) {
-                    return result;
-                }
-                work.finish()?;
-                result
-            }
-        }
-    }
-
     /// Author every fragment's package semantics from SQL's original source
     /// journal. A structural program has no SQL journal; it is refused rather
     /// than given fabricated call scopes.
@@ -203,14 +135,6 @@ impl CompletedPhysicalPlanCandidate {
         }
     }
 
-    /// A structural program has no SQL emission certification. It is never
-    /// assigned a default SQL mode by this projection.
-    pub fn sql_emission_mode(&self) -> Option<novarocks_sql::compiler::SqlPhysicalEmissionMode> {
-        match &self.source {
-            CompletedPlanSource::Sql(source) => Some(source.emission_mode()),
-            CompletedPlanSource::Program(_) => None,
-        }
-    }
     /// Same immutable source's publication-proved public output obligation.
     /// No caller can replace it with another plan or supplied result schema.
     pub fn original_public_result_port(&self) -> Option<&novarocks_physical_plan::ResultPort> {
@@ -711,7 +635,6 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             crate::completed_plan_fixture::test_constant_policy(),
-            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
             PipelineDopDomain {
                 min: 1,

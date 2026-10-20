@@ -17,27 +17,10 @@
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::node::ExecNode;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub enum TableFunctionOutputSlot {
     Outer { slot: SlotId },
     Result { index: usize },
-}
-
-#[derive(Clone, Debug)]
-pub struct TableFunctionNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub function_name: String,
-    pub param_slots: Vec<SlotId>,
-    pub outer_slots: Vec<SlotId>,
-    pub fn_result_slots: Vec<SlotId>,
-    pub fn_result_required: bool,
-    pub is_left_join: bool,
-    pub param_types: Vec<DataType>,
-    pub ret_types: Vec<DataType>,
-    pub output_chunk_schema: ChunkSchemaRef,
-    pub output_slot_sources: Vec<TableFunctionOutputSlot>,
 }

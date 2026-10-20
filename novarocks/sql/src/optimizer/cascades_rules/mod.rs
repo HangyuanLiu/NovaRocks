@@ -71,8 +71,7 @@ pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(sort_limit_to_top_n::SortLimitToTopN),
         Box::new(split_aggregate::SplitAggregateRule),
         Box::new(split_top_n::SplitTopN),
-        // The compiler disables this rule for OriginalNativeV1. Only the exact
-        // compiled carrier owns GroupedStates before complete aggregation.
+        // The compiled path owns GroupedStates before complete aggregation.
         Box::new(push_topn_to_preagg::PushDownTopNToPreAgg),
         Box::new(topn_compactness::MergeConsecutiveTopN),
         Box::new(topn_compactness::RemoveRedundantSortUnderTopN),

@@ -92,7 +92,7 @@ impl ScanAssignments {
     /// Carry the already-enriched `BoundScanRanges` per plan scan node. No
     /// validation happens here (kept `Result` for call-site symmetry): the
     /// old per-range kind assertion is gone, presence is cross-checked in
-    /// `FragmentSubmission::try_new`, and variant-vs-source correctness is
+    /// `CompiledFragmentSubmission::try_new`, and variant-vs-source correctness is
     /// enforced at materialize time by `ScanSource::bind`.
     #[allow(clippy::unnecessary_wraps)]
     pub fn try_new(

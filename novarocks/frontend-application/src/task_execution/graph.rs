@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use crate::native::fragment_encoder::frozen::FragmentArtifact;
+use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticSinkTarget};
 use crate::query_execution::artifact::FragmentId;
 use crate::query_execution::artifact::NativePlacementAssignment;
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
@@ -75,11 +75,10 @@ pub struct FragmentPlanFacts {
 /// order; the edges are the producer stage's own. Every task of the fragment
 /// produces on the same logical edges, so one binding serves all of them.
 fn bind_sink_edges(
-    fragment: &FragmentArtifact,
+    targets: &[StaticSinkTarget],
     outbound: &[&EdgeNode],
     stage_of_fragment: &BTreeMap<FragmentId, StageId>,
 ) -> Result<Arc<[ExchangeEdgeId]>, TaskExecutionError> {
-    let targets = fragment.facts().sink_targets();
     if targets.len() != outbound.len() {
         return Err(TaskExecutionError::Schedule(
             "static sink count differs from the task's outbound edge count".to_owned(),
@@ -125,6 +124,14 @@ fn bind_sink_edges(
 /// own ordinal, width and initial scan ranges. The graph binds sink branches
 /// to edges only after it has minted the edges.
 pub trait FragmentPlanSource {
+    /// Control-owner tests may supply neutral graph targets independently of
+    /// an executable package. This hook never exists in production: real task
+    /// creation always binds exactly the checked package's own sink facts.
+    #[cfg(test)]
+    fn control_topology_targets(&self, _fragment_id: FragmentId) -> Option<Vec<StaticSinkTarget>> {
+        None
+    }
+
     /// Moves one instance's creation facts out of the source.
     ///
     /// Taken rather than borrowed: an instance's initial scan ranges are held
@@ -535,6 +542,8 @@ pub fn build_task_graph(
     let mut sink_bindings = BTreeMap::<StageId, Arc<[ExchangeEdgeId]>>::new();
     for (&fragment_id, placements) in inputs.placements {
         for placement in placements {
+            #[cfg(test)]
+            let control_topology_targets = plans.control_topology_targets(fragment_id);
             let facts = plans.take_plan(fragment_id, placement.instance_index)?;
             let task_id = task_of_instance[&(fragment_id, placement.instance_index)];
             let node = &tasks[&task_id];
@@ -547,6 +556,8 @@ pub fn build_task_graph(
                 node,
                 facts,
                 inputs.transport_budget,
+                #[cfg(test)]
+                control_topology_targets.as_deref(),
             )?;
             seeds.insert(task_id, seed);
         }
@@ -654,6 +665,7 @@ fn bind_creation_seed(
     node: &TaskNode,
     facts: FragmentPlanFacts,
     transport_budget: TransportBudget,
+    #[cfg(test)] control_topology_targets: Option<&[StaticSinkTarget]>,
 ) -> Result<TaskCreationSeed, TaskExecutionError> {
     let FragmentPlanFacts {
         fragment,
@@ -686,7 +698,10 @@ fn bind_creation_seed(
                 .iter()
                 .map(|edge_id| &edges[edge_id])
                 .collect::<Vec<_>>();
-            let binding = bind_sink_edges(&fragment, &outbound, stage_of_fragment)?;
+            let targets = fragment.facts().sink_targets();
+            #[cfg(test)]
+            let targets = control_topology_targets.unwrap_or(targets);
+            let binding = bind_sink_edges(targets, &outbound, stage_of_fragment)?;
             sink_bindings.insert(node.stage_id(), Arc::clone(&binding));
             binding
         }
@@ -943,6 +958,8 @@ pub(crate) fn build_task_graph_from_manifest(
             &tasks[&task_id],
             facts,
             transport_budget,
+            #[cfg(test)]
+            None,
         )?;
         seeds.insert(task_id, seed);
     }

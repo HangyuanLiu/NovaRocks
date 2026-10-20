@@ -1525,6 +1525,7 @@ fn classify_root_termination(
         ),
         TerminationDetail::Failed(failure) => {
             let class = match failure.category() {
+                TaskFailureCategory::Unsupported => AttemptFailureClass::Unsupported,
                 TaskFailureCategory::ResourceExhausted => {
                     AttemptFailureClass::RecoverableInfrastructure
                 }
@@ -1535,14 +1536,18 @@ fn classify_root_termination(
                     AttemptFailureClass::ContractViolation
                 }
             };
-            (
-                class,
-                format!(
-                    "attempt ended without stable result success: FAILED(category={}, detail={})",
-                    failure.category(),
-                    failure.detail()
-                ),
-            )
+            let message = format!(
+                "attempt ended without stable result success: FAILED(category={}, detail={})",
+                failure.category(),
+                failure.detail()
+            );
+            let message = if class == AttemptFailureClass::Unsupported {
+                crate::engine_error::EngineError::unsupported_compiled_shape(message)
+                    .to_bracketed_user_message()
+            } else {
+                message
+            };
+            (class, message)
         }
     };
     Some(RootResultFetchFailure::new(
@@ -1674,6 +1679,63 @@ mod tests {
             TaskId::new(1).unwrap(),
             BackendProcessId::new_v7(),
         )
+    }
+
+    #[test]
+    fn unsupported_root_or_originating_failure_has_a_stable_nonretryable_identity() {
+        let root = root_task(execution(118));
+        let failure = TerminationDetail::Failed(TaskFailure::new(
+            TaskFailureCategory::Unsupported,
+            SafeDetail::truncating("FULL OUTER hash join"),
+        ));
+        let failed = TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Failed,
+            Some(failure.clone()),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        let derived = TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Aborted,
+            Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        for decision in [
+            classify_root_termination(&failed, None).unwrap(),
+            classify_root_termination(&derived, Some(&failure)).unwrap(),
+        ] {
+            assert_eq!(decision.class(), AttemptFailureClass::Unsupported);
+            assert!(
+                decision
+                    .error()
+                    .message()
+                    .starts_with("[UnsupportedCompiledShape] ")
+            );
+            assert!(decision.error().message().contains("FULL OUTER hash join"));
+        }
+        let invalid = TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Failed,
+            Some(TerminationDetail::Failed(TaskFailure::new(
+                TaskFailureCategory::Protocol,
+                SafeDetail::truncating("unsupported diagnostic is not a capability"),
+            ))),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        let decision = classify_root_termination(&invalid, None).unwrap();
+        assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
+        assert!(
+            !decision
+                .error()
+                .message()
+                .starts_with("[UnsupportedCompiledShape]")
+        );
     }
 
     fn result_schema() -> ResultSchema {

@@ -28,8 +28,6 @@ compile_error!("mem-1-m07-exact-mysql-write requires test-controls");
     not(novarocks_dev_controls)
 ))]
 compile_error!("native-compatibility-test-fixture requires test-controls");
-#[cfg(all(feature = "physical-wire-v2-candidate", not(novarocks_dev_controls)))]
-compile_error!("physical-wire-v2-candidate requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
@@ -48,8 +46,6 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
             "mem-1-m07-exact-mysql-write",
             #[cfg(feature = "native-compatibility-test-fixture")]
             "native-compatibility-test-fixture",
-            #[cfg(feature = "physical-wire-v2-candidate")]
-            "physical-wire-v2-candidate",
         ],
     )
 }
@@ -62,6 +58,7 @@ pub mod build_information;
 pub mod catalog_credential_registry;
 pub mod catalog_source_config;
 pub mod cgroup_memory;
+mod compiled_composition;
 pub mod composition;
 mod env_reference;
 mod joint_startup_report;
@@ -73,8 +70,6 @@ pub mod native_compatibility;
 pub mod native_trust;
 pub mod network;
 mod paimon_access;
-#[cfg(feature = "physical-wire-v2-candidate")]
-mod physical_wire_candidate;
 pub mod provider_manifest;
 pub mod roles;
 pub mod scan_io;

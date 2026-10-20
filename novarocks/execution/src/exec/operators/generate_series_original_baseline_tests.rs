@@ -80,7 +80,7 @@ pub(super) fn raw(
         &[result_slot],
     )
     .unwrap();
-    let factory = TableFunctionProcessorFactory::new(
+    let factory = TableFunctionFixtureFactory::new(
         43,
         "generate_series".into(),
         slots,
@@ -119,7 +119,7 @@ fn i64s(values: &[Option<i128>]) -> ArrayRef {
 fn actual(array: &ArrayRef) -> Vec<Option<i128>> {
     (0..array.len())
         .map(|row| {
-            let dummy = TableFunctionProcessorFactory::new(
+            let dummy = TableFunctionFixtureFactory::new(
                 1,
                 "generate_series".into(),
                 vec![],
@@ -137,7 +137,7 @@ fn actual(array: &ArrayRef) -> Vec<Option<i128>> {
                 vec![],
             );
             // The original private reader is the authority for test output projection.
-            let operator = TableFunctionProcessorOperator {
+            let operator = TableFunctionFixtureOperator {
                 name: dummy.name,
                 function_name: dummy.function_name,
                 param_slots: vec![],
