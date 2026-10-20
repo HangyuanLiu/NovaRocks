@@ -41,6 +41,21 @@ run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run)
 
 
+def exit_controlling_shell(terminal):
+    # Every case has a fresh shell with exactly one owned job. Reconcile that
+    # job through Bash before exit: a wrapper receipt does not reap its owner.
+    # Keep the normal stopped-job warning and the original bounded shell wait.
+    os.write(terminal, b"fg %1\nexit\n")
+
+
+def retain_pty_observation(case, trace, shell, terminal, waited):
+    case.mkdir(parents=True, exist_ok=True)
+    (case / "pty-trace.raw").write_bytes(trace)
+    (case / "pty-parent.json").write_text(json.dumps(dict(
+        shell_pid=shell, terminal_open=terminal >= 0, shell_reaped=waited),
+        indent=2) + "\n")
+
+
 class Materials(unittest.TestCase):
     def setUp(self):
         (REPO / "target").mkdir(exist_ok=True)
@@ -61,6 +76,72 @@ class Materials(unittest.TestCase):
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, target)
         self.temporary.cleanup()
+
+
+    def test_controlling_shell_reaps_its_stopped_owner_after_wrapper_exit(self):
+        case = self.root / "stopped-owner-after-wrapper-exit"
+        case.mkdir()
+        owner = case / "owner.py"
+        owner.write_text("import json,os,signal,sys\nfrom pathlib import Path\n"
+            "root=Path(sys.argv[1])\n"
+            "signals=[getattr(signal,n) for n in ('SIGINT','SIGQUIT','SIGHUP','SIGTERM','SIGTSTP','SIGTTIN','SIGTTOU')]\n"
+            "for number in signals: signal.signal(number,signal.SIG_IGN)\n"
+            "pid=os.posix_spawn(sys.executable,[sys.executable,'-c','pass'],os.environ,setsigdef=signals,setsigmask=())\n"
+            "child,status=os.waitpid(pid,0)\n"
+            "(root/'actual-wrapper-exit.json').write_text(json.dumps(dict(pid=pid,wait_status=status)))\n"
+            "os.kill(os.getpid(),signal.SIGSTOP)\n"
+            "(root/'owner-continued.json').write_text(json.dumps(dict(pid=os.getpid())))\n")
+        shell, terminal = pty.fork()
+        if shell == 0:
+            os.execl("/bin/bash", "bash", "--noprofile", "--norc", "-i")
+        trace = bytearray()
+        waited = False
+        def turn():
+            readable, _, _ = select.select([terminal], [], [], 0.02)
+            if readable:
+                try:
+                    trace.extend(os.read(terminal, 65536))
+                except OSError:
+                    pass
+        try:
+            command = " ".join(shlex.quote(value) for value in [sys.executable, str(owner), str(case)])
+            os.write(terminal, (command + "\n").encode())
+            receipt = case / "actual-wrapper-exit.json"
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if receipt.is_file() and b"Stopped" in trace:
+                    break
+                turn()
+            self.assertTrue(receipt.is_file(), trace.decode(errors="replace"))
+            self.assertIn(b"Stopped", trace)
+            actual = json.loads(receipt.read_text())
+            self.assertTrue(os.WIFEXITED(actual["wait_status"]))
+            self.assertEqual(os.WEXITSTATUS(actual["wait_status"]), 0)
+            self.assertFalse((case / "owner-continued.json").exists())
+            exit_controlling_shell(terminal)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                child, status = os.waitpid(shell, os.WNOHANG)
+                if child:
+                    waited = True
+                    break
+                turn()
+            self.assertTrue(waited, "controlling shell did not reap its stopped job: " + trace.decode(errors="replace")[-3000:])
+            self.assertTrue(os.WIFEXITED(status))
+            self.assertEqual(os.WEXITSTATUS(status), 0)
+            self.assertTrue((case / "owner-continued.json").is_file())
+        finally:
+            try:
+                retain_pty_observation(case, trace, shell, terminal, waited)
+            finally:
+                if not waited:
+                    try:
+                        os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
+                        os.kill(shell, signal.SIGHUP)
+                    except (OSError, ProcessLookupError):
+                        pass
+                    os.waitpid(shell, 0)
+                os.close(terminal)
 
     def context(self, name="run"):
         root = self.root / name
@@ -877,7 +958,7 @@ while True:
                     else:
                         self.assertEqual(result["cancelled"], [getattr(signal, "SIG" + event.removeprefix("doc-"))])
                     if terminal >= 0:
-                        os.write(terminal, b"exit\n")
+                        exit_controlling_shell(terminal)
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
                         child, status = os.waitpid(shell, os.WNOHANG)
@@ -887,15 +968,18 @@ while True:
                         turn()
                     self.assertTrue(waited, "controlling shell did not exit")
                 finally:
-                    if not waited:
-                        try:
-                            os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
-                            os.kill(shell, signal.SIGHUP)
-                        except (OSError, ProcessLookupError):
-                            pass
-                        os.waitpid(shell, 0)
-                    if terminal >= 0:
-                        os.close(terminal)
+                    try:
+                        retain_pty_observation(case, trace, shell, terminal, waited)
+                    finally:
+                        if not waited:
+                            try:
+                                os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
+                                os.kill(shell, signal.SIGHUP)
+                            except (OSError, ProcessLookupError):
+                                pass
+                            os.waitpid(shell, 0)
+                        if terminal >= 0:
+                            os.close(terminal)
 
 
 if __name__ == "__main__":
