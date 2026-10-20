@@ -40,6 +40,7 @@ write_fixture() {
   write_package "$root" "novarocks/execution" "novarocks-execution"
   write_package "$root" "novarocks/type-contract" "novarocks-type-contract"
   write_package "$root" "novarocks/result-contract" "novarocks-result-contract"
+  write_package "$root" "novarocks/failure-contract" "novarocks-failure-contract"
   write_package "$root" "novarocks/constant-contract" "novarocks-constant-contract"
   write_package "$root" "novarocks/function-contract" "novarocks-function-contract"
   write_package "$root" "novarocks/functions" "novarocks-functions"
@@ -60,6 +61,7 @@ members = [
   "novarocks/execution",
   "novarocks/type-contract",
   "novarocks/result-contract",
+  "novarocks/failure-contract",
   "novarocks/constant-contract",
   "novarocks/function-contract",
   "novarocks/functions",
@@ -97,6 +99,11 @@ EOF
 
 [dependencies]
 novarocks-result-contract = { path = "../result-contract" }
+EOF
+  cat >>"$root/novarocks/result-contract/Cargo.toml" <<'EOF'
+
+[dependencies]
+novarocks-failure-contract = { path = "../failure-contract" }
 EOF
   cat >>"$root/novarocks/constant-contract/Cargo.toml" <<'EOF'
 
@@ -350,15 +357,25 @@ printf 'novarocks-connector-iceberg = { path = "../connector/iceberg" }\n' \
   >>"$constant_contract_provider/novarocks/constant-contract/Cargo.toml"
 assert_rejected "$constant_contract_provider" "internal normal closure must be exactly"
 
-# Use a non-NovaRocks helper to prove dependency freedom independently of the
-# exact internal closure, including edges omitted by a normal resolved graph.
+# Result may forward only FailureContract, including edge kinds omitted by a
+# normal resolved graph. FailureContract itself must remain dependency-free.
 for dependency_kind in dependencies build-dependencies dev-dependencies; do
   result_dependency="$fixture_root/result-$dependency_kind"
   cp -R "$valid" "$result_dependency"
   write_package "$result_dependency" "helper" "result-helper"
-  printf '\n[%s]\nresult-helper = { path = "../../helper" }\n' "$dependency_kind" \
+  if [ "$dependency_kind" != dependencies ]; then
+    printf '\n[%s]\n' "$dependency_kind" >>"$result_dependency/novarocks/result-contract/Cargo.toml"
+  fi
+  printf 'result-helper = { path = "../../helper" }\n' \
     >>"$result_dependency/novarocks/result-contract/Cargo.toml"
-  assert_rejected "$result_dependency" "novarocks-result-contract must not declare dependencies"
+  assert_rejected "$result_dependency" "novarocks-result-contract may declare only the required normal novarocks-failure-contract"
+
+  failure_dependency="$fixture_root/failure-$dependency_kind"
+  cp -R "$valid" "$failure_dependency"
+  write_package "$failure_dependency" helper failure-helper
+  printf '\n[%s]\nfailure-helper = { path = "../../helper" }\n' "$dependency_kind" \
+    >>"$failure_dependency/novarocks/failure-contract/Cargo.toml"
+  assert_rejected "$failure_dependency" "novarocks-failure-contract must not declare dependencies"
 done
 
 result_optional="$fixture_root/result-optional"
@@ -369,7 +386,37 @@ cat >>"$result_optional/novarocks/result-contract/Cargo.toml" <<'EOF'
 [target.'cfg(target_os = "none")'.dependencies]
 result-helper = { path = "../../helper", optional = true }
 EOF
-assert_rejected "$result_optional" "novarocks-result-contract must not declare dependencies"
+assert_rejected "$result_optional" "novarocks-result-contract may declare only the required normal novarocks-failure-contract"
+
+failure_optional="$fixture_root/failure-optional"
+cp -R "$valid" "$failure_optional"
+write_package "$failure_optional" helper failure-helper
+cat >>"$failure_optional/novarocks/failure-contract/Cargo.toml" <<'EOF'
+
+[target.'cfg(target_os = "none")'.dependencies]
+failure-helper = { path = "../../helper", optional = true }
+EOF
+assert_rejected "$failure_optional" "novarocks-failure-contract must not declare dependencies"
+
+for mutation in missing optional target; do
+  result_fact="$fixture_root/result-fact-$mutation"
+  cp -R "$valid" "$result_fact"
+  case "$mutation" in
+    missing)
+      replace_once "$result_fact/novarocks/result-contract/Cargo.toml" \
+        $'novarocks-failure-contract = { path = "../failure-contract" }\n' ''
+      expected="may declare only the required normal novarocks-failure-contract" ;;
+    optional)
+      replace_once "$result_fact/novarocks/result-contract/Cargo.toml" \
+        'path = "../failure-contract"' 'path = "../failure-contract", optional = true'
+      expected="novarocks-failure-contract must not be optional" ;;
+    target)
+      replace_once "$result_fact/novarocks/result-contract/Cargo.toml" \
+        '[dependencies]' "[target.'cfg(target_os = \"none\")'.dependencies]"
+      expected="novarocks-failure-contract must not be target-specific" ;;
+  esac
+  assert_rejected "$result_fact" "$expected"
+done
 
 execution_normal="$fixture_root/execution-normal"
 cp -R "$valid" "$execution_normal"
